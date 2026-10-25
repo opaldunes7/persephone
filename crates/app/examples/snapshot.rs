@@ -5,7 +5,10 @@
 //! ```
 //!
 //! SCRIPT is one character per action: `n` new chart, `q` close, `h`/`j`/`k`/`l` focus,
-//! `H`/`J`/`K`/`L` swap, `<`/`>`/`^`/`v` move a divider, `t` toggle split, `f` fullscreen.
+//! `H`/`J`/`K`/`L` swap, `<`/`>`/`^`/`v` move a divider, `t` toggle split, `f` fullscreen;
+//! `m` left-clicks the focused chart (opening its menu), `i` opens the indicator page, `s`
+//! the symbol page, `1`-`8` add a built-in indicator (in menu order), `e` opens the first
+//! indicator's settings.
 //! AT_MS freezes the clock that many milliseconds after the last action (default: settled),
 //! to look at animation frames. iced appends the renderer name to the file name.
 
@@ -15,10 +18,14 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use iced::{Settings, Size, Theme};
-use persephone::{Message, Persephone, keymap::Action};
-use persephone_chart::ChartData;
-use persephone_core::Timeframe;
+use iced::{Point, Settings, Size, Theme};
+use persephone::{
+    Message, Persephone,
+    keymap::Action,
+    menu::{MenuMessage, Page},
+};
+use persephone_chart::{ChartData, ChartMessage};
+use persephone_core::{Timeframe, indicator::BuiltIn};
 use persephone_data::binance::BinanceClient;
 use persephone_tiling::Direction;
 
@@ -40,7 +47,8 @@ fn main() -> anyhow::Result<()> {
 
     let mut app = Persephone::preloaded(fetch(&symbol, timeframe)?, WINDOW);
     for c in script.chars() {
-        let _ = app.update(Message::Key(action(c)?));
+        let focused = app.layout().focused();
+        let _ = app.update(message(c, focused)?);
     }
     let frozen = Instant::now() + at.map_or(Duration::from_secs(5), Duration::from_millis);
     let _ = app.update(Message::Tick(frozen));
@@ -53,27 +61,49 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn action(c: char) -> anyhow::Result<Action> {
+fn message(c: char, focused: u32) -> anyhow::Result<Message> {
     use Direction::{Down, Left, Right, Up};
-    Ok(match c {
-        'n' => Action::NewTile,
-        'q' => Action::CloseTile,
-        'h' => Action::Focus(Left),
-        'j' => Action::Focus(Down),
-        'k' => Action::Focus(Up),
-        'l' => Action::Focus(Right),
-        'H' => Action::Swap(Left),
-        'J' => Action::Swap(Down),
-        'K' => Action::Swap(Up),
-        'L' => Action::Swap(Right),
-        '<' => Action::Resize(Left),
-        '>' => Action::Resize(Right),
-        '^' => Action::Resize(Up),
-        'v' => Action::Resize(Down),
-        't' => Action::ToggleSplit,
-        'f' => Action::Fullscreen,
+    let key = |action| Ok(Message::Key(action));
+    let menu = |message| Ok(Message::Menu(message));
+    match c {
+        'n' => key(Action::NewTile),
+        'q' => key(Action::CloseTile),
+        'h' => key(Action::Focus(Left)),
+        'j' => key(Action::Focus(Down)),
+        'k' => key(Action::Focus(Up)),
+        'l' => key(Action::Focus(Right)),
+        'H' => key(Action::Swap(Left)),
+        'J' => key(Action::Swap(Down)),
+        'K' => key(Action::Swap(Up)),
+        'L' => key(Action::Swap(Right)),
+        '<' => key(Action::Resize(Left)),
+        '>' => key(Action::Resize(Right)),
+        '^' => key(Action::Resize(Up)),
+        'v' => key(Action::Resize(Down)),
+        't' => key(Action::ToggleSplit),
+        'f' => key(Action::Fullscreen),
+        'm' => Ok(Message::Chart(
+            focused,
+            ChartMessage::Clicked {
+                at: Point::new(260.0, 160.0),
+            },
+        )),
+        'e' => Ok(Message::Chart(
+            focused,
+            ChartMessage::StudyClicked {
+                study: 0,
+                at: Point::new(24.0, 60.0),
+            },
+        )),
+        'i' => menu(MenuMessage::Open(Page::Indicators)),
+        's' => menu(MenuMessage::Open(Page::Symbol {
+            query: String::new(),
+        })),
+        '1'..='8' => menu(MenuMessage::AddIndicator(
+            BuiltIn::ALL[c as usize - '1' as usize],
+        )),
         other => bail!("unknown script action `{other}`"),
-    })
+    }
 }
 
 fn fetch(symbol: &str, timeframe: Timeframe) -> anyhow::Result<std::sync::Arc<ChartData>> {

@@ -9,6 +9,7 @@
 //! Every layer derives the same [`Projection`] from the [`ChartState`] and its bounds, so they
 //! line up exactly without sharing anything mutable.
 
+pub mod study;
 pub mod theme;
 pub mod ticks;
 pub mod viewport;
@@ -23,11 +24,12 @@ use std::sync::{
 };
 
 use iced::{
-    Element, Length, Padding, Size,
+    Element, Length, Padding, Point, Size,
     widget::{canvas, container, shader, stack},
 };
 use persephone_core::{Candle, Timeframe};
 
+pub use study::{OutputStyle, Placement, Study, StudyLine};
 pub use viewport::{Projection, Viewport};
 
 /// Width of the price axis on the right, in logical pixels.
@@ -89,15 +91,48 @@ pub enum ChartMessage {
     ScalePrice { dy: f32 },
     /// Back to fitting the visible bars.
     ResetPriceScale,
+    /// A left click (no drag) on the plot at `at`, in chart coordinates. The chart itself
+    /// ignores it; the app opens its menu there.
+    Clicked { at: Point },
+    /// A left click on study `study`'s legend.
+    StudyClicked { study: usize, at: Point },
 }
 
-/// One chart: its data, what part of it is on screen, and cached layers.
+/// One chart: its data and indicators, what part of it is on screen, and cached layers.
 pub struct ChartState {
     /// Keys this chart's GPU buffers.
     id: u64,
     data: Arc<ChartData>,
+    studies: Arc<Vec<Study>>,
+    /// Changes whenever `studies` does, so the GPU re-uploads them.
+    studies_generation: u64,
     viewport: Viewport,
     grid_cache: canvas::Cache,
+}
+
+/// The price pane and one pane per indicator that wants its own, for one frame.
+pub(crate) struct Panes {
+    pub(crate) price: Projection,
+    /// (study index, its pane), top to bottom.
+    pub(crate) indicators: Vec<(usize, Projection)>,
+}
+
+impl Panes {
+    /// Every pane, price first.
+    pub(crate) fn all(&self) -> impl Iterator<Item = &Projection> {
+        std::iter::once(&self.price).chain(self.indicators.iter().map(|(_, p)| p))
+    }
+
+    /// The pane under `y` (from the top of the plot), and the study it shows if not prices.
+    pub(crate) fn at(&self, y: f32) -> Option<(Option<usize>, &Projection)> {
+        if self.price.contains_y(y) {
+            return Some((None, &self.price));
+        }
+        self.indicators
+            .iter()
+            .find(|(_, p)| p.contains_y(y))
+            .map(|(study, p)| (Some(*study), p))
+    }
 }
 
 impl ChartState {
@@ -107,8 +142,22 @@ impl ChartState {
             id: next_id(),
             viewport: Viewport::new(data.candles.len()),
             data,
+            studies: Arc::new(Vec::new()),
+            studies_generation: next_id(),
             grid_cache: canvas::Cache::new(),
         }
+    }
+
+    #[must_use]
+    pub fn studies(&self) -> &[Study] {
+        &self.studies
+    }
+
+    /// Replaces the chart's indicators. Each study's values must line up with the candles.
+    pub fn set_studies(&mut self, studies: Vec<Study>) {
+        self.studies = Arc::new(studies);
+        self.studies_generation = next_id();
+        self.grid_cache.clear();
     }
 
     #[must_use]
@@ -132,6 +181,7 @@ impl ChartState {
             } => self.viewport.zoom(factor, from_right, plot_width, len),
             ChartMessage::ScalePrice { dy } => self.viewport.scale_price(dy),
             ChartMessage::ResetPriceScale => self.viewport.reset_price(),
+            ChartMessage::Clicked { .. } | ChartMessage::StudyClicked { .. } => return,
         }
         self.grid_cache.clear();
     }
@@ -163,8 +213,38 @@ impl ChartState {
         .into()
     }
 
-    fn projection(&self, plot: Size) -> Projection {
-        Projection::new(&self.viewport, &self.data.candles, plot.width, plot.height)
+    pub(crate) fn panes(&self, plot: Size) -> Panes {
+        let overlays: Vec<&[f64]> = self
+            .studies
+            .iter()
+            .filter(|s| s.placement == Placement::Overlay)
+            .flat_map(Study::series)
+            .collect();
+        let separate: Vec<usize> = (0..self.studies.len())
+            .filter(|&i| self.studies[i].placement == Placement::Pane)
+            .collect();
+
+        let (price_height, pane_height) = viewport::pane_heights(plot.height, separate.len());
+        let price = Projection::price(
+            &self.viewport,
+            &self.data.candles,
+            &overlays,
+            plot.width,
+            price_height,
+        );
+        let indicators = separate
+            .iter()
+            .enumerate()
+            .map(|(k, &i)| {
+                let study = &self.studies[i];
+                let offset = price_height + k as f32 * pane_height;
+                (
+                    i,
+                    price.pane(&study.series(), study.range, offset, pane_height),
+                )
+            })
+            .collect();
+        Panes { price, indicators }
     }
 }
 

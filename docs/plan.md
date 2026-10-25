@@ -118,6 +118,7 @@ persephone/
 ### 3. Interaction (`crates/app`)
 - **Left-click** (press and release, under 4 px of movement) on the chart opens a small popover menu at the cursor: **Indicator ▸ / Strategy ▸ / Symbol ▸ / Timeframe ▸**. The lists include the built-in items and every plugin that's loaded.
 - Clicking an indicator or strategy legend opens its parameter popover, with a remove option.
+- *(Built in M3:)* the menu has drill-down pages: root (Indicators ›, Symbol ›, and one-click timeframe chips), indicators grouped "On the chart" / "In a pane below", and a symbol search (popular pairs; Enter loads any Binance spot pair). Strategy ▸ joins in M4. Escape, another click or any tiling key closes it. A tile keeps its indicators across symbol/timeframe changes, they're saved in the layout, and a new tile copies the market but starts without indicators.
 - Drag pans, scroll zooms, and dragging the price axis scales price. Nothing else is on screen.
 - **Stats overlay:** after a backtest, a compact line appears in the corner (PnL, Sharpe, max drawdown, win rate, trade count). Clicking it expands the full report inside the tile.
 
@@ -130,7 +131,7 @@ persephone/
   - The adapter turns each action into `self.order().market(..)` or similar plus `submit_order`.
   - Order events (`on_order_filled` and the rest) go back to the guest.
 - **Worker output:** it streams fills, position changes and equity samples to the UI while running, then sends a final report computed with `nautilus-analysis` (`PortfolioStatistics`).
-- **Built-in indicators** come from `nautilus-indicators` (SMA, EMA, RSI, MACD, Bollinger, ATR, VWAP, Keltner, Donchian and more), shown in the menu next to plugins.
+- **Built-in indicators** come from `nautilus-indicators` (SMA, EMA, RSI, MACD, Bollinger, ATR, VWAP, Keltner, Donchian and more), shown in the menu next to plugins. *(Built in M3:)* SMA, EMA, Bollinger Bands, Donchian Channels, RSI (Wilder), MACD, Stochastic and ATR, computed by `persephone_engine::indicators` from raw values so the chart shows exactly what strategies see; the catalog (params, limits, panes, levels) lives in `persephone_core::indicator`. Overlays draw on the price pane and widen its fit; the rest get their own panes with their own scales, drawn by the same GPU pipeline (anti-aliased lines, band fills, histograms) clipped per pane.
 - **Starting point:** `crates/backtest/examples/engine_ema_cross.rs` in the Nautilus repo is the reference for the first headless run.
 
 ### 5. Plugins (`wit/`, `crates/plugin-host`, `crates/sdk`)

@@ -28,3 +28,18 @@ pub const LEGEND_SIZE: f32 = 13.0;
 pub const ACCENT: Color = Color::from_rgb8(0x29, 0x62, 0xff);
 /// Behind the tiles, visible in the gaps between them.
 pub const DESKTOP: Color = Color::from_rgb8(0x0b, 0x0d, 0x13);
+
+/// Dashed reference levels in indicator panes (RSI 30/70...).
+pub const LEVEL: Color = Color::from_rgba8(0x78, 0x7b, 0x86, 0.6);
+/// Line between the price pane and indicator panes.
+pub const PANE_SEPARATOR: Color = Color::from_rgb8(0x2a, 0x2e, 0x39);
+
+/// Colors for single-line indicators, handed out in order (TradingView's defaults).
+pub const STUDY_PALETTE: [Color; 6] = [
+    Color::from_rgb8(0x29, 0x62, 0xff),
+    Color::from_rgb8(0xff, 0x98, 0x00),
+    Color::from_rgb8(0xab, 0x47, 0xbc),
+    Color::from_rgb8(0x00, 0xbc, 0xd4),
+    Color::from_rgb8(0xe9, 0x1e, 0x63),
+    Color::from_rgb8(0xfd, 0xd8, 0x35),
+];

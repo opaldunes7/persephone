@@ -3507,6 +3507,7 @@ dependencies = [
  "persephone-chart",
  "persephone-core",
  "persephone-data",
+ "persephone-engine",
  "persephone-tiling",
  "ron",
  "serde",

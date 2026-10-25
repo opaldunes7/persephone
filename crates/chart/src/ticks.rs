@@ -208,6 +208,27 @@ pub fn format_price(price: f64, precision: u8) -> String {
     format!("{price:.*}", usize::from(precision))
 }
 
+/// Formats an indicator value: two decimals, four for values below one.
+#[must_use]
+pub fn format_value(value: f64) -> String {
+    if !value.is_finite() {
+        "—".into()
+    } else if value.abs() >= 1.0 || value == 0.0 {
+        format!("{value:.2}")
+    } else {
+        format!("{value:.4}")
+    }
+}
+
+/// Decimal places needed to show labels `step` apart (e.g. 2.5 → 1, 0.05 → 2, 20 → 0).
+#[must_use]
+pub fn step_decimals(step: f64) -> usize {
+    let text = format!("{step:.8}");
+    text.trim_end_matches('0')
+        .split_once('.')
+        .map_or(0, |(_, frac)| frac.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +370,16 @@ mod tests {
         for pair in ticks.windows(2) {
             assert!(p.x(pair[1].index as f64) - p.x(pair[0].index as f64) >= TIME_GAP);
         }
+    }
+
+    #[test]
+    fn value_formats() {
+        assert_eq!(format_value(55.234), "55.23");
+        assert_eq!(format_value(-0.01234), "-0.0123");
+        assert_eq!(format_value(f64::NAN), "—");
+        assert_eq!(step_decimals(2.5), 1);
+        assert_eq!(step_decimals(0.05), 2);
+        assert_eq!(step_decimals(20.0), 0);
     }
 
     #[test]

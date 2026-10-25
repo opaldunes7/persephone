@@ -16,8 +16,14 @@ pub const RIGHT_MARGIN_BARS: f64 = 6.0;
 pub const TOP_MARGIN: f64 = 0.08;
 /// Fraction of the plot height below the lowest visible low; the volume histogram lives here.
 pub const BOTTOM_MARGIN: f64 = 0.22;
-/// Height of the tallest visible volume bar, as a fraction of the plot height.
+/// Height of the tallest visible volume bar, as a fraction of the price pane's height.
 pub const VOLUME_HEIGHT: f32 = 0.18;
+/// Height of each indicator pane, as a fraction of the plot...
+pub const PANE_SHARE: f32 = 0.22;
+/// ...but the price pane always keeps at least this much.
+pub const MIN_PRICE_SHARE: f32 = 0.4;
+/// Space above and below an indicator's values in its pane, as a fraction of its range.
+const PANE_MARGIN: f64 = 0.1;
 
 /// What the user controls: horizontal position and zoom, plus price-axis scaling.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -75,7 +81,18 @@ impl Viewport {
     }
 }
 
-/// The mapping between bar index/price and plot pixels for one frame.
+/// Heights of the price pane and of each indicator pane below it, for a plot `height` tall.
+#[must_use]
+pub fn pane_heights(height: f32, panes: usize) -> (f32, f32) {
+    if panes == 0 {
+        return (height, 0.0);
+    }
+    let share = PANE_SHARE.min((1.0 - MIN_PRICE_SHARE) / panes as f32);
+    let pane = (height * share).floor();
+    (height - pane * panes as f32, pane)
+}
+
+/// The mapping between bar index/value and plot pixels for one pane, for one frame.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Projection {
     /// Bar index at x = 0.
@@ -87,7 +104,10 @@ pub struct Projection {
     /// Price at y = `height`.
     pub bottom: f64,
     pub width: f32,
+    /// Height of this pane.
     pub height: f32,
+    /// Distance from the top of the plot to the top of this pane.
+    pub offset: f32,
     /// Bars with any part on screen.
     pub visible: Range<usize>,
     /// Largest volume among visible bars.
@@ -95,8 +115,21 @@ pub struct Projection {
 }
 
 impl Projection {
+    /// The price pane, fitted to the visible candles.
     #[must_use]
     pub fn new(viewport: &Viewport, candles: &[Candle], width: f32, height: f32) -> Self {
+        Self::price(viewport, candles, &[], width, height)
+    }
+
+    /// The price pane, fitted to the visible candles and overlay indicator values.
+    #[must_use]
+    pub fn price(
+        viewport: &Viewport,
+        candles: &[Candle],
+        overlays: &[&[f64]],
+        width: f32,
+        height: f32,
+    ) -> Self {
         let spacing = viewport.spacing;
         let left = viewport.right - f64::from(width) / spacing;
         let visible = visible_range(left, viewport.right, candles.len());
@@ -111,7 +144,10 @@ impl Projection {
                 })
             })
         };
-        let (lo, hi, max_volume) = fit.unwrap_or((0.0, 1.0, 0.0));
+        let (mut lo, mut hi, max_volume) = fit.unwrap_or((0.0, 1.0, 0.0));
+        if let Some((olo, ohi)) = value_range(overlays, &visible) {
+            (lo, hi) = (lo.min(olo), hi.max(ohi));
+        }
 
         // A flat range would divide by zero; give it a little height around the price.
         let half = ((hi - lo) / 2.0).max(hi.abs() * 1e-4).max(1e-9) * viewport.price_zoom;
@@ -126,8 +162,33 @@ impl Projection {
             bottom: mid - half - span * BOTTOM_MARGIN / inner,
             width,
             height,
+            offset: 0.0,
             visible,
             max_volume,
+        }
+    }
+
+    /// An indicator pane `height` tall, `offset` below the top of the plot: the same bars as
+    /// `self`, scaled to `range` or else to the visible values of `series`.
+    #[must_use]
+    pub fn pane(
+        &self,
+        series: &[&[f64]],
+        range: Option<(f64, f64)>,
+        offset: f32,
+        height: f32,
+    ) -> Self {
+        let (lo, hi) = range
+            .or_else(|| value_range(series, &self.visible))
+            .unwrap_or((0.0, 1.0));
+        let margin = ((hi - lo) * PANE_MARGIN).max(hi.abs().max(1.0) * 1e-6);
+        Self {
+            top: hi + margin,
+            bottom: lo - margin,
+            height,
+            offset,
+            max_volume: 0.0,
+            ..self.clone()
         }
     }
 
@@ -150,15 +211,35 @@ impl Projection {
         (index >= 0.0 && index < len as f64).then_some(index as usize)
     }
 
+    /// Y of `price`, measured from the top of the plot.
     #[must_use]
     pub fn y(&self, price: f64) -> f32 {
-        ((self.top - price) / (self.top - self.bottom) * f64::from(self.height)) as f32
+        self.offset
+            + ((self.top - price) / (self.top - self.bottom) * f64::from(self.height)) as f32
     }
 
     #[must_use]
     pub fn price_at(&self, y: f32) -> f64 {
-        self.top - f64::from(y) / f64::from(self.height) * (self.top - self.bottom)
+        self.top - f64::from(y - self.offset) / f64::from(self.height) * (self.top - self.bottom)
     }
+
+    /// Whether `y` (from the top of the plot) falls inside this pane.
+    #[must_use]
+    pub fn contains_y(&self, y: f32) -> bool {
+        (self.offset..self.offset + self.height).contains(&y)
+    }
+}
+
+/// Smallest and largest finite value of `series` over `visible`.
+fn value_range(series: &[&[f64]], visible: &Range<usize>) -> Option<(f64, f64)> {
+    series
+        .iter()
+        .flat_map(|s| s.get(visible.clone()).unwrap_or_default())
+        .filter(|v| v.is_finite())
+        .fold(None, |acc, &v| match acc {
+            None => Some((v, v)),
+            Some((lo, hi)) => Some((lo.min(v), hi.max(v))),
+        })
 }
 
 /// Bars whose center lies within half a bar of `[left, right]`.
@@ -273,6 +354,44 @@ mod tests {
         assert!(zoomed.top - zoomed.bottom > fitted.top - fitted.bottom);
         vp.reset_price();
         assert_eq!(Projection::new(&vp, &data, 800.0, 400.0), fitted);
+    }
+
+    #[test]
+    fn panes_split_the_plot_and_keep_the_price_pane_big() {
+        assert_eq!(pane_heights(500.0, 0), (500.0, 0.0));
+        assert_eq!(pane_heights(500.0, 1), (390.0, 110.0));
+        let (price, pane) = pane_heights(500.0, 4);
+        assert_eq!(price + 4.0 * pane, 500.0);
+        assert!(price >= 500.0 * MIN_PRICE_SHARE);
+    }
+
+    #[test]
+    fn overlays_widen_the_price_fit() {
+        let data = candles(200);
+        let vp = Viewport::new(200);
+        let plain = Projection::new(&vp, &data, 800.0, 400.0);
+        let band = vec![10_000.0; 200];
+        let widened = Projection::price(&vp, &data, &[&band], 800.0, 400.0);
+        assert!(widened.top > plain.top);
+        assert!(widened.y(10_000.0) >= 0.0);
+    }
+
+    #[test]
+    fn indicator_panes_have_their_own_scale_and_offset() {
+        let data = candles(200);
+        let price = Projection::new(&Viewport::new(200), &data, 800.0, 300.0);
+        let rsi = vec![50.0; 200];
+        let pane = price.pane(&[&rsi], Some((0.0, 100.0)), 300.0, 100.0);
+        assert_eq!(pane.left, price.left, "same bars");
+        assert!(pane.contains_y(pane.y(50.0)) && !price.contains_y(pane.y(50.0)));
+        assert!((pane.y(50.0) - 350.0).abs() < 1e-3, "middle of the pane");
+        assert!((pane.price_at(350.0) - 50.0).abs() < 1e-9);
+
+        let fitted = price.pane(&[&rsi], None, 300.0, 100.0);
+        assert!(
+            fitted.top > 50.0 && fitted.bottom < 50.0,
+            "flat values still get height"
+        );
     }
 
     #[test]

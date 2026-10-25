@@ -1,6 +1,10 @@
-//! Bottom layer: background and grid lines. Cached until the viewport or data changes.
+//! Bottom layer: background, grid lines and indicator reference levels. Cached until the
+//! viewport, data or studies change.
 
-use iced::{Point, Rectangle, Renderer, Size, Theme, mouse, widget::canvas};
+use iced::{
+    Point, Rectangle, Renderer, Size, Theme, mouse,
+    widget::canvas::{self, LineDash, Path, Stroke},
+};
 
 use crate::{ChartState, plot_size, theme, ticks};
 
@@ -30,24 +34,47 @@ impl<Message> canvas::Program<Message> for Grid<'_> {
                     return;
                 }
                 let data = &self.chart.data;
-                let p = self.chart.projection(plot);
+                let panes = self.chart.panes(plot);
 
-                for price in ticks::price_ticks(&p) {
-                    let y = p.y(price).round();
-                    frame.fill_rectangle(
-                        Point::new(0.0, y),
-                        Size::new(plot.width, 1.0),
-                        theme::GRID,
-                    );
+                for pane in panes.all() {
+                    for value in ticks::price_ticks(pane) {
+                        let y = pane.y(value).round();
+                        if pane.contains_y(y) {
+                            frame.fill_rectangle(
+                                Point::new(0.0, y),
+                                Size::new(plot.width, 1.0),
+                                theme::GRID,
+                            );
+                        }
+                    }
                 }
-                for tick in ticks::time_ticks(&data.candles, &p, data.timeframe) {
-                    let x = p.x(tick.index as f64).round();
+                for tick in ticks::time_ticks(&data.candles, &panes.price, data.timeframe) {
+                    let x = panes.price.x(tick.index as f64).round();
                     let color = if tick.major {
                         theme::GRID_MAJOR
                     } else {
                         theme::GRID
                     };
                     frame.fill_rectangle(Point::new(x, 0.0), Size::new(1.0, plot.height), color);
+                }
+
+                let level_stroke = Stroke {
+                    line_dash: LineDash {
+                        segments: &[3.0, 3.0],
+                        offset: 0,
+                    },
+                    ..Stroke::default().with_color(theme::LEVEL).with_width(1.0)
+                };
+                for (study, pane) in &panes.indicators {
+                    for &level in &self.chart.studies[*study].levels {
+                        let y = pane.y(level).round() + 0.5;
+                        if pane.contains_y(y) {
+                            frame.stroke(
+                                &Path::line(Point::new(0.0, y), Point::new(plot.width, y)),
+                                level_stroke,
+                            );
+                        }
+                    }
                 }
             });
         vec![geometry]

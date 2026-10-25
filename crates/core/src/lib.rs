@@ -3,6 +3,7 @@
 //! Nothing here depends on Nautilus: the chart, the data layer and the plugin host all speak
 //! these types, and only `persephone-engine` translates them into Nautilus types.
 
+pub mod indicator;
 pub mod time;
 
 use std::{fmt, str::FromStr};

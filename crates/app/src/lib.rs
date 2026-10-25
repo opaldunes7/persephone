@@ -5,10 +5,13 @@
 //! that market, and the session's layout is not saved.
 //!
 //! The window is only charts, tiled like Hyprland's dwindle layout; see [`keymap`] for keys.
+//! Left-click a chart for its [`menu`]: indicators, symbol and timeframe.
 
 pub mod keymap;
+pub mod menu;
 mod motion;
 pub mod persist;
+mod studies;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -18,21 +21,28 @@ use std::{
 };
 
 use iced::{
-    Border, Color, Element, Fill, Length, Size, Subscription, Task, Theme, event,
+    Border, Color, Element, Fill, Length, Point, Size, Subscription, Task, Theme, event,
     futures::channel::oneshot,
-    keyboard,
-    widget::{container, mouse_area, pin, stack, text},
+    keyboard::{
+        self,
+        key::{Code, Physical},
+    },
+    widget::{container, mouse_area, operation, pin, stack, text},
     window,
 };
 use persephone_chart::{ChartData, ChartMessage, ChartState, theme};
-use persephone_core::Timeframe;
+use persephone_core::{
+    Timeframe,
+    indicator::{BuiltIn, IndicatorSpec},
+};
 use persephone_data::binance::BinanceClient;
 use persephone_tiling::{Layout, Rect, TileId};
 
 use crate::{
     keymap::Action,
+    menu::{MenuMessage, Page, Popup, TileInfo},
     motion::Motion,
-    persist::{Saved, SavedTile},
+    persist::{Saved, SavedIndicator, SavedTile},
 };
 
 /// How many bars each market loads.
@@ -72,6 +82,8 @@ enum Bars {
 
 struct Tile {
     market: Market,
+    /// The tile's indicators, in legend order. They survive symbol and timeframe changes.
+    indicators: Vec<IndicatorSpec>,
     /// `None` until the market's bars arrive.
     chart: Option<ChartState>,
     motion: Motion,
@@ -85,6 +97,8 @@ pub struct Persephone {
     bars: HashMap<Market, Bars>,
     window: Size,
     now: Instant,
+    /// The open menu or settings popover, if any.
+    popup: Option<Popup>,
     /// Where the layout is saved; `None` for one-off sessions started with arguments.
     save_path: Option<PathBuf>,
 }
@@ -98,6 +112,9 @@ pub enum Message {
     Hover(TileId),
     WindowResized(Size),
     Tick(Instant),
+    Menu(MenuMessage),
+    /// Closes the open popup.
+    Escape,
 }
 
 impl Persephone {
@@ -113,25 +130,31 @@ impl Persephone {
     pub fn start(args: &[String], save_path: Option<PathBuf>) -> (Self, Task<Message>) {
         let saved = save_path.as_deref().and_then(persist::load);
 
-        let (layout, markets) = match saved {
+        let (layout, tiles) = match saved {
             Some(saved) => {
-                let markets = saved
+                let tiles = saved
                     .tiles
                     .into_iter()
                     .map(|t| {
                         let timeframe = t.timeframe.parse().unwrap_or(Timeframe::M1);
-                        (
-                            t.id,
-                            Market {
-                                symbol: t.symbol,
-                                timeframe,
-                            },
-                        )
+                        let indicators = t
+                            .indicators
+                            .iter()
+                            .filter_map(|i| {
+                                BuiltIn::from_id(&i.kind)
+                                    .map(|kind| IndicatorSpec::with_params(kind, &i.params))
+                            })
+                            .collect();
+                        let market = Market {
+                            symbol: t.symbol,
+                            timeframe,
+                        };
+                        (t.id, market, indicators)
                     })
                     .collect();
-                (saved.layout, markets)
+                (saved.layout, tiles)
             }
-            None => (Layout::new(), vec![(0, market_from_args(args))]),
+            None => (Layout::new(), vec![(0, market_from_args(args), Vec::new())]),
         };
 
         let mut app = Self {
@@ -140,11 +163,12 @@ impl Persephone {
             bars: HashMap::new(),
             window: DEFAULT_WINDOW,
             now: Instant::now(),
+            popup: None,
             save_path,
         };
-        let loads: Vec<_> = markets
+        let loads: Vec<_> = tiles
             .into_iter()
-            .map(|(id, market)| app.add_tile(id, market))
+            .map(|(id, market, indicators)| app.add_tile(id, market, indicators))
             .collect();
         app.relayout(false);
         (app, Task::batch(loads))
@@ -164,9 +188,10 @@ impl Persephone {
             bars: HashMap::from([(market.clone(), Bars::Ready(data))]),
             window,
             now: Instant::now(),
+            popup: None,
             save_path: None,
         };
-        let _ = app.add_tile(0, market);
+        let _ = app.add_tile(0, market, Vec::new());
         app.relayout(false);
         app
     }
@@ -182,6 +207,23 @@ impl Persephone {
         self.tiles
             .get(&id)
             .map(|tile| (tile.market.symbol.as_str(), tile.market.timeframe))
+    }
+
+    /// The indicators on tile `id`, in legend order.
+    #[must_use]
+    pub fn tile_indicators(&self, id: TileId) -> Option<&[IndicatorSpec]> {
+        self.tiles.get(&id).map(|tile| tile.indicators.as_slice())
+    }
+
+    /// Tile `id`'s chart, once its bars are in.
+    #[must_use]
+    pub fn tile_chart(&self, id: TileId) -> Option<&ChartState> {
+        self.tiles.get(&id).and_then(|tile| tile.chart.as_ref())
+    }
+
+    #[must_use]
+    pub fn popup(&self) -> Option<&Popup> {
+        self.popup.as_ref()
     }
 
     /// Where tile `id` is drawn right now.
@@ -213,22 +255,45 @@ impl Persephone {
         match message {
             Message::Loaded(market, result) => {
                 let bars = match result {
-                    Ok(data) => {
-                        for tile in self.tiles.values_mut().filter(|t| t.market == market) {
-                            tile.chart
-                                .get_or_insert_with(|| ChartState::new(Arc::clone(&data)));
-                        }
-                        Bars::Ready(data)
-                    }
+                    Ok(data) => Bars::Ready(data),
                     Err(error) => Bars::Failed(error),
                 };
-                self.bars.insert(market, bars);
+                self.bars.insert(market.clone(), bars);
+                let waiting: Vec<TileId> = self
+                    .tiles
+                    .iter()
+                    .filter(|(_, t)| t.market == market && t.chart.is_none())
+                    .map(|(&id, _)| id)
+                    .collect();
+                for id in waiting {
+                    self.attach(id);
+                }
+            }
+            Message::Chart(id, ChartMessage::Clicked { at }) => {
+                // A click closes whatever is open; on a chart with nothing open, it opens the menu.
+                self.popup = match self.popup.take() {
+                    Some(_) => None,
+                    None => Some(Popup::Menu {
+                        tile: id,
+                        at,
+                        page: Page::Root,
+                    }),
+                };
+            }
+            Message::Chart(id, ChartMessage::StudyClicked { study, at }) => {
+                self.popup = self
+                    .tiles
+                    .get(&id)
+                    .and_then(|tile| tile.indicators.get(study))
+                    .map(|spec| Popup::settings(id, study, at, spec));
             }
             Message::Chart(id, message) => {
                 if let Some(chart) = self.tiles.get_mut(&id).and_then(|t| t.chart.as_mut()) {
                     chart.update(message);
                 }
             }
+            Message::Menu(message) => return self.on_menu(message),
+            Message::Escape => self.popup = None,
             Message::Key(action) => return self.act(action),
             Message::Hover(id) => {
                 self.layout.focus(id);
@@ -243,6 +308,7 @@ impl Persephone {
     }
 
     fn act(&mut self, action: Action) -> Task<Message> {
+        self.popup = None;
         let area = self.tiling_area();
         let mut task = Task::none();
         let mut popped_in = None;
@@ -252,7 +318,7 @@ impl Persephone {
                 let market = self.focused_market();
                 match self.layout.insert(area) {
                     Ok(id) => {
-                        task = self.add_tile(id, market);
+                        task = self.add_tile(id, market, Vec::new());
                         popped_in = Some(id);
                         true
                     }
@@ -300,26 +366,183 @@ impl Persephone {
         false
     }
 
-    /// Adds a tile for `market`, loading its bars unless they're loaded or on the way.
-    fn add_tile(&mut self, id: TileId, market: Market) -> Task<Message> {
-        let (chart, task) = match self.bars.get(&market) {
-            Some(Bars::Ready(data)) => (Some(ChartState::new(Arc::clone(data))), Task::none()),
-            Some(Bars::Loading) => (None, Task::none()),
-            Some(Bars::Failed(_)) | None => {
-                self.bars.insert(market.clone(), Bars::Loading);
-                (None, load(market.clone()))
-            }
+    fn on_menu(&mut self, message: MenuMessage) -> Task<Message> {
+        let Some(mut popup) = self.popup.take() else {
+            return Task::none();
         };
+        let id = popup.tile();
+        let Some(market) = self.tiles.get(&id).map(|t| t.market.clone()) else {
+            return Task::none();
+        };
+
+        match message {
+            MenuMessage::Open(page) => {
+                let search = matches!(page, Page::Symbol { .. });
+                if let Popup::Menu { page: current, .. } = &mut popup {
+                    *current = page;
+                }
+                self.popup = Some(popup);
+                if search {
+                    return operation::focus(menu::symbol_input());
+                }
+            }
+            MenuMessage::AddIndicator(kind) => {
+                if let Some(tile) = self.tiles.get_mut(&id) {
+                    tile.indicators.push(IndicatorSpec::new(kind));
+                }
+                self.restudy(id);
+                self.save();
+            }
+            MenuMessage::SetTimeframe(timeframe) => {
+                return self.set_market(
+                    id,
+                    Market {
+                        timeframe,
+                        ..market
+                    },
+                );
+            }
+            MenuMessage::SetSymbol(symbol) => {
+                return self.set_market(id, Market { symbol, ..market });
+            }
+            MenuMessage::SubmitSymbol => {
+                if let Popup::Menu {
+                    page: Page::Symbol { query },
+                    ..
+                } = &popup
+                {
+                    let symbol = query.trim().to_uppercase();
+                    if !symbol.is_empty() {
+                        return self.set_market(id, Market { symbol, ..market });
+                    }
+                }
+                self.popup = Some(popup);
+            }
+            MenuMessage::QueryChanged(text) => {
+                if let Popup::Menu {
+                    page: Page::Symbol { query },
+                    ..
+                } = &mut popup
+                {
+                    *query = text.to_uppercase();
+                }
+                self.popup = Some(popup);
+            }
+            MenuMessage::ParamChanged(index, value) => {
+                if let Popup::Settings {
+                    study,
+                    inputs,
+                    error,
+                    ..
+                } = &mut popup
+                {
+                    if let Some(input) = inputs.get_mut(index) {
+                        input.clone_from(&value);
+                    }
+                    let spec = self
+                        .tiles
+                        .get_mut(&id)
+                        .and_then(|t| t.indicators.get_mut(*study));
+                    let outcome = match (spec, value.trim().parse::<f64>()) {
+                        (Some(spec), Ok(number)) => spec.set_param(index, number),
+                        (Some(_), Err(_)) => Err("Enter a number".into()),
+                        (None, _) => Ok(()),
+                    };
+                    *error = outcome.err();
+                    if error.is_none() {
+                        self.restudy(id);
+                        self.save();
+                    }
+                }
+                self.popup = Some(popup);
+            }
+            MenuMessage::RemoveStudy => {
+                if let Popup::Settings { study, .. } = popup
+                    && let Some(tile) = self.tiles.get_mut(&id)
+                    && study < tile.indicators.len()
+                {
+                    tile.indicators.remove(study);
+                    self.restudy(id);
+                    self.save();
+                }
+            }
+            MenuMessage::Close => {}
+        }
+        Task::none()
+    }
+
+    /// Adds a tile, loading its market's bars unless they're loaded or on the way.
+    fn add_tile(
+        &mut self,
+        id: TileId,
+        market: Market,
+        indicators: Vec<IndicatorSpec>,
+    ) -> Task<Message> {
+        let task = self.request(&market);
         self.tiles.insert(
             id,
             Tile {
                 market,
-                chart,
+                indicators,
+                chart: None,
                 motion: Motion::at_rest(Rect::default()),
                 flash: None,
             },
         );
+        self.attach(id);
         task
+    }
+
+    /// Points tile `id` at another market, keeping its indicators.
+    fn set_market(&mut self, id: TileId, market: Market) -> Task<Message> {
+        let Some(tile) = self.tiles.get_mut(&id) else {
+            return Task::none();
+        };
+        if tile.market == market {
+            return Task::none();
+        }
+        tile.market = market.clone();
+        tile.chart = None;
+        let task = self.request(&market);
+        self.attach(id);
+        self.save();
+        task
+    }
+
+    /// Starts loading `market` unless its bars are loaded or on the way.
+    fn request(&mut self, market: &Market) -> Task<Message> {
+        match self.bars.get(market) {
+            Some(Bars::Ready(_) | Bars::Loading) => Task::none(),
+            Some(Bars::Failed(_)) | None => {
+                self.bars.insert(market.clone(), Bars::Loading);
+                load(market.clone())
+            }
+        }
+    }
+
+    /// Gives tile `id` a chart, with its indicators, if its market's bars are in.
+    fn attach(&mut self, id: TileId) {
+        let Some(tile) = self.tiles.get_mut(&id) else {
+            return;
+        };
+        if tile.chart.is_some() {
+            return;
+        }
+        if let Some(Bars::Ready(data)) = self.bars.get(&tile.market) {
+            let mut chart = ChartState::new(Arc::clone(data));
+            chart.set_studies(studies::build(&tile.indicators, &data.candles));
+            tile.chart = Some(chart);
+        }
+    }
+
+    /// Recomputes tile `id`'s indicators after they change.
+    fn restudy(&mut self, id: TileId) {
+        if let Some(tile) = self.tiles.get_mut(&id)
+            && let Some(chart) = tile.chart.as_mut()
+        {
+            let data = Arc::clone(chart.data());
+            chart.set_studies(studies::build(&tile.indicators, &data.candles));
+        }
     }
 
     fn focused_market(&self) -> Market {
@@ -374,6 +597,14 @@ impl Persephone {
                     id,
                     symbol: tile.market.symbol.clone(),
                     timeframe: tile.market.timeframe.label().into(),
+                    indicators: tile
+                        .indicators
+                        .iter()
+                        .map(|spec| SavedIndicator {
+                            kind: spec.kind.id().into(),
+                            params: spec.params.clone(),
+                        })
+                        .collect(),
                 })
                 .collect(),
         };
@@ -387,6 +618,10 @@ impl Persephone {
 
     fn subscription(&self) -> Subscription<Message> {
         let input = event::listen_with(|event, _status, _window| match event {
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                physical_key: Physical::Code(Code::Escape),
+                ..
+            }) => Some(Message::Escape),
             iced::Event::Keyboard(keyboard::Event::KeyPressed {
                 physical_key,
                 modifiers,
@@ -411,13 +646,29 @@ impl Persephone {
         let fullscreen = self.layout.is_fullscreen();
         let framed = self.layout.len() > 1 && !fullscreen;
 
-        let tiles = self
+        let mut layers: Vec<Element<'_, Message>> = self
             .tiles
             .iter()
             .filter(|(id, _)| !fullscreen || **id == focused)
-            .map(|(&id, tile)| self.tile_view(id, tile, framed, id == focused));
+            .map(|(&id, tile)| self.tile_view(id, tile, framed, id == focused))
+            .collect();
 
-        container(stack(tiles).width(Fill).height(Fill))
+        // The popup goes above every tile, so neighbouring charts can't cover it.
+        if let Some(popup) = &self.popup
+            && let Some(tile) = self.tiles.get(&popup.tile())
+        {
+            let rect = tile.motion.rect(self.now);
+            let border = if framed { BORDER } else { 0.0 };
+            let info = TileInfo {
+                symbol: &tile.market.symbol,
+                timeframe: tile.market.timeframe,
+                specs: &tile.indicators,
+            };
+            let origin = Point::new(rect.x + border, rect.y + border);
+            layers.push(menu::view(popup, info, origin, self.window).map(Message::Menu));
+        }
+
+        container(stack(layers).width(Fill).height(Fill))
             .style(|_| container::background(theme::DESKTOP))
             .into()
     }

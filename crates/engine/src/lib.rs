@@ -8,6 +8,7 @@
 //! already on a worker thread.
 
 mod convert;
+pub mod indicators;
 mod report;
 mod strategies;
 

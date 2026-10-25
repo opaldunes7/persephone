@@ -24,6 +24,17 @@ pub struct SavedTile {
     pub symbol: String,
     /// Timeframe label, e.g. "1m".
     pub timeframe: String,
+    /// Missing in layouts saved before indicators existed.
+    #[serde(default)]
+    pub indicators: Vec<SavedIndicator>,
+}
+
+/// A built-in indicator by id (e.g. "ema") with its parameters. Unknown ids are skipped when
+/// loading, so older builds can open newer layouts.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedIndicator {
+    pub kind: String,
+    pub params: Vec<f64>,
 }
 
 impl Saved {
@@ -93,11 +104,16 @@ mod tests {
                     id: 0,
                     symbol: "BTCUSDT".into(),
                     timeframe: "1m".into(),
+                    indicators: vec![SavedIndicator {
+                        kind: "ema".into(),
+                        params: vec![21.0],
+                    }],
                 },
                 SavedTile {
                     id: 1,
                     symbol: "ETHUSDT".into(),
                     timeframe: "4h".into(),
+                    indicators: Vec::new(),
                 },
             ],
         }
@@ -124,6 +140,21 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, "not ron at all").unwrap();
         assert_eq!(load(&path), None);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn layouts_saved_before_indicators_still_load() {
+        let path = temp_path("pre-indicators");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut old = ron::ser::to_string(&saved()).unwrap();
+        old = old
+            .replace(",indicators:[(kind:\"ema\",params:[21.0])]", "")
+            .replace(",indicators:[]", "");
+        assert!(!old.contains("indicators"), "{old}");
+        fs::write(&path, old).unwrap();
+        let loaded = load(&path).expect("still loads");
+        assert!(loaded.tiles.iter().all(|t| t.indicators.is_empty()));
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
