@@ -1,0 +1,17 @@
+[package]
+name = "persephone-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "persephone-cli"
+path = "src/main.rs"
+
+[dependencies]
+persephone-core.workspace = true
+persephone-data.workspace = true
+persephone-engine.workspace = true
+anyhow.workspace = true
+clap.workspace = true

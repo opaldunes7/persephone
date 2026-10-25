@@ -1,0 +1,23 @@
+[package]
+name = "persephone-engine"
+description = "The only Persephone crate that depends on NautilusTrader."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+persephone-core.workspace = true
+
+nautilus-backtest.workspace = true
+nautilus-common.workspace = true
+nautilus-core.workspace = true
+nautilus-execution.workspace = true
+nautilus-indicators.workspace = true
+nautilus-model.workspace = true
+nautilus-trading.workspace = true
+
+anyhow.workspace = true
+log.workspace = true
+rust_decimal.workspace = true
+thiserror.workspace = true

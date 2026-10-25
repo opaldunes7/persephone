@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[workspace.dependencies]
+# Nautilus is pinned to one exact version: its Rust API still changes between
+# releases, and every nautilus-* crate must agree on the same version.
+nautilus-analysis = "=0.66.0"
+nautilus-backtest = "=0.66.0"
+nautilus-common = "=0.66.0"
+nautilus-core = "=0.66.0"
+nautilus-execution = "=0.66.0"
+nautilus-indicators = "=0.66.0"
+nautilus-model = "=0.66.0"
+nautilus-trading = "=0.66.0"
+
+persephone-core = { path = "crates/core" }
+persephone-data = { path = "crates/data" }
+persephone-engine = { path = "crates/engine" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rust_decimal = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
