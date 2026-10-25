@@ -10,5 +10,12 @@ publish.workspace = true
 persephone-chart.workspace = true
 persephone-core.workspace = true
 persephone-data.workspace = true
-iced.workspace = true
+persephone-tiling.workspace = true
 anyhow.workspace = true
+dirs.workspace = true
+iced.workspace = true
+ron.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+iced_test = "0.14"

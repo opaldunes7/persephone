@@ -221,7 +221,7 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
             draw_time_tag(&mut frame, plot, tag);
         }
         if let Some(i) = hovered_bar.or(data.candles.len().checked_sub(1)) {
-            draw_legend(&mut frame, data, i);
+            draw_legend(&mut frame, data, i, plot.width);
         }
 
         vec![frame.into_geometry()]
@@ -397,8 +397,9 @@ fn draw_time_tag(frame: &mut Frame, plot: Size, tag: &Tag) {
     );
 }
 
-/// `BTCUSDT · 1m · BINANCE` and the O/H/L/C/change line for bar `i`.
-fn draw_legend(frame: &mut Frame, data: &ChartData, i: usize) {
+/// `BTCUSDT · 1m · BINANCE` and the O/H/L/C/change line for bar `i`. Fields that would run
+/// past the plot are left out, so narrow tiles show what fits.
+fn draw_legend(frame: &mut Frame, data: &ChartData, i: usize, plot_width: f32) {
     let c = &data.candles[i];
     label_with(
         frame,
@@ -440,6 +441,11 @@ fn draw_legend(frame: &mut Frame, data: &ChartData, i: usize) {
     let advance = size * MONO_ADVANCE;
     let mut x = 12.0;
     for (name, value) in fields {
+        let label_width = if name.is_empty() { 0.0 } else { advance * 2.0 };
+        let width = value.chars().count() as f32 * advance;
+        if x + label_width + width > plot_width - 8.0 {
+            break;
+        }
         if !name.is_empty() {
             label_with(
                 frame,
@@ -449,9 +455,8 @@ fn draw_legend(frame: &mut Frame, data: &ChartData, i: usize) {
                 size,
                 Font::MONOSPACE,
             );
-            x += advance * 2.0;
+            x += label_width;
         }
-        let width = value.chars().count() as f32 * advance;
         label_with(
             frame,
             value,

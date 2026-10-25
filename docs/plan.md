@@ -83,11 +83,11 @@ persephone/
 
 ### 1. Tiling (`crates/tiling`), fixed and not configurable
 - A binary tree in which each node is either a split (axis, ratio) or a leaf (a tile id).
-- **Dwindle rule:** a new tile splits the focused tile along its *longer* side, as Hyprland does.
+- **Dwindle rule:** a new tile splits the focused tile along its *longer* side, as Hyprland does. *(Built:)* if the halves would be smaller than 320×200, the largest tile splits instead, so 16 charts end as a 4×4 grid rather than a spiral of slivers. New tiles copy the focused tile's market.
 - Operations: insert, close (the sibling takes the freed space), focus by direction (nearest tile whose center lies in that direction), swap, resize the ratio, toggle the split axis, fullscreen.
 - **Cap:** `MAX_TILES = 16`. Past that, the insert is refused and the tile border flashes.
-- Moving or resizing tiles animates them with an eased transition from the old rectangle to the new one (about 150 ms), using iced 0.14's animation support. This is a custom layout widget, not iced's `PaneGrid`.
-- The layout is saved to `~/Library/Application Support/persephone/layout.ron` and restored at launch.
+- Moving or resizing tiles animates them with an eased transition from the old rectangle to the new one (about 150 ms), using iced 0.14's animation support. This is a custom layout widget, not iced's `PaneGrid`. *(Built:)* 180 ms ease-out, new tiles pop in from 88% size; tiles are absolutely positioned with `pin` inside a `stack`. A lone chart fills the window with no gap or border; focus follows the mouse, as on Hyprland.
+- The layout is saved to `~/Library/Application Support/persephone/layout.ron` and restored at launch. *(Built:)* saved after every structural change; launching with `persephone SYMBOL TIMEFRAME` starts a one-off single chart that isn't saved.
 
 **Keymap** (Mod = ⌥ Option on macOS, Alt elsewhere; ⌘ is avoided because macOS uses it):
 

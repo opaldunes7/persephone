@@ -24,12 +24,15 @@ persephone-chart = { path = "crates/chart" }
 persephone-core = { path = "crates/core" }
 persephone-data = { path = "crates/data" }
 persephone-engine = { path = "crates/engine" }
+persephone-tiling = { path = "crates/tiling" }
 
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
+dirs = "6"
 iced = { version = "0.14", features = ["advanced", "canvas", "wgpu"] }
 log = "0.4"
+ron = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rust_decimal = "1"
 serde = { version = "1", features = ["derive"] }

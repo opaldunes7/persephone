@@ -23,3 +23,8 @@ pub const LABEL_TEXT: Color = Color::WHITE;
 pub const TEXT_SIZE: f32 = 11.0;
 /// Legend font size.
 pub const LEGEND_SIZE: f32 = 13.0;
+
+/// Border of the focused tile.
+pub const ACCENT: Color = Color::from_rgb8(0x29, 0x62, 0xff);
+/// Behind the tiles, visible in the gaps between them.
+pub const DESKTOP: Color = Color::from_rgb8(0x0b, 0x0d, 0x13);

@@ -7,19 +7,23 @@ use persephone_core::{
 
 use crate::viewport::Projection;
 
-/// Minimum vertical gap between price labels, in pixels.
-const PRICE_GAP: f32 = 56.0;
+/// Minimum vertical gap between price labels, in pixels: tighter in small tiles so they
+/// still get a few labels, looser on big charts so they don't get crowded.
+fn price_gap(height: f32) -> f32 {
+    (height / 6.0).clamp(30.0, 56.0)
+}
 /// Minimum horizontal gap between time labels, in pixels.
 const TIME_GAP: f32 = 90.0;
 
-/// Round price levels at least [`PRICE_GAP`] pixels apart, bottom to top.
+/// Round price levels at least [`price_gap`] pixels apart, bottom to top.
 #[must_use]
 pub fn price_ticks(projection: &Projection) -> Vec<f64> {
     let range = projection.top - projection.bottom;
     if range <= 0.0 || projection.height <= 0.0 {
         return Vec::new();
     }
-    let step = nice_step(range * f64::from(PRICE_GAP) / f64::from(projection.height));
+    let gap = price_gap(projection.height);
+    let step = nice_step(range * f64::from(gap) / f64::from(projection.height));
     let first = (projection.bottom / step).ceil() as i64;
     let last = (projection.top / step).floor() as i64;
     (first..=last).map(|k| k as f64 * step).collect()
@@ -210,6 +214,30 @@ mod tests {
     use crate::viewport::Viewport;
 
     #[test]
+    fn small_tiles_still_get_several_price_labels() {
+        let data: Vec<Candle> = (0..2_000u64)
+            .map(|i| {
+                let p = 80_480.0 + 160.0 * (i as f64 / 30.0).sin().abs();
+                Candle {
+                    ts: i,
+                    open: p,
+                    high: p + 10.0,
+                    low: p - 10.0,
+                    close: p + 3.0,
+                    volume: 1.0,
+                }
+            })
+            .collect();
+        // A tile in a 4x4 grid on a 1440x900 window.
+        let p = Projection::new(&Viewport::new(data.len()), &data, 270.0, 187.0);
+        let inside = price_ticks(&p)
+            .iter()
+            .filter(|t| (8.0..179.0).contains(&p.y(**t)))
+            .count();
+        assert!(inside >= 3, "only {inside} labels");
+    }
+
+    #[test]
     fn nice_steps() {
         assert_eq!(nice_step(0.7), 1.0);
         assert_eq!(nice_step(1.3), 2.0);
@@ -240,7 +268,7 @@ mod tests {
         let ticks = price_ticks(&p);
         assert!(ticks.len() >= 3, "{ticks:?}");
         let gap = p.y(ticks[0]) - p.y(ticks[1]);
-        assert!(gap >= PRICE_GAP - 1e-3, "gap {gap}");
+        assert!(gap >= price_gap(400.0) - 1e-3, "gap {gap}");
         assert!(ticks.iter().all(|t| *t >= p.bottom && *t <= p.top));
     }
 

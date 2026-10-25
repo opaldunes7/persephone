@@ -1,0 +1,15 @@
+[package]
+name = "persephone-tiling"
+description = "Hyprland-style dwindle tiling as pure data: a split tree, rectangles and focus moves."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+serde_json.workspace = true
