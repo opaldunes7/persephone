@@ -1,0 +1,17 @@
+[package]
+name = "persephone-chart"
+description = "GPU candlestick chart widget for iced, styled after TradingView."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+persephone-core.workspace = true
+bytemuck.workspace = true
+iced.workspace = true
+
+[dev-dependencies]
+persephone-data.workspace = true
+anyhow.workspace = true
+iced_test = "0.14"
