@@ -12,6 +12,7 @@
 pub mod study;
 pub mod theme;
 pub mod ticks;
+pub mod trades;
 pub mod viewport;
 
 mod gpu;
@@ -30,6 +31,7 @@ use iced::{
 use persephone_core::{Candle, Timeframe};
 
 pub use study::{OutputStyle, Placement, Study, StudyLine};
+pub use trades::{FillMark, PositionSpan, TradeMarker, Trades};
 pub use viewport::{Projection, Viewport};
 
 /// Width of the price axis on the right, in logical pixels.
@@ -106,6 +108,8 @@ pub struct ChartState {
     studies: Arc<Vec<Study>>,
     /// Changes whenever `studies` does, so the GPU re-uploads them.
     studies_generation: u64,
+    /// A backtest's fills and holding periods, if one ran.
+    trades: Option<Trades>,
     viewport: Viewport,
     grid_cache: canvas::Cache,
 }
@@ -144,6 +148,7 @@ impl ChartState {
             data,
             studies: Arc::new(Vec::new()),
             studies_generation: next_id(),
+            trades: None,
             grid_cache: canvas::Cache::new(),
         }
     }
@@ -151,6 +156,17 @@ impl ChartState {
     #[must_use]
     pub fn studies(&self) -> &[Study] {
         &self.studies
+    }
+
+    #[must_use]
+    pub fn trades(&self) -> Option<&Trades> {
+        self.trades.as_ref()
+    }
+
+    /// Shows (or with `None`, clears) a backtest's trade markers and position shading.
+    pub fn set_trades(&mut self, trades: Option<Trades>) {
+        self.trades = trades;
+        self.grid_cache.clear();
     }
 
     /// Replaces the chart's indicators. Each study's values must line up with the candles.
@@ -240,7 +256,13 @@ impl ChartState {
                 let offset = price_height + k as f32 * pane_height;
                 (
                     i,
-                    price.pane(&study.series(), study.range, offset, pane_height),
+                    price.pane(
+                        &study.series(),
+                        study.range,
+                        &study.levels,
+                        offset,
+                        pane_height,
+                    ),
                 )
             })
             .collect();

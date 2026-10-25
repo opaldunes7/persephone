@@ -36,6 +36,26 @@ impl<Message> canvas::Program<Message> for Grid<'_> {
                 let data = &self.chart.data;
                 let panes = self.chart.panes(plot);
 
+                if let Some(trades) = &self.chart.trades {
+                    let price = &panes.price;
+                    for span in &trades.spans {
+                        let left = price.x(span.from as f64).max(0.0);
+                        let right = price.x(span.to as f64).min(plot.width);
+                        if right > left {
+                            let tint = if span.long {
+                                theme::LONG_SHADE
+                            } else {
+                                theme::SHORT_SHADE
+                            };
+                            frame.fill_rectangle(
+                                Point::new(left, price.offset),
+                                Size::new(right - left, price.height),
+                                tint,
+                            );
+                        }
+                    }
+                }
+
                 for pane in panes.all() {
                     for value in ticks::price_ticks(pane) {
                         let y = pane.y(value).round();

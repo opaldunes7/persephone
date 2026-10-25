@@ -5,7 +5,8 @@
 //! that market, and the session's layout is not saved.
 //!
 //! The window is only charts, tiled like Hyprland's dwindle layout; see [`keymap`] for keys.
-//! Left-click a chart for its [`menu`]: indicators, symbol and timeframe.
+//! Left-click a chart for its [`menu`]: indicators, a strategy to backtest, symbol and
+//! timeframe.
 
 pub mod keymap;
 pub mod menu;
@@ -21,32 +22,37 @@ use std::{
 };
 
 use iced::{
-    Border, Color, Element, Fill, Length, Point, Size, Subscription, Task, Theme, event,
+    Background, Border, Color, Element, Fill, Length, Padding, Point, Size, Subscription, Task,
+    Theme, event,
     futures::channel::oneshot,
     keyboard::{
         self,
         key::{Code, Physical},
     },
-    widget::{container, mouse_area, operation, pin, stack, text},
+    widget::{button, container, mouse_area, operation, pin, row, stack, text},
     window,
 };
-use persephone_chart::{ChartData, ChartMessage, ChartState, theme};
+use persephone_chart::{ChartData, ChartMessage, ChartState, PRICE_AXIS_WIDTH, theme};
 use persephone_core::{
-    Timeframe,
+    InstrumentSpec, Timeframe,
     indicator::{BuiltIn, IndicatorSpec},
+    strategy::{BuiltInStrategy, StrategySpec},
 };
 use persephone_data::binance::BinanceClient;
+use persephone_engine::{BacktestReport, BacktestRequest, FeeRates};
 use persephone_tiling::{Layout, Rect, TileId};
 
 use crate::{
     keymap::Action,
     menu::{MenuMessage, Page, Popup, TileInfo},
     motion::Motion,
-    persist::{Saved, SavedIndicator, SavedTile},
+    persist::{Saved, SavedIndicator, SavedStrategy, SavedTile},
 };
 
 /// How many bars each market loads.
 const HISTORY_BARS: u64 = 5_000;
+/// Every backtest starts with this much of the quote currency.
+pub const STARTING_BALANCE: f64 = 100_000.0;
 /// Space around and between tiles when there is more than one.
 const GAP: f32 = 6.0;
 const BORDER: f32 = 2.0;
@@ -74,16 +80,42 @@ pub struct Market {
     timeframe: Timeframe,
 }
 
+/// One market's bars plus what the engine needs to trade it.
+#[derive(Clone, Debug)]
+pub struct MarketData {
+    pub data: Arc<ChartData>,
+    pub instrument: InstrumentSpec,
+}
+
 enum Bars {
     Loading,
-    Ready(Arc<ChartData>),
+    Ready(MarketData),
     Failed(String),
+}
+
+/// The latest backtest of a tile's strategy.
+#[derive(Clone, Debug)]
+pub enum Run {
+    /// The tile's bars haven't arrived yet.
+    Waiting,
+    Running,
+    Done(Arc<BacktestReport>),
+    Failed(String),
+}
+
+struct Strategy {
+    spec: StrategySpec,
+    run: Run,
+    /// Bumped on every new run so results from older runs are dropped.
+    generation: u64,
 }
 
 struct Tile {
     market: Market,
     /// The tile's indicators, in legend order. They survive symbol and timeframe changes.
     indicators: Vec<IndicatorSpec>,
+    /// Backtested on the tile's bars; reruns when the bars or settings change.
+    strategy: Option<Strategy>,
     /// `None` until the market's bars arrive.
     chart: Option<ChartState>,
     motion: Motion,
@@ -97,7 +129,7 @@ pub struct Persephone {
     bars: HashMap<Market, Bars>,
     window: Size,
     now: Instant,
-    /// The open menu or settings popover, if any.
+    /// The open menu, settings popover or report, if any.
     popup: Option<Popup>,
     /// Where the layout is saved; `None` for one-off sessions started with arguments.
     save_path: Option<PathBuf>,
@@ -105,7 +137,7 @@ pub struct Persephone {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    Loaded(Market, Result<Arc<ChartData>, String>),
+    Loaded(Market, Result<MarketData, String>),
     Chart(TileId, ChartMessage),
     Key(Action),
     /// The mouse entered a tile: focus follows it, as on Hyprland.
@@ -115,6 +147,10 @@ pub enum Message {
     Menu(MenuMessage),
     /// Closes the open popup.
     Escape,
+    /// A backtest finished: tile, run generation, outcome.
+    BacktestDone(TileId, u64, Result<Arc<BacktestReport>, String>),
+    /// The strategy summary on a tile was clicked.
+    OpenReport(TileId),
 }
 
 impl Persephone {
@@ -130,35 +166,35 @@ impl Persephone {
     pub fn start(args: &[String], save_path: Option<PathBuf>) -> (Self, Task<Message>) {
         let saved = save_path.as_deref().and_then(persist::load);
 
-        let (layout, tiles) = match saved {
-            Some(saved) => {
-                let tiles = saved
-                    .tiles
-                    .into_iter()
-                    .map(|t| {
-                        let timeframe = t.timeframe.parse().unwrap_or(Timeframe::M1);
-                        let indicators = t
-                            .indicators
-                            .iter()
-                            .filter_map(|i| {
-                                BuiltIn::from_id(&i.kind)
-                                    .map(|kind| IndicatorSpec::with_params(kind, &i.params))
-                            })
-                            .collect();
-                        let market = Market {
-                            symbol: t.symbol,
-                            timeframe,
-                        };
-                        (t.id, market, indicators)
-                    })
-                    .collect();
-                (saved.layout, tiles)
-            }
-            None => (Layout::new(), vec![(0, market_from_args(args), Vec::new())]),
+        let tiles: Vec<(TileId, Market, Vec<IndicatorSpec>, Option<StrategySpec>)> = match &saved {
+            Some(saved) => saved
+                .tiles
+                .iter()
+                .map(|t| {
+                    let market = Market {
+                        symbol: t.symbol.clone(),
+                        timeframe: t.timeframe.parse().unwrap_or(Timeframe::M1),
+                    };
+                    let indicators = t
+                        .indicators
+                        .iter()
+                        .filter_map(|i| {
+                            BuiltIn::from_id(&i.kind)
+                                .map(|kind| IndicatorSpec::with_params(kind, &i.params))
+                        })
+                        .collect();
+                    let strategy = t.strategy.as_ref().and_then(|s| {
+                        BuiltInStrategy::from_id(&s.kind)
+                            .map(|kind| StrategySpec::with_params(kind, &s.params))
+                    });
+                    (t.id, market, indicators, strategy)
+                })
+                .collect(),
+            None => vec![(0, market_from_args(args), Vec::new(), None)],
         };
 
         let mut app = Self {
-            layout,
+            layout: saved.map_or_else(Layout::new, |s| s.layout),
             tiles: BTreeMap::new(),
             bars: HashMap::new(),
             window: DEFAULT_WINDOW,
@@ -168,30 +204,40 @@ impl Persephone {
         };
         let loads: Vec<_> = tiles
             .into_iter()
-            .map(|(id, market, indicators)| app.add_tile(id, market, indicators))
+            .map(|(id, market, indicators, strategy)| {
+                app.add_tile(id, market, indicators, strategy)
+            })
             .collect();
         app.relayout(false);
         (app, Task::batch(loads))
     }
 
     /// A one-chart app over bars already in memory: no network, nothing saved. For tests and
-    /// offscreen snapshots.
+    /// offscreen snapshots. Assumes a `…USDT` pair with 5-decimal lots.
     #[doc(hidden)]
     pub fn preloaded(data: Arc<ChartData>, window: Size) -> Self {
         let market = Market {
             symbol: data.symbol.clone(),
             timeframe: data.timeframe,
         };
+        let instrument = InstrumentSpec {
+            symbol: data.symbol.clone(),
+            venue: data.venue.clone(),
+            base: data.symbol.trim_end_matches("USDT").to_owned(),
+            quote: "USDT".into(),
+            price_precision: data.price_precision,
+            size_precision: 5,
+        };
         let mut app = Self {
             layout: Layout::new(),
             tiles: BTreeMap::new(),
-            bars: HashMap::from([(market.clone(), Bars::Ready(data))]),
+            bars: HashMap::from([(market.clone(), Bars::Ready(MarketData { data, instrument }))]),
             window,
             now: Instant::now(),
             popup: None,
             save_path: None,
         };
-        let _ = app.add_tile(0, market, Vec::new());
+        let _ = app.add_tile(0, market, Vec::new(), None);
         app.relayout(false);
         app
     }
@@ -213,6 +259,15 @@ impl Persephone {
     #[must_use]
     pub fn tile_indicators(&self, id: TileId) -> Option<&[IndicatorSpec]> {
         self.tiles.get(&id).map(|tile| tile.indicators.as_slice())
+    }
+
+    /// Tile `id`'s strategy and the state of its latest backtest.
+    #[must_use]
+    pub fn tile_strategy(&self, id: TileId) -> Option<(&StrategySpec, &Run)> {
+        self.tiles
+            .get(&id)
+            .and_then(|tile| tile.strategy.as_ref())
+            .map(|s| (&s.spec, &s.run))
     }
 
     /// Tile `id`'s chart, once its bars are in.
@@ -240,6 +295,27 @@ impl Persephone {
         })
     }
 
+    /// The backtest tile `id` would run now (its strategy on its bars) and the generation its
+    /// result must carry. For tests and snapshots, which run it themselves.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn backtest_request(&self, id: TileId) -> Option<(u64, BacktestRequest)> {
+        let tile = self.tiles.get(&id)?;
+        let strategy = tile.strategy.as_ref()?;
+        let Some(Bars::Ready(market)) = self.bars.get(&tile.market) else {
+            return None;
+        };
+        let request = BacktestRequest {
+            instrument: market.instrument.clone(),
+            timeframe: tile.market.timeframe,
+            candles: market.data.candles.clone(),
+            strategy: strategy.spec.clone(),
+            starting_balance: STARTING_BALANCE,
+            fees: FeeRates::BINANCE_SPOT,
+        };
+        Some((strategy.generation, request))
+    }
+
     fn title(&self) -> String {
         match self.tiles.get(&self.layout.focused()) {
             Some(tile) => format!(
@@ -265,9 +341,7 @@ impl Persephone {
                     .filter(|(_, t)| t.market == market && t.chart.is_none())
                     .map(|(&id, _)| id)
                     .collect();
-                for id in waiting {
-                    self.attach(id);
-                }
+                return Task::batch(waiting.into_iter().map(|id| self.attach(id)));
             }
             Message::Chart(id, ChartMessage::Clicked { at }) => {
                 // A click closes whatever is open; on a chart with nothing open, it opens the menu.
@@ -281,11 +355,14 @@ impl Persephone {
                 };
             }
             Message::Chart(id, ChartMessage::StudyClicked { study, at }) => {
-                self.popup = self
-                    .tiles
-                    .get(&id)
-                    .and_then(|tile| tile.indicators.get(study))
-                    .map(|spec| Popup::settings(id, study, at, spec));
+                let Some(tile) = self.tiles.get(&id) else {
+                    return Task::none();
+                };
+                // Studies after the indicators belong to the strategy (its equity pane).
+                self.popup = match tile.indicators.get(study) {
+                    Some(spec) => Some(Popup::settings(id, study, at, spec)),
+                    None => self.report_popup(id),
+                };
             }
             Message::Chart(id, message) => {
                 if let Some(chart) = self.tiles.get_mut(&id).and_then(|t| t.chart.as_mut()) {
@@ -294,6 +371,24 @@ impl Persephone {
             }
             Message::Menu(message) => return self.on_menu(message),
             Message::Escape => self.popup = None,
+            Message::OpenReport(id) => {
+                let open = matches!(&self.popup, Some(Popup::Report { tile, .. }) if *tile == id);
+                self.popup = if open { None } else { self.report_popup(id) };
+            }
+            Message::BacktestDone(id, generation, result) => {
+                if let Some(strategy) = self
+                    .tiles
+                    .get_mut(&id)
+                    .and_then(|t| t.strategy.as_mut())
+                    .filter(|s| s.generation == generation)
+                {
+                    strategy.run = match result {
+                        Ok(report) => Run::Done(report),
+                        Err(error) => Run::Failed(error),
+                    };
+                    self.restudy(id);
+                }
+            }
             Message::Key(action) => return self.act(action),
             Message::Hover(id) => {
                 self.layout.focus(id);
@@ -318,7 +413,7 @@ impl Persephone {
                 let market = self.focused_market();
                 match self.layout.insert(area) {
                     Ok(id) => {
-                        task = self.add_tile(id, market, Vec::new());
+                        task = self.add_tile(id, market, Vec::new(), None);
                         popped_in = Some(id);
                         true
                     }
@@ -436,19 +531,16 @@ impl Persephone {
                     ..
                 } = &mut popup
                 {
-                    if let Some(input) = inputs.get_mut(index) {
-                        input.clone_from(&value);
-                    }
                     let spec = self
                         .tiles
                         .get_mut(&id)
                         .and_then(|t| t.indicators.get_mut(*study));
-                    let outcome = match (spec, value.trim().parse::<f64>()) {
-                        (Some(spec), Ok(number)) => spec.set_param(index, number),
-                        (Some(_), Err(_)) => Err("Enter a number".into()),
-                        (None, _) => Ok(()),
-                    };
-                    *error = outcome.err();
+                    *error = edit_param(
+                        inputs,
+                        index,
+                        &value,
+                        spec.map(|s| move |i, v| s.set_param(i, v)),
+                    );
                     if error.is_none() {
                         self.restudy(id);
                         self.save();
@@ -466,9 +558,59 @@ impl Persephone {
                     self.save();
                 }
             }
+            MenuMessage::SetStrategy(kind) => {
+                if let Some(tile) = self.tiles.get_mut(&id) {
+                    let generation = tile.strategy.as_ref().map_or(0, |s| s.generation);
+                    tile.strategy = Some(Strategy {
+                        spec: StrategySpec::new(kind),
+                        run: Run::Waiting,
+                        generation,
+                    });
+                }
+                self.save();
+                return self.run_backtest(id);
+            }
+            MenuMessage::StrategyParamChanged(index, value) => {
+                let mut task = Task::none();
+                if let Popup::Report { inputs, error, .. } = &mut popup {
+                    let spec = self
+                        .tiles
+                        .get_mut(&id)
+                        .and_then(|t| t.strategy.as_mut())
+                        .map(|s| &mut s.spec);
+                    *error = edit_param(
+                        inputs,
+                        index,
+                        &value,
+                        spec.map(|s| move |i, v| s.set_param(i, v)),
+                    );
+                    if error.is_none() {
+                        self.save();
+                        task = self.run_backtest(id);
+                    }
+                }
+                self.popup = Some(popup);
+                return task;
+            }
+            MenuMessage::RemoveStrategy => {
+                if let Some(tile) = self.tiles.get_mut(&id) {
+                    tile.strategy = None;
+                }
+                self.restudy(id);
+                self.save();
+            }
             MenuMessage::Close => {}
         }
         Task::none()
+    }
+
+    /// The report popover for tile `id`'s strategy, tucked under its summary at the top right.
+    fn report_popup(&self, id: TileId) -> Option<Popup> {
+        let tile = self.tiles.get(&id)?;
+        let strategy = tile.strategy.as_ref()?;
+        let width = tile.motion.target().width;
+        let at = Point::new(width - PRICE_AXIS_WIDTH - menu::REPORT_WIDTH - 12.0, 40.0);
+        Some(Popup::report(id, at, &strategy.spec))
     }
 
     /// Adds a tile, loading its market's bars unless they're loaded or on the way.
@@ -477,23 +619,29 @@ impl Persephone {
         id: TileId,
         market: Market,
         indicators: Vec<IndicatorSpec>,
+        strategy: Option<StrategySpec>,
     ) -> Task<Message> {
-        let task = self.request(&market);
+        let load = self.request(&market);
         self.tiles.insert(
             id,
             Tile {
                 market,
                 indicators,
+                strategy: strategy.map(|spec| Strategy {
+                    spec,
+                    run: Run::Waiting,
+                    generation: 0,
+                }),
                 chart: None,
                 motion: Motion::at_rest(Rect::default()),
                 flash: None,
             },
         );
-        self.attach(id);
-        task
+        let backtest = self.attach(id);
+        Task::batch([load, backtest])
     }
 
-    /// Points tile `id` at another market, keeping its indicators.
+    /// Points tile `id` at another market, keeping its indicators and strategy.
     fn set_market(&mut self, id: TileId, market: Market) -> Task<Message> {
         let Some(tile) = self.tiles.get_mut(&id) else {
             return Task::none();
@@ -503,10 +651,13 @@ impl Persephone {
         }
         tile.market = market.clone();
         tile.chart = None;
-        let task = self.request(&market);
-        self.attach(id);
+        if let Some(strategy) = &mut tile.strategy {
+            strategy.run = Run::Waiting;
+        }
+        let load = self.request(&market);
+        let backtest = self.attach(id);
         self.save();
-        task
+        Task::batch([load, backtest])
     }
 
     /// Starts loading `market` unless its bars are loaded or on the way.
@@ -520,29 +671,61 @@ impl Persephone {
         }
     }
 
-    /// Gives tile `id` a chart, with its indicators, if its market's bars are in.
-    fn attach(&mut self, id: TileId) {
+    /// Gives tile `id` a chart, with its indicators, if its market's bars are in, and starts
+    /// its strategy's backtest.
+    fn attach(&mut self, id: TileId) -> Task<Message> {
+        let Some(tile) = self.tiles.get_mut(&id) else {
+            return Task::none();
+        };
+        if tile.chart.is_some() {
+            return Task::none();
+        }
+        let Some(Bars::Ready(market)) = self.bars.get(&tile.market) else {
+            return Task::none();
+        };
+        tile.chart = Some(ChartState::new(Arc::clone(&market.data)));
+        self.restudy(id);
+        self.run_backtest(id)
+    }
+
+    /// Backtests tile `id`'s strategy on its bars, on a worker thread.
+    fn run_backtest(&mut self, id: TileId) -> Task<Message> {
+        let Some(strategy) = self.tiles.get_mut(&id).and_then(|t| t.strategy.as_mut()) else {
+            return Task::none();
+        };
+        strategy.generation += 1;
+        strategy.run = Run::Waiting;
+        let Some((generation, request)) = self.backtest_request(id) else {
+            return Task::none();
+        };
+        if let Some(strategy) = self.tiles.get_mut(&id).and_then(|t| t.strategy.as_mut()) {
+            strategy.run = Run::Running;
+        }
+        Task::perform(backtest_on_thread(request), move |result| {
+            Message::BacktestDone(id, generation, result)
+        })
+    }
+
+    /// Rebuilds what tile `id`'s chart draws: its indicators, plus its strategy's equity pane
+    /// and trades once a backtest has finished.
+    fn restudy(&mut self, id: TileId) {
         let Some(tile) = self.tiles.get_mut(&id) else {
             return;
         };
-        if tile.chart.is_some() {
+        let Some(chart) = tile.chart.as_mut() else {
             return;
+        };
+        let data = Arc::clone(chart.data());
+        let mut built = studies::build(&tile.indicators, &data.candles);
+        let report = match tile.strategy.as_ref().map(|s| &s.run) {
+            Some(Run::Done(report)) if report.equity.len() == data.candles.len() => Some(report),
+            _ => None,
+        };
+        if let Some(report) = report {
+            built.push(studies::equity(report));
         }
-        if let Some(Bars::Ready(data)) = self.bars.get(&tile.market) {
-            let mut chart = ChartState::new(Arc::clone(data));
-            chart.set_studies(studies::build(&tile.indicators, &data.candles));
-            tile.chart = Some(chart);
-        }
-    }
-
-    /// Recomputes tile `id`'s indicators after they change.
-    fn restudy(&mut self, id: TileId) {
-        if let Some(tile) = self.tiles.get_mut(&id)
-            && let Some(chart) = tile.chart.as_mut()
-        {
-            let data = Arc::clone(chart.data());
-            chart.set_studies(studies::build(&tile.indicators, &data.candles));
-        }
+        chart.set_studies(built);
+        chart.set_trades(report.map(|r| studies::trades(r, data.candles.len())));
     }
 
     fn focused_market(&self) -> Market {
@@ -605,6 +788,10 @@ impl Persephone {
                             params: spec.params.clone(),
                         })
                         .collect(),
+                    strategy: tile.strategy.as_ref().map(|s| SavedStrategy {
+                        kind: s.spec.kind.id().into(),
+                        params: s.spec.params.clone(),
+                    }),
                 })
                 .collect(),
         };
@@ -659,10 +846,16 @@ impl Persephone {
         {
             let rect = tile.motion.rect(self.now);
             let border = if framed { BORDER } else { 0.0 };
+            let quote = match self.bars.get(&tile.market) {
+                Some(Bars::Ready(market)) => market.instrument.quote.as_str(),
+                _ => "",
+            };
             let info = TileInfo {
                 symbol: &tile.market.symbol,
+                quote,
                 timeframe: tile.market.timeframe,
                 specs: &tile.indicators,
+                strategy: tile.strategy.as_ref().map(|s| (&s.spec, &s.run)),
             };
             let origin = Point::new(rect.x + border, rect.y + border);
             layers.push(menu::view(popup, info, origin, self.window).map(Message::Menu));
@@ -699,10 +892,23 @@ impl Persephone {
         };
         let color = flash.map_or(idle, |strength| mix(idle, theme::DOWN, strength));
 
-        let content: Element<'a, Message> = match &tile.chart {
+        let mut content: Element<'a, Message> = match &tile.chart {
             Some(chart) => chart.view().map(move |message| Message::Chart(id, message)),
             None => placeholder(&tile.market, self.bars.get(&tile.market)),
         };
+        if let Some(strategy) = &tile.strategy {
+            let compact = rect.width < 640.0;
+            let summary = container(strategy_summary(id, strategy, compact))
+                .align_right(Fill)
+                .padding(Padding {
+                    top: 6.0,
+                    right: PRICE_AXIS_WIDTH + 10.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                });
+            content = stack![content, summary].into();
+        }
+
         let frame = container(content)
             .padding(border)
             .width(Length::Fixed(rect.width.max(0.0)))
@@ -721,6 +927,87 @@ impl Persephone {
             .x(rect.x)
             .y(rect.y)
             .into()
+    }
+}
+
+/// The clickable strategy summary in a chart's top-right corner: name and headline numbers,
+/// or what the backtest is doing. Narrow charts get just the return.
+fn strategy_summary(id: TileId, strategy: &Strategy, compact: bool) -> Element<'_, Message> {
+    let mono = |content: String, color: Color| {
+        text(content)
+            .size(12)
+            .color(color)
+            .font(iced::Font::MONOSPACE)
+    };
+    let mut pieces = row![
+        text(strategy.spec.kind.name())
+            .size(12)
+            .color(theme::TEXT_BRIGHT)
+    ]
+    .spacing(10);
+    pieces = match &strategy.run {
+        Run::Waiting => pieces.push(mono("waiting for bars".into(), theme::TEXT_MUTED)),
+        Run::Running => pieces.push(mono("backtesting…".into(), theme::TEXT_MUTED)),
+        Run::Failed(_) => pieces.push(mono("couldn't run — click for details".into(), theme::DOWN)),
+        Run::Done(report) => {
+            let ret = report.net_return() * 100.0;
+            let color = if ret >= 0.0 { theme::UP } else { theme::DOWN };
+            let pieces = pieces.push(mono(format!("{ret:+.2}%"), color));
+            if compact {
+                pieces
+            } else {
+                let win = report
+                    .stat("Win Rate")
+                    .map_or("—".into(), |w| format!("{:.0}%", w * 100.0));
+                pieces
+                    .push(mono(
+                        format!("DD {:.1}%", report.max_drawdown * 100.0),
+                        theme::TEXT,
+                    ))
+                    .push(mono(format!("Win {win}"), theme::TEXT))
+                    .push(mono(format!("{} trades", report.fills.len()), theme::TEXT))
+            }
+        }
+    };
+
+    button(pieces)
+        .padding([3, 9])
+        .on_press(Message::OpenReport(id))
+        .style(|_, status| button::Style {
+            background: Some(Background::Color(Color {
+                a: if matches!(status, button::Status::Hovered) {
+                    1.0
+                } else {
+                    0.88
+                },
+                ..Color::from_rgb8(0x1e, 0x22, 0x2d)
+            })),
+            text_color: theme::TEXT_BRIGHT,
+            border: Border {
+                color: Color::from_rgb8(0x36, 0x3a, 0x45),
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..button::Style::default()
+        })
+        .into()
+}
+
+/// Applies a typed parameter value: remembers the text, parses it, and lets `set` validate
+/// it. Returns the error to show, if any.
+fn edit_param(
+    inputs: &mut [String],
+    index: usize,
+    value: &str,
+    set: Option<impl FnOnce(usize, f64) -> Result<(), String>>,
+) -> Option<String> {
+    if let Some(input) = inputs.get_mut(index) {
+        value.clone_into(input);
+    }
+    let set = set?;
+    match value.trim().parse::<f64>() {
+        Ok(number) => set(index, number).err(),
+        Err(_) => Some("Enter a number".into()),
     }
 }
 
@@ -773,31 +1060,47 @@ fn load(market: Market) -> Task<Message> {
     })
 }
 
-/// Fetches bars on a plain thread (the Binance client is blocking) and hands them back to
-/// iced's executor.
-async fn fetch_on_thread(symbol: String, timeframe: Timeframe) -> Result<Arc<ChartData>, String> {
+/// Runs `job` on a plain thread and hands its result back to iced's executor. Used for the
+/// blocking Binance client and for backtests, which need a thread of their own anyway.
+async fn on_thread<T: Send + 'static>(
+    job: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
     let (tx, rx) = oneshot::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(fetch(&symbol, timeframe).map_err(|e| format!("{e:#}")));
+        let _ = tx.send(job());
     });
     rx.await
-        .map_err(|_| "the loader thread stopped".to_string())?
+        .map_err(|_| "the worker thread stopped".to_string())?
 }
 
-fn fetch(symbol: &str, timeframe: Timeframe) -> anyhow::Result<Arc<ChartData>> {
+async fn fetch_on_thread(symbol: String, timeframe: Timeframe) -> Result<MarketData, String> {
+    on_thread(move || fetch(&symbol, timeframe).map_err(|e| format!("{e:#}"))).await
+}
+
+async fn backtest_on_thread(request: BacktestRequest) -> Result<Arc<BacktestReport>, String> {
+    on_thread(move || {
+        persephone_engine::run_backtest(&request)
+            .map(Arc::new)
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+fn fetch(symbol: &str, timeframe: Timeframe) -> anyhow::Result<MarketData> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
     let end = now - now % timeframe.nanos() + timeframe.nanos(); // include the forming bar
     let start = end.saturating_sub(HISTORY_BARS * timeframe.nanos());
 
     let binance = BinanceClient::new()?;
-    let spec = binance.instrument(symbol)?;
+    let instrument = binance.instrument(symbol)?;
     let candles = binance.klines(symbol, timeframe, start, end)?;
     anyhow::ensure!(!candles.is_empty(), "Binance returned no bars for {symbol}");
-    Ok(ChartData::new(
-        spec.symbol,
-        spec.venue,
+    let data = ChartData::new(
+        instrument.symbol.clone(),
+        instrument.venue.clone(),
         timeframe,
-        spec.price_precision,
+        instrument.price_precision,
         candles,
-    ))
+    );
+    Ok(MarketData { data, instrument })
 }

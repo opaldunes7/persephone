@@ -17,6 +17,8 @@ use iced::{
     },
 };
 
+use persephone_core::Side;
+
 use crate::{
     ChartData, ChartMessage, ChartState, PRICE_AXIS_WIDTH, Panes, TIME_AXIS_HEIGHT, plot_size,
     study::Placement,
@@ -271,6 +273,7 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
         draw_value_labels(&mut frame, data, &panes, plot, &price_tags);
         draw_time_labels(&mut frame, data, &panes.price, plot, time_tag.as_ref());
         draw_last_price_line(&mut frame, data, &panes.price, plot);
+        draw_trade_markers(&mut frame, self.chart, &panes.price);
         if let Some(c) = hovered {
             draw_crosshair(&mut frame, &panes, plot, c, hovered_bar);
         }
@@ -535,6 +538,64 @@ fn draw_last_price_line(frame: &mut Frame, data: &ChartData, price: &Projection,
         &Path::line(Point::new(0.0, y), Point::new(plot.width, y)),
         dashed(color, &[1.0, 2.0]),
     );
+}
+
+/// An arrow under the bar for each buy and over it for each sell, labelled with the position
+/// it leaves when bars are wide enough for text.
+fn draw_trade_markers(frame: &mut Frame, chart: &ChartState, price: &Projection) {
+    let Some(trades) = &chart.trades else { return };
+    let first = trades
+        .markers
+        .partition_point(|m| m.bar < price.visible.start);
+    let labelled = price.spacing >= 5.0;
+
+    for marker in trades.markers[first..]
+        .iter()
+        .take_while(|m| m.bar < price.visible.end)
+    {
+        let Some(candle) = chart.data.candles.get(marker.bar) else {
+            continue;
+        };
+        let x = price.x(marker.bar as f64);
+        let (tip, base, label_y, color) = match marker.side {
+            Side::Buy => {
+                let tip = price.y(candle.low) + 4.0;
+                (tip, tip + 7.0, tip + 17.0, theme::UP)
+            }
+            Side::Sell => {
+                let tip = price.y(candle.high) - 4.0;
+                (tip, tip - 7.0, tip - 17.0, theme::DOWN)
+            }
+        };
+        if !price.contains_y(tip) {
+            continue;
+        }
+        let arrow = Path::new(|b| {
+            b.move_to(Point::new(x, tip));
+            b.line_to(Point::new(x - 4.5, base));
+            b.line_to(Point::new(x + 4.5, base));
+            b.close();
+        });
+        frame.fill(&arrow, color);
+        if labelled && price.contains_y(label_y) {
+            // A filled tag, so the label reads over candles of the same color.
+            let width = marker.label.len() as f32 * 10.0 * MONO_ADVANCE + 8.0;
+            frame.fill_rectangle(
+                Point::new(x - width / 2.0, label_y - 7.0),
+                Size::new(width, 14.0),
+                color,
+            );
+            frame.fill_text(Text {
+                content: marker.label.into(),
+                position: Point::new(x, label_y),
+                color: theme::LABEL_TEXT,
+                size: Pixels(10.0),
+                align_x: Alignment::Center,
+                align_y: alignment::Vertical::Center,
+                ..Text::default()
+            });
+        }
+    }
 }
 
 /// The vertical line crosses every pane; the horizontal one stays in the hovered pane.

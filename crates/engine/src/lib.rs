@@ -26,12 +26,12 @@ use nautilus_model::{
     instruments::Instrument,
     types::{Currency, Money},
 };
-use persephone_core::{Candle, InstrumentSpec, Timeframe};
+use persephone_core::{Candle, InstrumentSpec, Timeframe, strategy::StrategySpec};
 use rust_decimal::Decimal;
 
 pub use report::{BacktestReport, Fill};
 
-use crate::strategies::ema_cross::EmaCross;
+use crate::strategies::{SignalStrategy, builtins};
 
 /// Everything needed to run one backtest.
 #[derive(Clone, Debug)]
@@ -44,18 +44,6 @@ pub struct BacktestRequest {
     /// Starting cash, in the instrument's quote currency.
     pub starting_balance: f64,
     pub fees: FeeRates,
-}
-
-/// Built-in strategies. WASM plugin strategies join this list in M5.
-#[derive(Clone, Debug)]
-pub enum StrategySpec {
-    /// Goes long when the fast EMA crosses above the slow one and short on the opposite cross.
-    EmaCross {
-        fast: usize,
-        slow: usize,
-        /// Position size in base units (e.g. BTC).
-        trade_size: f64,
-    },
 }
 
 /// Maker/taker fee rates as fractions (0.001 = 0.1%).
@@ -115,28 +103,33 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
         request.timeframe,
     )?;
 
+    let strategy = &request.strategy;
+    strategy.validate().map_err(EngineError::InvalidRequest)?;
+    let notional = request.starting_balance * strategy.size_fraction();
+    let last_close = request.candles.last().map_or(0.0, |c| c.close);
+    convert::quantity(notional / last_close, &request.instrument)?;
+
     let fills = Rc::new(RefCell::new(Vec::new()));
-    match request.strategy {
-        StrategySpec::EmaCross {
-            fast,
-            slow,
-            trade_size,
-        } => {
-            if fast == 0 || fast >= slow {
-                return Err(EngineError::InvalidRequest(format!(
-                    "EMA periods must satisfy 0 < fast < slow (got {fast} and {slow})"
-                )));
-            }
-            let size = convert::quantity(trade_size, &request.instrument)?;
-            engine.add_strategy(EmaCross::new(bar_type, size, fast, slow, Rc::clone(&fills)))?;
-        }
-    }
+    engine.add_strategy(SignalStrategy::new(
+        bar_type,
+        builtins::signal(strategy),
+        notional,
+        request.instrument.size_precision,
+        Rc::clone(&fills),
+    ))?;
 
     engine.add_data(bars, None, true, true)?;
     engine.run(None, None, None, false)?;
 
     let result = engine.get_result();
-    let report = report::build(&result, fills.take(), &request.instrument.quote);
+    let report = report::build(
+        &result,
+        fills.take(),
+        &request.candles,
+        request.timeframe,
+        request.starting_balance,
+        &request.instrument.quote,
+    );
     engine.dispose();
     Ok(report)
 }

@@ -10,10 +10,11 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use persephone_core::{
     Side, Timeframe, UnixNanos,
+    strategy::{BuiltInStrategy, StrategySpec},
     time::{DateTime, NANOS_PER_DAY},
 };
 use persephone_data::binance::BinanceClient;
-use persephone_engine::{BacktestReport, BacktestRequest, FeeRates, StrategySpec, spawn_backtest};
+use persephone_engine::{BacktestReport, BacktestRequest, FeeRates, spawn_backtest};
 
 #[derive(Parser)]
 #[command(name = "persephone-cli", version, about)]
@@ -24,7 +25,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Fetch Binance spot bars and run the built-in EMA-cross strategy on them.
+    /// Fetch Binance spot bars and run a built-in strategy on them.
     Backtest(BacktestArgs),
 }
 
@@ -39,15 +40,13 @@ struct BacktestArgs {
     /// How many days of history to test, ending now.
     #[arg(long, default_value_t = 90)]
     days: u64,
-    /// Fast EMA period.
-    #[arg(long, default_value_t = 10)]
-    fast: usize,
-    /// Slow EMA period.
-    #[arg(long, default_value_t = 30)]
-    slow: usize,
-    /// Position size in the base asset (e.g. BTC).
-    #[arg(long, default_value_t = 0.1)]
-    size: f64,
+    /// Strategy: ema-cross, rsi-reversion or donchian-breakout.
+    #[arg(long, default_value = "ema-cross", value_parser = parse_strategy)]
+    strategy: BuiltInStrategy,
+    /// Strategy parameters in order, comma-separated (e.g. `10,30,10` for EMA Cross fast,
+    /// slow, size %). Missing ones keep their defaults.
+    #[arg(long, value_delimiter = ',')]
+    params: Vec<f64>,
     /// Starting balance in the quote asset (e.g. USDT).
     #[arg(long, default_value_t = 100_000.0)]
     balance: f64,
@@ -64,6 +63,16 @@ enum Fees {
     /// Binance spot base tier, 0.1% maker and taker.
     Binance,
     Zero,
+}
+
+fn parse_strategy(id: &str) -> Result<BuiltInStrategy, String> {
+    BuiltInStrategy::from_id(id).ok_or_else(|| {
+        let ids: Vec<_> = BuiltInStrategy::ALL.iter().map(|s| s.id()).collect();
+        format!(
+            "unknown strategy `{id}` (expected one of {})",
+            ids.join(", ")
+        )
+    })
 }
 
 fn main() -> anyhow::Result<()> {
@@ -91,16 +100,14 @@ fn backtest(args: &BacktestArgs) -> anyhow::Result<()> {
         args.symbol
     );
 
+    let strategy = StrategySpec::with_params(args.strategy, &args.params);
     println!(
-        "{} {tf} · {} → {} · {} bars · EMA {}/{} · size {} {}",
+        "{} {tf} · {} → {} · {} bars · {strategy} · {}% per position",
         instrument.symbol,
         date(candles[0].ts),
         date(candles[candles.len() - 1].ts),
         candles.len(),
-        args.fast,
-        args.slow,
-        args.size,
-        instrument.base,
+        strategy.size_fraction() * 100.0,
     );
 
     let quote = instrument.quote.clone();
@@ -108,11 +115,7 @@ fn backtest(args: &BacktestArgs) -> anyhow::Result<()> {
         instrument,
         timeframe: tf,
         candles,
-        strategy: StrategySpec::EmaCross {
-            fast: args.fast,
-            slow: args.slow,
-            trade_size: args.size,
-        },
+        strategy,
         starting_balance: args.balance,
         fees: match args.fees {
             Fees::Binance => FeeRates::BINANCE_SPOT,
@@ -137,7 +140,7 @@ fn backtest(args: &BacktestArgs) -> anyhow::Result<()> {
 }
 
 fn print_summary(report: &BacktestReport, quote: &str) {
-    let pnl = |key: &str| report.pnl.get(key).copied().unwrap_or(f64::NAN);
+    let stat = |key: &str| report.stat(key).unwrap_or(f64::NAN);
     println!(
         "  {:<14}{} fills · {} positions",
         "Trades",
@@ -146,11 +149,17 @@ fn print_summary(report: &BacktestReport, quote: &str) {
     );
     println!(
         "  {:<14}{:+.2} {quote} ({:+.2}%)",
-        "PnL",
-        pnl("PnL (total)"),
-        pnl("PnL% (total)")
+        "Net PnL",
+        report.net_pnl(),
+        report.net_return() * 100.0
     );
-    println!("  {:<14}{}", "Win rate", percent(pnl("Win Rate")));
+    println!(
+        "  {:<14}{:.2}%",
+        "Max drawdown",
+        report.max_drawdown * 100.0
+    );
+    println!("  {:<14}{}", "Win rate", percent(stat("Win Rate")));
+    println!("  {:<14}{:.2} {quote}", "Fees", report.fees);
     println!();
 
     print_section("PnL", &report.pnl);

@@ -169,18 +169,25 @@ impl Projection {
     }
 
     /// An indicator pane `height` tall, `offset` below the top of the plot: the same bars as
-    /// `self`, scaled to `range` or else to the visible values of `series`.
+    /// `self`, scaled to `range`, or else to the visible values of `series` and the `levels`
+    /// drawn across them (so MACD's zero line or a starting balance stays in view).
     #[must_use]
     pub fn pane(
         &self,
         series: &[&[f64]],
         range: Option<(f64, f64)>,
+        levels: &[f64],
         offset: f32,
         height: f32,
     ) -> Self {
-        let (lo, hi) = range
-            .or_else(|| value_range(series, &self.visible))
-            .unwrap_or((0.0, 1.0));
+        let fitted = || {
+            let values = value_range(series, &self.visible);
+            levels.iter().fold(values, |acc, &level| match acc {
+                None => Some((level, level)),
+                Some((lo, hi)) => Some((lo.min(level), hi.max(level))),
+            })
+        };
+        let (lo, hi) = range.or_else(fitted).unwrap_or((0.0, 1.0));
         let margin = ((hi - lo) * PANE_MARGIN).max(hi.abs().max(1.0) * 1e-6);
         Self {
             top: hi + margin,
@@ -381,13 +388,16 @@ mod tests {
         let data = candles(200);
         let price = Projection::new(&Viewport::new(200), &data, 800.0, 300.0);
         let rsi = vec![50.0; 200];
-        let pane = price.pane(&[&rsi], Some((0.0, 100.0)), 300.0, 100.0);
+        let pane = price.pane(&[&rsi], Some((0.0, 100.0)), &[], 300.0, 100.0);
         assert_eq!(pane.left, price.left, "same bars");
         assert!(pane.contains_y(pane.y(50.0)) && !price.contains_y(pane.y(50.0)));
         assert!((pane.y(50.0) - 350.0).abs() < 1e-3, "middle of the pane");
         assert!((pane.price_at(350.0) - 50.0).abs() < 1e-9);
 
-        let fitted = price.pane(&[&rsi], None, 300.0, 100.0);
+        let with_level = price.pane(&[&rsi], None, &[100.0], 300.0, 100.0);
+        assert!(with_level.top > 100.0, "levels stay in view");
+
+        let fitted = price.pane(&[&rsi], None, &[], 300.0, 100.0);
         assert!(
             fitted.top > 50.0 && fitted.bottom < 50.0,
             "flat values still get height"

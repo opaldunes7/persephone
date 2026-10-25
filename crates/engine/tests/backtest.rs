@@ -1,9 +1,11 @@
-use persephone_core::{Candle, InstrumentSpec, Side, Timeframe};
-use persephone_engine::{
-    BacktestReport, BacktestRequest, EngineError, FeeRates, StrategySpec, spawn_backtest,
+use persephone_core::{
+    Candle, InstrumentSpec, Side, Timeframe,
+    strategy::{BuiltInStrategy, StrategySpec},
 };
+use persephone_engine::{BacktestReport, BacktestRequest, EngineError, FeeRates, spawn_backtest};
 
 const START: u64 = 1_735_689_600_000_000_000; // 2025-01-01T00:00:00Z
+const BALANCE: f64 = 100_000.0;
 
 fn btcusdt() -> InstrumentSpec {
     InstrumentSpec {
@@ -16,7 +18,7 @@ fn btcusdt() -> InstrumentSpec {
     }
 }
 
-/// A slow sine wave around 50k, so the EMAs cross a predictable number of times.
+/// A slow sine wave around 50k, so trend and reversion rules both trigger predictably.
 fn sine_candles(n: usize) -> Vec<Candle> {
     (0..n)
         .map(|i| {
@@ -33,19 +35,19 @@ fn sine_candles(n: usize) -> Vec<Candle> {
         .collect()
 }
 
-fn request(candles: Vec<Candle>, fast: usize, slow: usize) -> BacktestRequest {
+fn request(candles: Vec<Candle>, strategy: StrategySpec) -> BacktestRequest {
     BacktestRequest {
         instrument: btcusdt(),
         timeframe: Timeframe::H1,
         candles,
-        strategy: StrategySpec::EmaCross {
-            fast,
-            slow,
-            trade_size: 0.1,
-        },
-        starting_balance: 100_000.0,
+        strategy,
+        starting_balance: BALANCE,
         fees: FeeRates::ZERO,
     }
+}
+
+fn ema(fast: f64, slow: f64) -> StrategySpec {
+    StrategySpec::with_params(BuiltInStrategy::EmaCross, &[fast, slow, 10.0])
 }
 
 fn run(req: BacktestRequest) -> Result<BacktestReport, EngineError> {
@@ -56,26 +58,66 @@ fn run(req: BacktestRequest) -> Result<BacktestReport, EngineError> {
 
 #[test]
 fn ema_cross_flips_between_long_and_short() {
-    let report = run(request(sine_candles(1_000), 5, 20)).unwrap();
+    let report = run(request(sine_candles(1_000), ema(5.0, 20.0))).unwrap();
     let fills = &report.fills;
 
     // ~1000 / (2π·40) ≈ 4 full waves → about 8 crosses.
     assert!((6..=10).contains(&fills.len()), "got {} fills", fills.len());
-    assert!((fills[0].qty - 0.1).abs() < 1e-9, "first entry is one unit");
+    // Each position is 10% of the balance: ~0.2 BTC at 50k; reversals carry two positions.
+    let first_value = fills[0].qty * fills[0].price;
     assert!(
-        fills[1..].iter().all(|f| (f.qty - 0.2).abs() < 1e-9),
-        "reversals are two units"
+        (first_value - 10_000.0).abs() < 50.0,
+        "first entry worth {first_value}"
+    );
+    assert!(
+        fills[1..].iter().all(|f| f.qty > fills[0].qty * 1.5),
+        "reversals close and reopen"
     );
     assert!(
         fills.windows(2).all(|w| w[0].side != w[1].side),
         "sides alternate"
     );
-    assert!(fills.windows(2).all(|w| w[0].ts < w[1].ts));
+    assert!(fills.windows(2).all(|w| w[0].bar < w[1].bar));
     assert_eq!(report.total_orders, fills.len());
+}
+
+#[test]
+fn every_builtin_trades_and_reports_equity() {
+    for kind in BuiltInStrategy::ALL {
+        let candles = sine_candles(1_200);
+        let report = run(request(candles.clone(), StrategySpec::new(kind))).unwrap();
+        assert!(!report.fills.is_empty(), "{kind:?} trades");
+        assert_eq!(report.equity.len(), candles.len());
+        assert_eq!(report.equity[0], BALANCE, "{kind:?} starts flat");
+        assert!(report.max_drawdown <= 0.0);
+        assert!(report.fills.iter().all(|f| f.bar < candles.len()));
+    }
+}
+
+#[test]
+fn equity_agrees_with_nautilus_realized_pnl_when_flat() {
+    // Zero fees and a reversal strategy: the position is open at the end, so compare the
+    // equity change up to the last fill with Nautilus's realized PnL plus that open trade.
+    let report = run(request(sine_candles(800), ema(5.0, 20.0))).unwrap();
+    let last = report.fills.last().unwrap();
+    let equity_at_last_fill = report.equity[last.bar];
+    let realized = report.stat("PnL (total)").unwrap();
     assert!(
-        report.pnl.contains_key("PnL (total)"),
-        "pnl stats: {:?}",
-        report.pnl.keys()
+        (equity_at_last_fill - BALANCE - realized).abs() < 1.0,
+        "equity {equity_at_last_fill} vs realized {realized}"
+    );
+}
+
+#[test]
+fn fees_are_counted() {
+    let mut req = request(sine_candles(600), ema(5.0, 20.0));
+    req.fees = FeeRates::BINANCE_SPOT;
+    let report = run(req).unwrap();
+    let traded: f64 = report.fills.iter().map(|f| f.qty * f.price).sum();
+    assert!(
+        (report.fees - traded * 0.001).abs() < 0.05,
+        "0.1% of {traded} vs {}",
+        report.fees
     );
 }
 
@@ -83,41 +125,38 @@ fn ema_cross_flips_between_long_and_short() {
 fn fills_never_precede_the_signal_bar_close() {
     let candles = sine_candles(400);
     let first_bar_close = candles[0].ts + Timeframe::H1.nanos();
-    let report = run(request(candles, 5, 20)).unwrap();
+    let report = run(request(candles, ema(5.0, 20.0))).unwrap();
     assert!(report.fills.iter().all(|f| f.ts >= first_bar_close));
 }
 
 #[test]
 fn same_input_gives_same_fills() {
-    let a = run(request(sine_candles(600), 8, 21)).unwrap();
-    let b = run(request(sine_candles(600), 8, 21)).unwrap();
+    let a = run(request(sine_candles(600), ema(8.0, 21.0))).unwrap();
+    let b = run(request(sine_candles(600), ema(8.0, 21.0))).unwrap();
     assert_eq!(a.fills, b.fills);
-    // Stats with no samples (e.g. "Avg Loser" without losers) are NaN, and NaN != NaN.
-    assert_eq!(format!("{:?}", a.pnl), format!("{:?}", b.pnl));
+    assert_eq!(a.equity, b.equity);
 }
 
 #[test]
 fn rejects_bad_requests() {
     assert!(matches!(
-        run(request(Vec::new(), 5, 20)),
+        run(request(Vec::new(), ema(5.0, 20.0))),
         Err(EngineError::NoData)
     ));
     assert!(matches!(
-        run(request(sine_candles(100), 20, 5)),
+        run(request(sine_candles(100), ema(20.0, 5.0))),
         Err(EngineError::InvalidRequest(_))
     ));
-    let mut tiny = request(sine_candles(100), 5, 20);
-    tiny.strategy = StrategySpec::EmaCross {
-        fast: 5,
-        slow: 20,
-        trade_size: 0.000_001,
-    };
-    assert!(matches!(run(tiny), Err(EngineError::InvalidRequest(_))));
+    let mut tiny = request(sine_candles(100), ema(5.0, 20.0));
+    tiny.starting_balance = 0.000_001;
+    assert!(
+        matches!(run(tiny), Err(EngineError::InvalidRequest(_))),
+        "positions round to zero"
+    );
 }
 
 #[test]
-fn long_short_pnl_has_the_right_sign() {
-    // Price only rises after the first cross: the strategy goes long and stays long.
+fn ends_long_in_an_uptrend() {
     let mut candles = sine_candles(120);
     let last = candles.last().unwrap().close;
     for i in 0..200 {
@@ -131,7 +170,7 @@ fn long_short_pnl_has_the_right_sign() {
             volume: 10.0,
         });
     }
-    let report = run(request(candles, 5, 20)).unwrap();
-    let last_fill = report.fills.last().expect("at least one fill");
-    assert_eq!(last_fill.side, Side::Buy, "ends long in an uptrend");
+    let report = run(request(candles, ema(5.0, 20.0))).unwrap();
+    assert_eq!(report.fills.last().unwrap().side, Side::Buy);
+    assert!(report.net_pnl() > 0.0, "the trend paid");
 }

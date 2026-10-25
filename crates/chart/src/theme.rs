@@ -43,3 +43,8 @@ pub const STUDY_PALETTE: [Color; 6] = [
     Color::from_rgb8(0xe9, 0x1e, 0x63),
     Color::from_rgb8(0xfd, 0xd8, 0x35),
 ];
+
+/// Tint behind the bars while a backtest holds a long position...
+pub const LONG_SHADE: Color = Color::from_rgba8(0x26, 0xa6, 0x9a, 0.07);
+/// ...or a short one.
+pub const SHORT_SHADE: Color = Color::from_rgba8(0xef, 0x53, 0x50, 0.07);

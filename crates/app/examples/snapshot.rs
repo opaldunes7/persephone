@@ -8,7 +8,9 @@
 //! `H`/`J`/`K`/`L` swap, `<`/`>`/`^`/`v` move a divider, `t` toggle split, `f` fullscreen;
 //! `m` left-clicks the focused chart (opening its menu), `i` opens the indicator page, `s`
 //! the symbol page, `1`-`8` add a built-in indicator (in menu order), `e` opens the first
-//! indicator's settings.
+//! indicator's settings; `x`/`y`/`z` set the EMA Cross / RSI Reversion / Donchian Breakout
+//! strategy (menu open) and `r` opens the focused chart's strategy report. Backtests run to
+//! completion before the snapshot.
 //! AT_MS freezes the clock that many milliseconds after the last action (default: settled),
 //! to look at animation frames. iced appends the renderer name to the file name.
 
@@ -20,12 +22,12 @@ use std::{
 use anyhow::{Context, bail};
 use iced::{Point, Settings, Size, Theme};
 use persephone::{
-    Message, Persephone,
+    Message, Persephone, Run,
     keymap::Action,
     menu::{MenuMessage, Page},
 };
 use persephone_chart::{ChartData, ChartMessage};
-use persephone_core::{Timeframe, indicator::BuiltIn};
+use persephone_core::{Timeframe, indicator::BuiltIn, strategy::BuiltInStrategy};
 use persephone_data::binance::BinanceClient;
 use persephone_tiling::Direction;
 
@@ -49,6 +51,7 @@ fn main() -> anyhow::Result<()> {
     for c in script.chars() {
         let focused = app.layout().focused();
         let _ = app.update(message(c, focused)?);
+        finish_backtests(&mut app);
     }
     let frozen = Instant::now() + at.map_or(Duration::from_secs(5), Duration::from_millis);
     let _ = app.update(Message::Tick(frozen));
@@ -102,7 +105,26 @@ fn message(c: char, focused: u32) -> anyhow::Result<Message> {
         '1'..='8' => menu(MenuMessage::AddIndicator(
             BuiltIn::ALL[c as usize - '1' as usize],
         )),
+        'x' => menu(MenuMessage::SetStrategy(BuiltInStrategy::EmaCross)),
+        'y' => menu(MenuMessage::SetStrategy(BuiltInStrategy::RsiReversion)),
+        'z' => menu(MenuMessage::SetStrategy(BuiltInStrategy::DonchianBreakout)),
+        'r' => Ok(Message::OpenReport(focused)),
         other => bail!("unknown script action `{other}`"),
+    }
+}
+
+/// Runs every backtest the app is waiting on, here instead of on a worker thread.
+fn finish_backtests(app: &mut Persephone) {
+    for id in app.layout().tiles() {
+        if !matches!(app.tile_strategy(id), Some((_, Run::Running))) {
+            continue;
+        }
+        if let Some((generation, request)) = app.backtest_request(id) {
+            let result = persephone_engine::run_backtest(&request)
+                .map(std::sync::Arc::new)
+                .map_err(|e| e.to_string());
+            let _ = app.update(Message::BacktestDone(id, generation, result));
+        }
     }
 }
 

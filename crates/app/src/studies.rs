@@ -2,17 +2,19 @@
 //! styles from TradingView's defaults.
 
 use iced::Color;
-use persephone_chart::{Study, StudyLine, theme};
+use persephone_chart::{FillMark, Placement, Study, StudyLine, Trades, theme};
 use persephone_core::{
     Candle,
-    indicator::{BuiltIn, IndicatorSpec},
+    indicator::{BuiltIn, IndicatorSpec, OutputStyle},
 };
+use persephone_engine::BacktestReport;
 
 const BLUE: Color = Color::from_rgb8(0x29, 0x62, 0xff);
 const ORANGE: Color = Color::from_rgb8(0xff, 0x6d, 0x00);
 const PURPLE: Color = Color::from_rgb8(0x7e, 0x57, 0xc2);
 const RED: Color = Color::from_rgb8(0xf2, 0x36, 0x45);
 const HISTOGRAM: Color = Color::from_rgba8(0x26, 0xa6, 0x9a, 0.6);
+const EQUITY: Color = Color::from_rgb8(0x42, 0xa5, 0xf5);
 
 /// Computes every indicator over `candles`, in order. An indicator that can't be computed
 /// (e.g. MACD with fast ≥ slow) still gets a study, carrying the error for its legend.
@@ -61,6 +63,39 @@ pub fn build(specs: &[IndicatorSpec], candles: &[Candle]) -> Vec<Study> {
         .collect()
 }
 
+/// The strategy's equity curve as a pane, with the starting balance as a dashed level.
+pub fn equity(report: &BacktestReport) -> Study {
+    Study {
+        label: "Equity".into(),
+        placement: Placement::Pane,
+        lines: vec![StudyLine {
+            name: "Equity".into(),
+            values: report.equity.clone(),
+            color: EQUITY,
+            style: OutputStyle::Line,
+        }],
+        fill: None,
+        levels: vec![report.starting_balance],
+        range: None,
+        error: None,
+    }
+}
+
+/// The strategy's fills as chart markers and holding periods.
+pub fn trades(report: &BacktestReport, bars: usize) -> Trades {
+    let fills: Vec<FillMark> = report
+        .fills
+        .iter()
+        .map(|f| FillMark {
+            bar: f.bar,
+            side: f.side,
+            price: f.price,
+            qty: f.qty,
+        })
+        .collect();
+    Trades::from_fills(&fills, bars)
+}
+
 /// One color per output. Moving averages and channels take the next palette color so
 /// several of them on one chart stay distinguishable.
 fn colors(kind: BuiltIn, next: &mut usize) -> Vec<Color> {
@@ -84,8 +119,6 @@ fn colors(kind: BuiltIn, next: &mut usize) -> Vec<Color> {
 
 #[cfg(test)]
 mod tests {
-    use persephone_chart::Placement;
-
     use super::*;
 
     fn candles(n: usize) -> Vec<Candle> {

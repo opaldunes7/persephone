@@ -27,6 +27,16 @@ pub struct SavedTile {
     /// Missing in layouts saved before indicators existed.
     #[serde(default)]
     pub indicators: Vec<SavedIndicator>,
+    /// Missing in layouts saved before strategies existed.
+    #[serde(default)]
+    pub strategy: Option<SavedStrategy>,
+}
+
+/// A built-in strategy by id (e.g. "ema-cross") with its parameters. Unknown ids are skipped.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedStrategy {
+    pub kind: String,
+    pub params: Vec<f64>,
 }
 
 /// A built-in indicator by id (e.g. "ema") with its parameters. Unknown ids are skipped when
@@ -108,12 +118,17 @@ mod tests {
                         kind: "ema".into(),
                         params: vec![21.0],
                     }],
+                    strategy: Some(SavedStrategy {
+                        kind: "ema-cross".into(),
+                        params: vec![10.0, 30.0, 10.0],
+                    }),
                 },
                 SavedTile {
                     id: 1,
                     symbol: "ETHUSDT".into(),
                     timeframe: "4h".into(),
                     indicators: Vec::new(),
+                    strategy: None,
                 },
             ],
         }
@@ -144,17 +159,30 @@ mod tests {
     }
 
     #[test]
-    fn layouts_saved_before_indicators_still_load() {
+    fn layouts_saved_before_indicators_and_strategies_still_load() {
         let path = temp_path("pre-indicators");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut old = ron::ser::to_string(&saved()).unwrap();
         old = old
             .replace(",indicators:[(kind:\"ema\",params:[21.0])]", "")
-            .replace(",indicators:[]", "");
-        assert!(!old.contains("indicators"), "{old}");
+            .replace(",indicators:[]", "")
+            .replace(
+                ",strategy:Some((kind:\"ema-cross\",params:[10.0,30.0,10.0]))",
+                "",
+            )
+            .replace(",strategy:None", "");
+        assert!(
+            !old.contains("indicators") && !old.contains("strategy"),
+            "{old}"
+        );
         fs::write(&path, old).unwrap();
         let loaded = load(&path).expect("still loads");
-        assert!(loaded.tiles.iter().all(|t| t.indicators.is_empty()));
+        assert!(
+            loaded
+                .tiles
+                .iter()
+                .all(|t| t.indicators.is_empty() && t.strategy.is_none())
+        );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
