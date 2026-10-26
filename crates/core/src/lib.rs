@@ -6,6 +6,7 @@
 pub mod indicator;
 pub mod signal;
 pub mod strategy;
+pub mod tick;
 pub mod time;
 
 use std::{fmt, str::FromStr};

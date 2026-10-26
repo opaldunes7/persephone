@@ -194,6 +194,7 @@ fn saved_plugins_wait_for_their_plugin_then_resolve() {
             layout: Layout::new(),
             tiles: vec![SavedTile {
                 id: 0,
+                local: None,
                 symbol: "BTCUSDT".into(),
                 timeframe: "1h".into(),
                 indicators: vec![SavedIndicator {

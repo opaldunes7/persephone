@@ -5,12 +5,16 @@
 //! - root: Indicators ›, Strategy ›, Symbol ›, and a row of timeframe chips;
 //! - indicators: every built-in, grouped by where it's drawn, then loaded plugins;
 //! - strategies: every built-in strategy and plugin, with a one-line description;
-//! - symbol: a search box with popular Binance pairs.
+//! - symbol: a search box over markets in the local store and popular Binance pairs.
 //!
 //! The report opens from a chart's strategy summary: settings, full statistics and a remove
-//! button.
+//! button. Dropping CSV files on a chart opens the import panel: what was detected, the
+//! market to put the ticks in, and progress.
 
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use iced::{
     Background, Border, Color, Element, Fill, Point, Shadow, Size, Vector,
@@ -21,6 +25,11 @@ use persephone_core::{
     Timeframe,
     indicator::{BuiltIn, IndicatorSpec, Param, Placement},
     strategy::{BuiltInStrategy, StrategyKind, StrategySpec},
+    time::DateTime,
+};
+use persephone_data::{
+    import::{Detection, Progress, Summary},
+    store::MarketInfo,
 };
 use persephone_engine::BacktestReport;
 use persephone_plugin_host::Plugins;
@@ -30,12 +39,16 @@ use crate::Run;
 
 pub const WIDTH: f32 = 248.0;
 pub const REPORT_WIDTH: f32 = 300.0;
+pub const IMPORT_WIDTH: f32 = 440.0;
 /// Room kept between a popup and the window edge.
 const MARGIN: f32 = 6.0;
 
 const PANEL: Color = Color::from_rgb8(0x1e, 0x22, 0x2d);
 const PANEL_BORDER: Color = Color::from_rgb8(0x36, 0x3a, 0x45);
 const HOVER: Color = Color::from_rgb8(0x2a, 0x2e, 0x39);
+
+/// The most local markets the symbol page lists at once.
+const LOCAL_SHOWN: usize = 6;
 
 /// Popular Binance pairs offered in the symbol search.
 const SYMBOLS: [&str; 14] = [
@@ -78,14 +91,50 @@ pub enum Popup {
         inputs: Vec<String>,
         error: Option<String>,
     },
+    /// CSV files dropped on the tile, on their way into the local store.
+    Import {
+        tile: TileId,
+        files: Vec<PathBuf>,
+        state: ImportState,
+        /// What's typed for the market's symbol and venue, and the zone of the file's times.
+        symbol: String,
+        venue: String,
+        zone: String,
+        error: Option<String>,
+    },
+}
+
+/// Where an import of dropped files stands.
+#[derive(Clone, Debug)]
+pub enum ImportState {
+    /// Reading the first file to work out its layout.
+    Detecting,
+    Ready(Arc<Detection>),
+    Importing(Progress),
+    Done(Arc<Summary>),
+    Failed(String),
 }
 
 impl Popup {
     pub fn tile(&self) -> TileId {
         match self {
-            Self::Menu { tile, .. } | Self::Settings { tile, .. } | Self::Report { tile, .. } => {
-                *tile
-            }
+            Self::Menu { tile, .. }
+            | Self::Settings { tile, .. }
+            | Self::Report { tile, .. }
+            | Self::Import { tile, .. } => *tile,
+        }
+    }
+
+    /// The import panel for `file`, dropped on `tile`, while its layout is worked out.
+    pub fn import(tile: TileId, file: PathBuf, symbol: String) -> Self {
+        Self::Import {
+            tile,
+            files: vec![file],
+            state: ImportState::Detecting,
+            symbol,
+            venue: persephone_data::import::DEFAULT_VENUE.into(),
+            zone: "UTC".into(),
+            error: None,
         }
     }
 
@@ -113,12 +162,14 @@ impl Popup {
     fn at(&self) -> Point {
         match self {
             Self::Menu { at, .. } | Self::Settings { at, .. } | Self::Report { at, .. } => *at,
+            Self::Import { .. } => Point::new(24.0, 48.0),
         }
     }
 
     fn width(&self) -> f32 {
         match self {
             Self::Report { .. } => REPORT_WIDTH,
+            Self::Import { .. } => IMPORT_WIDTH,
             _ => WIDTH,
         }
     }
@@ -145,6 +196,7 @@ impl Popup {
             } => 330.0,
             Self::Settings { inputs, .. } => 110.0 + 40.0 * inputs.len() as f32,
             Self::Report { inputs, .. } => 360.0 + 40.0 * inputs.len() as f32,
+            Self::Import { .. } => 300.0 + extra,
         }
     }
 }
@@ -158,7 +210,17 @@ pub enum MenuMessage {
     SetTimeframe(Timeframe),
     QueryChanged(String),
     SetSymbol(String),
+    /// A market from the local store.
+    SetLocal {
+        venue: String,
+        symbol: String,
+    },
     SubmitSymbol,
+    /// The import panel's symbol and venue boxes, and its Import button.
+    ImportSymbolChanged(String),
+    ImportVenueChanged(String),
+    ImportZoneChanged(String),
+    StartImport,
     ParamChanged(usize, String),
     RemoveStudy,
     SetStrategy(BuiltInStrategy),
@@ -172,8 +234,14 @@ pub enum MenuMessage {
 /// What the tile under the popup shows, for labels and the current selection.
 pub struct TileInfo<'a> {
     pub symbol: &'a str,
+    /// The local store's venue, for a stored market.
+    pub venue: Option<&'a str>,
     /// Quote currency for money figures.
     pub quote: &'a str,
+    /// How the market's backtests fill orders, when worth saying.
+    pub fills: Option<&'a str>,
+    /// Markets in the local store, for the symbol page.
+    pub local_markets: &'a [MarketInfo],
     pub timeframe: Timeframe,
     pub specs: &'a [IndicatorSpec],
     pub strategy: Option<(&'a StrategySpec, &'a Run)>,
@@ -199,7 +267,7 @@ pub fn view<'a>(
                 tile.plugins,
                 tile.plugin_dir,
             ),
-            Page::Symbol { query } => symbols(query, tile.symbol),
+            Page::Symbol { query } => symbols(query, &tile),
         },
         Popup::Settings {
             study,
@@ -211,9 +279,18 @@ pub fn view<'a>(
             None => column![].into(),
         },
         Popup::Report { inputs, error, .. } => match tile.strategy {
-            Some((spec, run)) => report(spec, run, tile.quote, inputs, error.as_deref()),
+            Some((spec, run)) => report(spec, run, &tile, inputs, error.as_deref()),
             None => column![].into(),
         },
+        Popup::Import {
+            files,
+            state,
+            symbol,
+            venue,
+            zone,
+            error,
+            ..
+        } => import_panel(files, state, [symbol, venue, zone], error.as_deref()),
     };
 
     let extra = match popup {
@@ -225,6 +302,14 @@ pub fn view<'a>(
             page: Page::Strategies,
             ..
         } => 2 * tile.plugins.strategies.len() + 2,
+        Popup::Menu {
+            page: Page::Symbol { .. },
+            ..
+        } => tile.local_markets.len().min(LOCAL_SHOWN) + 1,
+        Popup::Import {
+            state: ImportState::Ready(detection),
+            ..
+        } => detection.roles().len() + detection.notes.len(),
         _ => 0,
     };
     let at = popup.at();
@@ -382,7 +467,7 @@ fn plugin_note<'a>(dir: Option<&Path>, plugins: &Plugins) -> Option<Element<'a, 
     }
 }
 
-fn symbols<'a>(query: &'a str, current: &'a str) -> Element<'a, MenuMessage> {
+fn symbols<'a>(query: &'a str, tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
     let needle = query.trim().to_uppercase();
     let input = text_input("Search, e.g. ETHUSDT", query)
         .id(symbol_input())
@@ -392,23 +477,225 @@ fn symbols<'a>(query: &'a str, current: &'a str) -> Element<'a, MenuMessage> {
         .size(13)
         .style(|_, status| input_style(status));
 
-    let matches = SYMBOLS
+    let (current, venue) = (tile.symbol, tile.venue);
+    let local: Vec<Element<'a, MenuMessage>> = tile
+        .local_markets
+        .iter()
+        .filter(|m| m.symbol.contains(&needle) || m.venue.contains(&needle))
+        .take(LOCAL_SHOWN)
+        .map(|m| {
+            let selected = m.symbol == current && Some(m.venue.as_str()) == venue;
+            let hint = if selected {
+                "current".to_owned()
+            } else {
+                format!(
+                    "{} · {} {}",
+                    m.venue,
+                    m.kind,
+                    DateTime::from_nanos(m.first).year
+                )
+            };
+            local_item(
+                &m.symbol,
+                hint,
+                MenuMessage::SetLocal {
+                    venue: m.venue.clone(),
+                    symbol: m.symbol.clone(),
+                },
+            )
+        })
+        .collect();
+
+    let binance = SYMBOLS
         .into_iter()
         .filter(move |s| s.contains(&needle))
         .take(8)
         .map(move |s| {
+            let selected = s == current && venue.is_none();
             item(
                 s,
-                if s == current { "current" } else { "" },
+                if selected { "current" } else { "" },
                 MenuMessage::SetSymbol(s.into()),
             )
         });
 
-    column![back("Symbol"), container(input).padding([4, 6])]
-        .extend(matches)
+    let mut page = column![back("Symbol"), container(input).padding([4, 6])];
+    if !local.is_empty() {
+        page = page
+            .push(section("Local"))
+            .extend(local)
+            .push(section("Binance"));
+    }
+    page.extend(binance)
         .push(note("Enter loads any Binance spot pair"))
         .spacing(2)
         .into()
+}
+
+/// A menu item whose hint is built for it.
+fn local_item<'a>(label: &'a str, hint: String, on_press: MenuMessage) -> Element<'a, MenuMessage> {
+    button(
+        row![
+            text(label).size(13),
+            space::horizontal(),
+            text(hint).size(12).color(theme::TEXT_MUTED),
+        ]
+        .align_y(iced::Center),
+    )
+    .width(Fill)
+    .padding([6, 10])
+    .on_press(on_press)
+    .style(|_, status| item_style(status))
+    .into()
+}
+
+fn import_panel<'a>(
+    files: &'a [PathBuf],
+    state: &'a ImportState,
+    [symbol, venue, zone]: [&'a str; 3],
+    error: Option<&'a str>,
+) -> Element<'a, MenuMessage> {
+    let name = files[0]
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let files_line = match files.len() {
+        1 => name,
+        n => format!("{name} and {} more", n - 1),
+    };
+    let muted = |content: String| text(content).size(12).color(theme::TEXT_MUTED);
+    let mut body = column![header("Import ticks"), muted(files_line)].spacing(8);
+
+    body = match state {
+        ImportState::Detecting => body.push(muted("Reading the file…".into())),
+        ImportState::Failed(message) => body
+            .push(text(message.as_str()).size(12).color(theme::DOWN))
+            .push(muted(
+                "Files that need columns named by hand can go through `persephone-cli import`."
+                    .into(),
+            )),
+        ImportState::Ready(detection) => {
+            body = body.push(text(detection.summary()).size(12).color(theme::TEXT_BRIGHT));
+            for (role, i) in detection.roles() {
+                let name = detection.names.get(i).map_or("", String::as_str);
+                let example = detection.example.get(i).map_or("", String::as_str);
+                body = body.push(
+                    row![
+                        text(role.name())
+                            .size(12)
+                            .width(70)
+                            .color(theme::TEXT_MUTED),
+                        text(name).size(12).width(120).color(theme::TEXT_BRIGHT),
+                        text(example)
+                            .size(12)
+                            .font(iced::Font::MONOSPACE)
+                            .color(theme::TEXT_BRIGHT),
+                    ]
+                    .spacing(8),
+                );
+            }
+            for note in &detection.notes {
+                body = body.push(text(note.as_str()).size(11).color(theme::TEXT_MUTED));
+            }
+            let field = |placeholder, value, on_input: fn(String) -> MenuMessage| {
+                text_input(placeholder, value)
+                    .on_input(on_input)
+                    .on_submit(MenuMessage::StartImport)
+                    .padding([5, 8])
+                    .size(13)
+                    .style(|_, status| input_style(status))
+            };
+            let mut fields = row![
+                column![
+                    muted("Symbol".into()),
+                    field("EURUSD", symbol, MenuMessage::ImportSymbolChanged)
+                ]
+                .spacing(3),
+                column![
+                    muted("Venue".into()),
+                    field("LOCAL", venue, MenuMessage::ImportVenueChanged)
+                ]
+                .spacing(3),
+            ]
+            .spacing(10);
+            if !detection.format.time_format.is_epoch() {
+                fields = fields.push(
+                    column![
+                        muted("Time zone".into()),
+                        field("UTC", zone, MenuMessage::ImportZoneChanged)
+                    ]
+                    .spacing(3),
+                );
+            }
+            if detection.zone_assumed {
+                body = body.push(muted(
+                    "The times don't say their zone: UTC unless you give one (e.g. -05:00 or America/New_York).".into(),
+                ));
+            }
+            body = body.push(fields);
+            if let Some(error) = error {
+                body = body.push(text(error).size(11).color(theme::DOWN));
+            }
+            body.push(
+                button(text("Import").size(13).width(Fill).center())
+                    .width(Fill)
+                    .padding([6, 0])
+                    .on_press(MenuMessage::StartImport)
+                    .style(|_, status| chip(true, status)),
+            )
+        }
+        ImportState::Importing(progress) => {
+            let percent = if progress.total > 0 {
+                progress.read as f64 / progress.total as f64 * 100.0
+            } else {
+                0.0
+            };
+            body.push(muted(format!(
+                "Importing… {percent:.0}% · {} rows",
+                thousands(progress.rows)
+            )))
+        }
+        ImportState::Done(summary) => {
+            let market = &summary.market;
+            body = body.push(
+                text(format!(
+                    "Imported {} {} into {}, {} → {}.",
+                    thousands(summary.imported),
+                    market.info.kind,
+                    market.id(),
+                    DateTime::from_nanos(summary.first).date(),
+                    DateTime::from_nanos(summary.last).date(),
+                ))
+                .size(12)
+                .color(theme::TEXT_BRIGHT),
+            );
+            if summary.skipped > 0 {
+                body = body.push(muted(format!(
+                    "Skipped {} rows that didn't fit:",
+                    thousands(summary.skipped)
+                )));
+                for problem in summary.problems.iter().take(3) {
+                    body = body.push(text(problem.as_str()).size(11).color(theme::TEXT_MUTED));
+                }
+            }
+            body.push(muted(
+                "It's on this chart now, and under Symbol › Local.".into(),
+            ))
+        }
+    };
+    container(body).padding([6, 8]).into()
+}
+
+/// `1234567` → `1,234,567`.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn settings<'a>(
@@ -435,10 +722,11 @@ fn settings<'a>(
 fn report<'a>(
     spec: &'a StrategySpec,
     run: &'a Run,
-    quote: &'a str,
+    tile: &TileInfo<'a>,
     inputs: &'a [String],
     error: Option<&'a str>,
 ) -> Element<'a, MenuMessage> {
+    let quote = tile.quote;
     let mut body = column![header(&spec.info.name)]
         .extend(param_rows(
             &spec.info.params,
@@ -460,6 +748,9 @@ fn report<'a>(
         Run::Failed(message) => body.push(text(message.as_str()).size(12).color(theme::DOWN)),
         Run::Done(report) => body.extend(statistics(report, quote)),
     };
+    if let Some(fills) = tile.fills {
+        body = body.push(text(fills).size(11).color(theme::TEXT_MUTED));
+    }
     container(body.push(separator()).push(remove_button(
         "Remove strategy",
         MenuMessage::RemoveStrategy,

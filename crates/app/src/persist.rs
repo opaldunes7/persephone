@@ -21,6 +21,9 @@ pub struct Saved {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SavedTile {
     pub id: TileId,
+    /// The venue of a market in the local store; missing for Binance markets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<String>,
     pub symbol: String,
     /// Timeframe label, e.g. "1m".
     pub timeframe: String,
@@ -112,6 +115,7 @@ mod tests {
             tiles: vec![
                 SavedTile {
                     id: 0,
+                    local: None,
                     symbol: "BTCUSDT".into(),
                     timeframe: "1m".into(),
                     indicators: vec![SavedIndicator {
@@ -125,7 +129,8 @@ mod tests {
                 },
                 SavedTile {
                     id: 1,
-                    symbol: "ETHUSDT".into(),
+                    local: Some("TRUEFX".into()),
+                    symbol: "EURUSD".into(),
                     timeframe: "4h".into(),
                     indicators: Vec::new(),
                     strategy: None,

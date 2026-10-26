@@ -67,9 +67,31 @@ pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// (year, month, day) → days since 1970-01-01, from Howard Hinnant's `days_from_civil`.
+#[must_use]
+pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let m = i64::from(month);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn days_and_dates_round_trip() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 2, 29), 11_016);
+        for days in (-800_000..800_000).step_by(997) {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days);
+        }
+    }
 
     #[test]
     fn converts_utc_timestamps() {

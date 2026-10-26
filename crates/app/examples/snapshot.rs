@@ -13,6 +13,10 @@
 //! plugins built (`cargo build --release --target wasm32-wasip2` in `plugins/`), `a`/`b` add
 //! the SMA / z-score plugin indicators, `w` sets the EMA Cross plugin strategy and `P` opens
 //! the strategy page. Backtests run to completion before the snapshot.
+//!
+//! With `SNAPSHOT_STORE` naming a local tick store, `L` / `M` open its first / second market
+//! (menu open), `D` drops the file named by `SNAPSHOT_DROP` on the focused chart (detecting its
+//! layout here) and `I` imports it.
 //! AT_MS freezes the clock that many milliseconds after the last action (default: settled),
 //! to look at animation frames. iced appends the renderer name to the file name.
 
@@ -26,11 +30,15 @@ use iced::{Point, Settings, Size, Theme};
 use persephone::{
     Message, Persephone, Run,
     keymap::Action,
-    menu::{MenuMessage, Page},
+    menu::{ImportState, MenuMessage, Page, Popup},
 };
 use persephone_chart::{ChartData, ChartMessage};
 use persephone_core::{Timeframe, indicator::BuiltIn, strategy::BuiltInStrategy};
-use persephone_data::binance::BinanceClient;
+use persephone_data::{
+    binance::BinanceClient,
+    import::{self, MarketOptions, Overrides},
+    store::Store,
+};
 use persephone_plugin_host::{Host, Plugin, Plugins};
 use persephone_tiling::Direction;
 
@@ -52,9 +60,30 @@ fn main() -> anyhow::Result<()> {
 
     let mut app = Persephone::preloaded(fetch(&symbol, timeframe)?, WINDOW);
     let _ = app.set_plugins(example_plugins()?);
+    let store = std::env::var_os("SNAPSHOT_STORE").map(Store::new);
+    if let Some(store) = &store {
+        app.set_store(store.clone());
+    }
     for c in script.chars() {
         let focused = app.layout().focused();
-        let _ = app.update(message(c, focused)?);
+        match c {
+            'D' => drop_file(&mut app)?,
+            'I' => import_dropped(&mut app, store.as_ref().context("set SNAPSHOT_STORE")?)?,
+            'L' | 'M' => {
+                let markets = store.as_ref().context("set SNAPSHOT_STORE")?.markets();
+                let market = markets
+                    .get(usize::from(c == 'M'))
+                    .context("the store has too few markets")?;
+                let _ = app.update(Message::Menu(MenuMessage::SetLocal {
+                    venue: market.info.venue.clone(),
+                    symbol: market.info.symbol.clone(),
+                }));
+            }
+            c => {
+                let _ = app.update(message(c, focused)?);
+            }
+        }
+        app.load_now();
         finish_backtests(&mut app);
     }
     let frozen = Instant::now() + at.map_or(Duration::from_secs(5), Duration::from_millis);
@@ -119,6 +148,47 @@ fn message(c: char, focused: u32) -> anyhow::Result<Message> {
         'w' => menu(MenuMessage::SetPluginStrategy("ema_cross".into())),
         other => bail!("unknown script action `{other}`"),
     }
+}
+
+/// Drops `SNAPSHOT_DROP` on the focused chart and works out its layout, as the app's tasks would.
+fn drop_file(app: &mut Persephone) -> anyhow::Result<()> {
+    let path: std::path::PathBuf = std::env::var_os("SNAPSHOT_DROP")
+        .context("set SNAPSHOT_DROP to a CSV file")?
+        .into();
+    let _ = app.update(Message::FileDropped(path.clone()));
+    let detection = import::detect(&import::sample(&path)?, &Overrides::default())
+        .map(std::sync::Arc::new)
+        .map_err(|e| format!("{e:#}"));
+    let _ = app.update(Message::Detected(path, detection));
+    Ok(())
+}
+
+/// Presses Import on the import panel and runs the import here.
+fn import_dropped(app: &mut Persephone, store: &Store) -> anyhow::Result<()> {
+    let Some(Popup::Import {
+        files,
+        state: ImportState::Ready(detection),
+        symbol,
+        venue,
+        ..
+    }) = app.popup()
+    else {
+        bail!("`I` needs the import panel ready (drop a file with `D` first)");
+    };
+    let (files, format) = (files.clone(), detection.format.clone());
+    let options = MarketOptions {
+        symbol: symbol.clone(),
+        venue: venue.clone(),
+        base: None,
+        quote: None,
+        fee: None,
+    };
+    let _ = app.update(Message::Menu(MenuMessage::StartImport));
+    let summary = import::import(store, &files, &format, &options, &mut |_| true)
+        .map(std::sync::Arc::new)
+        .map_err(|e| format!("{e:#}"));
+    let _ = app.update(Message::Imported(summary));
+    Ok(())
 }
 
 /// Runs every backtest the app is waiting on, here instead of on a worker thread.

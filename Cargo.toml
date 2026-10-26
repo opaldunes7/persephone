@@ -30,12 +30,19 @@ persephone-plugin-host = { path = "crates/plugin-host" }
 persephone-tiling = { path = "crates/tiling" }
 
 anyhow = "1"
+arrow-array = "60"
+arrow-schema = "60"
 bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
+csv = "1"
 dirs = "6"
+flate2 = "1"
 iced = { version = "0.14", features = ["advanced", "canvas", "wgpu"] }
+jiff = "0.2"
 log = "0.4"
 notify = "8"
+# Tick store files: Parquet with ZSTD, without the parts of Arrow we don't use.
+parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 ron = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 rust_decimal = "1"
@@ -49,3 +56,5 @@ wasmtime-wasi = "50"
 # Only for the plugin sandbox's seeded randomness; the same version wasmtime-wasi uses.
 rand = { version = "0.10", default-features = false, features = ["std_rng"] }
 wit-bindgen = "0.63"
+# Reading zipped CSV files (e.g. Binance's monthly archives).
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }

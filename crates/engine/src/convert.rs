@@ -2,13 +2,16 @@
 
 use nautilus_core::UnixNanos;
 use nautilus_model::{
-    data::{Bar, BarSpecification, BarType, Data},
-    enums::{AggregationSource, BarAggregation, PriceType},
-    identifiers::{InstrumentId, Symbol},
+    data::{Bar, BarSpecification, BarType, Data, QuoteTick, TradeTick},
+    enums::{AggregationSource, AggressorSide, BarAggregation, CurrencyType, PriceType},
+    identifiers::{InstrumentId, Symbol, TradeId},
     instruments::{CurrencyPair, InstrumentAny},
     types::{Currency, Price, Quantity},
 };
-use persephone_core::{Candle, InstrumentSpec, Timeframe};
+use persephone_core::{
+    Candle, InstrumentSpec, Timeframe,
+    tick::{Aggressor, Quote, Trade},
+};
 
 use crate::EngineError;
 
@@ -26,8 +29,8 @@ pub(crate) fn instrument(spec: &InstrumentSpec) -> Result<InstrumentAny, EngineE
     let pair = CurrencyPair::builder()
         .instrument_id(id)
         .raw_symbol(Symbol::from(spec.symbol.as_str()))
-        .base_currency(Currency::from(spec.base.as_str()))
-        .quote_currency(Currency::from(spec.quote.as_str()))
+        .base_currency(currency(&spec.base)?)
+        .quote_currency(currency(&spec.quote)?)
         .price_precision(spec.price_precision)
         .size_precision(spec.size_precision)
         .price_increment(price_increment)
@@ -38,6 +41,18 @@ pub(crate) fn instrument(spec: &InstrumentSpec) -> Result<InstrumentAny, EngineE
         .build()
         .map_err(|e| EngineError::InvalidRequest(format!("instrument {id}: {e}")))?;
     Ok(InstrumentAny::CurrencyPair(pair))
+}
+
+/// A currency by code. Codes Nautilus doesn't know (an index's made-up base, an old coin from
+/// imported data) are registered on first use instead of failing the run.
+pub(crate) fn currency(code: &str) -> Result<Currency, EngineError> {
+    if let Some(known) = Currency::try_from_str(code) {
+        return Ok(known);
+    }
+    let currency = Currency::new_checked(code, 8, 0, code, CurrencyType::Crypto)
+        .map_err(|e| EngineError::InvalidRequest(format!("currency `{code}`: {e}")))?;
+    let _ = Currency::register(currency, false);
+    Ok(currency)
 }
 
 pub(crate) fn bar_type(id: InstrumentId, timeframe: Timeframe) -> Result<BarType, EngineError> {
@@ -57,7 +72,9 @@ pub(crate) fn bar_type(id: InstrumentId, timeframe: Timeframe) -> Result<BarType
 /// Converts candles to Nautilus bars.
 ///
 /// Nautilus stamps a bar with its **close** time, while [`Candle::ts`] is the open time. Shifting
-/// by one timeframe keeps a strategy from seeing a bar before it has closed.
+/// by one timeframe keeps a strategy from seeing a bar before it has closed. Bars get a deep
+/// book like ticks do: Nautilus caps bar fills at the bar's volume, which for bars made from
+/// quotes is only a count of quotes.
 pub(crate) fn bars(
     candles: &[Candle],
     bar_type: BarType,
@@ -75,11 +92,74 @@ pub(crate) fn bars(
                 px(c.high),
                 px(c.low),
                 px(c.close),
-                Quantity::new(c.volume, spec.size_precision),
+                depth(spec),
                 closed_at,
                 closed_at,
             )?;
             Ok(Data::Bar(bar))
+        })
+        .collect()
+}
+
+/// The size every tick gets in the simulated book: deep enough that an order always fills in
+/// full at the tick's price. A trade's size says nothing about the book's depth, and quote
+/// sizes come in whatever units the source used, so neither can cap fills (on an L1 book
+/// Nautilus slips whatever a level can't fill by one tick).
+const BOOK_DEPTH: f64 = 1e9;
+
+fn depth(spec: &InstrumentSpec) -> Quantity {
+    Quantity::new(BOOK_DEPTH, spec.size_precision)
+}
+
+/// Converts trades to Nautilus trade ticks, numbering their ids from `next_id`.
+pub(crate) fn trade_ticks(
+    trades: &[Trade],
+    id: InstrumentId,
+    spec: &InstrumentSpec,
+    next_id: &mut u64,
+) -> Result<Vec<TradeTick>, EngineError> {
+    trades
+        .iter()
+        .map(|t| {
+            *next_id += 1;
+            let aggressor = match t.aggressor {
+                Aggressor::Buyer => AggressorSide::Buy,
+                Aggressor::Seller => AggressorSide::Sell,
+                Aggressor::Unknown => AggressorSide::NoAggressor,
+            };
+            let ts = UnixNanos::from(t.ts);
+            Ok(TradeTick::new_checked(
+                id,
+                Price::new(t.price, spec.price_precision),
+                depth(spec),
+                aggressor,
+                TradeId::new(next_id.to_string()),
+                ts,
+                ts,
+            )?)
+        })
+        .collect()
+}
+
+pub(crate) fn quote_ticks(
+    quotes: &[Quote],
+    id: InstrumentId,
+    spec: &InstrumentSpec,
+) -> Result<Vec<QuoteTick>, EngineError> {
+    let px = |v: f64| Price::new(v, spec.price_precision);
+    quotes
+        .iter()
+        .map(|q| {
+            let ts = UnixNanos::from(q.ts);
+            Ok(QuoteTick::new_checked(
+                id,
+                px(q.bid),
+                px(q.ask),
+                depth(spec),
+                depth(spec),
+                ts,
+                ts,
+            )?)
         })
         .collect()
 }

@@ -207,6 +207,7 @@ fn request(strategy: StrategySpec, plugin: Option<Arc<dyn SignalFactory>>) -> Ba
         candles: candles(1_500),
         strategy,
         plugin,
+        ticks: None,
         starting_balance: 100_000.0,
         fees: FeeRates::BINANCE_SPOT,
     }

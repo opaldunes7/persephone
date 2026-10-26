@@ -2,14 +2,18 @@
 //!
 //! Usage: `persephone [SYMBOL] [TIMEFRAME]`. With no arguments the last layout is restored
 //! (one Binance BTCUSDT 1m chart on first launch). With arguments you get a single chart for
-//! that market, and the session's layout is not saved.
+//! that market, and the session's layout is not saved. `SYMBOL.VENUE` (e.g. `EURUSD.LOCAL`)
+//! opens a market from the local store, filled by `persephone-cli import`.
 //!
 //! The window is only charts, tiled like Hyprland's dwindle layout; see [`keymap`] for keys.
 //! Left-click a chart for its [`menu`]: indicators, a strategy to backtest, symbol and
 //! timeframe. Custom indicators and strategies are WebAssembly [`plugins`] dropped into the
-//! plugins folder; they load, and reload when the files change, without a restart.
+//! plugins folder; they load, and reload when the files change, without a restart. CSV tick
+//! files dropped on a chart import into the local store and open there.
 
+mod importing;
 pub mod keymap;
+mod local;
 pub mod menu;
 mod motion;
 pub mod persist;
@@ -40,15 +44,20 @@ use persephone_core::{
     indicator::{IndicatorKind, IndicatorSpec},
     signal::SignalFactory,
     strategy::{StrategyKind, StrategySpec},
+    tick::TickFeed,
 };
-use persephone_data::binance::BinanceClient;
+use persephone_data::{
+    binance::BinanceClient,
+    import::{Detection, Format, MarketOptions, Progress, Summary, Zone, split_symbol},
+    store::{MarketInfo, Store, check_name},
+};
 use persephone_engine::{BacktestReport, BacktestRequest, FeeRates};
 use persephone_plugin_host::{Host, Plugins};
 use persephone_tiling::{Layout, Rect, TileId};
 
 use crate::{
     keymap::Action,
-    menu::{MenuMessage, Page, Popup, TileInfo},
+    menu::{ImportState, MenuMessage, Page, Popup, TileInfo},
     motion::Motion,
     persist::{Saved, SavedIndicator, SavedStrategy, SavedTile},
 };
@@ -83,6 +92,8 @@ pub fn run() -> iced::Result {
 /// What a tile shows. Tiles showing the same market share its bars.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Market {
+    /// The venue of a market in the local store; `None` for Binance, fetched live.
+    local: Option<String>,
     symbol: String,
     timeframe: Timeframe,
 }
@@ -92,6 +103,11 @@ pub struct Market {
 pub struct MarketData {
     pub data: Arc<ChartData>,
     pub instrument: InstrumentSpec,
+    pub fees: FeeRates,
+    /// Ticks to fill backtest orders on; `None` fills them on the bars.
+    pub ticks: Option<Arc<dyn TickFeed>>,
+    /// How backtest orders fill, for the report; `None` for a plain bar market.
+    pub fills: Option<String>,
 }
 
 enum Bars {
@@ -148,6 +164,12 @@ pub struct Persephone {
     plugins: Arc<Plugins>,
     /// A reload is already on its way.
     reloading: bool,
+    /// The local tick store; `None` when there's no data folder (or in tests that don't set one).
+    store: Option<Store>,
+    /// The store's markets, as of the last look (refreshed when the symbol page opens).
+    local_markets: Vec<MarketInfo>,
+    /// Files are being dragged over the window.
+    drop_hint: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +191,14 @@ pub enum Message {
     /// A plugin file was added, changed or removed.
     PluginsChanged,
     PluginsLoaded(Arc<Plugins>),
+    /// Files started (`true`) or stopped being dragged over the window.
+    FilesHovered(bool),
+    /// A file was dropped on the window; it imports into the focused chart.
+    FileDropped(PathBuf),
+    /// The layout of a dropped file, worked out.
+    Detected(PathBuf, Result<Arc<Detection>, String>),
+    ImportProgress(Progress),
+    Imported(Result<Arc<Summary>, String>),
 }
 
 impl Persephone {
@@ -201,6 +231,7 @@ impl Persephone {
                 .iter()
                 .map(|t| {
                     let market = Market {
+                        local: t.local.clone(),
                         symbol: t.symbol.clone(),
                         timeframe: t.timeframe.parse().unwrap_or(Timeframe::M1),
                     };
@@ -231,7 +262,11 @@ impl Persephone {
             plugin_dir: None,
             plugins: Arc::default(),
             reloading: false,
+            store: Store::default_root().map(Store::new),
+            local_markets: Vec::new(),
+            drop_hint: false,
         };
+        app.refresh_local_markets();
         let loads: Vec<_> = tiles
             .into_iter()
             .map(|(id, market, indicators, strategy)| {
@@ -247,6 +282,7 @@ impl Persephone {
     #[doc(hidden)]
     pub fn preloaded(data: Arc<ChartData>, window: Size) -> Self {
         let market = Market {
+            local: None,
             symbol: data.symbol.clone(),
             timeframe: data.timeframe,
         };
@@ -261,7 +297,16 @@ impl Persephone {
         let mut app = Self {
             layout: Layout::new(),
             tiles: BTreeMap::new(),
-            bars: HashMap::from([(market.clone(), Bars::Ready(MarketData { data, instrument }))]),
+            bars: HashMap::from([(
+                market.clone(),
+                Bars::Ready(MarketData {
+                    data,
+                    instrument,
+                    fees: FeeRates::BINANCE_SPOT,
+                    ticks: None,
+                    fills: None,
+                }),
+            )]),
             window,
             now: Instant::now(),
             popup: None,
@@ -270,6 +315,9 @@ impl Persephone {
             plugin_dir: None,
             plugins: Arc::default(),
             reloading: false,
+            store: None,
+            local_markets: Vec::new(),
+            drop_hint: false,
         };
         let _ = app.add_tile(0, market, Vec::new(), None);
         app.relayout(false);
@@ -287,6 +335,42 @@ impl Persephone {
         self.tiles
             .get(&id)
             .map(|tile| (tile.market.symbol.as_str(), tile.market.timeframe))
+    }
+
+    /// The local store's venue for tile `id`'s market, or `None` for a Binance market.
+    #[must_use]
+    pub fn tile_venue(&self, id: TileId) -> Option<&str> {
+        self.tiles.get(&id)?.market.local.as_deref()
+    }
+
+    /// Uses `store` for local markets. For tests, which keep away from the real one.
+    #[doc(hidden)]
+    pub fn set_store(&mut self, store: Store) {
+        self.store = Some(store);
+        self.refresh_local_markets();
+    }
+
+    /// Loads every market still waiting, here and now instead of in a task. For tests.
+    #[doc(hidden)]
+    pub fn load_now(&mut self) {
+        let waiting: Vec<Market> = self
+            .bars
+            .iter()
+            .filter(|(_, bars)| matches!(bars, Bars::Loading))
+            .map(|(market, _)| market.clone())
+            .collect();
+        for market in waiting {
+            let result = fetch(&market, self.store.as_ref());
+            let _ = self.update(Message::Loaded(market, result));
+        }
+    }
+
+    fn refresh_local_markets(&mut self) {
+        self.local_markets = self
+            .store
+            .as_ref()
+            .map(|store| store.markets().into_iter().map(|m| m.info).collect())
+            .unwrap_or_default();
     }
 
     /// The indicators on tile `id`, in legend order.
@@ -308,6 +392,15 @@ impl Persephone {
     #[must_use]
     pub fn tile_chart(&self, id: TileId) -> Option<&ChartState> {
         self.tiles.get(&id).and_then(|tile| tile.chart.as_ref())
+    }
+
+    /// Why tile `id`'s bars didn't load, if they didn't.
+    #[must_use]
+    pub fn tile_error(&self, id: TileId) -> Option<&str> {
+        match self.bars.get(&self.tiles.get(&id)?.market)? {
+            Bars::Failed(error) => Some(error),
+            _ => None,
+        }
     }
 
     #[must_use]
@@ -359,8 +452,9 @@ impl Persephone {
             candles: market.data.candles.clone(),
             strategy: strategy.spec.clone(),
             plugin,
+            ticks: market.ticks.clone(),
             starting_balance: STARTING_BALANCE,
-            fees: FeeRates::BINANCE_SPOT,
+            fees: market.fees,
         };
         Some((strategy.generation, request))
     }
@@ -452,6 +546,47 @@ impl Persephone {
                     return self.reload_plugins(PLUGIN_SETTLE);
                 }
             }
+            Message::FilesHovered(hovering) => self.drop_hint = hovering,
+            Message::FileDropped(path) => {
+                self.drop_hint = false;
+                return self.on_drop(path);
+            }
+            Message::Detected(path, result) => {
+                if let Some(Popup::Import { files, state, .. }) = &mut self.popup
+                    && files.first() == Some(&path)
+                    && matches!(state, ImportState::Detecting)
+                {
+                    *state = match result {
+                        Ok(detection) => ImportState::Ready(detection),
+                        Err(error) => ImportState::Failed(error),
+                    };
+                }
+            }
+            Message::ImportProgress(progress) => {
+                if let Some(Popup::Import { state, .. }) = &mut self.popup
+                    && matches!(state, ImportState::Importing(_))
+                {
+                    *state = ImportState::Importing(progress);
+                }
+            }
+            Message::Imported(result) => {
+                self.refresh_local_markets();
+                let tile = match &self.popup {
+                    Some(Popup::Import { tile, .. }) => Some(*tile),
+                    _ => None,
+                };
+                let shown = match &result {
+                    Ok(summary) => self.show_imported(tile, &summary.market.info),
+                    Err(_) => Task::none(),
+                };
+                if let Some(Popup::Import { state, .. }) = &mut self.popup {
+                    *state = match result {
+                        Ok(summary) => ImportState::Done(summary),
+                        Err(error) => ImportState::Failed(error),
+                    };
+                }
+                return shown;
+            }
             Message::PluginsLoaded(plugins) => {
                 self.reloading = false;
                 return self.use_plugins(plugins);
@@ -512,6 +647,109 @@ impl Persephone {
     }
 
     /// Flashes the focused tile's border; always returns `false` (nothing changed).
+    /// A dropped file: the first opens the import panel on the focused chart; more dropped
+    /// with it (or before its import starts) join that import.
+    fn on_drop(&mut self, path: PathBuf) -> Task<Message> {
+        if let Some(Popup::Import { files, state, .. }) = &mut self.popup
+            && matches!(state, ImportState::Detecting | ImportState::Ready(_))
+        {
+            if !files.contains(&path) {
+                files.push(path);
+            }
+            return Task::none();
+        }
+        let tile = self.layout.focused();
+        self.popup = Some(Popup::import(
+            tile,
+            path.clone(),
+            importing::guess_symbol(&path),
+        ));
+        importing::detect(path)
+    }
+
+    fn start_import(&mut self, mut popup: Popup) -> Task<Message> {
+        let mut task = Task::none();
+        if let Popup::Import {
+            files,
+            state,
+            symbol,
+            venue,
+            zone,
+            error,
+            ..
+        } = &mut popup
+            && let ImportState::Ready(detection) = state
+        {
+            let checked = check_name("symbol", symbol)
+                .and_then(|()| check_name("venue", venue))
+                .and_then(|()| zone.parse::<Zone>());
+            match (checked, &self.store) {
+                (Err(e), _) => *error = Some(e.to_string()),
+                (Ok(_), None) => *error = Some("there's no data folder to keep ticks in".into()),
+                (Ok(zone), Some(store)) => {
+                    // Names that don't split into two currencies (an index, say) count in USD.
+                    let (base, quote) = match split_symbol(symbol) {
+                        Some(_) => (None, None),
+                        None => (Some(symbol.clone()), Some("USD".to_owned())),
+                    };
+                    let options = MarketOptions {
+                        symbol: symbol.clone(),
+                        venue: venue.clone(),
+                        base,
+                        quote,
+                        fee: None,
+                    };
+                    let format = Format {
+                        zone,
+                        ..detection.format.clone()
+                    };
+                    task = importing::run(store.clone(), files.clone(), format, options);
+                    *state = ImportState::Importing(Progress::default());
+                    *error = None;
+                }
+            }
+        }
+        self.popup = Some(popup);
+        task
+    }
+
+    /// After an import: charts already showing the market reload it, and `tile` switches to it.
+    fn show_imported(&mut self, tile: Option<TileId>, info: &MarketInfo) -> Task<Message> {
+        let is_it =
+            |m: &Market| m.local.as_deref() == Some(info.venue.as_str()) && m.symbol == info.symbol;
+        self.bars.retain(|market, _| !is_it(market));
+        let showing: Vec<TileId> = self
+            .tiles
+            .iter()
+            .filter(|(_, t)| is_it(&t.market))
+            .map(|(&id, _)| id)
+            .collect();
+        let mut tasks = Vec::new();
+        for id in showing {
+            let Some(t) = self.tiles.get_mut(&id) else {
+                continue;
+            };
+            t.chart = None;
+            if let Some(strategy) = &mut t.strategy {
+                strategy.run = Run::Waiting;
+            }
+            let market = t.market.clone();
+            tasks.push(self.request(&market));
+            tasks.push(self.attach(id));
+        }
+        if let Some(id) = tile
+            && let Some(t) = self.tiles.get(&id)
+        {
+            let market = Market {
+                local: Some(info.venue.clone()),
+                symbol: info.symbol.clone(),
+                timeframe: t.market.timeframe,
+            };
+            tasks.push(self.set_market(id, market));
+        }
+        Task::batch(tasks)
+    }
+
     fn refuse(&mut self) -> bool {
         if let Some(tile) = self.tiles.get_mut(&self.layout.focused()) {
             tile.flash = Some(self.now);
@@ -536,6 +774,8 @@ impl Persephone {
                 }
                 self.popup = Some(popup);
                 if search {
+                    // Markets imported since the last look show up.
+                    self.refresh_local_markets();
                     return operation::focus(menu::symbol_input());
                 }
             }
@@ -560,7 +800,24 @@ impl Persephone {
                 );
             }
             MenuMessage::SetSymbol(symbol) => {
-                return self.set_market(id, Market { symbol, ..market });
+                return self.set_market(
+                    id,
+                    Market {
+                        local: None,
+                        symbol,
+                        ..market
+                    },
+                );
+            }
+            MenuMessage::SetLocal { venue, symbol } => {
+                return self.set_market(
+                    id,
+                    Market {
+                        local: Some(venue),
+                        symbol,
+                        ..market
+                    },
+                );
             }
             MenuMessage::SubmitSymbol => {
                 if let Popup::Menu {
@@ -570,11 +827,37 @@ impl Persephone {
                 {
                     let symbol = query.trim().to_uppercase();
                     if !symbol.is_empty() {
-                        return self.set_market(id, Market { symbol, ..market });
+                        return self.set_market(
+                            id,
+                            Market {
+                                local: None,
+                                symbol,
+                                ..market
+                            },
+                        );
                     }
                 }
                 self.popup = Some(popup);
             }
+            MenuMessage::ImportSymbolChanged(text) => {
+                if let Popup::Import { symbol, .. } = &mut popup {
+                    *symbol = text.trim().to_uppercase();
+                }
+                self.popup = Some(popup);
+            }
+            MenuMessage::ImportVenueChanged(text) => {
+                if let Popup::Import { venue, .. } = &mut popup {
+                    *venue = text.trim().to_uppercase();
+                }
+                self.popup = Some(popup);
+            }
+            MenuMessage::ImportZoneChanged(text) => {
+                if let Popup::Import { zone, .. } = &mut popup {
+                    *zone = text.trim().to_owned();
+                }
+                self.popup = Some(popup);
+            }
+            MenuMessage::StartImport => return self.start_import(popup),
             MenuMessage::QueryChanged(text) => {
                 if let Popup::Menu {
                     page: Page::Symbol { query },
@@ -812,7 +1095,7 @@ impl Persephone {
             Some(Bars::Ready(_) | Bars::Loading) => Task::none(),
             Some(Bars::Failed(_)) | None => {
                 self.bars.insert(market.clone(), Bars::Loading);
-                load(market.clone())
+                load(market.clone(), self.store.clone())
             }
         }
     }
@@ -877,6 +1160,7 @@ impl Persephone {
     fn focused_market(&self) -> Market {
         self.tiles.get(&self.layout.focused()).map_or_else(
             || Market {
+                local: None,
                 symbol: DEFAULT_SYMBOL.into(),
                 timeframe: Timeframe::M1,
             },
@@ -924,6 +1208,7 @@ impl Persephone {
                 .iter()
                 .map(|(&id, tile)| SavedTile {
                     id,
+                    local: tile.market.local.clone(),
                     symbol: tile.market.symbol.clone(),
                     timeframe: tile.market.timeframe.label().into(),
                     indicators: tile
@@ -964,6 +1249,13 @@ impl Persephone {
             iced::Event::Window(
                 window::Event::Opened { size, .. } | window::Event::Resized(size),
             ) => Some(Message::WindowResized(size)),
+            iced::Event::Window(window::Event::FileHovered(_)) => Some(Message::FilesHovered(true)),
+            iced::Event::Window(window::Event::FilesHoveredLeft) => {
+                Some(Message::FilesHovered(false))
+            }
+            iced::Event::Window(window::Event::FileDropped(path)) => {
+                Some(Message::FileDropped(path))
+            }
             _ => None,
         });
 
@@ -997,13 +1289,16 @@ impl Persephone {
         {
             let rect = tile.motion.rect(self.now);
             let border = if framed { BORDER } else { 0.0 };
-            let quote = match self.bars.get(&tile.market) {
-                Some(Bars::Ready(market)) => market.instrument.quote.as_str(),
-                _ => "",
+            let ready = match self.bars.get(&tile.market) {
+                Some(Bars::Ready(market)) => Some(market),
+                _ => None,
             };
             let info = TileInfo {
                 symbol: &tile.market.symbol,
-                quote,
+                venue: tile.market.local.as_deref(),
+                quote: ready.map_or("", |m| m.instrument.quote.as_str()),
+                fills: ready.and_then(|m| m.fills.as_deref()),
+                local_markets: &self.local_markets,
                 timeframe: tile.market.timeframe,
                 specs: &tile.indicators,
                 strategy: tile.strategy.as_ref().map(|s| (&s.spec, &s.run)),
@@ -1060,6 +1355,21 @@ impl Persephone {
                     left: 0.0,
                 });
             content = stack![content, summary].into();
+        }
+        if focused && self.drop_hint {
+            let hint = container(
+                text("Drop CSV tick files to import them into this chart")
+                    .size(15)
+                    .color(theme::TEXT_BRIGHT),
+            )
+            .center(Fill)
+            .style(|_| {
+                container::background(Color {
+                    a: 0.82,
+                    ..theme::BACKGROUND
+                })
+            });
+            content = stack![content, hint].into();
         }
 
         let frame = container(content)
@@ -1195,6 +1505,11 @@ fn market_from_args(args: &[String]) -> Market {
     let symbol = args
         .first()
         .map_or(DEFAULT_SYMBOL.into(), |s| s.to_uppercase());
+    // `SYMBOL.VENUE` is a market in the local store.
+    let (symbol, local) = match symbol.rsplit_once('.') {
+        Some((symbol, venue)) => (symbol.to_owned(), Some(venue.to_owned())),
+        None => (symbol, None),
+    };
     let timeframe = match args.get(1).map(|tf| tf.parse::<Timeframe>()) {
         Some(Ok(tf)) => tf,
         Some(Err(e)) => {
@@ -1203,18 +1518,24 @@ fn market_from_args(args: &[String]) -> Market {
         }
         None => Timeframe::M1,
     };
-    Market { symbol, timeframe }
+    Market {
+        local,
+        symbol,
+        timeframe,
+    }
 }
 
-fn load(market: Market) -> Task<Message> {
-    let Market { symbol, timeframe } = market.clone();
-    Task::perform(fetch_on_thread(symbol, timeframe), move |result| {
-        Message::Loaded(market.clone(), result)
-    })
+fn load(market: Market, store: Option<Store>) -> Task<Message> {
+    let job = market.clone();
+    Task::perform(
+        on_thread(move || Ok(fetch(&job, store.as_ref()))),
+        move |result| Message::Loaded(market.clone(), result.and_then(|r| r)),
+    )
 }
 
 /// Runs `job` on a plain thread and hands its result back to iced's executor. Used for the
-/// blocking Binance client and for backtests, which need a thread of their own anyway.
+/// blocking Binance client, reading the store, and backtests, which need a thread of their
+/// own anyway.
 async fn on_thread<T: Send + 'static>(
     job: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
@@ -1226,10 +1547,6 @@ async fn on_thread<T: Send + 'static>(
         .map_err(|_| "the worker thread stopped".to_string())?
 }
 
-async fn fetch_on_thread(symbol: String, timeframe: Timeframe) -> Result<MarketData, String> {
-    on_thread(move || fetch(&symbol, timeframe).map_err(|e| format!("{e:#}"))).await
-}
-
 async fn backtest_on_thread(request: BacktestRequest) -> Result<Arc<BacktestReport>, String> {
     on_thread(move || {
         persephone_engine::run_backtest(&request)
@@ -1239,7 +1556,19 @@ async fn backtest_on_thread(request: BacktestRequest) -> Result<Arc<BacktestRepo
     .await
 }
 
-fn fetch(symbol: &str, timeframe: Timeframe) -> anyhow::Result<MarketData> {
+/// A market's bars: from the local store, or from Binance.
+fn fetch(market: &Market, store: Option<&Store>) -> Result<MarketData, String> {
+    let result = match &market.local {
+        Some(venue) => match store {
+            Some(store) => local::load(store, venue, &market.symbol, market.timeframe),
+            None => Err(anyhow::anyhow!("there's no local store on this system")),
+        },
+        None => fetch_binance(&market.symbol, market.timeframe),
+    };
+    result.map_err(|e| format!("{e:#}"))
+}
+
+fn fetch_binance(symbol: &str, timeframe: Timeframe) -> anyhow::Result<MarketData> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
     let end = now - now % timeframe.nanos() + timeframe.nanos(); // include the forming bar
     let start = end.saturating_sub(HISTORY_BARS * timeframe.nanos());
@@ -1255,5 +1584,11 @@ fn fetch(symbol: &str, timeframe: Timeframe) -> anyhow::Result<MarketData> {
         instrument.price_precision,
         candles,
     );
-    Ok(MarketData { data, instrument })
+    Ok(MarketData {
+        data,
+        instrument,
+        fees: FeeRates::BINANCE_SPOT,
+        ticks: None,
+        fills: None,
+    })
 }

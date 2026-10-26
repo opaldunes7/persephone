@@ -42,6 +42,7 @@ fn request(candles: Vec<Candle>, strategy: StrategySpec) -> BacktestRequest {
         candles,
         strategy,
         plugin: None,
+        ticks: None,
         starting_balance: BALANCE,
         fees: FeeRates::ZERO,
     }
@@ -154,6 +155,21 @@ fn rejects_bad_requests() {
         matches!(run(tiny), Err(EngineError::InvalidRequest(_))),
         "positions round to zero"
     );
+}
+
+#[test]
+fn unknown_currencies_are_fine() {
+    // An index or an old coin from imported data: Nautilus doesn't know these codes.
+    let mut req = request(sine_candles(300), ema(5.0, 20.0));
+    req.instrument = InstrumentSpec {
+        symbol: "SPX500".into(),
+        venue: "LOCAL".into(),
+        base: "SPX500".into(),
+        quote: "XUSD".into(),
+        ..btcusdt()
+    };
+    let report = run(req).unwrap();
+    assert!(!report.fills.is_empty());
 }
 
 #[test]

@@ -1,21 +1,24 @@
-//! `persephone-cli`: headless tools for Persephone: backtests, and scaffolding, building and
-//! installing plugins.
+//! `persephone-cli`: headless tools for Persephone: backtests, importing CSV tick data, and
+//! scaffolding, building and installing plugins.
 
+mod data;
 mod plugin;
 
 use std::{
     collections::BTreeMap,
+    sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use persephone_core::{
-    Side, Timeframe, UnixNanos,
+    Candle, InstrumentSpec, Side, Timeframe, UnixNanos,
     strategy::{BuiltInStrategy, StrategySpec},
+    tick::TickFeed,
     time::{DateTime, NANOS_PER_DAY},
 };
-use persephone_data::binance::BinanceClient;
+use persephone_data::{binance::BinanceClient, store::Store};
 use persephone_engine::{BacktestReport, BacktestRequest, FeeRates, spawn_backtest};
 
 #[derive(Parser)]
@@ -27,8 +30,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Fetch Binance spot bars and run a built-in strategy on them.
+    /// Run a built-in strategy on Binance spot bars, or on a market from the local store.
     Backtest(BacktestArgs),
+    /// Import CSV tick files (trades or quotes) into the local store.
+    Import(Box<data::ImportArgs>),
+    /// List or remove markets in the local store.
+    #[command(subcommand)]
+    Data(data::DataCommand),
     /// Create, build and install WebAssembly plugins.
     #[command(subcommand)]
     Plugin(plugin::PluginCommand),
@@ -39,10 +47,17 @@ struct BacktestArgs {
     /// Binance spot symbol.
     #[arg(long, default_value = "BTCUSDT")]
     symbol: String,
+    /// Test a market from the local store instead (SYMBOL.VENUE, as `data list` shows it).
+    /// Orders fill on its ticks.
+    #[arg(long, conflicts_with = "symbol")]
+    local: Option<String>,
+    /// With --local, fill orders on the bars instead of the ticks.
+    #[arg(long, requires = "local")]
+    bar_fills: bool,
     /// Bar timeframe: 1m, 5m, 15m, 30m, 1h, 4h or 1d.
     #[arg(long, default_value = "1h")]
     timeframe: Timeframe,
-    /// How many days of history to test, ending now.
+    /// How many days of history to test, ending now (or at the local market's last tick).
     #[arg(long, default_value_t = 90)]
     days: u64,
     /// Strategy: ema-cross, rsi-reversion or donchian-breakout.
@@ -55,9 +70,9 @@ struct BacktestArgs {
     /// Starting balance in the quote asset (e.g. USDT).
     #[arg(long, default_value_t = 100_000.0)]
     balance: f64,
-    /// Fee schedule.
-    #[arg(long, value_enum, default_value_t = Fees::Binance)]
-    fees: Fees,
+    /// Fee schedule (default: Binance's for Binance, the market's own for --local).
+    #[arg(long, value_enum)]
+    fees: Option<Fees>,
     /// Print every fill.
     #[arg(long)]
     fills: bool,
@@ -83,37 +98,46 @@ fn parse_strategy(id: &str) -> Result<BuiltInStrategy, String> {
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Backtest(args) => backtest(&args),
+        Command::Import(args) => data::import(&args),
+        Command::Data(command) => data::run(&command),
         Command::Plugin(command) => plugin::run(&command),
     }
 }
 
 fn backtest(args: &BacktestArgs) -> anyhow::Result<()> {
     let tf = args.timeframe;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
-    let end = now - now % tf.nanos();
-    let start = end.saturating_sub(args.days * NANOS_PER_DAY);
-
-    let fetch_started = Instant::now();
-    let binance = BinanceClient::new()?;
-    let instrument = binance.instrument(&args.symbol)?;
-    let candles = binance
-        .klines(&args.symbol, tf, start, end)
-        .context("fetching bars from Binance")?;
-    let fetch_secs = fetch_started.elapsed().as_secs_f64();
+    let loaded_at = Instant::now();
+    let (instrument, candles, ticks, own_fee) = match &args.local {
+        Some(id) => local_market(id, tf, args.days, args.bar_fills)?,
+        None => {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
+            let end = now - now % tf.nanos();
+            let start = end.saturating_sub(args.days * NANOS_PER_DAY);
+            let binance = BinanceClient::new()?;
+            let instrument = binance.instrument(&args.symbol)?;
+            let candles = binance
+                .klines(&args.symbol, tf, start, end)
+                .context("fetching bars from Binance")?;
+            (instrument, candles, None, FeeRates::BINANCE_SPOT)
+        }
+    };
+    let load_secs = loaded_at.elapsed().as_secs_f64();
     anyhow::ensure!(
         !candles.is_empty(),
-        "Binance returned no bars for {}",
-        args.symbol
+        "there are no bars for {}",
+        instrument.symbol
     );
 
     let strategy = StrategySpec::with_params(args.strategy, &args.params);
     println!(
-        "{} {tf} · {} → {} · {} bars · {strategy} · {}% per position",
+        "{}.{} {tf} · {} → {} · {} bars · {strategy} · {}% per position · fills on {}",
         instrument.symbol,
+        instrument.venue,
         date(candles[0].ts),
         date(candles[candles.len() - 1].ts),
         candles.len(),
         strategy.size_fraction() * 100.0,
+        if ticks.is_some() { "ticks" } else { "bars" },
     );
 
     let quote = instrument.quote.clone();
@@ -123,10 +147,12 @@ fn backtest(args: &BacktestArgs) -> anyhow::Result<()> {
         candles,
         strategy,
         plugin: None,
+        ticks,
         starting_balance: args.balance,
         fees: match args.fees {
-            Fees::Binance => FeeRates::BINANCE_SPOT,
-            Fees::Zero => FeeRates::ZERO,
+            None => own_fee,
+            Some(Fees::Binance) => FeeRates::BINANCE_SPOT,
+            Some(Fees::Zero) => FeeRates::ZERO,
         },
     };
 
@@ -135,7 +161,7 @@ fn backtest(args: &BacktestArgs) -> anyhow::Result<()> {
         .join()
         .map_err(|_| anyhow::anyhow!("backtest thread panicked"))??;
     println!(
-        "fetched in {fetch_secs:.1}s, backtested in {:.2}s\n",
+        "loaded in {load_secs:.1}s, backtested in {:.2}s\n",
         run_started.elapsed().as_secs_f64()
     );
 
@@ -144,6 +170,31 @@ fn backtest(args: &BacktestArgs) -> anyhow::Result<()> {
         print_fills(&report);
     }
     Ok(())
+}
+
+type Loaded = (
+    InstrumentSpec,
+    Vec<Candle>,
+    Option<Arc<dyn TickFeed>>,
+    FeeRates,
+);
+
+/// The last `days` of a stored market's bars, and its ticks unless `bar_fills`.
+fn local_market(id: &str, tf: Timeframe, days: u64, bar_fills: bool) -> anyhow::Result<Loaded> {
+    let (symbol, venue) = id
+        .rsplit_once('.')
+        .with_context(|| format!("`{id}` should be SYMBOL.VENUE"))?;
+    let root = Store::default_root().context("no data folder on this system")?;
+    let market = Store::new(root).market(&venue.to_uppercase(), &symbol.to_uppercase())?;
+    let max_bars = (days * NANOS_PER_DAY).div_ceil(tf.nanos()) as usize;
+    let candles = market.candles(tf, max_bars)?;
+    let fee = FeeRates {
+        maker: market.info.fee,
+        taker: market.info.fee,
+    };
+    let instrument = market.instrument();
+    let ticks = (!bar_fills).then(|| Arc::new(market) as Arc<dyn TickFeed>);
+    Ok((instrument, candles, ticks, fee))
 }
 
 fn print_summary(report: &BacktestReport, quote: &str) {
