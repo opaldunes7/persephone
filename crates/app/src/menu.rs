@@ -221,6 +221,8 @@ pub enum MenuMessage {
     ImportVenueChanged(String),
     ImportZoneChanged(String),
     StartImport,
+    /// Lets the tile's strategy plugin ask language models, or stops it.
+    AllowAi(bool),
     ParamChanged(usize, String),
     RemoveStudy,
     SetStrategy(BuiltInStrategy),
@@ -242,6 +244,8 @@ pub struct TileInfo<'a> {
     pub fills: Option<&'a str>,
     /// Markets in the local store, for the symbol page.
     pub local_markets: &'a [MarketInfo],
+    /// For a strategy plugin that asks language models: whether it may.
+    pub ai_allowed: Option<bool>,
     pub timeframe: Timeframe,
     pub specs: &'a [IndicatorSpec],
     pub strategy: Option<(&'a StrategySpec, &'a Run)>,
@@ -403,16 +407,22 @@ fn strategies<'a>(
         let selected = current == Some(&StrategyKind::BuiltIn(kind));
         strategy_choice(
             kind.name(),
-            kind.description(),
+            kind.description().to_owned(),
             selected,
             MenuMessage::SetStrategy(kind),
         )
     });
     let from_plugins = plugins.strategies.values().map(move |plugin| {
         let selected = current == Some(&StrategyKind::Plugin(plugin.id.clone()));
+        // Worth knowing before picking it: it sends prompts out.
+        let description = if plugin.uses_ai {
+            format!("{} · asks AI models", plugin.info.description)
+        } else {
+            plugin.info.description.clone()
+        };
         strategy_choice(
             &plugin.info.name,
-            &plugin.info.description,
+            description,
             selected,
             MenuMessage::SetPluginStrategy(plugin.id.clone()),
         )
@@ -429,7 +439,7 @@ fn strategies<'a>(
 
 fn strategy_choice<'a>(
     name: &'a str,
-    description: &'a str,
+    description: String,
     selected: bool,
     on_press: MenuMessage,
 ) -> Element<'a, MenuMessage> {
@@ -747,6 +757,38 @@ fn report<'a>(
         Run::Running => body.push(text("Backtesting…").size(12).color(theme::TEXT_MUTED)),
         Run::Failed(message) => body.push(text(message.as_str()).size(12).color(theme::DOWN)),
         Run::Done(report) => body.extend(statistics(report, quote)),
+    };
+    if let Run::Done(report) = run {
+        for note in &report.notes {
+            let color = if note.warning {
+                theme::DOWN
+            } else {
+                theme::TEXT_MUTED
+            };
+            body = body.push(text(note.text.as_str()).size(11).color(color));
+        }
+    }
+    body = match tile.ai_allowed {
+        Some(false) => body
+            .push(
+                text("This strategy asks language models. Its prompts go to the model's provider and new calls can cost money; answers are recorded, so reruns are free.")
+                    .size(11)
+                    .color(theme::TEXT_MUTED),
+            )
+            .push(
+                button(text("Allow it to ask AI models").size(12).width(Fill).center())
+                    .width(Fill)
+                    .padding([5, 0])
+                    .on_press(MenuMessage::AllowAi(true))
+                    .style(|_, status| chip(true, status)),
+            ),
+        Some(true) => body.push(
+            button(text("Stop it asking AI models").size(11).color(theme::TEXT_MUTED))
+                .padding([2, 0])
+                .on_press(MenuMessage::AllowAi(false))
+                .style(|_, _| button::Style::default()),
+        ),
+        None => body,
     };
     if let Some(fills) = tile.fills {
         body = body.push(text(fills).size(11).color(theme::TEXT_MUTED));

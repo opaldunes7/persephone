@@ -7,8 +7,13 @@
 //! seeded, so the same inputs always give the same results. A crash comes back as an error
 //! carrying the plugin's own panic message.
 //!
+//! Outside the sandbox, plugins can reach only what [`Services`] hands them: ONNX models from
+//! the models folder, and language models for strategies the user has allowed.
+//!
 //! This crate knows nothing about Nautilus: strategies are handed to the engine as a
 //! [`SignalFactory`].
+
+mod services;
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -19,15 +24,16 @@ use std::{
 };
 
 use persephone_core::{
-    Candle,
+    Candle, UnixNanos,
     indicator::{IndicatorInfo, Output, OutputStyle, Param, Placement},
-    signal::{Signal, SignalFactory},
+    signal::{Note, Signal, SignalFactory},
     strategy::StrategyInfo,
 };
+use persephone_ml::{ai::Ai, models::Models};
 use rand::{SeedableRng, rngs::StdRng};
 use wasmtime::{
     Config, Engine, Store, StoreLimits, StoreLimitsBuilder,
-    component::{Component, Linker, ResourceTable},
+    component::{Component, HasSelf, Linker, ResourceTable},
 };
 use wasmtime_wasi::{
     HostMonotonicClock, HostWallClock, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView,
@@ -39,13 +45,18 @@ mod indicator_world {
 }
 
 mod strategy_world {
-    // Both worlds share `types`; reuse the indicator world's copy.
+    // Both worlds share `types` and `ml`; reuse the indicator world's copies.
     wasmtime::component::bindgen!({
         world: "strategy",
         path: "../../wit",
-        with: { "persephone:plugin/types": crate::indicator_world::persephone::plugin::types },
+        with: {
+            "persephone:plugin/types": crate::indicator_world::persephone::plugin::types,
+            "persephone:plugin/ml": crate::indicator_world::persephone::plugin::ml,
+        },
     });
 }
+
+pub use services::Services;
 
 use indicator_world::persephone::plugin::types as wit;
 
@@ -66,6 +77,7 @@ const STDERR_CAPACITY: usize = 16 << 10;
 pub struct Host {
     engine: Engine,
     linker: Linker<State>,
+    services: Arc<Services>,
     /// Plugins already loaded, by path, with the file's modification time when loaded.
     cache: Mutex<HashMap<PathBuf, (SystemTime, Plugin)>>,
 }
@@ -97,17 +109,43 @@ impl Host {
     ///
     /// Returns a message if the WebAssembly runtime can't start.
     pub fn new() -> Result<Self, String> {
+        Self::with_services(Services::default())
+    }
+
+    /// A runtime whose plugins can use `services`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if the WebAssembly runtime can't start.
+    pub fn with_services(services: Services) -> Result<Self, String> {
         let mut config = Config::new();
         config.wasm_component_model(true).consume_fuel(true);
         let engine =
             Engine::new(&config).map_err(|e| format!("can't start the plugin runtime: {e}"))?;
         let mut linker = Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|e| e.to_string())?;
+        indicator_world::persephone::plugin::ml::add_to_linker::<State, HasSelf<State>>(
+            &mut linker,
+            |state| state,
+        )
+        .map_err(|e| e.to_string())?;
+        strategy_world::persephone::plugin::ai::add_to_linker::<State, HasSelf<State>>(
+            &mut linker,
+            |state| state,
+        )
+        .map_err(|e| e.to_string())?;
         Ok(Self {
             engine,
             linker,
+            services: Arc::new(services),
             cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// What plugins may reach, and which may call language models.
+    #[must_use]
+    pub fn services(&self) -> &Services {
+        &self.services
     }
 
     /// Loads every `.wasm` file in `dir`. Unchanged files come from the cache.
@@ -179,7 +217,7 @@ impl Host {
             .map_err(|e| format!("imports something plugins can't have: {e:#}"))?;
 
         if let Ok(indicator) = indicator_world::IndicatorPre::new(pre.clone()) {
-            let mut store = sandbox(&self.engine, DESCRIBE_FUEL)?;
+            let mut store = sandbox(&self.engine, DESCRIBE_FUEL, Access::default())?;
             let bindings = indicator
                 .instantiate(&mut store)
                 .map_err(|e| failure(&store, &e))?;
@@ -192,10 +230,16 @@ impl Host {
                 info: Arc::new(info),
                 engine: self.engine.clone(),
                 pre: indicator,
+                services: Arc::clone(&self.services),
             })));
         }
         if let Ok(strategy) = strategy_world::StrategyPre::new(pre) {
-            let mut store = sandbox(&self.engine, DESCRIBE_FUEL)?;
+            // Components keep only the imports they use, so this says whether it asks models.
+            let uses_ai = component
+                .component_type()
+                .imports(&self.engine)
+                .any(|(name, _)| name.starts_with("persephone:plugin/ai"));
+            let mut store = sandbox(&self.engine, DESCRIBE_FUEL, Access::default())?;
             let bindings = strategy
                 .instantiate(&mut store)
                 .map_err(|e| failure(&store, &e))?;
@@ -210,8 +254,10 @@ impl Host {
             return Ok(Plugin::Strategy(Arc::new(StrategyPlugin {
                 id,
                 info: Arc::new(StrategyInfo::new(info.name, info.description, params)),
+                uses_ai,
                 engine: self.engine.clone(),
                 pre: strategy,
+                services: Arc::clone(&self.services),
             })));
         }
         Err("exports neither the indicator nor the strategy world".into())
@@ -224,6 +270,7 @@ pub struct IndicatorPlugin {
     pub info: Arc<IndicatorInfo>,
     engine: Engine,
     pre: indicator_world::IndicatorPre<State>,
+    services: Arc<Services>,
 }
 
 impl fmt::Debug for IndicatorPlugin {
@@ -242,7 +289,11 @@ impl IndicatorPlugin {
     ///
     /// Returns the plugin's own error, its panic message, or why the sandbox stopped it.
     pub fn compute(&self, params: &[f64], candles: &[Candle]) -> Result<Vec<Vec<f64>>, String> {
-        let mut store = sandbox(&self.engine, COMPUTE_FUEL)?;
+        let access = Access {
+            models: self.services.models.clone(),
+            ..Access::default()
+        };
+        let mut store = sandbox(&self.engine, COMPUTE_FUEL, access)?;
         let bindings = self
             .pre
             .instantiate(&mut store)
@@ -275,8 +326,11 @@ pub struct StrategyPlugin {
     pub id: String,
     /// Includes the "Size %" parameter the host adds.
     pub info: Arc<StrategyInfo>,
+    /// It asks language models, so it needs the user's permission.
+    pub uses_ai: bool,
     engine: Engine,
     pre: strategy_world::StrategyPre<State>,
+    services: Arc<Services>,
 }
 
 impl fmt::Debug for StrategyPlugin {
@@ -288,9 +342,29 @@ impl fmt::Debug for StrategyPlugin {
     }
 }
 
+impl StrategyPlugin {
+    /// Whether it may call language models.
+    #[must_use]
+    pub fn ai_allowed(&self) -> bool {
+        self.services.ai_allowed(&self.id)
+    }
+
+    /// Lets it call language models, or stops it. Applies to every plugin sharing its host.
+    pub fn allow_ai(&self, allow: bool) {
+        self.services.allow_ai(&self.id, allow);
+    }
+}
+
 impl SignalFactory for StrategyPlugin {
     fn create(&self, params: &[f64]) -> Result<Box<dyn Signal>, String> {
-        let mut store = sandbox(&self.engine, START_FUEL)?;
+        let ai = self.services.ai_for(&self.id);
+        let access = Access {
+            models: self.services.models.clone(),
+            budget: ai.as_ref().map_or(0, |ai| ai.max_new_calls()),
+            ai: ai.clone(),
+            ai_allowed: self.ai_allowed(),
+        };
+        let mut store = sandbox(&self.engine, START_FUEL, access)?;
         let bindings = self
             .pre
             .instantiate(&mut store)
@@ -298,7 +372,11 @@ impl SignalFactory for StrategyPlugin {
         bindings
             .call_start(&mut store, params)
             .map_err(|e| failure(&store, &e))??;
-        Ok(Box::new(StrategyInstance { store, bindings }))
+        Ok(Box::new(StrategyInstance {
+            store,
+            bindings,
+            ai: self.services.ai.clone(),
+        }))
     }
 }
 
@@ -306,10 +384,18 @@ impl SignalFactory for StrategyPlugin {
 struct StrategyInstance {
     store: Store<State>,
     bindings: strategy_world::Strategy,
+    /// For release dates in the notes, even when this plugin wasn't allowed to call.
+    ai: Option<Arc<Ai>>,
 }
 
 impl Signal for StrategyInstance {
+    fn notes(&mut self) -> Vec<Note> {
+        let state = self.store.data();
+        services::notes(&state.usage, self.ai.as_deref(), state.budget)
+    }
+
     fn on_bar(&mut self, candle: &Candle) -> Result<Option<i8>, String> {
+        self.store.data_mut().bar = Some(candle.ts);
         self.store.set_fuel(BAR_FUEL).map_err(|e| e.to_string())?;
         let target = self
             .bindings
@@ -323,12 +409,30 @@ impl Signal for StrategyInstance {
 }
 
 /// What a sandboxed instance can reach: an empty WASI (no files, network or environment) that
-/// collects stderr, plus its limits.
+/// collects stderr, its limits, and whatever services it was given.
 struct State {
     wasi: WasiCtx,
     table: ResourceTable,
     limits: StoreLimits,
     stderr: MemoryOutputPipe,
+    models: Option<Arc<Models>>,
+    ai: Option<Arc<Ai>>,
+    /// The user allowed it to call language models (whether or not there's a client).
+    ai_allowed: bool,
+    /// New language-model calls this instance may make.
+    budget: u32,
+    usage: services::AiUsage,
+    /// The open time of the bar being handled, for look-ahead checks.
+    bar: Option<UnixNanos>,
+}
+
+/// The services one sandbox gets.
+#[derive(Default)]
+struct Access {
+    models: Option<Arc<Models>>,
+    ai: Option<Arc<Ai>>,
+    ai_allowed: bool,
+    budget: u32,
 }
 
 impl WasiView for State {
@@ -367,7 +471,7 @@ impl HostMonotonicClock for Frozen {
     }
 }
 
-fn sandbox(engine: &Engine, fuel: u64) -> Result<Store<State>, String> {
+fn sandbox(engine: &Engine, fuel: u64, access: Access) -> Result<Store<State>, String> {
     let stderr = MemoryOutputPipe::new(STDERR_CAPACITY);
     // Same inputs, same outputs: a frozen clock and seeded randomness keep backtests
     // repeatable.
@@ -384,6 +488,12 @@ fn sandbox(engine: &Engine, fuel: u64) -> Result<Store<State>, String> {
         table: ResourceTable::new(),
         limits: StoreLimitsBuilder::new().memory_size(MEMORY_LIMIT).build(),
         stderr,
+        models: access.models,
+        ai: access.ai,
+        ai_allowed: access.ai_allowed,
+        budget: access.budget,
+        usage: services::AiUsage::default(),
+        bar: None,
     };
     let mut store = Store::new(engine, state);
     store.limiter(|state| &mut state.limits);

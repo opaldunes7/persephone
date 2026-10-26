@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use nautilus_backtest::result::BacktestResult;
-use persephone_core::{Candle, Side, Timeframe, UnixNanos};
+use persephone_core::{Candle, Side, Timeframe, UnixNanos, signal::Note};
 
 /// A fill as the strategy saw it, before it is matched to a bar.
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +50,8 @@ pub struct BacktestReport {
     pub general: BTreeMap<String, f64>,
     /// Per-period returns, as Nautilus computes them.
     pub returns_series: Vec<(UnixNanos, f64)>,
+    /// What the strategy had to say about the run (a plugin's AI use, look-ahead warnings).
+    pub notes: Vec<Note>,
 }
 
 impl BacktestReport {
@@ -108,6 +110,7 @@ pub(crate) fn build(
             .iter()
             .map(|(ts, r)| (ts.as_u64(), *r))
             .collect(),
+        notes: Vec::new(),
     }
 }
 

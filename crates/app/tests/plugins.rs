@@ -229,3 +229,50 @@ fn saved_plugins_wait_for_their_plugin_then_resolve() {
     assert_ne!(strategy, &StrategySpec::new(BuiltInStrategy::EmaCross));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn ai_plugins_ask_before_calling_and_remember_the_answer() {
+    let mut app = app();
+    let _ = app.set_plugins(plugins(&["ai_probe", "ema_cross"]));
+    assert!(app.plugins().strategies["ai_probe"].uses_ai);
+    assert!(!app.plugins().strategies["ema_cross"].uses_ai);
+
+    menu(&mut app, MenuMessage::SetPluginStrategy("ai_probe".into()));
+    finish_backtest(&mut app);
+    let Run::Done(report) = app.tile_strategy(0).unwrap().1.clone() else {
+        panic!("the run failed")
+    };
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.warning && n.text.contains("isn't allowed to ask")),
+        "{:?}",
+        report.notes
+    );
+    assert!(!app.plugins().strategies["ai_probe"].ai_allowed());
+
+    let _ = app.update(Message::OpenReport(0));
+    let _ = app.update(Message::Menu(MenuMessage::AllowAi(true)));
+    assert!(app.plugins().strategies["ai_probe"].ai_allowed());
+    assert!(
+        matches!(app.tile_strategy(0).unwrap().1, Run::Running),
+        "allowing reruns the backtest"
+    );
+    finish_backtest(&mut app);
+    let Run::Done(report) = app.tile_strategy(0).unwrap().1.clone() else {
+        panic!("the run failed")
+    };
+    // This test host has no AI client, so the questions go unanswered, and the report says so.
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.text.contains("got no answer") && n.text.contains("aren't set up")),
+        "{:?}",
+        report.notes
+    );
+
+    let _ = app.update(Message::Menu(MenuMessage::AllowAi(false)));
+    assert!(!app.plugins().strategies["ai_probe"].ai_allowed());
+}

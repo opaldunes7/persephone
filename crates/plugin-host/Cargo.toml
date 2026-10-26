@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 persephone-core.workspace = true
+persephone-ml.workspace = true
 rand.workspace = true
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true

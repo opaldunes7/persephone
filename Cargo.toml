@@ -26,6 +26,7 @@ persephone-chart = { path = "crates/chart" }
 persephone-core = { path = "crates/core" }
 persephone-data = { path = "crates/data" }
 persephone-engine = { path = "crates/engine" }
+persephone-ml = { path = "crates/ml" }
 persephone-plugin-host = { path = "crates/plugin-host" }
 persephone-tiling = { path = "crates/tiling" }
 
@@ -49,6 +50,10 @@ rust_decimal = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+# ONNX inference in pure Rust (no native runtime to download), for plugins' models; prost
+# is tract's own protobuf crate, for writing small models.
+tract-onnx = { version = "0.23", default-features = false }
+prost = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wasmtime = { version = "50", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "parallel-compilation"] }

@@ -1,7 +1,8 @@
-//! `persephone-cli`: headless tools for Persephone: backtests, importing CSV tick data, and
-//! scaffolding, building and installing plugins.
+//! `persephone-cli`: headless tools for Persephone: backtests, importing CSV tick data,
+//! scaffolding, building and installing plugins, and setting up their models and AI access.
 
 mod data;
+mod ml;
 mod plugin;
 
 use std::{
@@ -40,6 +41,12 @@ enum Command {
     /// Create, build and install WebAssembly plugins.
     #[command(subcommand)]
     Plugin(plugin::PluginCommand),
+    /// The folder of ONNX models plugins can run.
+    #[command(subcommand)]
+    Models(ml::ModelsCommand),
+    /// How plugins reach language models, and their recorded replies.
+    #[command(subcommand)]
+    Ai(ml::AiCommand),
 }
 
 #[derive(clap::Args)]
@@ -101,6 +108,8 @@ fn main() -> anyhow::Result<()> {
         Command::Import(args) => data::import(&args),
         Command::Data(command) => data::run(&command),
         Command::Plugin(command) => plugin::run(&command),
+        Command::Models(command) => ml::models(&command),
+        Command::Ai(command) => ml::ai(&command),
     }
 }
 

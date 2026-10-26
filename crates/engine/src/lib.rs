@@ -139,9 +139,10 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
 
     let fills = Rc::new(RefCell::new(Vec::new()));
     let failure = Rc::new(RefCell::new(None));
+    let signal = Rc::new(RefCell::new(signal));
     engine.add_strategy(SignalStrategy::new(
         bar_type,
-        signal,
+        Rc::clone(&signal),
         notional,
         request.instrument.size_precision,
         Rc::clone(&fills),
@@ -168,7 +169,7 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
     }
 
     let result = engine.get_result();
-    let report = report::build(
+    let mut report = report::build(
         &result,
         fills.take(),
         &request.candles,
@@ -177,6 +178,7 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
         &request.instrument.quote,
     );
     engine.dispose();
+    report.notes = signal.borrow_mut().notes();
     Ok(report)
 }
 

@@ -69,9 +69,50 @@ interface types {
     }
 }
 
+/// ONNX models from Persephone's models folder, run by the host (outside the sandbox, at native
+/// speed). Train anywhere, export to ONNX, drop `<name>.onnx` in the folder.
+interface ml {
+    /// A dense f32 tensor, row-major.
+    record tensor {
+        shape: list<u32>,
+        data: list<f32>,
+    }
+
+    /// Runs `models/<name>.onnx` on one input. One tensor per model output; integer outputs,
+    /// such as a classifier's label, come back as floats.
+    run: func(name: string, input: tensor) -> result<list<tensor>, string>;
+}
+
+/// Language models. A strategy importing this can't use it until the user allows it, since
+/// prompts leave the machine and calls can cost money. Every reply is recorded: a backtest
+/// asks each distinct question once, and reruns get the same answers.
+interface ai {
+    enum effort {
+        low,
+        medium,
+        high,
+    }
+
+    record request {
+        /// A Claude model id (`claude-opus-5-5`), `openai/<model>` or `ollama/<model>`.
+        model: string,
+        system: option<string>,
+        prompt: string,
+        /// Output allowance; models that think count their thinking against it.
+        max-tokens: option<u32>,
+        /// How hard models that support it should think.
+        effort: option<effort>,
+    }
+
+    /// The model's reply, or why there isn't one (not allowed, out of new calls for this
+    /// backtest, unreachable, declined...).
+    complete: func(request: request) -> result<string, string>;
+}
+
 /// An indicator: values for every bar, all at once.
 world indicator {
     use types.{bar, indicator-info};
+    import ml;
 
     export describe: func() -> indicator-info;
 
@@ -83,6 +124,8 @@ world indicator {
 /// turns those wishes into orders and runs the backtest.
 world strategy {
     use types.{bar, strategy-info};
+    import ml;
+    import ai;
 
     export describe: func() -> strategy-info;
 

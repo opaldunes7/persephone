@@ -1,0 +1,17 @@
+[package]
+name = "persephone-ml"
+description = "What plugins may call beyond their sandbox: ONNX models and language models (with a record/replay cache)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+persephone-core.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
+prost.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tract-onnx.workspace = true

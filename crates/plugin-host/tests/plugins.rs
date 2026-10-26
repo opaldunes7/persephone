@@ -278,3 +278,286 @@ fn a_plugin_strategy_needs_its_plugin() {
         Err(EngineError::InvalidRequest(_))
     ));
 }
+
+// --- Models and language models ------------------------------------------------------------
+
+mod services {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        path::PathBuf,
+        sync::{Arc, Mutex},
+        thread,
+    };
+
+    use persephone_core::{signal::SignalFactory, strategy::StrategyKind, strategy::StrategySpec};
+    use persephone_engine::run_backtest;
+    use persephone_ml::{
+        ai::{Ai, Config},
+        models::{Models, logistic_regression},
+    };
+    use persephone_plugin_host::{Host, Plugin, Services};
+
+    use super::{built, candles, request};
+
+    fn temp(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("persephone-host-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A stand-in Anthropic API: every question is answered LONG, model lookups say the model
+    /// came out on 2026-04-01. Returns the base URL and the request lines it saw.
+    fn anthropic() -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = header.to_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let body = if line.starts_with("GET /v1/models/") {
+                    r#"{"id":"claude-opus-5-5","created_at":"2026-04-01T00:00:00Z"}"#
+                } else {
+                    r#"{"content":[{"type":"text","text":"LONG"}],"stop_reason":"end_turn"}"#
+                };
+                log.lock().unwrap().push(line.trim_end().to_owned());
+                let mut stream = stream;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (url, seen)
+    }
+
+    fn strategy(host: &Host, name: &str) -> Arc<persephone_plugin_host::StrategyPlugin> {
+        match host.load(&built().join(format!("{name}.wasm"))).unwrap() {
+            Plugin::Strategy(p) => p,
+            Plugin::Indicator(_) => panic!("{name} is a strategy"),
+        }
+    }
+
+    #[test]
+    fn strategies_say_whether_they_ask_models() {
+        let host = Host::new().unwrap();
+        assert!(strategy(&host, "ai_probe").uses_ai);
+        assert!(strategy(&host, "llm_daily").uses_ai);
+        assert!(
+            !strategy(&host, "ema_cross").uses_ai,
+            "unused imports are left out of components"
+        );
+        assert!(!strategy(&host, "ml_trend").uses_ai);
+    }
+
+    #[test]
+    fn indicators_run_models_from_the_folder() {
+        let dir = temp("ml");
+        std::fs::write(dir.join("probe.onnx"), logistic_regression(&[2.0], -1.0)).unwrap();
+        let host =
+            Host::with_services(Services::new(Some(Arc::new(Models::new(&dir))), None)).unwrap();
+        let Plugin::Indicator(probe) = host.load(&built().join("ml_probe.wasm")).unwrap() else {
+            panic!()
+        };
+        let data = candles(200);
+        let values = probe.compute(&[], &data).unwrap();
+        for (value, candle) in values[0].iter().zip(&data) {
+            let expected = 1.0 / (1.0 + (-(2.0 * (candle.close / 10_000.0) as f32 - 1.0)).exp());
+            assert!(
+                (*value - f64::from(expected)).abs() < 1e-6,
+                "{value} vs {expected}"
+            );
+        }
+
+        let bare = Host::new().unwrap();
+        let Plugin::Indicator(probe) = bare.load(&built().join("ml_probe.wasm")).unwrap() else {
+            panic!()
+        };
+        assert!(
+            probe
+                .compute(&[], &data)
+                .unwrap_err()
+                .contains("models aren't available")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_model_driven_strategy_trades_and_explains_a_missing_model() {
+        let dir = temp("ml-trend");
+        let host =
+            Host::with_services(Services::new(Some(Arc::new(Models::new(&dir))), None)).unwrap();
+        let plugin = strategy(&host, "ml_trend");
+        let spec = StrategySpec::from_info(
+            StrategyKind::Plugin(plugin.id.clone()),
+            Arc::clone(&plugin.info),
+            &[55.0, 10.0],
+        );
+        let factory: Arc<dyn SignalFactory> = plugin;
+
+        let error = run_backtest(&request(spec.clone(), Some(Arc::clone(&factory)))).unwrap_err();
+        assert!(error.to_string().contains("models example"), "{error}");
+
+        // Momentum: rising returns mean a rising close.
+        std::fs::write(
+            dir.join("trend.onnx"),
+            logistic_regression(&[1.0, 1.0, 1.0, 1.0], 0.0),
+        )
+        .unwrap();
+        let report = run_backtest(&request(spec, Some(factory))).unwrap();
+        assert!(report.fills.len() > 2, "{} fills", report.fills.len());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn ai_host(url: &str, name: &str, max_new_calls: Option<u32>) -> (Host, PathBuf) {
+        let dir = temp(name);
+        let config = Config {
+            anthropic_api_key: Some("test".into()),
+            anthropic_base_url: Some(url.into()),
+            max_new_calls,
+            ..Config::default()
+        };
+        let ai = Ai::new(config, dir.join("cache")).unwrap();
+        (
+            Host::with_services(Services::new(None, Some(Arc::new(ai)))).unwrap(),
+            dir,
+        )
+    }
+
+    fn probe_run(host: &Host) -> persephone_engine::BacktestReport {
+        let plugin = strategy(host, "ai_probe");
+        // 1,500 bars, a question every 300: five questions.
+        let spec = StrategySpec::from_info(
+            StrategyKind::Plugin(plugin.id.clone()),
+            Arc::clone(&plugin.info),
+            &[300.0, 10.0],
+        );
+        let factory: Arc<dyn SignalFactory> = plugin;
+        run_backtest(&request(spec, Some(factory))).unwrap()
+    }
+
+    #[test]
+    fn language_models_need_permission_and_answers_are_recorded() {
+        let (url, seen) = anthropic();
+        let (host, dir) = ai_host(&url, "ai", None);
+
+        // Not allowed yet: no calls, no trades, and the report says why.
+        let refused = probe_run(&host);
+        assert!(refused.fills.is_empty());
+        assert!(
+            seen.lock().unwrap().iter().all(|l| !l.starts_with("POST")),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        assert!(
+            refused
+                .notes
+                .iter()
+                .any(|n| n.warning && n.text.contains("isn't allowed to ask")),
+            "{:?}",
+            refused.notes
+        );
+
+        host.services().allow_ai("ai_probe", true);
+        let first = probe_run(&host);
+        assert_eq!(
+            first.fills.len(),
+            1,
+            "the first LONG opens the position; the rest keep it"
+        );
+        let texts: Vec<&str> = first.notes.iter().map(|n| n.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| t.contains(
+                "Asked claude-opus-5-5 5 times: 0 answered from recordings, 5 new calls"
+            )),
+            "{texts:?}"
+        );
+        let look_ahead = first
+            .notes
+            .iter()
+            .find(|n| n.text.starts_with("Look-ahead"))
+            .expect("a look-ahead warning");
+        assert!(
+            look_ahead.warning
+                && look_ahead.text.contains("2026-04-01")
+                && look_ahead.text.contains("2025-01"),
+            "{}",
+            look_ahead.text
+        );
+        let posts = |seen: &Arc<Mutex<Vec<String>>>| {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|l| l.starts_with("POST"))
+                .count()
+        };
+        assert_eq!(posts(&seen), 5);
+
+        // The same backtest again: every answer from the recordings, nothing sent.
+        let again = probe_run(&host);
+        assert_eq!(again.fills, first.fills);
+        assert!(
+            again
+                .notes
+                .iter()
+                .any(|n| n.text.contains("5 answered from recordings, 0 new calls")),
+            "{:?}",
+            again.notes
+        );
+        assert_eq!(posts(&seen), 5);
+        let lookups = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("GET"))
+            .count();
+        assert_eq!(lookups, 1, "the release date is looked up once");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn each_backtest_has_a_budget_of_new_calls() {
+        let (url, _) = anthropic();
+        let (host, dir) = ai_host(&url, "budget", Some(2));
+        host.services().allow_ai("ai_probe", true);
+        let report = probe_run(&host);
+        let texts: Vec<&str> = report.notes.iter().map(|n| n.text.as_str()).collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("2 times") && t.contains("2 new calls")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("limit of 2 new AI calls")),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("3 questions got no answer")),
+            "{texts:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

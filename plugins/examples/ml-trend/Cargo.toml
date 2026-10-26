@@ -1,0 +1,11 @@
+[package]
+name = "ml-trend"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+persephone-sdk = { path = "../../../crates/sdk", features = ["strategy"] }

@@ -6,6 +6,8 @@
 //! own description takes over and the values are checked against it.
 
 use std::{
+    collections::BTreeSet,
+    fs, io,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -15,7 +17,11 @@ use persephone_core::{
     indicator::{BuiltIn, IndicatorInfo, IndicatorKind, IndicatorSpec, Placement},
     strategy::{BuiltInStrategy, StrategyInfo, StrategyKind, StrategySpec},
 };
-use persephone_plugin_host::Plugins;
+use persephone_ml::{
+    ai::{self, Ai},
+    models::Models,
+};
+use persephone_plugin_host::{Plugins, Services};
 
 use crate::Message;
 
@@ -26,6 +32,48 @@ const PREFIX: &str = "plugin:";
 #[must_use]
 pub fn default_dir() -> Option<PathBuf> {
     dirs::data_dir().map(|dir| dir.join("persephone").join("plugins"))
+}
+
+/// The models folder and the language-model client plugins get, set up from
+/// `…/persephone/ai.json` and the environment. Whatever can't be set up is left out, and
+/// plugins asking for it get an error saying so.
+#[must_use]
+pub fn services() -> Services {
+    let models = Models::default_dir()
+        .filter(|dir| fs::create_dir_all(dir).is_ok())
+        .map(|dir| Arc::new(Models::new(dir)));
+    let ai = ai::default_paths().and_then(|(config, cache)| {
+        let config = ai::Config::load(&config)
+            .map_err(|e| eprintln!("persephone: AI is off: {e:#}"))
+            .ok()?;
+        Ai::new(config, cache).ok().map(Arc::new)
+    });
+    Services::new(models, ai)
+}
+
+/// Where the plugins allowed to call language models are listed.
+#[must_use]
+pub fn grants_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|dir| dir.join("persephone").join("ai-grants.json"))
+}
+
+/// The plugin ids allowed to call language models; none if the file is missing or unreadable.
+#[must_use]
+pub fn load_grants(path: &Path) -> BTreeSet<String> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// # Errors
+///
+/// Returns an error if the file can't be written.
+pub fn save_grants(path: &Path, grants: &BTreeSet<String>) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(grants)? + "\n")
 }
 
 /// Emits [`Message::PluginsChanged`] whenever a `.wasm` file in `dir` changes.

@@ -26,10 +26,17 @@
 //!
 //! export_indicator!(Sma);
 //! ```
+//!
+//! Beyond their sandbox, plugins can run ONNX models ([`ml`]) and strategies can ask language
+//! models ([`ai`], once the user allows it).
 
 // Lets the generated bindings name this crate the same way from inside it and from plugins.
 extern crate self as persephone_sdk;
 
+#[cfg(feature = "strategy")]
+pub mod ai;
+#[cfg(any(feature = "indicator", feature = "strategy"))]
+pub mod ml;
 pub mod ta;
 
 #[doc(hidden)]

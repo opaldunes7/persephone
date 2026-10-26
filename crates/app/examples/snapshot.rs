@@ -11,8 +11,8 @@
 //! indicator's settings; `x`/`y`/`z` set the EMA Cross / RSI Reversion / Donchian Breakout
 //! strategy (menu open) and `r` opens the focused chart's strategy report. With the example
 //! plugins built (`cargo build --release --target wasm32-wasip2` in `plugins/`), `a`/`b` add
-//! the SMA / z-score plugin indicators, `w` sets the EMA Cross plugin strategy and `P` opens
-//! the strategy page. Backtests run to completion before the snapshot.
+//! the SMA / z-score plugin indicators, `w` sets the EMA Cross plugin strategy, `u` the LLM
+//! Daily one (`U` allows it to ask models) and `P` opens the strategy page. Backtests run to completion before the snapshot.
 //!
 //! With `SNAPSHOT_STORE` naming a local tick store, `L` / `M` open its first / second market
 //! (menu open), `D` drops the file named by `SNAPSHOT_DROP` on the focused chart (detecting its
@@ -146,6 +146,8 @@ fn message(c: char, focused: u32) -> anyhow::Result<Message> {
         'a' => menu(MenuMessage::AddPluginIndicator("sma".into())),
         'b' => menu(MenuMessage::AddPluginIndicator("zscore".into())),
         'w' => menu(MenuMessage::SetPluginStrategy("ema_cross".into())),
+        'u' => menu(MenuMessage::SetPluginStrategy("llm_daily".into())),
+        'U' => menu(MenuMessage::AllowAi(true)),
         other => bail!("unknown script action `{other}`"),
     }
 }
@@ -212,7 +214,7 @@ fn example_plugins() -> anyhow::Result<Plugins> {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/target/wasm32-wasip2/release");
     let host = Host::new().map_err(anyhow::Error::msg)?;
     let mut plugins = Plugins::default();
-    for name in ["sma", "zscore", "ema_cross"] {
+    for name in ["sma", "zscore", "ema_cross", "llm_daily", "ml_trend"] {
         match host.load(&built.join(format!("{name}.wasm"))) {
             Ok(Plugin::Indicator(p)) => {
                 plugins.indicators.insert(p.id.clone(), p);

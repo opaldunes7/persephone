@@ -23,7 +23,8 @@ use crate::report::RawFill;
 pub(crate) struct SignalStrategy {
     core: StrategyCore,
     bar_type: BarType,
-    signal: Box<dyn Signal>,
+    /// Shared with the engine thread, which asks it for notes after the run.
+    signal: Rc<RefCell<Box<dyn Signal>>>,
     notional: f64,
     size_precision: u8,
     /// Signed position in base units, kept from fills.
@@ -37,7 +38,7 @@ pub(crate) struct SignalStrategy {
 impl SignalStrategy {
     pub(crate) fn new(
         bar_type: BarType,
-        signal: Box<dyn Signal>,
+        signal: Rc<RefCell<Box<dyn Signal>>>,
         notional: f64,
         size_precision: u8,
         fills: Rc<RefCell<Vec<RawFill>>>,
@@ -121,7 +122,8 @@ impl DataActor for SignalStrategy {
         if self.failure.borrow().is_some() {
             return Ok(());
         }
-        let target = match self.signal.on_bar(&candle) {
+        let wanted = self.signal.borrow_mut().on_bar(&candle);
+        let target = match wanted {
             Ok(Some(target)) => target,
             Ok(None) => return Ok(()),
             Err(message) => {

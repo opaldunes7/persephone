@@ -21,7 +21,7 @@ pub mod plugins;
 mod studies;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -170,6 +170,9 @@ pub struct Persephone {
     local_markets: Vec<MarketInfo>,
     /// Files are being dragged over the window.
     drop_hint: bool,
+    /// Plugins allowed to call language models, and where that list is saved.
+    ai_grants: BTreeSet<String>,
+    grants_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,8 +210,17 @@ impl Persephone {
         let save_path = args.is_empty().then(persist::default_path).flatten();
         let (mut app, loads) = Self::start(&args, save_path);
 
-        match Host::new() {
+        match Host::with_services(plugins::services()) {
             Ok(host) => {
+                app.grants_path = plugins::grants_path();
+                app.ai_grants = app
+                    .grants_path
+                    .as_deref()
+                    .map(plugins::load_grants)
+                    .unwrap_or_default();
+                for id in &app.ai_grants {
+                    host.services().allow_ai(id, true);
+                }
                 app.host = Some(Arc::new(host));
                 app.plugin_dir =
                     plugins::default_dir().filter(|dir| std::fs::create_dir_all(dir).is_ok());
@@ -265,6 +277,8 @@ impl Persephone {
             store: Store::default_root().map(Store::new),
             local_markets: Vec::new(),
             drop_hint: false,
+            ai_grants: BTreeSet::new(),
+            grants_path: None,
         };
         app.refresh_local_markets();
         let loads: Vec<_> = tiles
@@ -318,6 +332,8 @@ impl Persephone {
             store: None,
             local_markets: Vec::new(),
             drop_hint: false,
+            ai_grants: BTreeSet::new(),
+            grants_path: None,
         };
         let _ = app.add_tile(0, market, Vec::new(), None);
         app.relayout(false);
@@ -647,6 +663,43 @@ impl Persephone {
     }
 
     /// Flashes the focused tile's border; always returns `false` (nothing changed).
+    /// Lets tile `id`'s strategy plugin call language models (or stops it), remembers that, and
+    /// reruns every chart using the plugin.
+    fn allow_ai(&mut self, id: TileId, allow: bool) -> Task<Message> {
+        let Some(StrategyKind::Plugin(plugin_id)) = self
+            .tiles
+            .get(&id)
+            .and_then(|t| t.strategy.as_ref())
+            .map(|s| s.spec.kind.clone())
+        else {
+            return Task::none();
+        };
+        if let Some(plugin) = self.plugins.strategies.get(&plugin_id) {
+            plugin.allow_ai(allow);
+        }
+        if allow {
+            self.ai_grants.insert(plugin_id.clone());
+        } else {
+            self.ai_grants.remove(&plugin_id);
+        }
+        if let Some(path) = &self.grants_path
+            && let Err(e) = plugins::save_grants(path, &self.ai_grants)
+        {
+            eprintln!("persephone: couldn't save {}: {e}", path.display());
+        }
+        let using: Vec<TileId> = self
+            .tiles
+            .iter()
+            .filter(|(_, t)| {
+                t.strategy
+                    .as_ref()
+                    .is_some_and(|s| s.spec.kind == StrategyKind::Plugin(plugin_id.clone()))
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        Task::batch(using.into_iter().map(|id| self.run_backtest(id)))
+    }
+
     /// A dropped file: the first opens the import panel on the focused chart; more dropped
     /// with it (or before its import starts) join that import.
     fn on_drop(&mut self, path: PathBuf) -> Task<Message> {
@@ -858,6 +911,10 @@ impl Persephone {
                 self.popup = Some(popup);
             }
             MenuMessage::StartImport => return self.start_import(popup),
+            MenuMessage::AllowAi(allow) => {
+                self.popup = Some(popup);
+                return self.allow_ai(id, allow);
+            }
             MenuMessage::QueryChanged(text) => {
                 if let Popup::Menu {
                     page: Page::Symbol { query },
@@ -1293,9 +1350,19 @@ impl Persephone {
                 Some(Bars::Ready(market)) => Some(market),
                 _ => None,
             };
+            let ai_allowed = tile
+                .strategy
+                .as_ref()
+                .and_then(|s| match &s.spec.kind {
+                    StrategyKind::Plugin(id) => self.plugins.strategies.get(id),
+                    StrategyKind::BuiltIn(_) => None,
+                })
+                .filter(|plugin| plugin.uses_ai)
+                .map(|plugin| plugin.ai_allowed());
             let info = TileInfo {
                 symbol: &tile.market.symbol,
                 venue: tile.market.local.as_deref(),
+                ai_allowed,
                 quote: ready.map_or("", |m| m.instrument.quote.as_str()),
                 fills: ready.and_then(|m| m.fills.as_deref()),
                 local_markets: &self.local_markets,
@@ -1415,7 +1482,11 @@ fn strategy_summary(id: TileId, strategy: &Strategy, compact: bool) -> Element<'
         Run::Done(report) => {
             let ret = report.net_return() * 100.0;
             let color = if ret >= 0.0 { theme::UP } else { theme::DOWN };
-            let pieces = pieces.push(mono(format!("{ret:+.2}%"), color));
+            let mut pieces = pieces.push(mono(format!("{ret:+.2}%"), color));
+            // A caveat (look-ahead, unanswered questions) is in the report.
+            if report.notes.iter().any(|n| n.warning) {
+                pieces = pieces.push(mono("!".into(), theme::DOWN));
+            }
             if compact {
                 pieces
             } else {

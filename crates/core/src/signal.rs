@@ -15,6 +15,19 @@ pub trait Signal {
     ///
     /// Returns a message if the rule failed (e.g. a plugin crashed); the backtest stops.
     fn on_bar(&mut self, bar: &Candle) -> Result<Option<i8>, String>;
+
+    /// What the report should say about this run once it's over (a plugin's AI use, say).
+    fn notes(&mut self) -> Vec<Note> {
+        Vec::new()
+    }
+}
+
+/// A line for the backtest report.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Note {
+    pub text: String,
+    /// Something that makes the results less trustworthy.
+    pub warning: bool,
 }
 
 /// Makes a fresh [`Signal`] for each backtest, on the backtest's own thread.
