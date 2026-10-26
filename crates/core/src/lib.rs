@@ -4,6 +4,7 @@
 //! these types, and only `persephone-engine` translates them into Nautilus types.
 
 pub mod indicator;
+pub mod signal;
 pub mod strategy;
 pub mod time;
 

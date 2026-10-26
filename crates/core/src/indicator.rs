@@ -1,7 +1,8 @@
-//! The built-in indicator catalog: what each indicator is called, its parameters, where it is
-//! drawn and what it outputs. Computing values is the engine's job; drawing is the chart's.
+//! Indicators: the built-in catalog, and the description every indicator (built-in or
+//! plugin) shares: its name, parameters, where it is drawn and what it outputs. Computing
+//! values is the engine's (or the plugin host's) job; drawing is the chart's.
 
-use std::fmt;
+use std::{borrow::Cow, fmt, sync::Arc};
 
 /// Where an indicator is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,9 +21,10 @@ pub enum OutputStyle {
     Histogram,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A numeric parameter the user can edit.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Param {
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     pub default: f64,
     pub min: f64,
     pub max: f64,
@@ -31,31 +33,76 @@ pub struct Param {
 }
 
 impl Param {
-    const fn period(name: &'static str, default: f64) -> Self {
+    /// A look-back period from 1 to 1000 bars.
+    #[must_use]
+    pub const fn period(name: &'static str, default: f64) -> Self {
         Self {
-            name,
+            name: Cow::Borrowed(name),
             default,
             min: 1.0,
             max: 1_000.0,
             integer: true,
         }
     }
+
+    /// Whether `value` is allowed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message describing the allowed range.
+    pub fn check(&self, value: f64) -> Result<(), String> {
+        let valid = value.is_finite()
+            && (self.min..=self.max).contains(&value)
+            && (!self.integer || value.fract() == 0.0);
+        if valid {
+            Ok(())
+        } else if self.integer {
+            Err(format!(
+                "{} must be a whole number from {} to {}",
+                self.name, self.min, self.max
+            ))
+        } else {
+            Err(format!(
+                "{} must be from {} to {}",
+                self.name, self.min, self.max
+            ))
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Output {
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     pub style: OutputStyle,
 }
 
 const fn line(name: &'static str) -> Output {
     Output {
-        name,
+        name: Cow::Borrowed(name),
         style: OutputStyle::Line,
     }
 }
 
-/// The indicators that ship with Persephone. Custom ones arrive as plugins (M5).
+/// Everything about an indicator except its values.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IndicatorInfo {
+    /// Full name for menus, e.g. "Exponential Moving Average".
+    pub name: String,
+    /// Legend name, e.g. "EMA".
+    pub short_name: String,
+    pub placement: Placement,
+    pub params: Vec<Param>,
+    /// Output series, in the order values are computed.
+    pub outputs: Vec<Output>,
+    /// Outputs whose area between them is shaded (upper, lower).
+    pub fill: Option<(usize, usize)>,
+    /// Dashed reference levels in the indicator's pane.
+    pub levels: Vec<f64>,
+    /// A fixed scale for its pane; `None` fits the visible values.
+    pub range: Option<(f64, f64)>,
+}
+
+/// The indicators that ship with Persephone. Custom ones arrive as plugins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BuiltIn {
     Sma,
@@ -141,7 +188,7 @@ impl BuiltIn {
     #[must_use]
     pub const fn params(self) -> &'static [Param] {
         const STD_DEV: Param = Param {
-            name: "StdDev",
+            name: Cow::Borrowed("StdDev"),
             default: 2.0,
             min: 0.1,
             max: 10.0,
@@ -170,23 +217,16 @@ impl BuiltIn {
     /// Output series, in the order the engine returns them.
     #[must_use]
     pub const fn outputs(self) -> &'static [Output] {
+        const HISTOGRAM: Output = Output {
+            name: Cow::Borrowed("Histogram"),
+            style: OutputStyle::Histogram,
+        };
         match self {
             Self::Sma | Self::Ema | Self::Rsi | Self::Atr => const { &[line("Value")] },
             Self::Bollinger | Self::Donchian => {
                 const { &[line("Upper"), line("Basis"), line("Lower")] }
             }
-            Self::Macd => {
-                const {
-                    &[
-                        Output {
-                            name: "Histogram",
-                            style: OutputStyle::Histogram,
-                        },
-                        line("MACD"),
-                        line("Signal"),
-                    ]
-                }
-            }
+            Self::Macd => const { &[HISTOGRAM, line("MACD"), line("Signal")] },
             Self::Stochastic => const { &[line("%K"), line("%D")] },
         }
     }
@@ -219,60 +259,84 @@ impl BuiltIn {
             _ => None,
         }
     }
+
+    #[must_use]
+    pub fn info(self) -> IndicatorInfo {
+        IndicatorInfo {
+            name: self.name().into(),
+            short_name: self.short_name().into(),
+            placement: self.placement(),
+            params: self.params().to_vec(),
+            outputs: self.outputs().to_vec(),
+            fill: self.fill(),
+            levels: self.levels().to_vec(),
+            range: self.range(),
+        }
+    }
 }
 
-/// One indicator on a chart: which one, with what parameters.
-#[derive(Clone, Debug, PartialEq)]
+/// Which indicator: a built-in, or a plugin by id (its file name without `.wasm`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum IndicatorKind {
+    BuiltIn(BuiltIn),
+    Plugin(String),
+}
+
+/// One indicator on a chart: which one, its description, and its parameter values.
+#[derive(Clone, Debug)]
 pub struct IndicatorSpec {
-    pub kind: BuiltIn,
-    /// One value per [`BuiltIn::params`] entry.
+    pub kind: IndicatorKind,
+    pub info: Arc<IndicatorInfo>,
+    /// One value per `info.params` entry.
     pub params: Vec<f64>,
 }
 
+impl PartialEq for IndicatorSpec {
+    /// Same indicator with the same values; the description follows from the kind.
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.params == other.params
+    }
+}
+
 impl IndicatorSpec {
-    /// The indicator with its default parameters.
+    /// A built-in with its default parameters.
     #[must_use]
     pub fn new(kind: BuiltIn) -> Self {
-        Self {
-            kind,
-            params: kind.params().iter().map(|p| p.default).collect(),
-        }
+        Self::from_info(IndicatorKind::BuiltIn(kind), Arc::new(kind.info()), &[])
     }
 
-    /// Builds a spec from saved values, falling back to defaults for missing or invalid ones.
+    /// A built-in with saved values, falling back to defaults for missing or invalid ones.
     #[must_use]
     pub fn with_params(kind: BuiltIn, params: &[f64]) -> Self {
-        let mut spec = Self::new(kind);
-        for (i, value) in params.iter().enumerate().take(spec.params.len()) {
+        Self::from_info(IndicatorKind::BuiltIn(kind), Arc::new(kind.info()), params)
+    }
+
+    /// Any indicator from its description, with saved values where they are still valid.
+    #[must_use]
+    pub fn from_info(kind: IndicatorKind, info: Arc<IndicatorInfo>, saved: &[f64]) -> Self {
+        let mut spec = Self {
+            params: info.params.iter().map(|p| p.default).collect(),
+            kind,
+            info,
+        };
+        for (i, value) in saved.iter().enumerate().take(spec.params.len()) {
             let _ = spec.set_param(i, *value);
         }
         spec
     }
 
-    /// Sets parameter `index` if `value` is within its limits (whole for periods).
+    /// Sets parameter `index` if `value` is within its limits.
     ///
     /// # Errors
     ///
     /// Returns a message describing the allowed range.
     pub fn set_param(&mut self, index: usize, value: f64) -> Result<(), String> {
         let param = self
-            .kind
-            .params()
+            .info
+            .params
             .get(index)
-            .ok_or_else(|| format!("{} has no parameter {index}", self.kind.short_name()))?;
-        let valid = value.is_finite()
-            && (param.min..=param.max).contains(&value)
-            && (!param.integer || value.fract() == 0.0);
-        if !valid {
-            return Err(if param.integer {
-                format!(
-                    "{} must be a whole number from {} to {}",
-                    param.name, param.min, param.max
-                )
-            } else {
-                format!("{} must be from {} to {}", param.name, param.min, param.max)
-            });
-        }
+            .ok_or_else(|| format!("{} has no parameter {index}", self.info.short_name))?;
+        param.check(value)?;
         self.params[index] = value;
         Ok(())
     }
@@ -287,7 +351,7 @@ impl IndicatorSpec {
 impl fmt::Display for IndicatorSpec {
     /// Legend label, e.g. `EMA 21` or `BB 20 2`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.kind.short_name())?;
+        f.write_str(&self.info.short_name)?;
         for value in &self.params {
             write!(f, " {value}")?;
         }
@@ -303,12 +367,13 @@ mod tests {
     fn catalog_is_consistent() {
         for kind in BuiltIn::ALL {
             assert_eq!(BuiltIn::from_id(kind.id()), Some(kind));
-            assert!(!kind.outputs().is_empty());
-            if let Some((a, b)) = kind.fill() {
-                assert!(a < kind.outputs().len() && b < kind.outputs().len());
+            let info = kind.info();
+            assert!(!info.outputs.is_empty());
+            if let Some((a, b)) = info.fill {
+                assert!(a < info.outputs.len() && b < info.outputs.len());
             }
-            for p in kind.params() {
-                assert!((p.min..=p.max).contains(&p.default), "{kind:?} {}", p.name);
+            for p in &info.params {
+                assert!(p.check(p.default).is_ok(), "{kind:?} {}", p.name);
             }
         }
         assert_eq!(BuiltIn::from_id("nope"), None);
@@ -347,5 +412,23 @@ mod tests {
             vec![14.0],
             "invalid saved values fall back"
         );
+    }
+
+    #[test]
+    fn plugin_specs_describe_themselves() {
+        let info = Arc::new(IndicatorInfo {
+            name: "Hull Moving Average".into(),
+            short_name: "HMA".into(),
+            placement: Placement::Overlay,
+            params: vec![Param::period("Length", 9.0)],
+            outputs: vec![line("HMA")],
+            fill: None,
+            levels: Vec::new(),
+            range: None,
+        });
+        let mut hma = IndicatorSpec::from_info(IndicatorKind::Plugin("hma".into()), info, &[16.0]);
+        assert_eq!(hma.to_string(), "HMA 16");
+        assert!(hma.set_param(0, 2_000.0).is_err());
+        assert_ne!(hma, IndicatorSpec::new(BuiltIn::Sma));
     }
 }

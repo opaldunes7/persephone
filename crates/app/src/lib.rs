@@ -6,12 +6,14 @@
 //!
 //! The window is only charts, tiled like Hyprland's dwindle layout; see [`keymap`] for keys.
 //! Left-click a chart for its [`menu`]: indicators, a strategy to backtest, symbol and
-//! timeframe.
+//! timeframe. Custom indicators and strategies are WebAssembly [`plugins`] dropped into the
+//! plugins folder; they load, and reload when the files change, without a restart.
 
 pub mod keymap;
 pub mod menu;
 mod motion;
 pub mod persist;
+pub mod plugins;
 mod studies;
 
 use std::{
@@ -35,11 +37,13 @@ use iced::{
 use persephone_chart::{ChartData, ChartMessage, ChartState, PRICE_AXIS_WIDTH, theme};
 use persephone_core::{
     InstrumentSpec, Timeframe,
-    indicator::{BuiltIn, IndicatorSpec},
-    strategy::{BuiltInStrategy, StrategySpec},
+    indicator::{IndicatorKind, IndicatorSpec},
+    signal::SignalFactory,
+    strategy::{StrategyKind, StrategySpec},
 };
 use persephone_data::binance::BinanceClient;
 use persephone_engine::{BacktestReport, BacktestRequest, FeeRates};
+use persephone_plugin_host::{Host, Plugins};
 use persephone_tiling::{Layout, Rect, TileId};
 
 use crate::{
@@ -60,6 +64,9 @@ const BORDER: f32 = 2.0;
 const RESIZE_STEP: f32 = 0.05;
 /// How long the border flashes when an action is refused (17th chart, last chart).
 const FLASH: Duration = Duration::from_millis(450);
+/// How long to wait after a plugin file changes before reloading, so a build that writes the
+/// file in several steps reloads once.
+const PLUGIN_SETTLE: Duration = Duration::from_millis(300);
 const DEFAULT_SYMBOL: &str = "BTCUSDT";
 const DEFAULT_WINDOW: Size = Size::new(1280.0, 800.0);
 
@@ -133,6 +140,14 @@ pub struct Persephone {
     popup: Option<Popup>,
     /// Where the layout is saved; `None` for one-off sessions started with arguments.
     save_path: Option<PathBuf>,
+    /// Compiles and runs plugins; `None` when plugins aren't available.
+    host: Option<Arc<Host>>,
+    /// Where plugin files live, watched for changes.
+    plugin_dir: Option<PathBuf>,
+    /// What's loaded from `plugin_dir`.
+    plugins: Arc<Plugins>,
+    /// A reload is already on its way.
+    reloading: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -151,13 +166,27 @@ pub enum Message {
     BacktestDone(TileId, u64, Result<Arc<BacktestReport>, String>),
     /// The strategy summary on a tile was clicked.
     OpenReport(TileId),
+    /// A plugin file was added, changed or removed.
+    PluginsChanged,
+    PluginsLoaded(Arc<Plugins>),
 }
 
 impl Persephone {
     fn boot() -> (Self, Task<Message>) {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let save_path = args.is_empty().then(persist::default_path).flatten();
-        Self::start(&args, save_path)
+        let (mut app, loads) = Self::start(&args, save_path);
+
+        match Host::new() {
+            Ok(host) => {
+                app.host = Some(Arc::new(host));
+                app.plugin_dir =
+                    plugins::default_dir().filter(|dir| std::fs::create_dir_all(dir).is_ok());
+            }
+            Err(error) => eprintln!("persephone: plugins are off: {error}"),
+        }
+        let plugins = app.reload_plugins(Duration::ZERO);
+        (app, Task::batch([loads, plugins]))
     }
 
     /// Starts from the layout saved at `save_path` (if any, and valid), else from one chart
@@ -178,15 +207,12 @@ impl Persephone {
                     let indicators = t
                         .indicators
                         .iter()
-                        .filter_map(|i| {
-                            BuiltIn::from_id(&i.kind)
-                                .map(|kind| IndicatorSpec::with_params(kind, &i.params))
-                        })
+                        .filter_map(|i| plugins::saved_indicator(&i.kind, &i.params))
                         .collect();
-                    let strategy = t.strategy.as_ref().and_then(|s| {
-                        BuiltInStrategy::from_id(&s.kind)
-                            .map(|kind| StrategySpec::with_params(kind, &s.params))
-                    });
+                    let strategy = t
+                        .strategy
+                        .as_ref()
+                        .and_then(|s| plugins::saved_strategy(&s.kind, &s.params));
                     (t.id, market, indicators, strategy)
                 })
                 .collect(),
@@ -201,6 +227,10 @@ impl Persephone {
             now: Instant::now(),
             popup: None,
             save_path,
+            host: None,
+            plugin_dir: None,
+            plugins: Arc::default(),
+            reloading: false,
         };
         let loads: Vec<_> = tiles
             .into_iter()
@@ -236,6 +266,10 @@ impl Persephone {
             now: Instant::now(),
             popup: None,
             save_path: None,
+            host: None,
+            plugin_dir: None,
+            plugins: Arc::default(),
+            reloading: false,
         };
         let _ = app.add_tile(0, market, Vec::new(), None);
         app.relayout(false);
@@ -281,6 +315,12 @@ impl Persephone {
         self.popup.as_ref()
     }
 
+    /// The plugins currently loaded.
+    #[must_use]
+    pub fn plugins(&self) -> &Plugins {
+        &self.plugins
+    }
+
     /// Where tile `id` is drawn right now.
     #[must_use]
     pub fn tile_rect(&self, id: TileId) -> Option<Rect> {
@@ -305,11 +345,20 @@ impl Persephone {
         let Some(Bars::Ready(market)) = self.bars.get(&tile.market) else {
             return None;
         };
+        let plugin = match &strategy.spec.kind {
+            StrategyKind::Plugin(id) => self
+                .plugins
+                .strategies
+                .get(id)
+                .map(|p| Arc::clone(p) as Arc<dyn SignalFactory>),
+            StrategyKind::BuiltIn(_) => None,
+        };
         let request = BacktestRequest {
             instrument: market.instrument.clone(),
             timeframe: tile.market.timeframe,
             candles: market.data.candles.clone(),
             strategy: strategy.spec.clone(),
+            plugin,
             starting_balance: STARTING_BALANCE,
             fees: FeeRates::BINANCE_SPOT,
         };
@@ -398,6 +447,15 @@ impl Persephone {
                 self.relayout(false);
             }
             Message::Tick(now) => self.now = now,
+            Message::PluginsChanged => {
+                if !self.reloading {
+                    return self.reload_plugins(PLUGIN_SETTLE);
+                }
+            }
+            Message::PluginsLoaded(plugins) => {
+                self.reloading = false;
+                return self.use_plugins(plugins);
+            }
         }
         Task::none()
     }
@@ -481,12 +539,16 @@ impl Persephone {
                     return operation::focus(menu::symbol_input());
                 }
             }
-            MenuMessage::AddIndicator(kind) => {
-                if let Some(tile) = self.tiles.get_mut(&id) {
-                    tile.indicators.push(IndicatorSpec::new(kind));
+            MenuMessage::AddIndicator(kind) => self.add_indicator(id, IndicatorSpec::new(kind)),
+            MenuMessage::AddPluginIndicator(plugin) => {
+                if let Some(loaded) = self.plugins.indicators.get(&plugin) {
+                    let spec = IndicatorSpec::from_info(
+                        IndicatorKind::Plugin(plugin),
+                        Arc::clone(&loaded.info),
+                        &[],
+                    );
+                    self.add_indicator(id, spec);
                 }
-                self.restudy(id);
-                self.save();
             }
             MenuMessage::SetTimeframe(timeframe) => {
                 return self.set_market(
@@ -559,16 +621,17 @@ impl Persephone {
                 }
             }
             MenuMessage::SetStrategy(kind) => {
-                if let Some(tile) = self.tiles.get_mut(&id) {
-                    let generation = tile.strategy.as_ref().map_or(0, |s| s.generation);
-                    tile.strategy = Some(Strategy {
-                        spec: StrategySpec::new(kind),
-                        run: Run::Waiting,
-                        generation,
-                    });
+                return self.set_strategy(id, StrategySpec::new(kind));
+            }
+            MenuMessage::SetPluginStrategy(plugin) => {
+                if let Some(loaded) = self.plugins.strategies.get(&plugin) {
+                    let spec = StrategySpec::from_info(
+                        StrategyKind::Plugin(plugin),
+                        Arc::clone(&loaded.info),
+                        &[],
+                    );
+                    return self.set_strategy(id, spec);
                 }
-                self.save();
-                return self.run_backtest(id);
             }
             MenuMessage::StrategyParamChanged(index, value) => {
                 let mut task = Task::none();
@@ -602,6 +665,89 @@ impl Persephone {
             MenuMessage::Close => {}
         }
         Task::none()
+    }
+
+    fn add_indicator(&mut self, id: TileId, spec: IndicatorSpec) {
+        if let Some(tile) = self.tiles.get_mut(&id) {
+            tile.indicators.push(spec);
+        }
+        self.restudy(id);
+        self.save();
+    }
+
+    /// Gives tile `id` a strategy (replacing any) and backtests it.
+    fn set_strategy(&mut self, id: TileId, spec: StrategySpec) -> Task<Message> {
+        if let Some(tile) = self.tiles.get_mut(&id) {
+            let generation = tile.strategy.as_ref().map_or(0, |s| s.generation);
+            tile.strategy = Some(Strategy {
+                spec,
+                run: Run::Waiting,
+                generation,
+            });
+        }
+        self.save();
+        self.run_backtest(id)
+    }
+
+    /// Loads the plugin folder on a worker thread after `delay`.
+    fn reload_plugins(&mut self, delay: Duration) -> Task<Message> {
+        let (Some(host), Some(dir)) = (self.host.clone(), self.plugin_dir.clone()) else {
+            return Task::none();
+        };
+        self.reloading = true;
+        Task::perform(
+            on_thread(move || {
+                std::thread::sleep(delay);
+                Ok(host.load_dir(&dir))
+            }),
+            |loaded: Result<Plugins, String>| {
+                Message::PluginsLoaded(Arc::new(loaded.unwrap_or_default()))
+            },
+        )
+    }
+
+    /// Switches to a new set of plugins: plugin indicators and strategies pick up their
+    /// (possibly changed) descriptions, charts recompute, and plugin strategies rerun.
+    fn use_plugins(&mut self, plugins: Arc<Plugins>) -> Task<Message> {
+        self.plugins = plugins;
+        let ids: Vec<TileId> = self.tiles.keys().copied().collect();
+        let mut reruns = Vec::new();
+        for id in ids {
+            let Some(tile) = self.tiles.get_mut(&id) else {
+                continue;
+            };
+            let mut uses_plugins = false;
+            for spec in &mut tile.indicators {
+                if let IndicatorKind::Plugin(_) = spec.kind {
+                    uses_plugins = true;
+                    if let Some(refreshed) = plugins::refresh_indicator(spec, &self.plugins) {
+                        *spec = refreshed;
+                    }
+                }
+            }
+            let mut rerun = false;
+            if let Some(strategy) = &mut tile.strategy
+                && let StrategyKind::Plugin(_) = strategy.spec.kind
+            {
+                if let Some(refreshed) = plugins::refresh_strategy(&strategy.spec, &self.plugins) {
+                    strategy.spec = refreshed;
+                }
+                rerun = true;
+            }
+            if uses_plugins {
+                self.restudy(id);
+            }
+            if rerun {
+                reruns.push(self.run_backtest(id));
+            }
+        }
+        Task::batch(reruns)
+    }
+
+    /// Replaces the loaded plugins, as a reload would. For tests.
+    #[doc(hidden)]
+    pub fn set_plugins(&mut self, plugins: Plugins) -> Task<Message> {
+        self.use_plugins(Arc::new(plugins))
     }
 
     /// The report popover for tile `id`'s strategy, tucked under its summary at the top right.
@@ -716,7 +862,7 @@ impl Persephone {
             return;
         };
         let data = Arc::clone(chart.data());
-        let mut built = studies::build(&tile.indicators, &data.candles);
+        let mut built = studies::build(&tile.indicators, &data.candles, &self.plugins);
         let report = match tile.strategy.as_ref().map(|s| &s.run) {
             Some(Run::Done(report)) if report.equity.len() == data.candles.len() => Some(report),
             _ => None,
@@ -784,12 +930,12 @@ impl Persephone {
                         .indicators
                         .iter()
                         .map(|spec| SavedIndicator {
-                            kind: spec.kind.id().into(),
+                            kind: plugins::indicator_key(&spec.kind),
                             params: spec.params.clone(),
                         })
                         .collect(),
                     strategy: tile.strategy.as_ref().map(|s| SavedStrategy {
-                        kind: s.spec.kind.id().into(),
+                        kind: plugins::strategy_key(&s.spec.kind),
                         params: s.spec.params.clone(),
                     }),
                 })
@@ -821,11 +967,16 @@ impl Persephone {
             _ => None,
         });
 
-        if self.is_animating() {
-            Subscription::batch([input, window::frames().map(Message::Tick)])
-        } else {
-            input
+        let mut subscriptions = vec![input];
+        if let Some(dir) = &self.plugin_dir {
+            subscriptions.push(Subscription::run_with(dir.clone(), |dir: &PathBuf| {
+                plugins::watch(dir)
+            }));
         }
+        if self.is_animating() {
+            subscriptions.push(window::frames().map(Message::Tick));
+        }
+        Subscription::batch(subscriptions)
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -856,6 +1007,8 @@ impl Persephone {
                 timeframe: tile.market.timeframe,
                 specs: &tile.indicators,
                 strategy: tile.strategy.as_ref().map(|s| (&s.spec, &s.run)),
+                plugins: &self.plugins,
+                plugin_dir: self.plugin_dir.as_deref(),
             };
             let origin = Point::new(rect.x + border, rect.y + border);
             layers.push(menu::view(popup, info, origin, self.window).map(Message::Menu));
@@ -940,7 +1093,7 @@ fn strategy_summary(id: TileId, strategy: &Strategy, compact: bool) -> Element<'
             .font(iced::Font::MONOSPACE)
     };
     let mut pieces = row![
-        text(strategy.spec.kind.name())
+        text(strategy.spec.info.name.as_str())
             .size(12)
             .color(theme::TEXT_BRIGHT)
     ]

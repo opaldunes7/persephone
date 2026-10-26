@@ -1,13 +1,14 @@
-//! Turns a tile's indicator choices into chart studies: values from the engine, colors and
-//! styles from TradingView's defaults.
+//! Turns a tile's indicator choices into chart studies: values from the engine (built-ins)
+//! or the plugin host (plugins), colors and styles from TradingView's defaults.
 
 use iced::Color;
 use persephone_chart::{FillMark, Placement, Study, StudyLine, Trades, theme};
 use persephone_core::{
     Candle,
-    indicator::{BuiltIn, IndicatorSpec, OutputStyle},
+    indicator::{BuiltIn, IndicatorInfo, IndicatorKind, IndicatorSpec, OutputStyle},
 };
 use persephone_engine::BacktestReport;
+use persephone_plugin_host::Plugins;
 
 const BLUE: Color = Color::from_rgb8(0x29, 0x62, 0xff);
 const ORANGE: Color = Color::from_rgb8(0xff, 0x6d, 0x00);
@@ -17,18 +18,20 @@ const HISTOGRAM: Color = Color::from_rgba8(0x26, 0xa6, 0x9a, 0.6);
 const EQUITY: Color = Color::from_rgb8(0x42, 0xa5, 0xf5);
 
 /// Computes every indicator over `candles`, in order. An indicator that can't be computed
-/// (e.g. MACD with fast ≥ slow) still gets a study, carrying the error for its legend.
-pub fn build(specs: &[IndicatorSpec], candles: &[Candle]) -> Vec<Study> {
+/// (e.g. MACD with fast ≥ slow, or a plugin that crashed or isn't loaded) still gets a study,
+/// carrying the error for its legend.
+pub fn build(specs: &[IndicatorSpec], candles: &[Candle], plugins: &Plugins) -> Vec<Study> {
     let mut palette = 0;
     specs
         .iter()
         .map(|spec| {
-            let colors = colors(spec.kind, &mut palette);
+            let info = &spec.info;
+            let colors = colors(&spec.kind, info, &mut palette);
             let mut study = Study {
                 label: spec.to_string(),
-                placement: spec.kind.placement(),
+                placement: info.placement,
                 lines: Vec::new(),
-                fill: spec.kind.fill().map(|(upper, lower)| {
+                fill: info.fill.map(|(upper, lower)| {
                     (
                         upper,
                         lower,
@@ -38,18 +41,25 @@ pub fn build(specs: &[IndicatorSpec], candles: &[Candle]) -> Vec<Study> {
                         },
                     )
                 }),
-                levels: spec.kind.levels().to_vec(),
-                range: spec.kind.range(),
+                levels: info.levels.clone(),
+                range: info.range,
                 error: None,
             };
-            match persephone_engine::indicators::compute(spec, candles) {
+            let values = match &spec.kind {
+                IndicatorKind::BuiltIn(_) => persephone_engine::indicators::compute(spec, candles),
+                IndicatorKind::Plugin(id) => match plugins.indicators.get(id) {
+                    Some(plugin) => plugin.compute(&spec.params, candles),
+                    None => Err(format!("plugin `{id}` isn't loaded")),
+                },
+            };
+            match values {
                 Ok(outputs) => {
                     study.lines = outputs
                         .into_iter()
-                        .zip(spec.kind.outputs())
+                        .zip(&info.outputs)
                         .zip(colors)
                         .map(|((values, output), color)| StudyLine {
-                            name: output.name.into(),
+                            name: output.name.to_string(),
                             values,
                             color,
                             style: output.style,
@@ -96,13 +106,23 @@ pub fn trades(report: &BacktestReport, bars: usize) -> Trades {
     Trades::from_fills(&fills, bars)
 }
 
-/// One color per output. Moving averages and channels take the next palette color so
-/// several of them on one chart stay distinguishable.
-fn colors(kind: BuiltIn, next: &mut usize) -> Vec<Color> {
+/// One color per output. Moving averages, channels and plugin lines take the next palette
+/// color so several of them on one chart stay distinguishable.
+fn colors(kind: &IndicatorKind, info: &IndicatorInfo, next: &mut usize) -> Vec<Color> {
     let mut take = || {
         let color = theme::STUDY_PALETTE[*next % theme::STUDY_PALETTE.len()];
         *next += 1;
         color
+    };
+    let IndicatorKind::BuiltIn(kind) = kind else {
+        return info
+            .outputs
+            .iter()
+            .map(|output| match output.style {
+                OutputStyle::Histogram => HISTOGRAM,
+                OutputStyle::Line => take(),
+            })
+            .collect();
     };
     match kind {
         BuiltIn::Sma | BuiltIn::Ema => vec![take()],
@@ -140,11 +160,11 @@ mod tests {
     #[test]
     fn builds_one_study_per_spec_in_order() {
         let specs: Vec<_> = BuiltIn::ALL.into_iter().map(IndicatorSpec::new).collect();
-        let studies = build(&specs, &candles(300));
+        let studies = build(&specs, &candles(300), &Plugins::default());
         assert_eq!(studies.len(), specs.len());
         for (study, spec) in studies.iter().zip(&specs) {
             assert_eq!(study.label, spec.to_string());
-            assert_eq!(study.lines.len(), spec.kind.outputs().len());
+            assert_eq!(study.lines.len(), spec.info.outputs.len());
             assert!(study.error.is_none());
         }
         assert_eq!(
@@ -162,14 +182,14 @@ mod tests {
             IndicatorSpec::new(BuiltIn::Ema),
             IndicatorSpec::new(BuiltIn::Sma),
         ];
-        let studies = build(&specs, &candles(100));
+        let studies = build(&specs, &candles(100), &Plugins::default());
         assert_ne!(studies[0].lines[0].color, studies[1].lines[0].color);
     }
 
     #[test]
     fn bad_parameters_show_up_as_errors() {
         let spec = IndicatorSpec::with_params(BuiltIn::Macd, &[30.0, 10.0, 9.0]);
-        let studies = build(&[spec], &candles(100));
+        let studies = build(&[spec], &candles(100), &Plugins::default());
         assert!(
             studies[0]
                 .error

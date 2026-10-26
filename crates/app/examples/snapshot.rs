@@ -9,8 +9,10 @@
 //! `m` left-clicks the focused chart (opening its menu), `i` opens the indicator page, `s`
 //! the symbol page, `1`-`8` add a built-in indicator (in menu order), `e` opens the first
 //! indicator's settings; `x`/`y`/`z` set the EMA Cross / RSI Reversion / Donchian Breakout
-//! strategy (menu open) and `r` opens the focused chart's strategy report. Backtests run to
-//! completion before the snapshot.
+//! strategy (menu open) and `r` opens the focused chart's strategy report. With the example
+//! plugins built (`cargo build --release --target wasm32-wasip2` in `plugins/`), `a`/`b` add
+//! the SMA / z-score plugin indicators, `w` sets the EMA Cross plugin strategy and `P` opens
+//! the strategy page. Backtests run to completion before the snapshot.
 //! AT_MS freezes the clock that many milliseconds after the last action (default: settled),
 //! to look at animation frames. iced appends the renderer name to the file name.
 
@@ -29,6 +31,7 @@ use persephone::{
 use persephone_chart::{ChartData, ChartMessage};
 use persephone_core::{Timeframe, indicator::BuiltIn, strategy::BuiltInStrategy};
 use persephone_data::binance::BinanceClient;
+use persephone_plugin_host::{Host, Plugin, Plugins};
 use persephone_tiling::Direction;
 
 const WINDOW: Size = Size::new(1440.0, 900.0);
@@ -48,6 +51,7 @@ fn main() -> anyhow::Result<()> {
     let timeframe: Timeframe = args.next().as_deref().unwrap_or("15m").parse()?;
 
     let mut app = Persephone::preloaded(fetch(&symbol, timeframe)?, WINDOW);
+    let _ = app.set_plugins(example_plugins()?);
     for c in script.chars() {
         let focused = app.layout().focused();
         let _ = app.update(message(c, focused)?);
@@ -99,6 +103,7 @@ fn message(c: char, focused: u32) -> anyhow::Result<Message> {
             },
         )),
         'i' => menu(MenuMessage::Open(Page::Indicators)),
+        'P' => menu(MenuMessage::Open(Page::Strategies)),
         's' => menu(MenuMessage::Open(Page::Symbol {
             query: String::new(),
         })),
@@ -109,6 +114,9 @@ fn message(c: char, focused: u32) -> anyhow::Result<Message> {
         'y' => menu(MenuMessage::SetStrategy(BuiltInStrategy::RsiReversion)),
         'z' => menu(MenuMessage::SetStrategy(BuiltInStrategy::DonchianBreakout)),
         'r' => Ok(Message::OpenReport(focused)),
+        'a' => menu(MenuMessage::AddPluginIndicator("sma".into())),
+        'b' => menu(MenuMessage::AddPluginIndicator("zscore".into())),
+        'w' => menu(MenuMessage::SetPluginStrategy("ema_cross".into())),
         other => bail!("unknown script action `{other}`"),
     }
 }
@@ -126,6 +134,26 @@ fn finish_backtests(app: &mut Persephone) {
             let _ = app.update(Message::BacktestDone(id, generation, result));
         }
     }
+}
+
+/// The example plugins from `plugins/`, if they've been built (the fixtures stay out).
+fn example_plugins() -> anyhow::Result<Plugins> {
+    let built =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/target/wasm32-wasip2/release");
+    let host = Host::new().map_err(anyhow::Error::msg)?;
+    let mut plugins = Plugins::default();
+    for name in ["sma", "zscore", "ema_cross"] {
+        match host.load(&built.join(format!("{name}.wasm"))) {
+            Ok(Plugin::Indicator(p)) => {
+                plugins.indicators.insert(p.id.clone(), p);
+            }
+            Ok(Plugin::Strategy(p)) => {
+                plugins.strategies.insert(p.id.clone(), p);
+            }
+            Err(error) => plugins.errors.push((format!("{name}.wasm"), error)),
+        }
+    }
+    Ok(plugins)
 }
 
 fn fetch(symbol: &str, timeframe: Timeframe) -> anyhow::Result<std::sync::Arc<ChartData>> {

@@ -1,0 +1,15 @@
+[package]
+name = "persephone-sdk"
+description = "Write Persephone indicator and strategy plugins in Rust."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Pick one per plugin: each world's type information is linked into the component.
+indicator = []
+strategy = []
+
+[dependencies]
+wit-bindgen.workspace = true

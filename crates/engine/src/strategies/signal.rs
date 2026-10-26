@@ -14,15 +14,9 @@ use nautilus_trading::{
     nautilus_strategy,
     strategy::{Strategy, StrategyConfig, StrategyCore},
 };
-use persephone_core::{Candle, Side};
+use persephone_core::{Candle, Side, signal::Signal};
 
 use crate::report::RawFill;
-
-/// A trading rule: sees each closed bar and returns the position it wants, `1` long, `-1`
-/// short or `0` flat, or `None` to keep whatever it has.
-pub(crate) trait Signal {
-    fn on_bar(&mut self, bar: &Candle) -> Option<i8>;
-}
 
 /// Runs a [`Signal`] inside Nautilus. Each position is worth `notional` in the quote currency
 /// at entry; reversing long to short (or back) is one order.
@@ -36,6 +30,8 @@ pub(crate) struct SignalStrategy {
     position: f64,
     /// Shared with the engine thread that runs this strategy; collected after the run.
     fills: Rc<RefCell<Vec<RawFill>>>,
+    /// Set when the signal fails; the strategy stops trading and the run reports it.
+    failure: Rc<RefCell<Option<String>>>,
 }
 
 impl SignalStrategy {
@@ -45,6 +41,7 @@ impl SignalStrategy {
         notional: f64,
         size_precision: u8,
         fills: Rc<RefCell<Vec<RawFill>>>,
+        failure: Rc<RefCell<Option<String>>>,
     ) -> Self {
         let config = StrategyConfig {
             strategy_id: Some(StrategyId::from("PERSEPHONE-001")),
@@ -60,6 +57,7 @@ impl SignalStrategy {
             size_precision,
             position: 0.0,
             fills,
+            failure,
         }
     }
 
@@ -120,8 +118,16 @@ impl DataActor for SignalStrategy {
             close: bar.close.as_f64(),
             volume: bar.volume.as_f64(),
         };
-        let Some(target) = self.signal.on_bar(&candle) else {
+        if self.failure.borrow().is_some() {
             return Ok(());
+        }
+        let target = match self.signal.on_bar(&candle) {
+            Ok(Some(target)) => target,
+            Ok(None) => return Ok(()),
+            Err(message) => {
+                *self.failure.borrow_mut() = Some(message);
+                return Ok(());
+            }
         };
         if self.holds(target) || candle.close <= 0.0 {
             return Ok(());

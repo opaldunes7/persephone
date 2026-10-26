@@ -14,26 +14,39 @@ use persephone_core::{
     strategy::{BuiltInStrategy, StrategySpec},
 };
 
-use super::Signal;
+use persephone_core::signal::Signal;
 
-pub(crate) fn signal(spec: &StrategySpec) -> Box<dyn Signal> {
-    match spec.kind {
-        BuiltInStrategy::EmaCross => Box::new(EmaCross {
+/// A built-in rule: like [`Signal`], but it can't fail.
+trait Rule {
+    fn on_bar(&mut self, bar: &Candle) -> Option<i8>;
+}
+
+struct Infallible<R>(R);
+
+impl<R: Rule> Signal for Infallible<R> {
+    fn on_bar(&mut self, bar: &Candle) -> Result<Option<i8>, String> {
+        Ok(self.0.on_bar(bar))
+    }
+}
+
+pub(crate) fn signal(kind: BuiltInStrategy, spec: &StrategySpec) -> Box<dyn Signal> {
+    match kind {
+        BuiltInStrategy::EmaCross => Box::new(Infallible(EmaCross {
             fast: ExponentialMovingAverage::new(spec.period(0), Some(PriceType::Last)),
             slow: ExponentialMovingAverage::new(spec.period(1), Some(PriceType::Last)),
             fast_above: None,
-        }),
-        BuiltInStrategy::RsiReversion => Box::new(RsiReversion {
+        })),
+        BuiltInStrategy::RsiReversion => Box::new(Infallible(RsiReversion {
             rsi: RelativeStrengthIndex::new(spec.period(0), Some(MovingAverageType::Wilder)),
             oversold: spec.params[1],
             overbought: spec.params[2],
             previous: None,
-        }),
-        BuiltInStrategy::DonchianBreakout => Box::new(DonchianBreakout {
+        })),
+        BuiltInStrategy::DonchianBreakout => Box::new(Infallible(DonchianBreakout {
             length: spec.period(0),
             highs: VecDeque::new(),
             lows: VecDeque::new(),
-        }),
+        })),
     }
 }
 
@@ -44,7 +57,7 @@ struct EmaCross {
     fast_above: Option<bool>,
 }
 
-impl Signal for EmaCross {
+impl Rule for EmaCross {
     fn on_bar(&mut self, bar: &Candle) -> Option<i8> {
         self.fast.update_raw(bar.close);
         self.slow.update_raw(bar.close);
@@ -70,7 +83,7 @@ struct RsiReversion {
     previous: Option<f64>,
 }
 
-impl Signal for RsiReversion {
+impl Rule for RsiReversion {
     fn on_bar(&mut self, bar: &Candle) -> Option<i8> {
         self.rsi.update_raw(bar.close);
         if !self.rsi.initialized() {
@@ -95,7 +108,7 @@ struct DonchianBreakout {
     lows: VecDeque<f64>,
 }
 
-impl Signal for DonchianBreakout {
+impl Rule for DonchianBreakout {
     fn on_bar(&mut self, bar: &Candle) -> Option<i8> {
         let target = (self.highs.len() == self.length).then(|| {
             let high = self.highs.iter().copied().fold(f64::MIN, f64::max);
@@ -120,6 +133,8 @@ impl Signal for DonchianBreakout {
 
 #[cfg(test)]
 mod tests {
+    use persephone_core::strategy::StrategyKind;
+
     use super::*;
 
     fn bar(close: f64) -> Candle {
@@ -134,10 +149,13 @@ mod tests {
     }
 
     fn targets(spec: &StrategySpec, closes: impl IntoIterator<Item = f64>) -> Vec<i8> {
-        let mut signal = signal(spec);
+        let StrategyKind::BuiltIn(kind) = spec.kind else {
+            unreachable!("built-ins only")
+        };
+        let mut signal = signal(kind, spec);
         closes
             .into_iter()
-            .filter_map(|c| signal.on_bar(&bar(c)))
+            .filter_map(|c| signal.on_bar(&bar(c)).unwrap())
             .collect()
     }
 

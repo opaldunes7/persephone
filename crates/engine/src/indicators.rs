@@ -13,21 +13,27 @@ use nautilus_indicators::{
 use nautilus_model::enums::PriceType;
 use persephone_core::{
     Candle,
-    indicator::{BuiltIn, IndicatorSpec},
+    indicator::{BuiltIn, IndicatorKind, IndicatorSpec},
 };
 
-/// One series per [`BuiltIn::outputs`] entry, each as long as `candles`. Bars before the
+/// One series per output of a built-in indicator, each as long as `candles`. Bars before the
 /// indicator has enough history are `NaN`.
 ///
 /// # Errors
 ///
 /// Returns a message when the parameters don't make sense together (MACD's fast period must
-/// be shorter than its slow period).
+/// be shorter than its slow period), or for a plugin, which the plugin host computes.
 pub fn compute(spec: &IndicatorSpec, candles: &[Candle]) -> Result<Vec<Vec<f64>>, String> {
-    let mut out = vec![vec![f64::NAN; candles.len()]; spec.kind.outputs().len()];
+    let kind = match &spec.kind {
+        IndicatorKind::BuiltIn(kind) => *kind,
+        IndicatorKind::Plugin(id) => {
+            return Err(format!("`{id}` is a plugin; the plugin host computes it"));
+        }
+    };
+    let mut out = vec![vec![f64::NAN; candles.len()]; spec.info.outputs.len()];
     let p = |i| spec.period(i);
 
-    match spec.kind {
+    match kind {
         BuiltIn::Sma => {
             let mut sma = SimpleMovingAverage::new(p(0), Some(PriceType::Last));
             fill(&mut out, candles, |c| {

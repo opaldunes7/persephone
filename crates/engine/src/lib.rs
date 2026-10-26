@@ -12,7 +12,7 @@ pub mod indicators;
 mod report;
 mod strategies;
 
-use std::{cell::RefCell, rc::Rc, thread};
+use std::{cell::RefCell, rc::Rc, sync::Arc, thread};
 
 use nautilus_backtest::{
     config::{BacktestEngineConfig, SimulatedVenueConfig},
@@ -26,7 +26,11 @@ use nautilus_model::{
     instruments::Instrument,
     types::{Currency, Money},
 };
-use persephone_core::{Candle, InstrumentSpec, Timeframe, strategy::StrategySpec};
+use persephone_core::{
+    Candle, InstrumentSpec, Timeframe,
+    signal::{Signal, SignalFactory},
+    strategy::{StrategyKind, StrategySpec},
+};
 use rust_decimal::Decimal;
 
 pub use report::{BacktestReport, Fill};
@@ -41,6 +45,8 @@ pub struct BacktestRequest {
     /// Bars to replay, oldest first.
     pub candles: Vec<Candle>,
     pub strategy: StrategySpec,
+    /// Makes the strategy's signal when it is a plugin; built-ins ignore it.
+    pub plugin: Option<Arc<dyn SignalFactory>>,
     /// Starting cash, in the instrument's quote currency.
     pub starting_balance: f64,
     pub fees: FeeRates,
@@ -73,6 +79,9 @@ pub enum EngineError {
     InvalidRequest(String),
     #[error("backtest thread panicked")]
     Panicked,
+    /// The strategy itself failed (e.g. a plugin crashed or ran out of time).
+    #[error("{0}")]
+    Strategy(String),
     #[error(transparent)]
     Nautilus(#[from] anyhow::Error),
 }
@@ -109,17 +118,33 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
     let last_close = request.candles.last().map_or(0.0, |c| c.close);
     convert::quantity(notional / last_close, &request.instrument)?;
 
+    let signal: Box<dyn Signal> = match &strategy.kind {
+        StrategyKind::BuiltIn(kind) => builtins::signal(*kind, strategy),
+        StrategyKind::Plugin(id) => request
+            .plugin
+            .as_ref()
+            .ok_or_else(|| EngineError::InvalidRequest(format!("plugin `{id}` isn't loaded")))?
+            .create(strategy.own_params())
+            .map_err(EngineError::Strategy)?,
+    };
+
     let fills = Rc::new(RefCell::new(Vec::new()));
+    let failure = Rc::new(RefCell::new(None));
     engine.add_strategy(SignalStrategy::new(
         bar_type,
-        builtins::signal(strategy),
+        signal,
         notional,
         request.instrument.size_precision,
         Rc::clone(&fills),
+        Rc::clone(&failure),
     ))?;
 
     engine.add_data(bars, None, true, true)?;
     engine.run(None, None, None, false)?;
+    if let Some(message) = failure.take() {
+        engine.dispose();
+        return Err(EngineError::Strategy(message));
+    }
 
     let result = engine.get_result();
     let report = report::build(

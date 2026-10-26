@@ -41,6 +41,7 @@ fn request(candles: Vec<Candle>, strategy: StrategySpec) -> BacktestRequest {
         timeframe: Timeframe::H1,
         candles,
         strategy,
+        plugin: None,
         starting_balance: BALANCE,
         fees: FeeRates::ZERO,
     }

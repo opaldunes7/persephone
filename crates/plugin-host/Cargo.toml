@@ -1,0 +1,16 @@
+[package]
+name = "persephone-plugin-host"
+description = "Loads and runs Persephone's WebAssembly plugins (indicators and strategies), sandboxed."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+persephone-core.workspace = true
+rand.workspace = true
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+
+[dev-dependencies]
+persephone-engine.workspace = true

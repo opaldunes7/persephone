@@ -11,10 +11,12 @@ persephone-chart.workspace = true
 persephone-core.workspace = true
 persephone-data.workspace = true
 persephone-engine.workspace = true
+persephone-plugin-host.workspace = true
 persephone-tiling.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
 iced.workspace = true
+notify.workspace = true
 ron.workspace = true
 serde.workspace = true
 

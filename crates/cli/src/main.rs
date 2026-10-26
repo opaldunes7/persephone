@@ -1,5 +1,7 @@
-//! `persephone-cli`: headless tools for Persephone (backtests now; fetch, import and plugin
-//! scaffolding as later milestones land).
+//! `persephone-cli`: headless tools for Persephone: backtests, and scaffolding, building and
+//! installing plugins.
+
+mod plugin;
 
 use std::{
     collections::BTreeMap,
@@ -27,6 +29,9 @@ struct Cli {
 enum Command {
     /// Fetch Binance spot bars and run a built-in strategy on them.
     Backtest(BacktestArgs),
+    /// Create, build and install WebAssembly plugins.
+    #[command(subcommand)]
+    Plugin(plugin::PluginCommand),
 }
 
 #[derive(clap::Args)]
@@ -78,6 +83,7 @@ fn parse_strategy(id: &str) -> Result<BuiltInStrategy, String> {
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Backtest(args) => backtest(&args),
+        Command::Plugin(command) => plugin::run(&command),
     }
 }
 
@@ -116,6 +122,7 @@ fn backtest(args: &BacktestArgs) -> anyhow::Result<()> {
         timeframe: tf,
         candles,
         strategy,
+        plugin: None,
         starting_balance: args.balance,
         fees: match args.fees {
             Fees::Binance => FeeRates::BINANCE_SPOT,

@@ -1,0 +1,94 @@
+/// Persephone's plugin contract.
+///
+/// A plugin is a WebAssembly component built for `wasm32-wasip2` that exports one of the two
+/// worlds below. It runs sandboxed: no files, no network, bounded memory and CPU. Write
+/// plugins in Rust with the `persephone-sdk` crate, or in any language that targets the
+/// component model.
+package persephone:plugin@0.1.0;
+
+interface types {
+    /// One closed OHLCV bar. `ts` is the bar's open time in nanoseconds since the Unix epoch.
+    record bar {
+        ts: u64,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        volume: f64,
+    }
+
+    /// A numeric parameter the user can edit. Periods set `integer`.
+    record param {
+        name: string,
+        default: f64,
+        min: f64,
+        max: f64,
+        integer: bool,
+    }
+
+    enum placement {
+        /// On the price pane, sharing its scale.
+        overlay,
+        /// In a pane of its own below the prices.
+        pane,
+    }
+
+    enum output-style {
+        line,
+        /// Bars from zero, colored by sign.
+        histogram,
+    }
+
+    record output {
+        name: string,
+        style: output-style,
+    }
+
+    record indicator-info {
+        /// Full name for menus, e.g. "Hull Moving Average".
+        name: string,
+        /// Legend name, e.g. "HMA".
+        short-name: string,
+        placement: placement,
+        params: list<param>,
+        outputs: list<output>,
+        /// Indices of two outputs whose area between them is shaded.
+        fill: option<tuple<u32, u32>>,
+        /// Dashed reference levels in the indicator's pane.
+        levels: list<f64>,
+        /// A fixed scale for its pane; none fits the visible values.
+        range: option<tuple<f64, f64>>,
+    }
+
+    record strategy-info {
+        name: string,
+        /// One line for menus.
+        description: string,
+        /// The host adds a final "Size %" parameter of its own; don't declare one.
+        params: list<param>,
+    }
+}
+
+/// An indicator: values for every bar, all at once.
+world indicator {
+    use types.{bar, indicator-info};
+
+    export describe: func() -> indicator-info;
+
+    /// One list per output, each as long as `bars`; NaN where there is no value yet.
+    export compute: func(params: list<f64>, bars: list<bar>) -> result<list<list<f64>>, string>;
+}
+
+/// A strategy: sees each closed bar in order and says which position it wants. Persephone
+/// turns those wishes into orders and runs the backtest.
+world strategy {
+    use types.{bar, strategy-info};
+
+    export describe: func() -> strategy-info;
+
+    /// Called once before the first bar, with the user's parameters (without "Size %").
+    export start: func(params: list<f64>) -> result<_, string>;
+
+    /// 1 for long, -1 for short, 0 for flat, or none to keep the current position.
+    export on-bar: func(bar: bar) -> option<s8>;
+}

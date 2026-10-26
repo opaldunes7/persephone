@@ -3,12 +3,14 @@
 //!
 //! Menu pages:
 //! - root: Indicators ›, Strategy ›, Symbol ›, and a row of timeframe chips;
-//! - indicators: every built-in, grouped by where it's drawn;
-//! - strategies: every built-in strategy, with a one-line description;
+//! - indicators: every built-in, grouped by where it's drawn, then loaded plugins;
+//! - strategies: every built-in strategy and plugin, with a one-line description;
 //! - symbol: a search box with popular Binance pairs.
 //!
 //! The report opens from a chart's strategy summary: settings, full statistics and a remove
 //! button.
+
+use std::path::Path;
 
 use iced::{
     Background, Border, Color, Element, Fill, Point, Shadow, Size, Vector,
@@ -18,9 +20,10 @@ use persephone_chart::theme;
 use persephone_core::{
     Timeframe,
     indicator::{BuiltIn, IndicatorSpec, Param, Placement},
-    strategy::{BuiltInStrategy, StrategySpec},
+    strategy::{BuiltInStrategy, StrategyKind, StrategySpec},
 };
 use persephone_engine::BacktestReport;
+use persephone_plugin_host::Plugins;
 use persephone_tiling::TileId;
 
 use crate::Run;
@@ -120,8 +123,10 @@ impl Popup {
         }
     }
 
-    /// A generous guess at the panel's height, for keeping it on screen.
-    fn height(&self) -> f32 {
+    /// A generous guess at the panel's height, for keeping it on screen. `extra` counts rows a
+    /// page adds for plugins.
+    fn height(&self, extra: usize) -> f32 {
+        let extra = 30.0 * extra as f32;
         match self {
             Self::Menu {
                 page: Page::Root, ..
@@ -129,11 +134,11 @@ impl Popup {
             Self::Menu {
                 page: Page::Indicators,
                 ..
-            } => 360.0,
+            } => 400.0 + extra,
             Self::Menu {
                 page: Page::Strategies,
                 ..
-            } => 230.0,
+            } => 270.0 + extra,
             Self::Menu {
                 page: Page::Symbol { .. },
                 ..
@@ -148,6 +153,8 @@ impl Popup {
 pub enum MenuMessage {
     Open(Page),
     AddIndicator(BuiltIn),
+    /// A plugin indicator, by id.
+    AddPluginIndicator(String),
     SetTimeframe(Timeframe),
     QueryChanged(String),
     SetSymbol(String),
@@ -155,6 +162,8 @@ pub enum MenuMessage {
     ParamChanged(usize, String),
     RemoveStudy,
     SetStrategy(BuiltInStrategy),
+    /// A plugin strategy, by id.
+    SetPluginStrategy(String),
     StrategyParamChanged(usize, String),
     RemoveStrategy,
     Close,
@@ -168,6 +177,9 @@ pub struct TileInfo<'a> {
     pub timeframe: Timeframe,
     pub specs: &'a [IndicatorSpec],
     pub strategy: Option<(&'a StrategySpec, &'a Run)>,
+    pub plugins: &'a Plugins,
+    /// Where plugin files go, to tell people.
+    pub plugin_dir: Option<&'a Path>,
 }
 
 /// The popup, pinned at `origin` (the tile content's top-left in the window) plus its own
@@ -181,8 +193,12 @@ pub fn view<'a>(
     let content = match popup {
         Popup::Menu { page, .. } => match page {
             Page::Root => root(&tile),
-            Page::Indicators => indicators(),
-            Page::Strategies => strategies(tile.strategy.map(|(spec, _)| spec.kind)),
+            Page::Indicators => indicators(tile.plugins, tile.plugin_dir),
+            Page::Strategies => strategies(
+                tile.strategy.map(|(spec, _)| &spec.kind),
+                tile.plugins,
+                tile.plugin_dir,
+            ),
             Page::Symbol { query } => symbols(query, tile.symbol),
         },
         Popup::Settings {
@@ -200,13 +216,24 @@ pub fn view<'a>(
         },
     };
 
+    let extra = match popup {
+        Popup::Menu {
+            page: Page::Indicators,
+            ..
+        } => tile.plugins.indicators.len() + tile.plugins.errors.len() + 2,
+        Popup::Menu {
+            page: Page::Strategies,
+            ..
+        } => 2 * tile.plugins.strategies.len() + 2,
+        _ => 0,
+    };
     let at = popup.at();
     let width = popup.width();
     let x = (origin.x + at.x)
         .min(window.width - width - MARGIN)
         .max(MARGIN);
     let y = (origin.y + at.y)
-        .min(window.height - popup.height() - MARGIN)
+        .min(window.height - popup.height(extra) - MARGIN)
         .max(MARGIN);
     pin(opaque(panel(content, width))).x(x).y(y).into()
 }
@@ -223,7 +250,9 @@ fn root<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
     }))
     .spacing(3);
 
-    let strategy = tile.strategy.map_or("None", |(spec, _)| spec.kind.name());
+    let strategy = tile
+        .strategy
+        .map_or("None", |(spec, _)| spec.info.name.as_str());
     column![
         item("Indicators", "›", MenuMessage::Open(Page::Indicators)),
         item("Strategy", strategy, MenuMessage::Open(Page::Strategies)),
@@ -242,7 +271,7 @@ fn root<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
     .into()
 }
 
-fn indicators<'a>() -> Element<'a, MenuMessage> {
+fn indicators<'a>(plugins: &'a Plugins, dir: Option<&'a Path>) -> Element<'a, MenuMessage> {
     let group = |placement: Placement| {
         BuiltIn::ALL
             .into_iter()
@@ -255,39 +284,102 @@ fn indicators<'a>() -> Element<'a, MenuMessage> {
                 )
             })
     };
+    let from_plugins = plugins.indicators.values().map(|plugin| {
+        item(
+            &plugin.info.name,
+            &plugin.info.short_name,
+            MenuMessage::AddPluginIndicator(plugin.id.clone()),
+        )
+    });
+    let broken = plugins.errors.iter().map(|(file, error)| {
+        container(text(format!("{file}: {error}")).size(11).color(theme::DOWN))
+            .padding([2, 10])
+            .into()
+    });
+
     column![back("Indicators"), section("On the chart")]
         .extend(group(Placement::Overlay))
         .push(section("In a pane below"))
         .extend(group(Placement::Pane))
+        .push(section("Plugins"))
+        .extend(from_plugins)
+        .extend(broken)
+        .extend(plugin_note(dir, plugins))
         .spacing(2)
         .into()
 }
 
-fn strategies<'a>(current: Option<BuiltInStrategy>) -> Element<'a, MenuMessage> {
-    let choices = BuiltInStrategy::ALL.into_iter().map(move |kind| {
-        let hint = if current == Some(kind) { "current" } else { "" };
-        button(
-            column![
-                row![
-                    text(kind.name()).size(13),
-                    space::horizontal(),
-                    text(hint).size(12).color(theme::TEXT_MUTED),
-                ],
-                text(kind.description()).size(11).color(theme::TEXT_MUTED),
-            ]
-            .spacing(2),
+fn strategies<'a>(
+    current: Option<&'a StrategyKind>,
+    plugins: &'a Plugins,
+    dir: Option<&'a Path>,
+) -> Element<'a, MenuMessage> {
+    let built_in = BuiltInStrategy::ALL.into_iter().map(move |kind| {
+        let selected = current == Some(&StrategyKind::BuiltIn(kind));
+        strategy_choice(
+            kind.name(),
+            kind.description(),
+            selected,
+            MenuMessage::SetStrategy(kind),
         )
-        .width(Fill)
-        .padding([6, 10])
-        .on_press(MenuMessage::SetStrategy(kind))
-        .style(|_, status| item_style(status))
-        .into()
+    });
+    let from_plugins = plugins.strategies.values().map(move |plugin| {
+        let selected = current == Some(&StrategyKind::Plugin(plugin.id.clone()));
+        strategy_choice(
+            &plugin.info.name,
+            &plugin.info.description,
+            selected,
+            MenuMessage::SetPluginStrategy(plugin.id.clone()),
+        )
     });
     column![back("Strategy")]
-        .extend(choices)
+        .extend(built_in)
+        .push(section("Plugins"))
+        .extend(from_plugins)
         .push(note("Backtests this chart's bars from a 100,000 balance"))
+        .extend(plugin_note(dir, plugins))
         .spacing(2)
         .into()
+}
+
+fn strategy_choice<'a>(
+    name: &'a str,
+    description: &'a str,
+    selected: bool,
+    on_press: MenuMessage,
+) -> Element<'a, MenuMessage> {
+    button(
+        column![
+            row![
+                text(name).size(13),
+                space::horizontal(),
+                text(if selected { "current" } else { "" })
+                    .size(12)
+                    .color(theme::TEXT_MUTED),
+            ],
+            text(description).size(11).color(theme::TEXT_MUTED),
+        ]
+        .spacing(2),
+    )
+    .width(Fill)
+    .padding([6, 10])
+    .on_press(on_press)
+    .style(|_, status| item_style(status))
+    .into()
+}
+
+/// Where to drop plugin files; they load and reload on their own.
+fn plugin_note<'a>(dir: Option<&Path>, plugins: &Plugins) -> Option<Element<'a, MenuMessage>> {
+    match dir {
+        Some(dir) => Some(note_owned(format!(
+            "Drop .wasm plugins into {}",
+            dir.display()
+        ))),
+        None if plugins.indicators.is_empty() && plugins.strategies.is_empty() => {
+            Some(note("Plugins aren't available in this session"))
+        }
+        None => None,
+    }
 }
 
 fn symbols<'a>(query: &'a str, current: &'a str) -> Element<'a, MenuMessage> {
@@ -324,9 +416,9 @@ fn settings<'a>(
     inputs: &'a [String],
     error: Option<&'a str>,
 ) -> Element<'a, MenuMessage> {
-    let mut body = column![header(spec.kind.name())]
+    let mut body = column![header(&spec.info.name)]
         .extend(param_rows(
-            spec.kind.params(),
+            &spec.info.params,
             inputs,
             MenuMessage::ParamChanged,
         ))
@@ -347,9 +439,9 @@ fn report<'a>(
     inputs: &'a [String],
     error: Option<&'a str>,
 ) -> Element<'a, MenuMessage> {
-    let mut body = column![header(spec.kind.name())]
+    let mut body = column![header(&spec.info.name)]
         .extend(param_rows(
-            spec.kind.params(),
+            &spec.info.params,
             inputs,
             MenuMessage::StrategyParamChanged,
         ))
@@ -450,7 +542,7 @@ fn header(title: &str) -> Element<'_, MenuMessage> {
 
 /// One labelled input per parameter; edits go out as `on_change(index, text)`.
 fn param_rows<'a>(
-    params: &'static [Param],
+    params: &'a [Param],
     inputs: &'a [String],
     on_change: fn(usize, String) -> MenuMessage,
 ) -> Vec<Element<'a, MenuMessage>> {
@@ -460,7 +552,10 @@ fn param_rows<'a>(
         .enumerate()
         .map(|(i, (param, value))| {
             row![
-                text(param.name).size(12).color(theme::TEXT).width(90),
+                text(param.name.as_ref())
+                    .size(12)
+                    .color(theme::TEXT)
+                    .width(90),
                 text_input("", value)
                     .on_input(move |v| on_change(i, v))
                     .padding([5, 8])
@@ -537,6 +632,12 @@ fn section(title: &str) -> Element<'_, MenuMessage> {
 }
 
 fn note(content: &str) -> Element<'_, MenuMessage> {
+    container(text(content).size(11).color(theme::TEXT_MUTED))
+        .padding([4, 10])
+        .into()
+}
+
+fn note_owned<'a>(content: String) -> Element<'a, MenuMessage> {
     container(text(content).size(11).color(theme::TEXT_MUTED))
         .padding([4, 10])
         .into()
