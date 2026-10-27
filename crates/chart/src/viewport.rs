@@ -71,6 +71,11 @@ impl Viewport {
         self.price_zoom = 1.0;
     }
 
+    /// Back to the default bar width, keeping the bar at the right edge.
+    pub fn reset_spacing(&mut self) {
+        self.spacing = DEFAULT_SPACING;
+    }
+
     /// Keeps a few bars on screen at either end of the data.
     fn clamp(&mut self, plot_width: f32, len: usize) {
         let last = len.saturating_sub(1) as f64;

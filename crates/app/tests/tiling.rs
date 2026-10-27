@@ -322,7 +322,7 @@ mod workspaces {
         let mut app = app();
         let _ = app.update(Message::Chart(
             0,
-            persephone_chart::ChartMessage::Clicked {
+            persephone_chart::ChartMessage::RightClicked {
                 at: iced::Point::new(50.0, 50.0),
             },
         ));

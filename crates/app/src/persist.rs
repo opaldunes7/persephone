@@ -52,6 +52,9 @@ pub struct SavedTile {
     /// Missing in layouts saved before strategies existed.
     #[serde(default)]
     pub strategy: Option<SavedStrategy>,
+    /// The Active list has hidden the market's drawings on this chart.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub drawings_hidden: bool,
 }
 
 /// A built-in strategy by id (e.g. "ema-cross") with its parameters. Unknown ids are skipped.
@@ -59,6 +62,9 @@ pub struct SavedTile {
 pub struct SavedStrategy {
     pub kind: String,
     pub params: Vec<f64>,
+    /// Switched off in the Active list.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
 }
 
 /// A built-in indicator by id (e.g. "ema") with its parameters. Unknown ids are skipped when
@@ -67,6 +73,17 @@ pub struct SavedStrategy {
 pub struct SavedIndicator {
     pub kind: String,
     pub params: Vec<f64>,
+    /// Switched off in the Active list.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde passes fields by reference"
+)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Saved {
@@ -184,11 +201,14 @@ mod tests {
                     indicators: vec![SavedIndicator {
                         kind: "ema".into(),
                         params: vec![21.0],
+                        hidden: true,
                     }],
                     strategy: Some(SavedStrategy {
                         kind: "ema-cross".into(),
                         params: vec![10.0, 30.0, 10.0],
+                        hidden: false,
                     }),
+                    drawings_hidden: false,
                 },
                 SavedTile {
                     id: 1,
@@ -197,6 +217,7 @@ mod tests {
                     timeframe: "4h".into(),
                     indicators: Vec::new(),
                     strategy: None,
+                    drawings_hidden: true,
                 },
             ],
         }
@@ -232,7 +253,7 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut old = ron::ser::to_string(&saved()).unwrap();
         old = old
-            .replace(",indicators:[(kind:\"ema\",params:[21.0])]", "")
+            .replace(",indicators:[(kind:\"ema\",params:[21.0],hidden:true)]", "")
             .replace(",indicators:[]", "")
             .replace(
                 ",strategy:Some((kind:\"ema-cross\",params:[10.0,30.0,10.0]))",

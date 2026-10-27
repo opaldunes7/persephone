@@ -1,8 +1,13 @@
-//! The left-click menu, the indicator settings popover and the strategy report. All float
+//! The right-click menu, the indicator settings popover and the strategy report. All float
 //! above the tiles where they were opened; the app owns what they act on.
 //!
+//! The menu opens on a right click. The chart's header has two shortcuts of its own: clicking
+//! the symbol turns it into a search box with a dropdown of matching markets, and clicking the
+//! timeframe drops down every timeframe.
+//!
 //! Menu pages:
-//! - root: Indicators ›, Strategy ›, Symbol ›, and a row of timeframe chips;
+//! - root: what's active on the chart, each with a checkbox to show or hide it, then
+//!   Indicators ›, Strategy ›, Draw ›, Symbol ›, and a row of timeframe chips;
 //! - indicators: every built-in, grouped by where it's drawn, then loaded plugins;
 //! - strategies: every built-in strategy and plugin, with a one-line description;
 //! - symbol: a search box over markets in the local store and popular Binance pairs.
@@ -18,7 +23,9 @@ use std::{
 
 use iced::{
     Background, Border, Color, Element, Fill, Point, Shadow, Size, Vector,
-    widget::{Id, button, column, container, opaque, pin, row, rule, space, text, text_input},
+    widget::{
+        Id, button, checkbox, column, container, opaque, pin, row, rule, space, text, text_input,
+    },
 };
 use persephone_chart::{Tool, theme};
 use persephone_core::{
@@ -37,12 +44,14 @@ use persephone_plugin_host::Plugins;
 use persephone_tiling::TileId;
 
 use crate::{
-    Run,
+    Hidden, Run,
     live::{Live, LiveState},
 };
 
 pub const WIDTH: f32 = 248.0;
 pub const REPORT_WIDTH: f32 = 300.0;
+const SEARCH_WIDTH: f32 = 280.0;
+const TIMEFRAMES_WIDTH: f32 = 190.0;
 pub const IMPORT_WIDTH: f32 = 440.0;
 /// Room kept between a popup and the window edge.
 const MARGIN: f32 = 6.0;
@@ -118,6 +127,16 @@ pub enum Popup {
         index: usize,
         at: Point,
     },
+    /// The header's symbol, turned into a search box, with matching markets dropping down.
+    SymbolSearch {
+        tile: TileId,
+        query: String,
+    },
+    /// Every timeframe, dropping down from the header's timeframe.
+    Timeframes {
+        tile: TileId,
+        at: Point,
+    },
     /// CSV files dropped on the tile, on their way into the local store.
     Import {
         tile: TileId,
@@ -150,6 +169,8 @@ impl Popup {
             | Self::Report { tile, .. }
             | Self::Drawing { tile, .. }
             | Self::Sweep { tile, .. }
+            | Self::SymbolSearch { tile, .. }
+            | Self::Timeframes { tile, .. }
             | Self::Import { tile, .. } => *tile,
         }
     }
@@ -200,7 +221,10 @@ impl Popup {
             | Self::Settings { at, .. }
             | Self::Report { at, .. }
             | Self::Drawing { at, .. }
-            | Self::Sweep { at, .. } => *at,
+            | Self::Sweep { at, .. }
+            | Self::Timeframes { at, .. } => *at,
+            // Over the header, so the search box's text sits where the symbol was.
+            Self::SymbolSearch { .. } => Point::new(2.0, 1.0),
             Self::Import { .. } => Point::new(24.0, 48.0),
         }
     }
@@ -209,6 +233,8 @@ impl Popup {
         match self {
             Self::Report { .. } | Self::Sweep { .. } => REPORT_WIDTH,
             Self::Import { .. } => IMPORT_WIDTH,
+            Self::SymbolSearch { .. } => SEARCH_WIDTH,
+            Self::Timeframes { .. } => TIMEFRAMES_WIDTH,
             _ => WIDTH,
         }
     }
@@ -220,7 +246,9 @@ impl Popup {
         match self {
             Self::Menu {
                 page: Page::Root, ..
-            } => 260.0,
+            } => 260.0 + extra,
+            Self::SymbolSearch { .. } => 70.0 + extra,
+            Self::Timeframes { .. } => 250.0 + extra,
             Self::Menu {
                 page: Page::Indicators,
                 ..
@@ -292,10 +320,21 @@ pub enum MenuMessage {
     SetPluginStrategy(String),
     StrategyParamChanged(usize, String),
     RemoveStrategy,
+    /// Show (`true`) or hide something in the Active list.
+    Show(Active, bool),
     /// Trade the tile's strategy on live bars, or stop.
     GoLive(LiveMode),
     StopLive,
     Close,
+}
+
+/// Something on a chart that the Active list can hide.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Active {
+    /// The indicator at this index.
+    Indicator(usize),
+    Strategy,
+    Drawings,
 }
 
 /// What the tile under the popup shows, for labels and the current selection.
@@ -326,6 +365,8 @@ pub struct TileInfo<'a> {
     pub strategy: Option<(&'a StrategySpec, &'a Run)>,
     /// Trading the strategy live: the session, if one ran, or why the chart can't.
     pub live: LiveInfo<'a>,
+    /// What the Active list has hidden.
+    pub hidden: &'a Hidden,
     pub plugins: &'a Plugins,
     /// Where plugin files go, to tell people.
     pub plugin_dir: Option<&'a Path>,
@@ -409,6 +450,8 @@ pub fn view<'a>(
             }
             None => column![].into(),
         },
+        Popup::SymbolSearch { query, .. } => symbol_search(query, &tile),
+        Popup::Timeframes { .. } => timeframes(&tile),
         Popup::Drawing { index, .. } => match tile.drawings.get(*index) {
             Some(drawing) => container(
                 column![
@@ -424,6 +467,14 @@ pub fn view<'a>(
     };
 
     let extra = match popup {
+        Popup::Menu {
+            page: Page::Root, ..
+        } => match active_count(&tile) {
+            0 => 0,
+            n => n + 2,
+        },
+        Popup::Timeframes { .. } => usize::from(tile.tick_kind.is_some()),
+        Popup::SymbolSearch { .. } => tile.local_markets.len().min(LOCAL_SHOWN) + 11,
         Popup::Menu {
             page: Page::Indicators,
             ..
@@ -469,7 +520,104 @@ pub fn view<'a>(
     let y = (origin.y + at.y)
         .min(window.height - popup.height(extra) - MARGIN)
         .max(MARGIN);
-    pin(opaque(panel(content, width))).x(x).y(y).into()
+    // The search box brings its own dropdown panel.
+    let content = match popup {
+        Popup::SymbolSearch { .. } => content,
+        _ => panel(content, width),
+    };
+    pin(opaque(content)).x(x).y(y).into()
+}
+
+/// How many rows the Active list has.
+fn active_count(tile: &TileInfo<'_>) -> usize {
+    tile.specs.len() + usize::from(tile.strategy.is_some()) + usize::from(!tile.drawings.is_empty())
+}
+
+/// Everything on the chart, each with a checkbox that shows or hides it.
+fn active<'a>(tile: &TileInfo<'a>) -> Vec<Element<'a, MenuMessage>> {
+    let toggle = |label: String, shown: bool, what: Active| -> Element<'a, MenuMessage> {
+        container(
+            checkbox(shown)
+                .label(label)
+                .size(14)
+                .text_size(13)
+                .spacing(8)
+                .on_toggle(move |on| MenuMessage::Show(what, on)),
+        )
+        .padding([4, 10])
+        .into()
+    };
+    let mut rows: Vec<Element<'a, MenuMessage>> = tile
+        .specs
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            toggle(
+                spec.to_string(),
+                !tile.hidden.indicators.contains(&i),
+                Active::Indicator(i),
+            )
+        })
+        .collect();
+    if let Some((spec, _)) = tile.strategy {
+        rows.push(toggle(
+            spec.to_string(),
+            !tile.hidden.strategy,
+            Active::Strategy,
+        ));
+    }
+    if !tile.drawings.is_empty() {
+        rows.push(toggle(
+            format!("Drawings ({})", tile.drawings.len()),
+            !tile.hidden.drawings,
+            Active::Drawings,
+        ));
+    }
+    rows
+}
+
+/// The header's timeframe dropdown: every timeframe, the current one ticked, and for local
+/// markets the tick and volume bars.
+fn timeframes<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
+    let mut page = column(Timeframe::ALL.into_iter().map(|tf| {
+        let current = BarSpec::Time(tf) == tile.bars;
+        local_item(
+            timeframe_name(tf),
+            if current {
+                "✓".into()
+            } else {
+                tf.label().to_owned()
+            },
+            MenuMessage::SetTimeframe(tf),
+        )
+    }));
+    if tile.tick_kind.is_some() {
+        let current = match tile.bars {
+            BarSpec::Time(_) => "›".to_owned(),
+            other => format!("{}  ›", other.label()),
+        };
+        page = page.push(local_item(
+            "Tick & volume bars",
+            current,
+            MenuMessage::Open(Page::Bars {
+                input: String::new(),
+                error: None,
+            }),
+        ));
+    }
+    page.spacing(2).into()
+}
+
+const fn timeframe_name(tf: Timeframe) -> &'static str {
+    match tf {
+        Timeframe::M1 => "1 minute",
+        Timeframe::M5 => "5 minutes",
+        Timeframe::M15 => "15 minutes",
+        Timeframe::M30 => "30 minutes",
+        Timeframe::H1 => "1 hour",
+        Timeframe::H4 => "4 hours",
+        Timeframe::D1 => "1 day",
+    }
 }
 
 fn root<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
@@ -487,7 +635,15 @@ fn root<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
     let strategy = tile
         .strategy
         .map_or("None", |(spec, _)| spec.info.name.as_str());
-    let mut page = column![
+    let active = active(tile);
+    let mut page = column![];
+    if !active.is_empty() {
+        page = page
+            .push(section("Active"))
+            .extend(active)
+            .push(separator());
+    }
+    let mut page = page.extend([
         item("Indicators", "›", MenuMessage::Open(Page::Indicators)),
         item("Strategy", strategy, MenuMessage::Open(Page::Strategies)),
         item("Draw", "›", MenuMessage::Open(Page::Draw)),
@@ -495,13 +651,13 @@ fn root<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
             "Symbol",
             tile.symbol,
             MenuMessage::Open(Page::Symbol {
-                query: String::new()
-            })
+                query: String::new(),
+            }),
         ),
         separator(),
         section("Timeframe"),
-        container(chips).padding([2, 6]),
-    ];
+        container(chips).padding([2, 6]).into(),
+    ]);
     // Local markets have ticks, so they can also be cut by tick count or volume.
     if tile.tick_kind.is_some() {
         let current = match tile.bars {
@@ -638,7 +794,6 @@ fn plugin_note<'a>(dir: Option<&Path>, plugins: &Plugins) -> Option<Element<'a, 
 }
 
 fn symbols<'a>(query: &'a str, tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
-    let needle = query.trim().to_uppercase();
     let input = text_input("Search, e.g. ETHUSDT", query)
         .id(symbol_input())
         .on_input(MenuMessage::QueryChanged)
@@ -646,7 +801,34 @@ fn symbols<'a>(query: &'a str, tile: &TileInfo<'a>) -> Element<'a, MenuMessage> 
         .padding([7, 10])
         .size(13)
         .style(|_, status| input_style(status));
+    column![back("Symbol"), container(input).padding([4, 6])]
+        .extend(symbol_matches(query, tile))
+        .spacing(2)
+        .into()
+}
 
+/// The header's symbol as a search box: typing narrows the dropdown under it, a click picks
+/// a market, and Enter opens whatever Binance pair is typed.
+fn symbol_search<'a>(query: &'a str, tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
+    let input = text_input(tile.symbol, query)
+        .id(symbol_input())
+        .on_input(MenuMessage::QueryChanged)
+        .on_submit(MenuMessage::SubmitSymbol)
+        .padding([6, 9])
+        .size(theme::LEGEND_SIZE)
+        .width(SEARCH_WIDTH)
+        .style(|_, status| input_style(status));
+    let matches = column(symbol_matches(query, tile)).spacing(2);
+    // Touching the box, so the price line under it doesn't show through a gap.
+    column![input, panel(matches.into(), SEARCH_WIDTH)]
+        .spacing(1)
+        .into()
+}
+
+/// Markets matching `query`: local ones first (when there are any), then Binance pairs, and a
+/// note that Enter opens any pair.
+fn symbol_matches<'a>(query: &str, tile: &TileInfo<'a>) -> Vec<Element<'a, MenuMessage>> {
+    let needle = query.trim().to_uppercase();
     let (current, venue) = (tile.symbol, tile.venue);
     let local: Vec<Element<'a, MenuMessage>> = tile
         .local_markets
@@ -678,7 +860,7 @@ fn symbols<'a>(query: &'a str, tile: &TileInfo<'a>) -> Element<'a, MenuMessage> 
 
     let binance = SYMBOLS
         .into_iter()
-        .filter(move |s| s.contains(&needle))
+        .filter(|s| s.contains(&needle))
         .take(8)
         .map(move |s| {
             let selected = s == current && venue.is_none();
@@ -689,17 +871,15 @@ fn symbols<'a>(query: &'a str, tile: &TileInfo<'a>) -> Element<'a, MenuMessage> 
             )
         });
 
-    let mut page = column![back("Symbol"), container(input).padding([4, 6])];
+    let mut rows = Vec::new();
     if !local.is_empty() {
-        page = page
-            .push(section("Local"))
-            .extend(local)
-            .push(section("Binance"));
+        rows.push(section("Local"));
+        rows.extend(local);
+        rows.push(section("Binance"));
     }
-    page.extend(binance)
-        .push(note("Enter loads any Binance spot pair"))
-        .spacing(2)
-        .into()
+    rows.extend(binance);
+    rows.push(note("Enter loads any Binance spot pair"));
+    rows
 }
 
 /// A menu item whose hint is built for it.

@@ -91,7 +91,7 @@ pub(crate) fn binance_app() -> Persephone {
 fn menu(app: &mut Persephone, message: MenuMessage) {
     let _ = app.update(Message::Chart(
         0,
-        ChartMessage::Clicked {
+        ChartMessage::RightClicked {
             at: Point::new(100.0, 100.0),
         },
     ));
@@ -236,6 +236,7 @@ fn saved_layouts_remember_local_markets() {
                 timeframe: "1h".into(),
                 indicators: Vec::new(),
                 strategy: None,
+                drawings_hidden: false,
             }],
         },
     )

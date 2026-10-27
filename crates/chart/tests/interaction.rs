@@ -84,6 +84,13 @@ fn release(ui: &mut Simulator<'_, ChartMessage>) {
     ))]);
 }
 
+fn right_click(ui: &mut Simulator<'_, ChartMessage>) {
+    ui.simulate([
+        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)),
+        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+    ]);
+}
+
 #[test]
 fn dragging_the_plot_pans() {
     let messages = interact(|ui| {
@@ -153,14 +160,23 @@ fn dragging_the_price_axis_scales_and_double_click_resets() {
 }
 
 #[test]
-fn the_time_axis_ignores_drags() {
+fn dragging_the_time_axis_scales_and_double_click_resets() {
+    let axis_y = HEIGHT - TIME_AXIS_HEIGHT / 2.0;
     let messages = interact(|ui| {
-        move_to(ui, 300.0, HEIGHT - TIME_AXIS_HEIGHT / 2.0);
+        move_to(ui, 300.0, axis_y);
         press(ui);
-        move_to(ui, 200.0, HEIGHT - TIME_AXIS_HEIGHT / 2.0);
+        move_to(ui, 200.0, axis_y);
+        release(ui);
+        press(ui);
         release(ui);
     });
-    assert!(messages.is_empty(), "{messages:?}");
+    match &messages[..] {
+        [
+            ChartMessage::ScaleTime { dx, .. },
+            ChartMessage::ResetTimeScale,
+        ] => assert_eq!(*dx, -100.0),
+        other => panic!("unexpected {other:?}"),
+    }
 }
 
 #[test]
@@ -188,6 +204,17 @@ fn messages_move_the_viewport() {
     assert!(chart.viewport().price_zoom > 1.0);
     chart.update(ChartMessage::ResetPriceScale);
     assert_eq!(chart.viewport().price_zoom, 1.0);
+
+    // The time axis: dragging left fits more bars, keeping the newest one on screen in place.
+    let right = chart.viewport().right;
+    chart.update(ChartMessage::ScaleTime {
+        dx: -100.0,
+        plot_width: PLOT_WIDTH,
+    });
+    assert!(chart.viewport().spacing < start.spacing * 2.0);
+    assert_eq!(chart.viewport().right, right);
+    chart.update(ChartMessage::ResetTimeScale);
+    assert_eq!(chart.viewport().spacing, start.spacing);
 }
 
 mod clicks {
@@ -197,7 +224,7 @@ mod clicks {
         ChartMessage, ChartState, OutputStyle, Placement, Study, StudyLine, theme,
     };
 
-    use super::{HEIGHT, WIDTH, data, move_to, press, release};
+    use super::{HEIGHT, WIDTH, data, move_to, press, release, right_click};
 
     fn with_study(placement: Placement) -> ChartState {
         let mut chart = ChartState::new(data());
@@ -231,16 +258,44 @@ mod clicks {
     }
 
     #[test]
-    fn a_still_click_opens_rather_than_pans() {
+    fn left_and_right_clicks_are_told_apart() {
         let chart = ChartState::new(data());
         let messages = clicks(&chart, |ui| {
             move_to(ui, 400.0, 300.0);
             press(ui);
-            move_to(ui, 402.0, 301.0); // jitter under the slop
+            move_to(ui, 402.0, 301.0); // jitter under the slop: not a pan
             release(ui);
+            right_click(ui);
         });
         match &messages[..] {
-            [ChartMessage::Clicked { at }] => assert_eq!(*at, Point::new(400.0, 300.0)),
+            [
+                ChartMessage::Clicked { at: left },
+                ChartMessage::RightClicked { at: right },
+            ] => {
+                assert_eq!(*left, Point::new(400.0, 300.0));
+                assert_eq!(*right, Point::new(402.0, 301.0));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_headers_symbol_and_timeframe_are_clickable() {
+        // "TESTUSDT · 1m · SIM": the symbol, then the timeframe, then the venue (just a click).
+        let chart = ChartState::new(data());
+        let messages = clicks(&chart, |ui| {
+            for x in [40.0, 105.0, 160.0] {
+                move_to(ui, x, 16.0);
+                press(ui);
+                release(ui);
+            }
+        });
+        match &messages[..] {
+            [
+                ChartMessage::SymbolClicked { .. },
+                ChartMessage::TimeframeClicked { .. },
+                ChartMessage::Clicked { .. },
+            ] => {}
             other => panic!("unexpected {other:?}"),
         }
     }

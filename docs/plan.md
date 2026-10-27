@@ -252,6 +252,11 @@ world strategy {
   - **CLI:** `persephone-cli live [--testnet | --real-money]`. Real money needs `BINANCE_API_KEY`/`BINANCE_API_SECRET` and the exact confirmation phrase typed at a terminal, and it's only in the CLI.
   - Keys are read by Nautilus from the environment, never by Persephone.
   - On spot accounts (testnet and real money), strategies go flat instead of short. Stopping a session closes its position.
+- **Menus and axes** (changed on request): the menu opens on a right click, and a left click
+  only closes it. Clicking the header's symbol turns it into a search box with its own dropdown
+  of matches; clicking the timeframe drops down the timeframes. The
+  time axis drags like the price axis. The menu starts with an **Active** list that shows or
+  hides each indicator, the strategy and the drawings, saved with the layout.
 - **External strategies** (`persephone_plugin_host::external`):
   - A `NAME.external` file in the plugins folder names a process listening on TCP or a Unix socket. It speaks JSON lines: `describe`, `start`, one `bar` at a time, then `end`.
   - Persephone waits for each answer, so a backtest runs in lockstep. External strategies appear alongside the plugins and work everywhere they do: backtests, sweeps and live sessions.

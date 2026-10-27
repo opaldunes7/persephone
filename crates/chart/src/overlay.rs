@@ -1,10 +1,15 @@
 //! Top layer: axes, labels, last-price line, crosshair and legends, for every pane. It also
 //! owns all mouse input for the chart:
 //!
-//! - a click (press and release without moving) publishes [`ChartMessage::Clicked`], or
-//!   [`ChartMessage::StudyClicked`] on an indicator's legend;
+//! - a right click publishes [`ChartMessage::RightClicked`] (the app's menu), a left click
+//!   on the bare plot [`ChartMessage::Clicked`];
+//! - a left click (press and release without moving) on an indicator's legend publishes
+//!   [`ChartMessage::StudyClicked`], on the header's symbol or timeframe
+//!   [`ChartMessage::SymbolClicked`] or [`ChartMessage::TimeframeClicked`], on a drawing
+//!   [`ChartMessage::DrawingClicked`], and while drawing [`ChartMessage::Placed`];
 //! - dragging the plot pans, scrolling zooms, horizontal swipes pan;
-//! - dragging the price axis scales prices, and double-clicking it resets them.
+//! - dragging the price axis scales prices and dragging the time axis scales time;
+//!   double-clicking either resets it.
 
 use std::time::{Duration, Instant};
 
@@ -49,6 +54,9 @@ pub(crate) struct Interaction {
     drag: Drag,
     hovering: bool,
     last_axis_click: Option<Instant>,
+    last_time_axis_click: Option<Instant>,
+    /// Where the right button went down on the plot.
+    right_press: Option<Point>,
     /// The open time of the bar under the cursor, as last told to the app.
     hovered_ts: Option<u64>,
 }
@@ -67,6 +75,9 @@ enum Drag {
     Price {
         last_y: f32,
     },
+    Time {
+        last_x: f32,
+    },
 }
 
 fn in_plot(p: Point, plot: Size) -> bool {
@@ -75,6 +86,45 @@ fn in_plot(p: Point, plot: Size) -> bool {
 
 fn on_price_axis(p: Point, plot: Size) -> bool {
     p.x >= plot.width && p.y < plot.height
+}
+
+fn on_time_axis(p: Point, plot: Size) -> bool {
+    p.x < plot.width && p.y >= plot.height
+}
+
+/// A clickable part of the header line ("BTCUSDT · 1h · BINANCE").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderPart {
+    Symbol,
+    Timeframe,
+}
+
+/// The header part under `p`, if any. The header's font is proportional, so widths are
+/// estimated, generously, from the characters.
+fn header_part(data: &ChartData, p: Point) -> Option<HeaderPart> {
+    if !(4.0..=28.0).contains(&p.y) {
+        return None;
+    }
+    let width = |text: &str| {
+        text.chars()
+            .map(|c| match c {
+                'A'..='Z' | '0'..='9' => 0.68,
+                '.' | ',' | ' ' => 0.3,
+                _ => 0.56,
+            })
+            .sum::<f32>()
+            * theme::LEGEND_SIZE
+    };
+    let symbol_end = LEGEND_X + width(&data.symbol);
+    let timeframe_start = symbol_end + width(" · ");
+    let timeframe_end = timeframe_start + width(&data.bars.to_string());
+    if (LEGEND_X - 4.0..=symbol_end + 3.0).contains(&p.x) {
+        Some(HeaderPart::Symbol)
+    } else if (timeframe_start - 3.0..=timeframe_end + 4.0).contains(&p.x) {
+        Some(HeaderPart::Timeframe)
+    } else {
+        None
+    }
 }
 
 impl canvas::Program<ChartMessage> for Overlay<'_> {
@@ -106,6 +156,19 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
                     }
                     state.last_axis_click = Some(now);
                     state.drag = Drag::Price { last_y: p.y };
+                } else if on_time_axis(p, plot) {
+                    let now = Instant::now();
+                    if state
+                        .last_time_axis_click
+                        .is_some_and(|t| now - t < DOUBLE_CLICK)
+                    {
+                        state.last_time_axis_click = None;
+                        return Some(
+                            canvas::Action::publish(ChartMessage::ResetTimeScale).and_capture(),
+                        );
+                    }
+                    state.last_time_axis_click = Some(now);
+                    state.drag = Drag::Time { last_x: p.x };
                 } else if in_plot(p, plot) {
                     state.drag = Drag::Press { start: p };
                 } else {
@@ -132,21 +195,42 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
                     let study = legend_rows(self.chart, &panes, bar)
                         .into_iter()
                         .find(|row| row.contains(start));
-                    let message = match (study, drawing_at(self.chart, &panes.price, start)) {
-                        (Some(row), _) => ChartMessage::StudyClicked {
+                    let header = header_part(&self.chart.data, start);
+                    let drawing = drawing_at(self.chart, &panes.price, start);
+                    let message = match (header, study, drawing) {
+                        (Some(HeaderPart::Symbol), _, _) => {
+                            ChartMessage::SymbolClicked { at: start }
+                        }
+                        (Some(HeaderPart::Timeframe), _, _) => {
+                            ChartMessage::TimeframeClicked { at: start }
+                        }
+                        (None, Some(row), _) => ChartMessage::StudyClicked {
                             study: row.study,
                             at: start,
                         },
-                        (None, Some(index)) => ChartMessage::DrawingClicked { index, at: start },
-                        (None, None) => ChartMessage::Clicked { at: start },
+                        (None, None, Some(index)) => {
+                            ChartMessage::DrawingClicked { index, at: start }
+                        }
+                        // The menu is a right click; a left click only closes things.
+                        (None, None, None) => ChartMessage::Clicked { at: start },
                     };
                     Some(canvas::Action::publish(message).and_capture())
                 }
-                Drag::Pan { .. } | Drag::Price { .. } => {
+                Drag::Pan { .. } | Drag::Price { .. } | Drag::Time { .. } => {
                     state.drag = Drag::Idle;
                     Some(canvas::Action::request_redraw().and_capture())
                 }
             },
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                let p = local.filter(|p| in_plot(*p, plot))?;
+                state.right_press = Some(p);
+                Some(canvas::Action::capture())
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)) => {
+                let start = state.right_press.take()?;
+                let p = local.filter(|p| p.distance(start) <= CLICK_SLOP)?;
+                Some(canvas::Action::publish(ChartMessage::RightClicked { at: p }).and_capture())
+            }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 // Drags keep going outside the chart, so use the absolute position.
                 let p = Point::new(position.x - bounds.x, position.y - bounds.y);
@@ -173,6 +257,14 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
                     Drag::Price { last_y } => {
                         state.drag = Drag::Price { last_y: p.y };
                         let message = ChartMessage::ScalePrice { dy: p.y - last_y };
+                        Some(canvas::Action::publish(message).and_capture())
+                    }
+                    Drag::Time { last_x } => {
+                        state.drag = Drag::Time { last_x: p.x };
+                        let message = ChartMessage::ScaleTime {
+                            dx: p.x - last_x,
+                            plot_width: plot.width,
+                        };
                         Some(canvas::Action::publish(message).and_capture())
                     }
                     Drag::Idle => {
@@ -345,8 +437,13 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
         match state.drag {
             Drag::Pan { .. } => mouse::Interaction::Grabbing,
             Drag::Price { .. } => mouse::Interaction::ResizingVertically,
+            Drag::Time { .. } => mouse::Interaction::ResizingHorizontally,
             Drag::Idle | Drag::Press { .. } => match cursor.position_in(bounds) {
                 Some(p) if on_price_axis(p, plot) => mouse::Interaction::ResizingVertically,
+                Some(p) if on_time_axis(p, plot) => mouse::Interaction::ResizingHorizontally,
+                Some(p) if header_part(&self.chart.data, p).is_some() => {
+                    mouse::Interaction::Pointer
+                }
                 Some(p) if in_plot(p, plot) => {
                     let panes = self.chart.panes(plot);
                     let bar = panes.price.bar_at(p.x, self.chart.data.candles.len());

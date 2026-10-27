@@ -1,4 +1,5 @@
-//! The left-click menu and indicator settings, driven through the same messages the UI sends.
+//! The right-click menu, the header's shortcuts, the Active list and indicator settings,
+//! driven through the same messages the UI sends.
 
 use std::path::PathBuf;
 
@@ -37,7 +38,7 @@ fn app() -> Persephone {
 fn click(app: &mut Persephone) {
     let _ = app.update(Message::Chart(
         0,
-        ChartMessage::Clicked {
+        ChartMessage::RightClicked {
             at: Point::new(300.0, 200.0),
         },
     ));
@@ -63,7 +64,7 @@ fn labels(app: &Persephone) -> Vec<String> {
 }
 
 #[test]
-fn a_click_opens_the_menu_and_another_closes_it() {
+fn a_right_click_opens_the_menu_and_a_left_click_closes_it() {
     let mut app = app();
     click(&mut app);
     assert!(matches!(
@@ -73,7 +74,11 @@ fn a_click_opens_the_menu_and_another_closes_it() {
             ..
         })
     ));
-    click(&mut app);
+    // Another right click moves the menu there.
+    let at = Point::new(500.0, 400.0);
+    let _ = app.update(Message::Chart(0, ChartMessage::RightClicked { at }));
+    assert!(matches!(app.popup(), Some(Popup::Menu { at: here, .. }) if *here == at));
+    let _ = app.update(Message::Chart(0, ChartMessage::Clicked { at }));
     assert!(app.popup().is_none());
 
     click(&mut app);
@@ -175,7 +180,7 @@ fn indicators_are_saved_and_restored() {
     let (mut first, _loads) = Persephone::start(&[], Some(path.clone()));
     let _ = first.update(Message::Chart(
         0,
-        ChartMessage::Clicked {
+        ChartMessage::RightClicked {
             at: Point::new(10.0, 10.0),
         },
     ));
@@ -191,6 +196,160 @@ fn indicators_are_saved_and_restored() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn the_headers_symbol_becomes_a_search_box() {
+    let mut app = app();
+    let _ = app.update(Message::Chart(
+        0,
+        ChartMessage::SymbolClicked {
+            at: Point::new(40.0, 16.0),
+        },
+    ));
+    assert!(matches!(app.popup(), Some(Popup::SymbolSearch { query, .. }) if query.is_empty()));
+
+    // Typing narrows the dropdown (upper-cased); picking a match switches the chart.
+    menu(&mut app, MenuMessage::QueryChanged("eth".into()));
+    assert!(matches!(app.popup(), Some(Popup::SymbolSearch { query, .. }) if query == "ETH"));
+    menu(&mut app, MenuMessage::SetSymbol("ETHUSDT".into()));
+    assert!(app.popup().is_none());
+    assert_eq!(app.tile_market(0).unwrap().0, "ETHUSDT");
+
+    // Enter opens whatever pair is typed.
+    let _ = app.update(Message::Chart(
+        0,
+        ChartMessage::SymbolClicked {
+            at: Point::new(40.0, 16.0),
+        },
+    ));
+    menu(&mut app, MenuMessage::QueryChanged("solusdt".into()));
+    menu(&mut app, MenuMessage::SubmitSymbol);
+    assert_eq!(app.tile_market(0).unwrap().0, "SOLUSDT");
+
+    // Escape leaves the symbol as it was.
+    let _ = app.update(Message::Chart(
+        0,
+        ChartMessage::SymbolClicked {
+            at: Point::new(40.0, 16.0),
+        },
+    ));
+    menu(&mut app, MenuMessage::QueryChanged("x".into()));
+    let _ = app.update(Message::Escape);
+    assert!(app.popup().is_none());
+    assert_eq!(app.tile_market(0).unwrap().0, "SOLUSDT");
+}
+
+#[test]
+fn the_headers_timeframe_drops_down_every_timeframe() {
+    let mut app = app();
+    let _ = app.update(Message::Chart(
+        0,
+        ChartMessage::TimeframeClicked {
+            at: Point::new(100.0, 16.0),
+        },
+    ));
+    assert!(matches!(app.popup(), Some(Popup::Timeframes { .. })));
+    menu(&mut app, MenuMessage::SetTimeframe(Timeframe::H4));
+    assert!(app.popup().is_none());
+    assert_eq!(app.tile_market(0).unwrap().1, Timeframe::H4.into());
+}
+
+mod active {
+    use persephone::menu::Active;
+    use persephone_core::strategy::BuiltInStrategy;
+
+    use super::*;
+
+    #[test]
+    fn unchecking_hides_without_removing() {
+        let mut app = app();
+        add(&mut app, BuiltIn::Ema);
+        add(&mut app, BuiltIn::Rsi);
+        click(&mut app);
+        menu(&mut app, MenuMessage::Open(Page::Strategies));
+        menu(
+            &mut app,
+            MenuMessage::SetStrategy(BuiltInStrategy::EmaCross),
+        );
+
+        click(&mut app);
+        menu(&mut app, MenuMessage::Show(Active::Indicator(0), false));
+        assert!(app.popup().is_some(), "the menu stays open for more");
+        assert_eq!(labels(&app), ["RSI 14"], "EMA hidden, still listed");
+        assert_eq!(app.tile_indicators(0).unwrap().len(), 2);
+
+        // The chart's studies are the shown ones; clicking RSI's legend opens RSI.
+        let _ = app.update(Message::Chart(
+            0,
+            ChartMessage::StudyClicked {
+                study: 0,
+                at: Point::new(20.0, 60.0),
+            },
+        ));
+        assert!(matches!(
+            app.popup(),
+            Some(Popup::Settings { study: 1, .. })
+        ));
+
+        click(&mut app);
+        menu(&mut app, MenuMessage::Show(Active::Strategy, false));
+        assert!(app.tile_hidden(0).unwrap().strategy);
+        assert!(app.tile_chart(0).unwrap().trades().is_none());
+
+        menu(&mut app, MenuMessage::Show(Active::Indicator(0), true));
+        assert_eq!(labels(&app), ["EMA 21", "RSI 14"]);
+    }
+
+    #[test]
+    fn removing_an_indicator_keeps_the_others_hidden_state() {
+        let mut app = app();
+        for kind in [BuiltIn::Ema, BuiltIn::Sma, BuiltIn::Rsi] {
+            add(&mut app, kind);
+        }
+        click(&mut app);
+        menu(&mut app, MenuMessage::Show(Active::Indicator(2), false));
+        // Remove the first: RSI moves to index 1 and stays hidden.
+        let _ = app.update(Message::Chart(
+            0,
+            ChartMessage::StudyClicked {
+                study: 0,
+                at: Point::new(20.0, 60.0),
+            },
+        ));
+        menu(&mut app, MenuMessage::RemoveStudy);
+        let hidden: Vec<usize> = app
+            .tile_hidden(0)
+            .unwrap()
+            .indicators
+            .iter()
+            .copied()
+            .collect();
+        assert_eq!(hidden, [1]);
+        assert_eq!(labels(&app), ["SMA 20"]);
+    }
+
+    #[test]
+    fn hidden_things_stay_hidden_after_a_restart() {
+        let dir = std::env::temp_dir().join(format!("persephone-active-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path: PathBuf = dir.join("layout.ron");
+
+        let (mut first, _loads) = Persephone::start(&[], Some(path.clone()));
+        for kind in [BuiltIn::Ema, BuiltIn::Rsi] {
+            click(&mut first);
+            menu(&mut first, MenuMessage::AddIndicator(kind));
+        }
+        click(&mut first);
+        menu(&mut first, MenuMessage::Show(Active::Indicator(1), false));
+        menu(&mut first, MenuMessage::Show(Active::Drawings, false));
+
+        let (restored, _loads) = Persephone::start(&[], Some(path));
+        let hidden = restored.tile_hidden(0).unwrap();
+        assert_eq!(hidden.indicators.iter().copied().collect::<Vec<_>>(), [1]);
+        assert!(hidden.drawings && !hidden.strategy);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 mod drawing {
     use iced::Point;
     use persephone::{
@@ -204,7 +363,7 @@ mod drawing {
     fn open_menu(app: &mut Persephone, id: u32) {
         let _ = app.update(Message::Chart(
             id,
-            ChartMessage::Clicked {
+            ChartMessage::RightClicked {
                 at: Point::new(80.0, 80.0),
             },
         ));

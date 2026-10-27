@@ -103,7 +103,10 @@ impl ChartData {
 #[derive(Clone, Debug)]
 pub enum ChartMessage {
     /// Drag by `dx` pixels; positive moves the bars right (into the past).
-    Pan { dx: f32, plot_width: f32 },
+    Pan {
+        dx: f32,
+        plot_width: f32,
+    },
     /// Zoom by `factor` around the point `from_right` pixels left of the plot's right edge.
     Zoom {
         factor: f32,
@@ -111,21 +114,52 @@ pub enum ChartMessage {
         plot_width: f32,
     },
     /// Price-axis drag by `dy` pixels.
-    ScalePrice { dy: f32 },
+    ScalePrice {
+        dy: f32,
+    },
     /// Back to fitting the visible bars.
     ResetPriceScale,
-    /// A left click (no drag) on the plot at `at`, in chart coordinates. The chart itself
-    /// ignores it; the app opens its menu there.
-    Clicked { at: Point },
+    /// A right click on the plot at `at`, in chart coordinates. The chart itself ignores it;
+    /// the app opens its menu there.
+    RightClicked {
+        at: Point,
+    },
+    /// A left click (no drag) on the bare plot; the app closes whatever is open.
+    Clicked {
+        at: Point,
+    },
+    /// A click on the symbol, or on the timeframe, in the chart's top-left header.
+    SymbolClicked {
+        at: Point,
+    },
+    TimeframeClicked {
+        at: Point,
+    },
+    /// Time-axis drag by `dx` pixels: right widens the bars (fewer on screen), left narrows
+    /// them. The newest bar on screen stays put.
+    ScaleTime {
+        dx: f32,
+        plot_width: f32,
+    },
+    /// Back to the default bar width.
+    ResetTimeScale,
     /// A left click on study `study`'s legend.
-    StudyClicked { study: usize, at: Point },
+    StudyClicked {
+        study: usize,
+        at: Point,
+    },
     /// The bar under the cursor changed (its open time), or the cursor left (`None`). The chart
     /// ignores it; the app moves the other charts' crosshairs to the same time.
-    Hovered { ts: Option<UnixNanos> },
+    Hovered {
+        ts: Option<UnixNanos>,
+    },
     /// A click while drawing, at this time and price; [`ChartState::place`] takes it.
     Placed(Anchor),
     /// A left click on drawing `index`.
-    DrawingClicked { index: usize, at: Point },
+    DrawingClicked {
+        index: usize,
+        at: Point,
+    },
 }
 
 /// One chart: its data and indicators, what part of it is on screen, and cached layers.
@@ -347,7 +381,14 @@ impl ChartState {
             } => self.viewport.zoom(factor, from_right, plot_width, len),
             ChartMessage::ScalePrice { dy } => self.viewport.scale_price(dy),
             ChartMessage::ResetPriceScale => self.viewport.reset_price(),
-            ChartMessage::Clicked { .. }
+            ChartMessage::ScaleTime { dx, plot_width } => {
+                self.viewport.zoom((dx * 0.005).exp(), 0.0, plot_width, len);
+            }
+            ChartMessage::ResetTimeScale => self.viewport.reset_spacing(),
+            ChartMessage::RightClicked { .. }
+            | ChartMessage::Clicked { .. }
+            | ChartMessage::SymbolClicked { .. }
+            | ChartMessage::TimeframeClicked { .. }
             | ChartMessage::StudyClicked { .. }
             | ChartMessage::Hovered { .. }
             | ChartMessage::Placed(_)

@@ -6,9 +6,10 @@
 //! opens a market from the local store, filled by `persephone-cli import`.
 //!
 //! The window is only charts, tiled like Hyprland's dwindle layout; see [`keymap`] for keys.
-//! Left-click a chart for its [`menu`]: indicators, a strategy to backtest, symbol and
-//! timeframe. Custom indicators and strategies are WebAssembly [`plugins`] dropped into the
-//! plugins folder; they load, and reload when the files change, without a restart. CSV tick
+//! Right-click a chart for its [`menu`]: what's active on it (with checkboxes), indicators, a
+//! strategy to backtest, symbol and timeframe. In a chart's header, clicking the symbol turns
+//! it into a search box and clicking the timeframe drops down the others. Custom indicators and strategies are WebAssembly
+//! [`plugins`] dropped into the plugins folder; they load, and reload when the files change, without a restart. CSV tick
 //! files dropped on a chart import into the local store and open there. A strategy's report
 //! can start paper trading it on live Binance bars.
 
@@ -64,7 +65,9 @@ use persephone_tiling::{Layout, Rect, TileId};
 use crate::{
     keymap::Action,
     live::{Live, LiveState},
-    menu::{ImportState, LiveInfo, MenuMessage, Page, Popup, SweepResult, SweepRow, TileInfo},
+    menu::{
+        Active, ImportState, LiveInfo, MenuMessage, Page, Popup, SweepResult, SweepRow, TileInfo,
+    },
     motion::Motion,
     persist::{Saved, SavedIndicator, SavedStrategy, SavedTile, SavedWorkspace},
 };
@@ -158,6 +161,19 @@ struct Tile {
     sweep: Option<u64>,
     /// Its strategy trading live bars, or how that went.
     live: Option<Live>,
+    /// What its Active list has switched off.
+    hidden: Hidden,
+}
+
+/// What a chart's Active list has switched off. Hidden things stay on the chart (and keep
+/// computing, so turning them back on is instant); they just aren't drawn.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Hidden {
+    /// Indices into the chart's indicators.
+    pub indicators: BTreeSet<usize>,
+    /// Its trades, equity pane and summary.
+    pub strategy: bool,
+    pub drawings: bool,
 }
 
 /// The charts of a workspace that isn't on screen.
@@ -294,16 +310,16 @@ impl Persephone {
     pub fn start(args: &[String], save_path: Option<PathBuf>) -> (Self, Task<Message>) {
         let saved = save_path.as_deref().and_then(persist::load);
 
-        let tiles: Vec<(TileId, Market, Vec<IndicatorSpec>, Option<StrategySpec>)> = match &saved {
+        let tiles: Vec<(TileId, Restored)> = match &saved {
             Some(saved) => saved
                 .tiles
                 .iter()
-                .map(|t| {
-                    let (market, indicators, strategy) = restore_tile(t);
-                    (t.id, market, indicators, strategy)
-                })
+                .map(|t| (t.id, restore_tile(t)))
                 .collect(),
-            None => vec![(0, market_from_args(args), Vec::new(), None)],
+            None => vec![(
+                0,
+                (market_from_args(args), Vec::new(), None, Hidden::default()),
+            )],
         };
 
         let drawings_path = save_path.as_ref().map(|p| p.with_file_name("drawings.ron"));
@@ -342,9 +358,7 @@ impl Persephone {
         app.refresh_local_markets();
         let mut loads: Vec<_> = tiles
             .into_iter()
-            .map(|(id, market, indicators, strategy)| {
-                app.add_tile(id, market, indicators, strategy)
-            })
+            .map(|(id, restored)| app.restore(id, restored))
             .collect();
         // The other workspaces load the same way, each swapped in while its tiles are added.
         for other in others {
@@ -354,8 +368,7 @@ impl Persephone {
             };
             app.swap_workspace(&mut workspace);
             for tile in &other.tiles {
-                let (market, indicators, strategy) = restore_tile(tile);
-                loads.push(app.add_tile(tile.id, market, indicators, strategy));
+                loads.push(app.restore(tile.id, restore_tile(tile)));
             }
             app.swap_workspace(&mut workspace);
             app.stash.insert(other.number, workspace);
@@ -497,6 +510,11 @@ impl Persephone {
 
     /// Tile `id`'s chart, once its bars are in.
     #[must_use]
+    pub fn tile_hidden(&self, id: TileId) -> Option<&Hidden> {
+        self.tiles.get(&id).map(|t| &t.hidden)
+    }
+
+    #[must_use]
     pub fn tile_live(&self, id: TileId) -> Option<&Live> {
         self.tiles.get(&id)?.live.as_ref()
     }
@@ -621,24 +639,38 @@ impl Persephone {
                     .collect();
                 return Task::batch(waiting.into_iter().map(|id| self.attach(id)));
             }
-            Message::Chart(id, ChartMessage::Clicked { at }) => {
-                // A click closes whatever is open; on a chart with nothing open, it opens the menu.
-                self.popup = match self.popup.take() {
-                    Some(_) => None,
-                    None => Some(Popup::Menu {
-                        tile: id,
-                        at,
-                        page: Page::Root,
-                    }),
-                };
+            Message::Chart(id, ChartMessage::RightClicked { at }) => {
+                self.popup = Some(Popup::Menu {
+                    tile: id,
+                    at,
+                    page: Page::Root,
+                });
+            }
+            Message::Chart(_, ChartMessage::Clicked { .. }) => self.popup = None,
+            Message::Chart(id, ChartMessage::SymbolClicked { .. }) => {
+                self.popup = Some(Popup::SymbolSearch {
+                    tile: id,
+                    query: String::new(),
+                });
+                self.refresh_local_markets();
+                return operation::focus(menu::symbol_input());
+            }
+            Message::Chart(id, ChartMessage::TimeframeClicked { at }) => {
+                self.popup = Some(Popup::Timeframes {
+                    tile: id,
+                    at: below_header(at),
+                });
             }
             Message::Chart(id, ChartMessage::StudyClicked { study, at }) => {
                 let Some(tile) = self.tiles.get(&id) else {
                     return Task::none();
                 };
-                // Studies after the indicators belong to the strategy (its equity pane).
-                self.popup = match tile.indicators.get(study) {
-                    Some(spec) => Some(Popup::settings(id, study, at, spec)),
+                // The chart shows the indicators that aren't hidden, then the strategy's equity.
+                let shown = (0..tile.indicators.len())
+                    .filter(|i| !tile.hidden.indicators.contains(i))
+                    .nth(study);
+                self.popup = match shown {
+                    Some(index) => Some(Popup::settings(id, index, at, &tile.indicators[index])),
                     None => self.report_popup(id),
                 };
             }
@@ -1288,7 +1320,11 @@ impl Persephone {
             if drawing_key(&tile.market) == key
                 && let Some(chart) = &mut tile.chart
             {
-                chart.set_drawings(list.clone());
+                chart.set_drawings(if tile.hidden.drawings {
+                    Vec::new()
+                } else {
+                    list.clone()
+                });
             }
         }
         if let Some(path) = &self.drawings_path
@@ -1491,7 +1527,8 @@ impl Persephone {
                 if let Popup::Menu {
                     page: Page::Symbol { query },
                     ..
-                } = &popup
+                }
+                | Popup::SymbolSearch { query, .. } = &popup
                 {
                     let symbol = query.trim().to_uppercase();
                     if !symbol.is_empty() {
@@ -1583,9 +1620,36 @@ impl Persephone {
             }
             MenuMessage::StartSweep => return self.start_sweep(popup),
             MenuMessage::Draw(tool) => {
+                // Drawing on a chart whose drawings are hidden shows them again.
+                if let Some(tile) = self.tiles.get_mut(&id)
+                    && std::mem::take(&mut tile.hidden.drawings)
+                {
+                    self.show_drawings(&market);
+                    self.save();
+                }
                 if let Some(chart) = self.tiles.get_mut(&id).and_then(|t| t.chart.as_mut()) {
                     chart.start_drawing(tool);
                 }
+            }
+            MenuMessage::Show(what, shown) => {
+                if let Some(tile) = self.tiles.get_mut(&id) {
+                    match what {
+                        Active::Indicator(index) if shown => {
+                            tile.hidden.indicators.remove(&index);
+                        }
+                        Active::Indicator(index) => {
+                            tile.hidden.indicators.insert(index);
+                        }
+                        Active::Strategy => tile.hidden.strategy = !shown,
+                        Active::Drawings => tile.hidden.drawings = !shown,
+                    }
+                }
+                if what == Active::Drawings {
+                    self.show_drawings(&market);
+                }
+                self.restudy(id);
+                self.save();
+                self.popup = Some(popup);
             }
             MenuMessage::RemoveDrawing => {
                 if let Popup::Drawing { index, .. } = popup
@@ -1604,7 +1668,8 @@ impl Persephone {
                 if let Popup::Menu {
                     page: Page::Symbol { query },
                     ..
-                } = &mut popup
+                }
+                | Popup::SymbolSearch { query, .. } = &mut popup
                 {
                     *query = text.to_uppercase();
                 }
@@ -1641,6 +1706,12 @@ impl Persephone {
                     && study < tile.indicators.len()
                 {
                     tile.indicators.remove(study);
+                    // Later indicators move up one.
+                    tile.hidden.indicators = std::mem::take(&mut tile.hidden.indicators)
+                        .into_iter()
+                        .filter(|&i| i != study)
+                        .map(|i| if i > study { i - 1 } else { i })
+                        .collect();
                     self.restudy(id);
                     self.save();
                 }
@@ -1824,10 +1895,24 @@ impl Persephone {
                 flash: None,
                 sweep: None,
                 live: None,
+                hidden: Hidden::default(),
             },
         );
         let backtest = self.attach(id);
         Task::batch([load, backtest])
+    }
+
+    /// Adds a tile as it was saved, with what its Active list had hidden.
+    fn restore(
+        &mut self,
+        id: TileId,
+        (market, indicators, strategy, hidden): Restored,
+    ) -> Task<Message> {
+        let task = self.add_tile(id, market, indicators, strategy);
+        if let Some(tile) = self.tiles.get_mut(&id) {
+            tile.hidden = hidden;
+        }
+        task
     }
 
     /// Points tile `id` at another market, keeping its indicators and strategy.
@@ -1874,12 +1959,14 @@ impl Persephone {
             return Task::none();
         };
         let mut chart = ChartState::new(Arc::clone(&market.data));
-        chart.set_drawings(
-            self.drawings
-                .get(&drawing_key(&tile.market))
-                .cloned()
-                .unwrap_or_default(),
-        );
+        if !tile.hidden.drawings {
+            chart.set_drawings(
+                self.drawings
+                    .get(&drawing_key(&tile.market))
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
         tile.chart = Some(chart);
         self.restudy(id);
         self.run_backtest(id)
@@ -1932,10 +2019,18 @@ impl Persephone {
             return;
         };
         let data = Arc::clone(chart.data());
-        let mut built = studies::build(&tile.indicators, &data.candles, &self.plugins);
+        let shown: Vec<IndicatorSpec> = tile
+            .indicators
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !tile.hidden.indicators.contains(i))
+            .map(|(_, spec)| spec.clone())
+            .collect();
+        let mut built = studies::build(&shown, &data.candles, &self.plugins);
         // A report a bar or two short is the last one, while a rerun catches up with live bars.
         let len = data.candles.len();
-        let report = match tile.strategy.as_ref().map(|s| &s.run) {
+        let strategy = tile.strategy.as_ref().filter(|_| !tile.hidden.strategy);
+        let report = match strategy.map(|s| &s.run) {
             Some(Run::Done(report))
                 if (len.saturating_sub(2)..=len).contains(&report.equity.len()) =>
             {
@@ -1950,6 +2045,7 @@ impl Persephone {
         let live = tile
             .live
             .as_ref()
+            .filter(|_| !tile.hidden.strategy)
             .and_then(|l| Some((l.since?, l.fills.as_slice())));
         chart.set_trades(match (report, live) {
             (report, Some((since, fills))) => Some(studies::live_trades(
@@ -2117,6 +2213,7 @@ impl Persephone {
                     unavailable: self.live_unavailable(popup.tile()),
                     testnet: LiveMode::Testnet.has_keys(),
                 },
+                hidden: &tile.hidden,
                 plugins: &self.plugins,
                 plugin_dir: self.plugin_dir.as_deref(),
             };
@@ -2198,7 +2295,7 @@ impl Persephone {
             Some(chart) => chart.view().map(move |message| Message::Chart(id, message)),
             None => placeholder(&tile.market, self.bars.get(&tile.market)),
         };
-        if let Some(strategy) = &tile.strategy {
+        if let Some(strategy) = tile.strategy.as_ref().filter(|_| !tile.hidden.strategy) {
             let compact = rect.width < 640.0;
             let summary = container(strategy_summary(id, strategy, tile.live.as_ref(), compact))
                 .align_right(Fill)
@@ -2375,6 +2472,12 @@ fn placeholder<'a>(market: &Market, bars: Option<&Bars>) -> Element<'a, Message>
         .into()
 }
 
+/// Where a popup opened from the chart's header goes: just under the header line, so it
+/// stays readable.
+fn below_header(at: Point) -> Point {
+    Point::new((at.x - 16.0).max(0.0), 30.0)
+}
+
 fn mix(a: Color, b: Color, t: f32) -> Color {
     let lerp = |x: f32, y: f32| x + (y - x) * t;
     Color::from_rgba(
@@ -2395,22 +2498,33 @@ pub fn drawing_key(market: &Market) -> String {
 }
 
 /// A saved tile's market, indicators and strategy.
-fn restore_tile(t: &SavedTile) -> (Market, Vec<IndicatorSpec>, Option<StrategySpec>) {
+/// A saved tile, read back: its market, indicators, strategy, and what was hidden.
+type Restored = (Market, Vec<IndicatorSpec>, Option<StrategySpec>, Hidden);
+
+fn restore_tile(t: &SavedTile) -> Restored {
     let market = Market {
         local: t.local.clone(),
         symbol: t.symbol.clone(),
         bars: t.timeframe.parse().unwrap_or(BarSpec::Time(Timeframe::M1)),
     };
-    let indicators = t
-        .indicators
-        .iter()
-        .filter_map(|i| plugins::saved_indicator(&i.kind, &i.params))
-        .collect();
-    let strategy = t
-        .strategy
-        .as_ref()
-        .and_then(|s| plugins::saved_strategy(&s.kind, &s.params));
-    (market, indicators, strategy)
+    let mut hidden = Hidden {
+        drawings: t.drawings_hidden,
+        ..Hidden::default()
+    };
+    let mut indicators = Vec::new();
+    for saved in &t.indicators {
+        if let Some(spec) = plugins::saved_indicator(&saved.kind, &saved.params) {
+            if saved.hidden {
+                hidden.indicators.insert(indicators.len());
+            }
+            indicators.push(spec);
+        }
+    }
+    let strategy = t.strategy.as_ref().and_then(|s| {
+        hidden.strategy = s.hidden;
+        plugins::saved_strategy(&s.kind, &s.params)
+    });
+    (market, indicators, strategy, hidden)
 }
 
 fn saved_tiles(tiles: &BTreeMap<TileId, Tile>) -> Vec<SavedTile> {
@@ -2424,15 +2538,19 @@ fn saved_tiles(tiles: &BTreeMap<TileId, Tile>) -> Vec<SavedTile> {
             indicators: tile
                 .indicators
                 .iter()
-                .map(|spec| SavedIndicator {
+                .enumerate()
+                .map(|(i, spec)| SavedIndicator {
                     kind: plugins::indicator_key(&spec.kind),
                     params: spec.params.clone(),
+                    hidden: tile.hidden.indicators.contains(&i),
                 })
                 .collect(),
             strategy: tile.strategy.as_ref().map(|s| SavedStrategy {
                 kind: plugins::strategy_key(&s.spec.kind),
                 params: s.spec.params.clone(),
+                hidden: tile.hidden.strategy,
             }),
+            drawings_hidden: tile.hidden.drawings,
         })
         .collect()
 }

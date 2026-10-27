@@ -6,7 +6,8 @@
 //!
 //! SCRIPT is one character per action: `n` new chart, `q` close, `h`/`j`/`k`/`l` focus,
 //! `H`/`J`/`K`/`L` swap, `<`/`>`/`^`/`v` move a divider, `t` toggle split, `f` fullscreen;
-//! `m` left-clicks the focused chart (opening its menu), `i` opens the indicator page, `s`
+//! `m` right-clicks the focused chart (opening its menu), `S` / `T` click the header's symbol
+//! / timeframe, `E` types "ETH" into the symbol search, `A` unchecks the first item in the menu's Active list, `i` opens the indicator page, `s`
 //! the symbol page, `1`-`8` add a built-in indicator (in menu order), `e` opens the first
 //! indicator's settings; `x`/`y`/`z` set the EMA Cross / RSI Reversion / Donchian Breakout
 //! strategy (menu open) and `r` opens the focused chart's strategy report. With the example
@@ -34,7 +35,7 @@ use iced::{Point, Settings, Size, Theme};
 use persephone::{
     Message, Persephone, Run,
     keymap::Action,
-    menu::{ImportState, MenuMessage, Page, Popup},
+    menu::{Active, ImportState, MenuMessage, Page, Popup},
 };
 use persephone_chart::{Anchor, ChartData, ChartMessage, Tool};
 use persephone_core::{Candle, Timeframe, indicator::BuiltIn, strategy::BuiltInStrategy};
@@ -136,7 +137,7 @@ fn message(c: char, focused: u32) -> anyhow::Result<Message> {
         'f' => key(Action::Fullscreen),
         'm' => Ok(Message::Chart(
             focused,
-            ChartMessage::Clicked {
+            ChartMessage::RightClicked {
                 at: Point::new(260.0, 160.0),
             },
         )),
@@ -159,6 +160,20 @@ fn message(c: char, focused: u32) -> anyhow::Result<Message> {
         'y' => menu(MenuMessage::SetStrategy(BuiltInStrategy::RsiReversion)),
         'z' => menu(MenuMessage::SetStrategy(BuiltInStrategy::DonchianBreakout)),
         'r' => Ok(Message::OpenReport(focused)),
+        'S' => Ok(Message::Chart(
+            focused,
+            ChartMessage::SymbolClicked {
+                at: Point::new(40.0, 16.0),
+            },
+        )),
+        'T' => Ok(Message::Chart(
+            focused,
+            ChartMessage::TimeframeClicked {
+                at: Point::new(100.0, 16.0),
+            },
+        )),
+        'A' => menu(MenuMessage::Show(Active::Indicator(0), false)),
+        'E' => menu(MenuMessage::QueryChanged("ETH".into())),
         'O' => menu(MenuMessage::OpenSweep),
         'Y' => menu(MenuMessage::StartSweep),
         'a' => menu(MenuMessage::AddPluginIndicator("sma".into())),
@@ -207,7 +222,7 @@ fn draw_examples(app: &mut Persephone, id: u32) {
     for (tool, anchors) in drawings {
         let _ = app.update(Message::Chart(
             id,
-            ChartMessage::Clicked {
+            ChartMessage::RightClicked {
                 at: Point::new(5.0, 5.0),
             },
         ));

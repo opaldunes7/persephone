@@ -27,7 +27,10 @@ time. Binance charts load the latest 5,000 bars of their timeframe.
 
 ## Charts
 
-- **Click** (without dragging) opens the menu:
+- **Right-click** opens the menu:
+  - **Active**: everything on the chart (indicators, the strategy, drawings), each with a
+    checkbox. Unchecking hides it without removing it; checking brings it back at once.
+    What's hidden is saved with the layout.
   - **Indicators ›**: the built-ins, then plugin indicators.
   - **Strategy ›**: the strategy to backtest on this chart.
   - **Draw ›**: drawing tools.
@@ -35,8 +38,16 @@ time. Binance charts load the latest 5,000 bars of their timeframe.
     pair you type.
   - **Timeframe**: 1m, 5m, 15m, 30m, 1h, 4h or 1d.
   - **Tick & volume bars**: shown only for imported markets.
-- **Drag** pans, **scroll** zooms, and **dragging the price axis** stretches prices.
-  Double-click the price axis to fit prices again.
+- **The header** (top left, e.g. `BTCUSDT · 1h · BINANCE`):
+  - Click the symbol and it becomes a search box, with matching markets (yours first, then
+    Binance pairs) dropping down as you type. Click one to switch, press Enter to open
+    whatever Binance pair you typed, or press Esc to leave it as it was.
+  - Click the timeframe for a dropdown of every timeframe.
+  - A left click anywhere else on the chart closes what's open.
+- **Drag** pans and **scroll** zooms.
+- **Dragging the price axis** stretches prices; double-click it to fit prices again.
+- **Dragging the time axis** stretches time: drag right for wider bars (fewer on screen), left
+  for more bars. The newest bar on screen stays put. Double-click it for the default width.
 - **Indicator legends** (top left) open that indicator's settings when clicked. Values check
   as you type, and Remove is at the bottom. Overlays (moving averages, bands) draw on the
   prices; oscillators (RSI, MACD, …) get a pane of their own below.

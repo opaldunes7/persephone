@@ -42,7 +42,7 @@ fn menu(app: &mut Persephone, message: MenuMessage) {
 fn set_strategy(app: &mut Persephone, kind: BuiltInStrategy) {
     let _ = app.update(Message::Chart(
         0,
-        ChartMessage::Clicked {
+        ChartMessage::RightClicked {
             at: Point::new(200.0, 200.0),
         },
     ));
@@ -88,7 +88,7 @@ fn indicators_and_the_equity_pane_coexist() {
     let mut app = app();
     let _ = app.update(Message::Chart(
         0,
-        ChartMessage::Clicked {
+        ChartMessage::RightClicked {
             at: Point::new(5.0, 5.0),
         },
     ));
@@ -193,7 +193,7 @@ fn switching_timeframe_keeps_the_strategy_and_waits_for_bars() {
 
     let _ = app.update(Message::Chart(
         0,
-        ChartMessage::Clicked {
+        ChartMessage::RightClicked {
             at: Point::new(5.0, 5.0),
         },
     ));
@@ -215,7 +215,7 @@ fn strategies_are_saved_and_restored() {
     let (mut first, _loads) = Persephone::start(&[], Some(path.clone()));
     let _ = first.update(Message::Chart(
         0,
-        ChartMessage::Clicked {
+        ChartMessage::RightClicked {
             at: Point::new(10.0, 10.0),
         },
     ));
@@ -244,7 +244,7 @@ mod sweeps {
         let mut app = super::app();
         let _ = app.update(Message::Chart(
             0,
-            ChartMessage::Clicked {
+            ChartMessage::RightClicked {
                 at: Point::new(9.0, 9.0),
             },
         ));
@@ -316,7 +316,7 @@ mod sweeps {
         let _ = full.update(Message::Key(Action::Workspace(1)));
         let _ = full.update(Message::Chart(
             0,
-            ChartMessage::Clicked {
+            ChartMessage::RightClicked {
                 at: Point::new(9.0, 9.0),
             },
         ));

@@ -1,7 +1,7 @@
 # Persephone
 
 A backtesting app with no interface but its charts. It opens to one TradingView-style chart;
-a left click adds indicators and strategies, and a key splits the window into more charts,
+a right click adds indicators and strategies, and a key splits the window into more charts,
 tiled the way Hyprland tiles windows. Every backtest runs on
 [NautilusTrader](https://github.com/nautechsystems/nautilus_trader)'s Rust engine, and the same
 strategies can paper trade on live Binance bars.
@@ -62,8 +62,9 @@ any keyboard layout.
 | Mod+Shift+1…9 | move chart to workspace |
 | Esc | close a menu, stop drawing |
 
-On a chart: click for the menu, drag to pan, scroll to zoom, drag the price axis to stretch
-prices (double-click it to reset).
+On a chart: right-click for the menu. Click the symbol in the top-left header to search for
+another market right there, or the timeframe for a dropdown of the others. Drag to pan and scroll to zoom. Drag the price axis to stretch prices
+and the time axis to stretch time; double-click either to reset it.
 
 ## Documentation
 

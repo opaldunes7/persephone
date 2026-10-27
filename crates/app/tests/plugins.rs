@@ -85,7 +85,7 @@ fn app() -> Persephone {
 fn menu(app: &mut Persephone, message: MenuMessage) {
     let _ = app.update(Message::Chart(
         0,
-        ChartMessage::Clicked {
+        ChartMessage::RightClicked {
             at: Point::new(100.0, 100.0),
         },
     ));
@@ -140,7 +140,7 @@ fn a_plugin_strategy_backtests_like_its_built_in_twin() {
     let _ = app.set_plugins(plugins(&["ema_cross"]));
     let _ = app.update(Message::Chart(
         0,
-        ChartMessage::Clicked {
+        ChartMessage::RightClicked {
             at: Point::new(5.0, 5.0),
         },
     ));
@@ -202,11 +202,14 @@ fn saved_plugins_wait_for_their_plugin_then_resolve() {
                 indicators: vec![SavedIndicator {
                     kind: "plugin:sma".into(),
                     params: vec![30.0],
+                    hidden: false,
                 }],
                 strategy: Some(SavedStrategy {
                     kind: "plugin:ema_cross".into(),
                     params: vec![8.0, 21.0, 25.0],
+                    hidden: false,
                 }),
+                drawings_hidden: false,
             }],
         },
     )
