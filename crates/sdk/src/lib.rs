@@ -42,7 +42,8 @@ pub mod ta;
 #[doc(hidden)]
 pub use wit_bindgen as __wit_bindgen;
 
-/// One closed OHLCV bar. `ts` is the bar's open time in nanoseconds since the Unix epoch.
+/// One closed OHLCV bar. `ts` is in nanoseconds since the Unix epoch: the bar's open time for
+/// indicators, and its close time for strategies, which see each bar as it closes.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Bar {
     pub ts: u64,
