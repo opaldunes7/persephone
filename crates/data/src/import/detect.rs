@@ -1,21 +1,22 @@
 //! Working out a CSV file's layout from its first lines.
 //!
 //! Header names decide when they're recognisable (`time`, `price`, `qty`, `Bid`,
-//! `is_buyer_maker`, ...). Otherwise the values do: the time column is the one that reads as
-//! timestamps in order, two close columns with one always at or above the other are a bid and
-//! an ask, steadily increasing integers are ids, and so on. The result is checked by parsing
-//! the sample with it.
+//! `is_buyer_maker`, `Open`, ...). Otherwise the values do: the time column is the one that
+//! reads as timestamps in order, four columns in a row where the second is always the highest
+//! and the third the lowest are a bar's open, high, low and close, two close columns with one
+//! always at or above the other are a bid and an ask, steadily increasing integers are ids,
+//! and so on. The result is checked by parsing the sample with it.
 
 use std::{fmt::Write as _, str::FromStr};
 
 use anyhow::{Context, bail, ensure};
 use csv::ByteRecord;
-use persephone_core::tick::TickKind;
 
 use super::{
-    Columns, Format, RowParser, SideFormat, Tick,
+    Columns, Format, Kind, RowParser, SideFormat, Tick,
     time::{self, TimeFormat, Zone},
 };
+use crate::store::Spacing;
 
 /// What [`detect`] found, with enough context to show someone.
 #[derive(Clone, Debug)]
@@ -34,6 +35,8 @@ pub struct Detection {
     pub notes: Vec<String>,
     /// The times don't say their zone and none was given, so they're read as UTC.
     pub zone_assumed: bool,
+    /// For bars, how far apart they are (when the sample has two or more).
+    pub spacing: Option<Spacing>,
     /// Data rows in the sample, and how many of them didn't parse.
     pub rows: usize,
     pub bad_rows: usize,
@@ -44,7 +47,7 @@ pub struct Detection {
 pub struct Overrides {
     pub delimiter: Option<char>,
     pub header: Option<bool>,
-    pub kind: Option<TickKind>,
+    pub kind: Option<Kind>,
     pub time_format: Option<TimeFormat>,
     pub zone: Option<Zone>,
     /// A role and its column, by header name or number from 1.
@@ -63,10 +66,14 @@ pub enum Role {
     Ask,
     BidSize,
     AskSize,
+    Open,
+    High,
+    Low,
+    Close,
 }
 
 impl Role {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 13] = [
         Self::Time,
         Self::Date,
         Self::Price,
@@ -76,6 +83,10 @@ impl Role {
         Self::Ask,
         Self::BidSize,
         Self::AskSize,
+        Self::Open,
+        Self::High,
+        Self::Low,
+        Self::Close,
     ];
 
     #[must_use]
@@ -90,6 +101,10 @@ impl Role {
             Self::Ask => "ask",
             Self::BidSize => "bid size",
             Self::AskSize => "ask size",
+            Self::Open => "open",
+            Self::High => "high",
+            Self::Low => "low",
+            Self::Close => "close",
         }
     }
 
@@ -179,6 +194,10 @@ impl Role {
                 "offersize",
                 "offervolume",
             ],
+            Self::Open => &["open", "o", "openprice", "first"],
+            Self::High => &["high", "h", "highprice", "max"],
+            Self::Low => &["low", "l", "lowprice", "min"],
+            Self::Close => &["close", "c", "closeprice", "last"],
         }
     }
 }
@@ -191,7 +210,7 @@ impl FromStr for Role {
         Self::ALL
             .into_iter()
             .find(|role| normalise(role.name()) == wanted)
-            .with_context(|| format!("`{s}` isn't a column role (time, date, price, size, side, bid, ask, bid-size, ask-size)"))
+            .with_context(|| format!("`{s}` isn't a column role (time, date, price, size, side, bid, ask, bid-size, ask-size, open, high, low, close)"))
     }
 }
 
@@ -266,8 +285,26 @@ pub fn detect(sample: &str, overrides: &Overrides) -> anyhow::Result<Detection> 
     };
     let used = |columns: &Columns, i: usize| columns.time == i || columns.date == Some(i);
 
-    // By header name.
+    // By header name: a bar's four prices only together, since `close` alone is a price.
     if header {
+        let named = |role: Role, columns: &Columns| {
+            (0..width).find(|&i| {
+                !used(columns, i)
+                    && !assigned(columns, i)
+                    && role.names().contains(&normalise(&names[i]).as_str())
+                    && classes[i].fits(role)
+            })
+        };
+        let prices = [Role::Open, Role::High, Role::Low, Role::Close];
+        let mut bar = columns;
+        for role in prices {
+            if let Some(i) = named(role, &bar) {
+                set(&mut bar, role, i);
+            }
+        }
+        if prices.iter().all(|&role| get(&bar, role).is_some()) {
+            columns = bar;
+        }
         for role in [
             Role::Price,
             Role::Size,
@@ -277,13 +314,7 @@ pub fn detect(sample: &str, overrides: &Overrides) -> anyhow::Result<Detection> 
             Role::BidSize,
             Role::AskSize,
         ] {
-            let found = (0..width).find(|&i| {
-                !used(&columns, i)
-                    && !assigned(&columns, i)
-                    && role.names().contains(&normalise(&names[i]).as_str())
-                    && classes[i].fits(role)
-            });
-            if let Some(i) = found {
+            if let Some(i) = named(role, &columns) {
                 set(&mut columns, role, i);
                 if role == Role::Side {
                     columns.side_format = side_format(&classes[i], &names[i]);
@@ -294,12 +325,19 @@ pub fn detect(sample: &str, overrides: &Overrides) -> anyhow::Result<Detection> 
 
     // By value, for whatever names didn't settle.
     let has_quotes = columns.bid.is_some() && columns.ask.is_some();
-    if !has_quotes && columns.price.is_none() {
+    if !has_quotes && !has_bar(&columns) && columns.price.is_none() {
         let numbers: Vec<usize> = (0..width)
             .filter(|&i| !used(&columns, i) && !assigned(&columns, i))
             .filter(|&i| matches!(classes[i], Class::Number { id: false, .. }))
             .collect();
-        if let Some((bid, ask)) = bid_ask(checked, &numbers, decimal_comma) {
+        if let Some([open, high, low, close]) = ohlc(checked, &numbers, decimal_comma) {
+            (columns.open, columns.high, columns.low, columns.close) =
+                (Some(open), Some(high), Some(low), Some(close));
+            if columns.size.is_none() {
+                // The volume follows the prices.
+                columns.size = numbers.iter().copied().find(|&i| i > close);
+            }
+        } else if let Some((bid, ask)) = bid_ask(checked, &numbers, decimal_comma) {
             columns.bid = Some(bid);
             columns.ask = Some(ask);
             let rest: Vec<usize> = numbers
@@ -324,7 +362,7 @@ pub fn detect(sample: &str, overrides: &Overrides) -> anyhow::Result<Detection> 
             }
         }
     }
-    if columns.side.is_none() {
+    if columns.side.is_none() && !has_bar(&columns) {
         let side = (0..width).find(|&i| {
             !used(&columns, i)
                 && !assigned(&columns, i)
@@ -346,27 +384,41 @@ pub fn detect(sample: &str, overrides: &Overrides) -> anyhow::Result<Detection> 
 
     let kind = match overrides.kind {
         Some(kind) => kind,
-        None if columns.bid.is_some() && columns.ask.is_some() => TickKind::Quotes,
-        None if columns.price.is_some() => TickKind::Trades,
+        None if has_bar(&columns) => Kind::Bars,
+        None if columns.bid.is_some() && columns.ask.is_some() => Kind::Quotes,
+        None if columns.price.is_some() => Kind::Trades,
         None => bail!(
-            "couldn't find prices; name the column with --price (or --bid and --ask for quotes)"
+            "couldn't find prices; name the column with --price (--bid and --ask for quotes, or --open, --high, --low and --close for bars)"
         ),
     };
     match kind {
-        TickKind::Trades => {
+        Kind::Trades => {
+            // A series of closes is a series of prices.
+            columns.price = columns.price.or(columns.close);
             ensure!(
                 columns.price.is_some(),
                 "couldn't find the price column; name it with --price"
             );
             (columns.bid, columns.ask, columns.bid_size, columns.ask_size) =
                 (None, None, None, None);
+            (columns.open, columns.high, columns.low, columns.close) = (None, None, None, None);
         }
-        TickKind::Quotes => {
+        Kind::Quotes => {
             ensure!(
                 columns.bid.is_some() && columns.ask.is_some(),
                 "couldn't find bid and ask columns; name them with --bid and --ask"
             );
             (columns.price, columns.size, columns.side) = (None, None, None);
+            (columns.open, columns.high, columns.low, columns.close) = (None, None, None, None);
+        }
+        Kind::Bars => {
+            ensure!(
+                has_bar(&columns),
+                "couldn't find open, high, low and close columns; name them with --open, --high, --low and --close"
+            );
+            (columns.price, columns.side) = (None, None);
+            (columns.bid, columns.ask, columns.bid_size, columns.ask_size) =
+                (None, None, None, None);
         }
     }
 
@@ -397,11 +449,13 @@ fn check(
     let mut parser = RowParser::new(&format);
     let (mut preview, mut bad, mut first_problem) = (Vec::new(), 0, None);
     let (mut price_decimals, mut size_decimals) = (0, 0);
+    let mut times = Vec::new();
     for (i, row) in data.iter().enumerate() {
         match parser.parse(&ByteRecord::from(row.clone())) {
             Ok(parsed) => {
                 price_decimals = price_decimals.max(parsed.price_decimals);
                 size_decimals = size_decimals.max(parsed.size_decimals);
+                times.push(parsed.tick.ts());
                 if preview.len() < 3 {
                     preview.push(parsed.tick);
                 }
@@ -417,10 +471,21 @@ fn check(
         bail!(
             "{bad} of the first {rows} rows don't fit the layout found ({}); {}",
             first_problem.unwrap_or_default(),
-            "name the columns with --time, --price, --size, --bid, --ask"
+            "name the columns with --time, --price, --size, --bid, --ask, --open, --high, --low, --close"
         );
     }
+    let mut notes = notes;
+    let spacing = match format.kind {
+        Kind::Bars => Spacing::from_times(&times).map(|(spacing, rolled)| {
+            if rolled {
+                notes.push("The bars are less than a minute apart, so they're rolled up into 1-minute bars.".into());
+            }
+            spacing
+        }),
+        Kind::Trades | Kind::Quotes => None,
+    };
     Ok(Detection {
+        spacing,
         example: data[0].clone(),
         format,
         names,
@@ -463,9 +528,36 @@ impl Detection {
         };
         format!(
             "{separator}, {header}, {}{comma}; times are {}{zone}",
-            format.kind,
+            self.what(),
             format.time_format.describe()
         )
+    }
+
+    /// What the rows are: `trades`, `quotes`, or bars with their spacing (`1h bars`).
+    #[must_use]
+    pub fn what(&self) -> String {
+        let format = &self.format;
+        match (format.kind, self.spacing) {
+            (Kind::Bars, spacing) => {
+                let spacing = spacing.map_or_else(String::new, |s| format!("{s} "));
+                let volume = if format.columns.size.is_some() {
+                    ""
+                } else {
+                    " without volume"
+                };
+                format!("{spacing}bars{volume}")
+            }
+            (kind, _) => kind.to_string(),
+        }
+    }
+
+    /// What to call a role's column: a bar's size is its volume.
+    #[must_use]
+    pub fn role_name(&self, role: Role) -> &'static str {
+        match (self.format.kind, role) {
+            (Kind::Bars, Role::Size) => "volume",
+            _ => role.name(),
+        }
     }
 
     /// Each role found and its column (from 0), date and time first.
@@ -476,6 +568,10 @@ impl Detection {
             (Role::Date, c.date),
             (Role::Time, Some(c.time)),
             (Role::Price, c.price),
+            (Role::Open, c.open),
+            (Role::High, c.high),
+            (Role::Low, c.low),
+            (Role::Close, c.close),
             (Role::Size, c.size),
             (Role::Side, c.side),
             (Role::Bid, c.bid),
@@ -514,7 +610,7 @@ impl Detection {
             let _ = writeln!(
                 out,
                 "  {:<9} column {:<3} {:<18} {example}{note}",
-                role.name(),
+                self.role_name(role),
                 i + 1,
                 format!("\"{name}\""),
             );
@@ -789,7 +885,8 @@ fn calendar_class(values: &[&str]) -> Option<Class> {
 }
 
 /// Picks the time column: by name first, then calendar text, then a date column followed by a
-/// time-of-day column, then the finest-grained epoch column.
+/// time-of-day column, then the finest-grained epoch column, and last a date on its own (daily
+/// and longer bars).
 fn find_time(
     classes: &[Class],
     names: &[String],
@@ -851,13 +948,62 @@ fn find_time(
         TimeFormat::EpochMillis => 2,
         _ => 3,
     };
-    (0..classes.len())
+    let epoch = (0..classes.len())
         .filter_map(|i| match classes[i] {
             Class::Epoch { format, ordered } => Some(((rank(format), !ordered, i), format)),
             _ => None,
         })
         .min_by_key(|&(key, _)| key)
-        .map(|((_, _, i), format)| (i, None, Some(format)))
+        .map(|((_, _, i), format)| (i, None, Some(format)));
+    epoch.or_else(|| {
+        classes
+            .iter()
+            .enumerate()
+            .find_map(|(i, class)| match class {
+                Class::Calendar {
+                    format,
+                    date_only: true,
+                    ..
+                } => Some((i, None, Some(*format))),
+                _ => None,
+            })
+    })
+}
+
+/// Four neighbouring columns where, on almost every row, the second is the highest, the third
+/// the lowest, and they're within half of each other: a bar's open, high, low and close.
+fn ohlc(rows: &[Vec<String>], numbers: &[usize], decimal_comma: bool) -> Option<[usize; 4]> {
+    numbers.windows(4).find_map(|w| {
+        let bars: Vec<[f64; 4]> = rows
+            .iter()
+            .filter_map(|row| {
+                let value = |i: usize| row.get(i).and_then(|v| number(v, decimal_comma));
+                Some([value(w[0])?, value(w[1])?, value(w[2])?, value(w[3])?])
+            })
+            .collect();
+        if bars.is_empty() || bars.len() * 10 < rows.len() * 9 {
+            return None;
+        }
+        let fits = bars
+            .iter()
+            .filter(|&&[open, high, low, close]| {
+                low > 0.0
+                    && high >= open.max(close)
+                    && low <= open.min(close)
+                    && (high - low) < high / 2.0
+            })
+            .count();
+        // Not four copies of one price.
+        let ranges = bars.iter().filter(|&&[_, high, low, _]| high > low).count();
+        (fits * 50 >= bars.len() * 49 && ranges * 2 >= bars.len()).then(|| [w[0], w[1], w[2], w[3]])
+    })
+}
+
+fn has_bar(columns: &Columns) -> bool {
+    columns.open.is_some()
+        && columns.high.is_some()
+        && columns.low.is_some()
+        && columns.close.is_some()
 }
 
 /// Two columns that are close (within 2%) with one at or above the other on almost every row:
@@ -1007,6 +1153,10 @@ fn get(columns: &Columns, role: Role) -> Option<usize> {
         Role::Ask => columns.ask,
         Role::BidSize => columns.bid_size,
         Role::AskSize => columns.ask_size,
+        Role::Open => columns.open,
+        Role::High => columns.high,
+        Role::Low => columns.low,
+        Role::Close => columns.close,
     }
 }
 
@@ -1021,6 +1171,10 @@ fn set(columns: &mut Columns, role: Role, column: usize) {
         Role::Ask => columns.ask = Some(column),
         Role::BidSize => columns.bid_size = Some(column),
         Role::AskSize => columns.ask_size = Some(column),
+        Role::Open => columns.open = Some(column),
+        Role::High => columns.high = Some(column),
+        Role::Low => columns.low = Some(column),
+        Role::Close => columns.close = Some(column),
     }
 }
 
@@ -1034,6 +1188,10 @@ fn assigned(columns: &Columns, column: usize) -> bool {
         columns.ask,
         columns.bid_size,
         columns.ask_size,
+        columns.open,
+        columns.high,
+        columns.low,
+        columns.close,
     ]
     .contains(&Some(column))
 }

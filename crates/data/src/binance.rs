@@ -76,7 +76,7 @@ impl BinanceClient {
             let page = parse_klines(&body)?;
             let Some(last) = page.last() else { break };
 
-            cursor_ms = last.ts / NANOS_PER_MILLI + timeframe.nanos() / NANOS_PER_MILLI;
+            cursor_ms = timeframe.close_time(last.ts) / NANOS_PER_MILLI;
             let full_page = page.len() == PAGE_LIMIT;
             candles.extend(page);
             if !full_page {

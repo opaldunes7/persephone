@@ -17,8 +17,9 @@ strategies can paper trade on live Binance bars.
 - **Your own indicators and strategies** as sandboxed WebAssembly plugins (Rust SDK), which
   can run ONNX models and ask language models, or as any process (Python, …) reached over a
   socket.
-- **Data:** Binance spot, your own CSV tick files (trades or quotes, almost any layout), and
-  Binance's bulk archives. Tick data backtests fill on ticks.
+- **Data:** Binance spot, your own CSV files of ticks (trades or quotes) or bars (a minute to
+  a month apart), in almost any layout, imported from the symbol search or by dropping them on
+  a chart, and Binance's bulk archives. Tick data backtests fill on ticks.
 - **Paper and live trading** of the same strategies through Nautilus's live node.
 
 ## Run it
@@ -46,20 +47,20 @@ cargo run -p persephone-cli --release -- --help
 
 ## Keys
 
-Mod is ⌥ Option on macOS and Alt elsewhere. Keys follow physical positions, so they work on
-any keyboard layout.
+Every command is Control plus a key (⌃ on a Mac). Keys follow physical positions, so they work
+on any keyboard layout.
 
 | Keys | Action |
 |---|---|
-| Mod+Enter | new chart |
-| Mod+Q | close chart |
-| Mod+H/J/K/L or arrows | move focus |
-| Mod+Shift+H/J/K/L | swap charts |
-| Mod+Ctrl+H/J/K/L | move the divider |
-| Mod+T | toggle split direction |
-| Mod+F | fullscreen |
-| Mod+1…9 | switch workspace |
-| Mod+Shift+1…9 | move chart to workspace |
+| Ctrl+Enter | new chart |
+| Ctrl+Q | close chart |
+| Ctrl+H/J/K/L or arrows | move focus |
+| Ctrl+Shift+H/J/K/L | swap charts |
+| Ctrl+Alt+H/J/K/L (Option on a Mac) | move the divider |
+| Ctrl+T | toggle split direction |
+| Ctrl+F | fullscreen |
+| Ctrl+1…9 | switch workspace |
+| Ctrl+Shift+1…9 | move chart to workspace |
 | Esc | close a menu, stop drawing |
 
 New chart, toggle split and close are also buttons in each chart's bottom-right corner
@@ -89,7 +90,7 @@ and the time axis to stretch time; double-click either to reset it.
 | `crates/engine` | the only crate that uses Nautilus: backtests and live sessions |
 | `crates/plugin-host` | runs WebAssembly plugins and external strategies |
 | `crates/sdk` | the plugin SDK |
-| `crates/data` | Binance data, the local tick store, the CSV importer |
+| `crates/data` | Binance data, the local tick and bar store, the CSV importer |
 | `crates/ml` | ONNX models and language models for plugins |
 | `crates/core` | shared types |
 | `plugins/` | example plugins (a workspace of its own, built for `wasm32-wasip2`) |

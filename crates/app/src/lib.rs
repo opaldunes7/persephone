@@ -55,7 +55,7 @@ use persephone_core::{
 use persephone_data::{
     binance::BinanceClient,
     import::{Detection, Format, MarketOptions, Progress, Summary, Zone, split_symbol},
-    store::{MarketInfo, Store, check_name},
+    store::{MarketInfo, Spacing, Store, check_name},
 };
 use persephone_engine::{
     BacktestReport, BacktestRequest, FeeRates,
@@ -68,7 +68,8 @@ use crate::{
     keymap::Action,
     live::{Live, LiveState},
     menu::{
-        Active, ImportState, LiveInfo, MenuMessage, Page, Popup, SweepResult, SweepRow, TileInfo,
+        Active, ImportState, LiveInfo, MenuMessage, Page, Popup, Removal, SweepResult, SweepRow,
+        TileInfo,
     },
     motion::Motion,
     persist::{Saved, SavedIndicator, SavedStrategy, SavedTile, SavedWorkspace},
@@ -81,7 +82,7 @@ pub const STARTING_BALANCE: f64 = 100_000.0;
 /// Space around and between tiles when there is more than one.
 const GAP: f32 = 6.0;
 const BORDER: f32 = 2.0;
-/// How far one Mod+Ctrl press moves a divider, as a share of its split.
+/// How far one Ctrl+Alt press moves a divider, as a share of its split.
 const RESIZE_STEP: f32 = 0.05;
 /// How long the border flashes when an action is refused (17th chart, last chart).
 const FLASH: Duration = Duration::from_millis(450);
@@ -91,7 +92,9 @@ const PLUGIN_SETTLE: Duration = Duration::from_millis(300);
 /// How long the workspace number shows after switching.
 const WORKSPACE_BADGE: Duration = Duration::from_millis(900);
 const DEFAULT_SYMBOL: &str = "BTCUSDT";
-const DEFAULT_WINDOW: Size = Size::new(1280.0, 800.0);
+const DEFAULT_WINDOW: Size = Size::new(2560.0, 1600.0);
+/// The most of the screen's width and height the window opens at.
+const WINDOW_SHARE: f32 = 0.75;
 
 /// Opens the app window and runs until it closes.
 pub fn run() -> iced::Result {
@@ -233,6 +236,8 @@ pub struct Persephone {
     local_markets: Vec<MarketInfo>,
     /// Files are being dragged over the window.
     drop_hint: bool,
+    /// The market an import is writing to, as (venue, symbol), while it runs.
+    importing: Option<(String, String)>,
     /// Plugins allowed to call language models, and where that list is saved.
     ai_grants: BTreeSet<String>,
     grants_path: Option<PathBuf>,
@@ -246,6 +251,10 @@ pub struct Persephone {
     next_live: u64,
     /// Live sessions replay these bars at this pace instead of trading Binance's (tests).
     live_replay: Option<(Vec<Candle>, Duration)>,
+    /// The window has been sized to its default (or to the screen, if that's smaller).
+    window_fitted: bool,
+    /// When the app started, to tell start-up resizes from the user's.
+    launched: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +280,10 @@ pub enum Message {
     FilesHovered(bool),
     /// A file was dropped on the window; it imports into the focused chart.
     FileDropped(PathBuf),
+    /// Files picked from a chart's symbol search to import into it (none if cancelled).
+    FilesPicked(TileId, Vec<PathBuf>),
+    /// A local market was deleted, or couldn't be: venue, symbol, outcome.
+    LocalRemoved(String, String, Result<(), String>),
     /// The layout of a dropped file, worked out.
     Detected(PathBuf, Result<Arc<Detection>, String>),
     ImportProgress(Progress),
@@ -360,6 +373,9 @@ impl Persephone {
             next_sweep: 0,
             next_live: 0,
             live_replay: None,
+            importing: None,
+            window_fitted: false,
+            launched: Instant::now(),
         };
         app.refresh_local_markets();
         let mut loads: Vec<_> = tiles
@@ -435,6 +451,9 @@ impl Persephone {
             next_sweep: 0,
             next_live: 0,
             live_replay: None,
+            importing: None,
+            window_fitted: false,
+            launched: Instant::now(),
         };
         let _ = app.add_tile(0, market, Vec::new(), None);
         app.relayout(false);
@@ -454,13 +473,43 @@ impl Persephone {
             .map(|tile| (tile.market.symbol.as_str(), tile.market.bars))
     }
 
-    /// What kind of ticks a local market holds (for which bars it can have); `None` for Binance.
+    /// What kind of ticks a local market holds (for which bars it can have); `None` for Binance
+    /// and for markets imported as bars.
     fn local_kind(&self, market: &Market) -> Option<TickKind> {
+        self.local_info(market)?.kind.ticks()
+    }
+
+    /// How far apart a local market's bars are, for a market imported as bars.
+    fn local_spacing(&self, market: &Market) -> Option<Spacing> {
+        self.local_info(market)?.kind.spacing()
+    }
+
+    fn local_info(&self, market: &Market) -> Option<&MarketInfo> {
         let venue = market.local.as_deref()?;
         self.local_markets
             .iter()
             .find(|m| m.venue == venue && m.symbol == market.symbol)
-            .map(|m| m.kind)
+    }
+
+    /// `market` with bars it can have: a market imported as bars moves up to the shortest
+    /// timeframe its bars make, and one without ticks takes 1-minute bars instead of tick or
+    /// volume bars.
+    fn fit_bars(&self, market: Market) -> Market {
+        let bars = match (self.local_spacing(&market), market.bars) {
+            (Some(spacing), BarSpec::Time(tf)) if !spacing.allows(tf) => Timeframe::ALL
+                .into_iter()
+                .find(|&t| t.nanos() >= tf.nanos() && spacing.allows(t))
+                .unwrap_or_else(|| spacing.shortest())
+                .into(),
+            (Some(spacing), BarSpec::Ticks(_) | BarSpec::Volume(_)) => spacing.shortest().into(),
+            (None, BarSpec::Ticks(_) | BarSpec::Volume(_))
+                if self.local_kind(&market).is_none() =>
+            {
+                Timeframe::M1.into()
+            }
+            (_, bars) => bars,
+        };
+        Market { bars, ..market }
     }
 
     /// The local store's venue for tile `id`'s market, or `None` for a Binance market.
@@ -674,6 +723,7 @@ impl Persephone {
                 self.popup = Some(Popup::SymbolSearch {
                     tile: id,
                     query: String::new(),
+                    removing: None,
                 });
                 self.refresh_local_markets();
                 return operation::focus(menu::symbol_input());
@@ -779,6 +829,16 @@ impl Persephone {
             Message::WindowResized(size) => {
                 self.window = size;
                 self.relayout(false);
+                // The window opens, and then macOS resets it to a small default of its own a
+                // moment later, whatever size we asked for. So ask again once it exists, and
+                // again if it shrinks to that default during start-up. Later resizes are the
+                // user's.
+                let starting = self.launched.elapsed() < Duration::from_secs(2);
+                if !std::mem::replace(&mut self.window_fitted, true)
+                    || (starting && size.width < 1000.0)
+                {
+                    return fit_window();
+                }
             }
             Message::Tick(now) => self.now = now,
             Message::PluginsChanged => {
@@ -790,6 +850,14 @@ impl Persephone {
             Message::FileDropped(path) => {
                 self.drop_hint = false;
                 return self.on_drop(path);
+            }
+            Message::FilesPicked(tile, files) => {
+                if !files.is_empty() && self.tiles.contains_key(&tile) {
+                    return self.open_import(tile, files);
+                }
+            }
+            Message::LocalRemoved(venue, symbol, result) => {
+                return self.local_removed(&venue, &symbol, result);
             }
             Message::Detected(path, result) => {
                 if let Some(Popup::Import { files, state, .. }) = &mut self.popup
@@ -810,6 +878,7 @@ impl Persephone {
                 }
             }
             Message::Imported(result) => {
+                self.importing = None;
                 self.refresh_local_markets();
                 let tile = match &self.popup {
                     Some(Popup::Import { tile, .. }) => Some(*tile),
@@ -907,8 +976,12 @@ impl Persephone {
         if tile.market.local.is_some() {
             return Some("Live trading needs a Binance market; this one is from your files.");
         }
-        if tile.market.bars.timeframe().is_none() {
-            return Some("Live trading uses time bars.");
+        match tile.market.bars.timeframe() {
+            None => return Some("Live trading uses time bars."),
+            Some(Timeframe::W1 | Timeframe::MN1) => {
+                return Some("Live trading runs on bars from 1 minute to 1 day.");
+            }
+            Some(_) => {}
         }
         None
     }
@@ -1114,13 +1187,59 @@ impl Persephone {
             }
             return Task::none();
         }
-        let tile = self.layout.focused();
-        self.popup = Some(Popup::import(
-            tile,
-            path.clone(),
-            importing::guess_symbol(&path),
-        ));
-        importing::detect(path)
+        self.open_import(self.layout.focused(), vec![path])
+    }
+
+    /// Opens the import panel for `files` on `tile` and works out the first one's layout.
+    fn open_import(&mut self, tile: TileId, files: Vec<PathBuf>) -> Task<Message> {
+        let first = files[0].clone();
+        self.popup = Some(Popup::import(tile, files, importing::guess_symbol(&first)));
+        importing::detect(first)
+    }
+
+    /// After a local market is deleted: it leaves the symbol search, and charts showing it
+    /// switch to the default Binance pair.
+    fn local_removed(
+        &mut self,
+        venue: &str,
+        symbol: &str,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        if let Some(removing) = self.popup.as_mut().and_then(Popup::removing_mut)
+            && let Some(removal) = removing
+            && removal.venue == venue
+            && removal.symbol == symbol
+        {
+            match &result {
+                Ok(()) => *removing = None,
+                Err(error) => {
+                    removal.deleting = false;
+                    removal.error = Some(format!("Couldn't delete it: {error}"));
+                }
+            }
+        }
+        self.refresh_local_markets();
+        if result.is_err() {
+            return Task::none();
+        }
+        let is_it = |m: &Market| m.local.as_deref() == Some(venue) && m.symbol == symbol;
+        self.bars.retain(|market, _| !is_it(market));
+        let showing: Vec<(TileId, BarSpec)> = self
+            .tiles
+            .iter()
+            .filter(|(_, t)| is_it(&t.market))
+            .map(|(&id, t)| (id, t.market.bars))
+            .collect();
+        Task::batch(showing.into_iter().map(|(id, bars)| {
+            self.set_market(
+                id,
+                Market {
+                    local: None,
+                    symbol: DEFAULT_SYMBOL.to_owned(),
+                    bars,
+                },
+            )
+        }))
     }
 
     fn start_import(&mut self, mut popup: Popup) -> Task<Message> {
@@ -1159,6 +1278,7 @@ impl Persephone {
                         zone,
                         ..detection.format.clone()
                     };
+                    self.importing = Some((venue.clone(), symbol.clone()));
                     task = importing::run(store.clone(), files.clone(), format, options);
                     *state = ImportState::Importing(Progress::default());
                     *error = None;
@@ -1552,7 +1672,7 @@ impl Persephone {
             }
             MenuMessage::SubmitSymbol => {
                 if let Popup::Menu {
-                    page: Page::Symbol { query },
+                    page: Page::Symbol { query, .. },
                     ..
                 }
                 | Popup::SymbolSearch { query, .. } = &popup
@@ -1694,7 +1814,7 @@ impl Persephone {
             }
             MenuMessage::QueryChanged(text) => {
                 if let Popup::Menu {
-                    page: Page::Symbol { query },
+                    page: Page::Symbol { query, .. },
                     ..
                 }
                 | Popup::SymbolSearch { query, .. } = &mut popup
@@ -1702,6 +1822,46 @@ impl Persephone {
                     *query = text.to_uppercase();
                 }
                 self.popup = Some(popup);
+            }
+            MenuMessage::PickFiles => return importing::pick(id),
+            MenuMessage::AskRemoveLocal { venue, symbol } => {
+                let busy = self.importing.as_ref() == Some(&(venue.clone(), symbol.clone()));
+                let bytes = self
+                    .store
+                    .as_ref()
+                    .and_then(|store| store.market(&venue, &symbol).ok())
+                    .map_or(0, |market| market.disk_size());
+                if let Some(removing) = popup.removing_mut() {
+                    *removing = Some(Removal {
+                        venue,
+                        symbol,
+                        bytes,
+                        deleting: false,
+                        error: busy.then(|| {
+                            "It's being imported into; delete it once that's done.".to_owned()
+                        }),
+                    });
+                }
+                self.popup = Some(popup);
+            }
+            MenuMessage::KeepLocal => {
+                if let Some(removing) = popup.removing_mut() {
+                    *removing = None;
+                }
+                self.popup = Some(popup);
+            }
+            MenuMessage::RemoveLocal => {
+                let mut task = Task::none();
+                if let (Some(Some(removal)), Some(store)) = (popup.removing_mut(), &self.store)
+                    && !removal.deleting
+                    && removal.error.is_none()
+                {
+                    removal.deleting = true;
+                    task =
+                        remove_local(store.clone(), removal.venue.clone(), removal.symbol.clone());
+                }
+                self.popup = Some(popup);
+                return task;
             }
             MenuMessage::ParamChanged(index, value) => {
                 if let Popup::Settings {
@@ -1945,6 +2105,7 @@ impl Persephone {
 
     /// Points tile `id` at another market, keeping its indicators and strategy.
     fn set_market(&mut self, id: TileId, market: Market) -> Task<Message> {
+        let market = self.fit_bars(market);
         let Some(tile) = self.tiles.get_mut(&id) else {
             return Task::none();
         };
@@ -2253,6 +2414,7 @@ impl Persephone {
                 local_markets: &self.local_markets,
                 bars: tile.market.bars,
                 tick_kind: self.local_kind(&tile.market),
+                spacing: self.local_spacing(&tile.market),
                 specs: &tile.indicators,
                 strategy: tile.strategy.as_ref().map(|s| (&s.spec, &s.run)),
                 live: LiveInfo {
@@ -2410,9 +2572,9 @@ const TILE_BUTTONS_WIDTH: f32 = 3.0 * TILE_BUTTON + 4.0;
 /// Hovering one names it with its shortcut.
 fn tile_buttons<'a>(id: TileId) -> Element<'a, Message> {
     let modifier = if cfg!(target_os = "macos") {
-        "⌥"
+        "⌃"
     } else {
-        "Alt+"
+        "Ctrl+"
     };
     let one =
         |icon: &'a str, size: f32, what: &str, key: &str, action: Action| -> Element<'a, Message> {
@@ -2440,28 +2602,19 @@ fn tile_buttons<'a>(id: TileId) -> Element<'a, Message> {
                 .height(20)
                 .padding(0)
                 .on_press(Message::TileButton(id, action))
-                .style(|_, status| {
-                    let (background, border, text) = match status {
-                        button::Status::Hovered => {
-                            (theme::CROSSHAIR, theme::CROSSHAIR, Color::WHITE)
-                        }
-                        button::Status::Pressed => (theme::ACCENT, theme::ACCENT, Color::WHITE),
-                        _ => (
-                            theme::AXIS_LINE,
-                            theme::LABEL_BACKGROUND,
-                            theme::TEXT_BRIGHT,
-                        ),
-                    };
-                    button::Style {
-                        background: Some(Background::Color(background)),
-                        text_color: text,
-                        border: Border {
-                            color: border,
-                            width: 1.0,
-                            radius: 3.0.into(),
-                        },
-                        ..button::Style::default()
-                    }
+                .style(|_, status| button::Style {
+                    // No fill or border: just the glyph, brighter under the mouse.
+                    background: None,
+                    text_color: if matches!(
+                        status,
+                        button::Status::Hovered | button::Status::Pressed
+                    ) {
+                        theme::TEXT_BRIGHT
+                    } else {
+                        theme::TEXT_MUTED
+                    },
+                    border: Border::default(),
+                    ..button::Style::default()
                 });
             tooltip(control, tip, tooltip::Position::Top).gap(4).into()
         };
@@ -2602,6 +2755,24 @@ fn placeholder<'a>(market: &Market, bars: Option<&Bars>) -> Element<'a, Message>
         .into()
 }
 
+/// Sizes the window to [`DEFAULT_WINDOW`], or to [`WINDOW_SHARE`] of the screen where that's
+/// bigger, and centres it.
+fn fit_window() -> Task<Message> {
+    window::latest().and_then(|id| {
+        window::monitor_size(id).and_then(move |monitor| {
+            let size = Size::new(
+                DEFAULT_WINDOW.width.min(monitor.width * WINDOW_SHARE),
+                DEFAULT_WINDOW.height.min(monitor.height * WINDOW_SHARE),
+            );
+            let at = Point::new(
+                ((monitor.width - size.width) / 2.0).max(0.0),
+                ((monitor.height - size.height) / 2.0).max(0.0),
+            );
+            Task::batch([window::resize(id, size), window::move_to(id, at)])
+        })
+    })
+}
+
 /// Where a popup opened from the chart's header goes: just under the header line, so it
 /// stays readable.
 fn below_header(at: Point) -> Point {
@@ -2719,6 +2890,15 @@ fn load(market: Market, store: Option<Store>) -> Task<Message> {
     )
 }
 
+/// Deletes a local market's files on a worker thread.
+fn remove_local(store: Store, venue: String, symbol: String) -> Task<Message> {
+    let (v, s) = (venue.clone(), symbol.clone());
+    Task::perform(
+        on_thread(move || store.remove(&v, &s).map_err(|e| format!("{e:#}"))),
+        move |result| Message::LocalRemoved(venue.clone(), symbol.clone(), result),
+    )
+}
+
 /// Runs `job` on a plain thread and hands its result back to iced's executor. Used for the
 /// blocking Binance client, reading the store, and backtests, which need a thread of their
 /// own anyway.
@@ -2761,7 +2941,7 @@ fn fetch(market: &Market, store: Option<&Store>) -> Result<MarketData, String> {
 
 fn fetch_binance(symbol: &str, timeframe: Timeframe) -> anyhow::Result<MarketData> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
-    let end = now - now % timeframe.nanos() + timeframe.nanos(); // include the forming bar
+    let end = timeframe.close_time(now); // include the forming bar
     let start = end.saturating_sub(HISTORY_BARS * timeframe.nanos());
 
     let binance = BinanceClient::new()?;

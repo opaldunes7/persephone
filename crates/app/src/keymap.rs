@@ -1,19 +1,19 @@
 //! The fixed keymap. Like Hyprland's defaults, but deliberately not configurable.
 //!
-//! Mod is ⌥ Option on macOS and Alt elsewhere (⌘ belongs to macOS). Keys are matched by
-//! physical position, so the bindings work on any keyboard layout.
+//! Every command is Control plus a key (⌘ belongs to macOS). Keys are matched by physical
+//! position, so the bindings work on any keyboard layout.
 //!
 //! | Keys                  | Action                     |
 //! |-----------------------|----------------------------|
-//! | Mod+Enter             | new chart (dwindle split)  |
-//! | Mod+Q                 | close chart                |
-//! | Mod+H/J/K/L, arrows   | move focus                 |
-//! | Mod+Shift+H/J/K/L     | swap chart                 |
-//! | Mod+Ctrl+H/J/K/L      | move the divider           |
-//! | Mod+T                 | toggle split direction     |
-//! | Mod+F                 | fullscreen                 |
-//! | Mod+1…9               | switch workspace           |
-//! | Mod+Shift+1…9         | move chart to workspace    |
+//! | Ctrl+Enter             | new chart (dwindle split)  |
+//! | Ctrl+Q                 | close chart                |
+//! | Ctrl+H/J/K/L, arrows   | move focus                 |
+//! | Ctrl+Shift+H/J/K/L     | swap chart                 |
+//! | Ctrl+Alt+H/J/K/L       | move the divider           |
+//! | Ctrl+T                 | toggle split direction     |
+//! | Ctrl+F                 | fullscreen                 |
+//! | Ctrl+1…9               | switch workspace           |
+//! | Ctrl+Shift+1…9         | move chart to workspace    |
 
 use iced::keyboard::{
     Modifiers,
@@ -45,14 +45,14 @@ impl Action {
 
 /// The action bound to a key press, if any.
 pub fn action(key: Physical, modifiers: Modifiers, repeat: bool) -> Option<Action> {
-    if !modifiers.alt() || modifiers.logo() {
+    if !modifiers.control() || modifiers.logo() {
         return None;
     }
     let Physical::Code(code) = key else {
         return None;
     };
     if let Some(n) = digit(code) {
-        let action = match (modifiers.shift(), modifiers.control()) {
+        let action = match (modifiers.shift(), modifiers.alt()) {
             (false, false) => Action::Workspace(n),
             (true, false) => Action::MoveToWorkspace(n),
             _ => return None,
@@ -62,9 +62,9 @@ pub fn action(key: Physical, modifiers: Modifiers, repeat: bool) -> Option<Actio
 
     let action = match direction(code) {
         Some(d) if modifiers.shift() => Action::Swap(d),
-        Some(d) if modifiers.control() => Action::Resize(d),
+        Some(d) if modifiers.alt() => Action::Resize(d),
         Some(d) => Action::Focus(d),
-        None if modifiers.shift() || modifiers.control() => return None,
+        None if modifiers.shift() || modifiers.alt() => return None,
         None => match code {
             Code::Enter | Code::NumpadEnter => Action::NewTile,
             Code::KeyQ => Action::CloseTile,
@@ -111,31 +111,34 @@ mod tests {
     }
 
     #[test]
-    fn mod_bindings() {
-        let alt = Modifiers::ALT;
-        assert_eq!(press(Code::Enter, alt), Some(Action::NewTile));
-        assert_eq!(press(Code::KeyQ, alt), Some(Action::CloseTile));
-        assert_eq!(press(Code::KeyH, alt), Some(Action::Focus(Direction::Left)));
+    fn control_bindings() {
+        let ctrl = Modifiers::CTRL;
+        assert_eq!(press(Code::Enter, ctrl), Some(Action::NewTile));
+        assert_eq!(press(Code::KeyQ, ctrl), Some(Action::CloseTile));
         assert_eq!(
-            press(Code::ArrowDown, alt),
+            press(Code::KeyH, ctrl),
+            Some(Action::Focus(Direction::Left))
+        );
+        assert_eq!(
+            press(Code::ArrowDown, ctrl),
             Some(Action::Focus(Direction::Down))
         );
         assert_eq!(
-            press(Code::KeyL, alt | Modifiers::SHIFT),
+            press(Code::KeyL, ctrl | Modifiers::SHIFT),
             Some(Action::Swap(Direction::Right))
         );
         assert_eq!(
-            press(Code::KeyK, alt | Modifiers::CTRL),
+            press(Code::KeyK, ctrl | Modifiers::ALT),
             Some(Action::Resize(Direction::Up))
         );
-        assert_eq!(press(Code::KeyT, alt), Some(Action::ToggleSplit));
-        assert_eq!(press(Code::KeyF, alt), Some(Action::Fullscreen));
-        assert_eq!(press(Code::Digit3, alt), Some(Action::Workspace(3)));
+        assert_eq!(press(Code::KeyT, ctrl), Some(Action::ToggleSplit));
+        assert_eq!(press(Code::KeyF, ctrl), Some(Action::Fullscreen));
+        assert_eq!(press(Code::Digit3, ctrl), Some(Action::Workspace(3)));
         assert_eq!(
-            press(Code::Digit9, alt | Modifiers::SHIFT),
+            press(Code::Digit9, ctrl | Modifiers::SHIFT),
             Some(Action::MoveToWorkspace(9))
         );
-        assert_eq!(press(Code::Digit0, alt), None, "workspaces are 1 to 9");
+        assert_eq!(press(Code::Digit0, ctrl), None, "workspaces are 1 to 9");
     }
 
     #[test]
@@ -143,34 +146,44 @@ mod tests {
         assert_eq!(
             press(Code::Enter, Modifiers::empty()),
             None,
-            "Mod is required"
+            "Control is required"
         );
         assert_eq!(
-            press(Code::KeyQ, Modifiers::LOGO | Modifiers::ALT),
+            press(Code::KeyQ, Modifiers::LOGO | Modifiers::CTRL),
             None,
             "⌘ belongs to the OS"
         );
-        assert_eq!(press(Code::KeyQ, Modifiers::ALT | Modifiers::SHIFT), None);
-        assert_eq!(press(Code::KeyZ, Modifiers::ALT), None);
+        assert_eq!(press(Code::KeyQ, Modifiers::CTRL | Modifiers::SHIFT), None);
+        assert_eq!(press(Code::KeyZ, Modifiers::CTRL), None);
+        assert_eq!(
+            press(Code::Enter, Modifiers::ALT),
+            None,
+            "Option alone no longer does anything"
+        );
+        assert_eq!(
+            press(Code::Digit3, Modifiers::CTRL | Modifiers::ALT),
+            None,
+            "workspaces take Shift to move, nothing else"
+        );
     }
 
     #[test]
     fn only_moves_repeat() {
         let held = |code, m| action(Physical::Code(code), m, true);
         assert_eq!(
-            held(Code::KeyL, Modifiers::ALT),
+            held(Code::KeyL, Modifiers::CTRL),
             Some(Action::Focus(Direction::Right))
         );
         assert_eq!(
-            held(Code::KeyL, Modifiers::ALT | Modifiers::CTRL),
+            held(Code::KeyL, Modifiers::CTRL | Modifiers::ALT),
             Some(Action::Resize(Direction::Right))
         );
         assert_eq!(
-            held(Code::Enter, Modifiers::ALT),
+            held(Code::Enter, Modifiers::CTRL),
             None,
-            "holding Mod+Enter opens one chart"
+            "holding Ctrl+Enter opens one chart"
         );
-        assert_eq!(held(Code::KeyL, Modifiers::ALT | Modifiers::SHIFT), None);
-        assert_eq!(held(Code::Digit2, Modifiers::ALT), None);
+        assert_eq!(held(Code::KeyL, Modifiers::CTRL | Modifiers::SHIFT), None);
+        assert_eq!(held(Code::Digit2, Modifiers::CTRL), None);
     }
 }

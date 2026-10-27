@@ -215,14 +215,13 @@ fn extend(bars: &mut Vec<Candle>, new: bool, ts: UnixNanos, price: f64, volume: 
     }
 }
 
-/// Rolls bars (oldest first) up into a longer `timeframe`. Every [`Timeframe`] divides a day,
-/// so bars of the shorter timeframe never straddle a longer one.
+/// Rolls bars (oldest first) up into a longer `timeframe` that's
+/// [made of](Timeframe::is_made_of) theirs, so no bar straddles two longer ones.
 #[must_use]
 pub fn resample(bars: &[Candle], timeframe: Timeframe) -> Vec<Candle> {
-    let step = timeframe.nanos();
     let mut out: Vec<Candle> = Vec::new();
     for bar in bars {
-        let open_time = bar.ts - bar.ts % step;
+        let open_time = timeframe.open_time(bar.ts);
         match out.last_mut() {
             Some(last) if last.ts == open_time => {
                 last.high = last.high.max(bar.high);
@@ -240,20 +239,20 @@ pub fn resample(bars: &[Candle], timeframe: Timeframe) -> Vec<Candle> {
 }
 
 struct BarBuilder {
-    step: UnixNanos,
+    timeframe: Timeframe,
     bars: Vec<Candle>,
 }
 
 impl BarBuilder {
     fn new(timeframe: Timeframe) -> Self {
         Self {
-            step: timeframe.nanos(),
+            timeframe,
             bars: Vec::new(),
         }
     }
 
     fn push(&mut self, ts: UnixNanos, price: f64, volume: f64) {
-        let open_time = ts - ts % self.step;
+        let open_time = self.timeframe.open_time(ts);
         match self.bars.last_mut() {
             Some(bar) if bar.ts == open_time => {
                 bar.high = bar.high.max(price);
@@ -369,5 +368,30 @@ mod tests {
         for tf in [Timeframe::M5, Timeframe::M15, Timeframe::H1, Timeframe::D1] {
             assert_eq!(resample(&minute, tf), bars(&ticks, tf), "{tf}");
         }
+    }
+
+    #[test]
+    fn days_roll_up_into_weeks_and_months() {
+        const DAY: UnixNanos = crate::time::NANOS_PER_DAY;
+        // A trade at noon on each of 120 days from Monday 2024-01-01.
+        let first = crate::time::days_from_civil(2024, 1, 1) as UnixNanos;
+        let ticks = Ticks::Trades(
+            (0..120)
+                .map(|i| trade((first + i) * DAY + DAY / 2, 100.0 + i as f64, 1.0))
+                .collect(),
+        );
+        let daily = bars(&ticks, Timeframe::D1);
+        let weekly = resample(&daily, Timeframe::W1);
+        assert_eq!(weekly, bars(&ticks, Timeframe::W1));
+        assert_eq!(weekly.len(), 18, "17 full weeks and one day");
+        assert_eq!((weekly[0].ts, weekly[0].volume), (first * DAY, 7.0));
+        let monthly = resample(&daily, Timeframe::MN1);
+        let volumes: Vec<f64> = monthly.iter().map(|b| b.volume).collect();
+        assert_eq!(
+            volumes,
+            vec![31.0, 29.0, 31.0, 29.0],
+            "January to April 2024"
+        );
+        assert_eq!((monthly[1].open, monthly[1].close), (131.0, 159.0));
     }
 }

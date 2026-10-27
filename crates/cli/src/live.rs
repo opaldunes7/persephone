@@ -24,7 +24,7 @@ pub struct LiveArgs {
     /// Binance spot symbol.
     #[arg(long, default_value = "BTCUSDT")]
     symbol: String,
-    /// Bar timeframe: 1m, 5m, 15m, 30m, 1h, 4h or 1d.
+    /// Bar timeframe: 1m, 5m, 15m, 30m, 1h, 4h or 1d (live trading doesn't run on 1w or 1M).
     #[arg(long, alias = "bars", default_value = "1m")]
     timeframe: Timeframe,
     /// Strategy: ema-cross, rsi-reversion or donchian-breakout.
@@ -76,8 +76,12 @@ pub fn live(args: &LiveArgs) -> anyhow::Result<()> {
     let instrument = binance.instrument(&args.symbol)?;
 
     let tf = args.timeframe;
+    anyhow::ensure!(
+        !matches!(tf, Timeframe::W1 | Timeframe::MN1),
+        "live trading runs on bars from 1m to 1d"
+    );
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
-    let end = now - now % tf.nanos();
+    let end = tf.open_time(now);
     let history = binance
         .klines(
             &args.symbol,

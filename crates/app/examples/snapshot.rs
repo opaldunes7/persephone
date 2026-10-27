@@ -19,9 +19,9 @@
 //! came next), with the report open. `O` opens the sweep popup from the report and `Y` starts the sweep. `G` draws a trend line, a horizontal line and a box on the focused chart, and `c` hovers a
 //! bar on it so the other charts show the synced crosshair.
 //!
-//! With `SNAPSHOT_STORE` naming a local tick store, `L` / `M` open its first / second market
-//! (menu open), `D` drops the file named by `SNAPSHOT_DROP` on the focused chart (detecting its
-//! layout here) and `I` imports it.
+//! With `SNAPSHOT_STORE` naming a local store, `L` / `M` open its first / second market
+//! (menu open), `Z` asks to delete its first market (symbol search open), `D` drops the file
+//! named by `SNAPSHOT_DROP` on the focused chart (detecting its layout here) and `I` imports it.
 //! `SNAPSHOT_HOVER=X,Y` moves the mouse there before the snapshot, to show a tooltip.
 //! AT_MS freezes the clock that many milliseconds after the last action (default: settled),
 //! to look at animation frames. iced appends the renderer name to the file name.
@@ -87,6 +87,14 @@ fn main() -> anyhow::Result<()> {
                 ));
             }
             'I' => import_dropped(&mut app, store.as_ref().context("set SNAPSHOT_STORE")?)?,
+            'Z' => {
+                let markets = store.as_ref().context("set SNAPSHOT_STORE")?.markets();
+                let market = markets.first().context("the store is empty")?;
+                let _ = app.update(Message::Menu(MenuMessage::AskRemoveLocal {
+                    venue: market.info.venue.clone(),
+                    symbol: market.info.symbol.clone(),
+                }));
+            }
             'L' | 'M' => {
                 let markets = store.as_ref().context("set SNAPSHOT_STORE")?.markets();
                 let market = markets
@@ -162,6 +170,7 @@ fn message(c: char, focused: u32) -> anyhow::Result<Message> {
         'P' => menu(MenuMessage::Open(Page::Strategies)),
         's' => menu(MenuMessage::Open(Page::Symbol {
             query: String::new(),
+            removing: None,
         })),
         '1'..='8' => menu(MenuMessage::AddIndicator(
             BuiltIn::ALL[c as usize - '1' as usize],
@@ -376,10 +385,15 @@ fn example_plugins() -> anyhow::Result<Plugins> {
 
 fn fetch(symbol: &str, timeframe: Timeframe) -> anyhow::Result<std::sync::Arc<ChartData>> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
-    let end = now - now % timeframe.nanos() + timeframe.nanos();
+    let end = timeframe.close_time(now);
     let binance = BinanceClient::new()?;
     let spec = binance.instrument(symbol)?;
-    let candles = binance.klines(symbol, timeframe, end - 2_000 * timeframe.nanos(), end)?;
+    let candles = binance.klines(
+        symbol,
+        timeframe,
+        end.saturating_sub(2_000 * timeframe.nanos()),
+        end,
+    )?;
     Ok(ChartData::new(
         spec.symbol,
         spec.venue,

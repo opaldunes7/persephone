@@ -1,6 +1,6 @@
 use std::io::Write as _;
 
-use persephone_core::{Timeframe, tick::Aggressor};
+use persephone_core::{Timeframe, tick::Aggressor, time::NANOS_PER_DAY};
 
 use super::*;
 
@@ -15,14 +15,21 @@ fn found(sample: &str) -> Detection {
 fn trade(d: &Detection, i: usize) -> Trade {
     match d.preview[i] {
         Tick::Trade(t) => t,
-        Tick::Quote(_) => panic!("expected a trade"),
+        _ => panic!("expected a trade"),
     }
 }
 
 fn quote(d: &Detection, i: usize) -> Quote {
     match d.preview[i] {
         Tick::Quote(q) => q,
-        Tick::Trade(_) => panic!("expected a quote"),
+        _ => panic!("expected a quote"),
+    }
+}
+
+fn bar(d: &Detection, i: usize) -> Candle {
+    match d.preview[i] {
+        Tick::Bar(b) => b,
+        _ => panic!("expected a bar"),
     }
 }
 
@@ -31,7 +38,7 @@ fn bitcoincharts_dumps() {
     let d = found(
         "1388631845,5.800000000000,1.000000000000\n1388631846,5.810000000000,0.250000000000\n1388631846,5.79,2\n",
     );
-    assert_eq!(d.format.kind, TickKind::Trades);
+    assert_eq!(d.format.kind, Kind::Trades);
     assert!(!d.format.header);
     assert_eq!(d.format.time_format, TimeFormat::EpochSeconds);
     assert_eq!(
@@ -107,7 +114,7 @@ fn histdata_ticks_in_new_york_standard_time() {
         ..Overrides::default()
     };
     let d = detect(sample, &overrides).unwrap();
-    assert_eq!(d.format.kind, TickKind::Quotes);
+    assert_eq!(d.format.kind, Kind::Quotes);
     assert_eq!(d.format.time_format, TimeFormat::YearFirst);
     let q = quote(&d, 0);
     assert_eq!((q.ts, q.bid, q.ask), (T, 1.37625, 1.3769));
@@ -212,14 +219,14 @@ fn semicolons_and_decimal_commas() {
 fn overrides_win() {
     // Two close columns read as quotes, but they're really open/close trades... say so.
     let sample = "time,a,b\n2014-01-02 03:04:05,100.0,100.5\n2014-01-02 03:04:06,100.1,100.6\n";
-    assert_eq!(found(sample).format.kind, TickKind::Quotes);
+    assert_eq!(found(sample).format.kind, Kind::Quotes);
     let overrides = Overrides {
-        kind: Some(TickKind::Trades),
+        kind: Some(Kind::Trades),
         columns: vec![(Role::Price, "b".into())],
         ..Overrides::default()
     };
     let d = detect(sample, &overrides).unwrap();
-    assert_eq!(d.format.kind, TickKind::Trades);
+    assert_eq!(d.format.kind, Kind::Trades);
     assert_eq!(trade(&d, 0).price, 100.5);
     assert!(
         detect(
@@ -254,6 +261,109 @@ fn describes_what_it_found() {
     );
     assert!(text.contains("bid       column 3   \"Bid\""), "{text}");
     assert!(text.contains("day first, UTC"), "{text}");
+}
+
+#[test]
+fn metatrader_bar_exports() {
+    // Date and time apart, no header: open, high, low, close, tick volume.
+    let d = found(
+        "2014.01.02,03:00,1.37650,1.37702,1.37598,1.37624,1520
+         2014.01.02,04:00,1.37624,1.37730,1.37610,1.37700,1310
+         2014.01.02,05:00,1.37700,1.37712,1.37500,1.37530,990
+",
+    );
+    assert_eq!(d.format.kind, Kind::Bars);
+    assert_eq!(d.spacing, Some(Spacing::Minutes(60)));
+    assert_eq!(d.what(), "1h bars");
+    let b = bar(&d, 0);
+    assert_eq!(
+        (b.ts, b.open, b.high, b.low, b.close, b.volume),
+        (
+            T - 245 * 1_000_000_000,
+            1.3765,
+            1.37702,
+            1.37598,
+            1.37624,
+            1520.0
+        )
+    );
+    assert_eq!(d.price_decimals, 5);
+    assert!(
+        d.describe().contains("volume    column 7"),
+        "{}",
+        d.describe()
+    );
+}
+
+#[test]
+fn yahoo_daily_bars_with_a_header() {
+    let d = found(
+        "Date,Open,High,Low,Close,Adj Close,Volume
+         2024-01-02,187.15,188.44,183.89,185.64,184.94,82488700
+         2024-01-03,184.22,185.88,183.43,184.25,183.55,58414500
+         2024-01-04,182.15,183.09,180.88,181.91,181.22,71983600
+         2024-01-05,181.99,182.76,180.17,181.18,180.49,62303300
+         2024-01-08,182.09,185.60,181.50,185.56,184.86,59144500
+",
+    );
+    assert_eq!(d.format.kind, Kind::Bars);
+    let c = d.format.columns;
+    assert_eq!(
+        (c.open, c.high, c.low, c.close, c.size),
+        (Some(1), Some(2), Some(3), Some(4), Some(6))
+    );
+    assert_eq!(
+        d.spacing,
+        Some(Spacing::Minutes(1_440)),
+        "weekends don't make it weekly"
+    );
+    assert_eq!(bar(&d, 2).close, 181.91);
+}
+
+#[test]
+fn binance_klines_without_a_header() {
+    // open time, open, high, low, close, volume, close time, quote volume, trades, taker buys…
+    let d = found(
+        "1388631600000,42000.1,42100.0,41950.5,42050.0,12.5,1388631659999,525000.1,310,6.1,256000.2,0
+         1388631660000,42050.0,42080.0,42010.0,42070.0,8.25,1388631719999,347000.4,201,4.0,168000.9,0
+         1388631720000,42070.0,42070.0,41900.0,41920.0,15.0,1388631779999,628000.0,402,7.2,301000.3,0
+",
+    );
+    assert_eq!(d.format.kind, Kind::Bars);
+    assert_eq!(d.format.columns.time, 0);
+    assert_eq!(d.format.columns.size, Some(5));
+    assert_eq!(d.spacing, Some(Spacing::Minutes(1)));
+    assert_eq!(bar(&d, 1).ts, 1_388_631_660 * 1_000_000_000);
+}
+
+#[test]
+fn weekly_and_monthly_bars() {
+    let weekly = found(
+        "time,open,high,low,close
+2024-01-01,10,12,9,11
+2024-01-08,11,13,10,12
+2024-01-15,12,12.5,11,11.5
+",
+    );
+    assert_eq!(weekly.spacing, Some(Spacing::Week));
+    assert_eq!(weekly.what(), "1w bars without volume");
+    let monthly = found(
+        "time,open,high,low,close,volume
+2024-01-01,10,12,9,11,5
+2024-02-01,11,13,10,12,6
+2024-03-01,12,12.5,11,11.5,7
+",
+    );
+    assert_eq!(monthly.spacing, Some(Spacing::Month));
+    // Only a close: a series of prices.
+    let closes = found(
+        "time,close
+2024-01-01 00:00,10
+2024-01-01 00:01,11
+",
+    );
+    assert_eq!(closes.format.kind, Kind::Trades);
+    assert_eq!(closes.format.columns.price, Some(1));
 }
 
 // --- Importing -------------------------------------------------------------------------------
@@ -406,11 +516,112 @@ fn unsorted_files_and_wrong_kinds() {
     assert_eq!(summary.market.info.count, 4);
 
     let quotes = Format {
-        kind: TickKind::Quotes,
+        kind: Kind::Quotes,
         ..format
     };
     let error = import(&store, &[file], &quotes, &options(), &mut |_| true).unwrap_err();
     assert!(error.to_string().contains("holds trades"), "{error}");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Hourly bars from 2023-12-31 22:00 UTC for `hours`, written in New York time.
+fn hourly_csv(hours: u64) -> String {
+    let start = persephone_core::time::days_from_civil(2023, 12, 31) as UnixNanos * 86_400
+        + 22 * 3_600
+        - 5 * 3_600;
+    let mut csv = String::from(
+        "Date,Time,Open,High,Low,Close,Volume
+",
+    );
+    for h in 0..hours {
+        let dt = persephone_core::time::DateTime::from_nanos((start + h * 3_600) * 1_000_000_000);
+        let price = 100.0 + (h % 24) as f64;
+        csv.push_str(&format!(
+            "{},{},{price},{},{},{},10
+",
+            dt.date(),
+            dt.time(),
+            price + 2.0,
+            price - 1.0,
+            price + 1.0
+        ));
+    }
+    csv
+}
+
+#[test]
+fn imports_bars_and_charts_them_at_their_spacing_and_up() {
+    let dir = temp_dir("bars");
+    let file = dir.join("EURUSD_H1.csv");
+    fs::write(&file, hourly_csv(24 * 40)).unwrap();
+    let detection = detect(
+        &sample(&file).unwrap(),
+        &Overrides {
+            zone: Some("America/New_York".parse().unwrap()),
+            ..Overrides::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(detection.spacing, Some(Spacing::Minutes(60)));
+    let store = Store::new(dir.join("store"));
+    let import_it = |file: &PathBuf| {
+        import(
+            &store,
+            std::slice::from_ref(file),
+            &detection.format,
+            &options(),
+            &mut |_| true,
+        )
+    };
+    let summary = import_it(&file).unwrap();
+    assert_eq!(summary.imported, 960);
+    let market = summary.market;
+    assert_eq!(market.info.kind, MarketKind::Bars(Spacing::Minutes(60)));
+    assert_eq!(market.info.count, 960);
+    assert_eq!(market.info.fee, 0.001);
+    assert_eq!(
+        market.info.first,
+        persephone_core::time::days_from_civil(2023, 12, 31) as UnixNanos * NANOS_PER_DAY
+            + 22 * 3_600_000_000_000,
+        "read in New York time"
+    );
+    assert!(market.dir().join("bars/2023.parquet").exists());
+    assert!(market.dir().join("bars/2024.parquet").exists());
+    assert_eq!(
+        import_it(&file).unwrap().market.info.count,
+        960,
+        "again replaces"
+    );
+
+    assert_eq!(
+        market.candles(Timeframe::H4, 1_000).unwrap().len(),
+        241,
+        "from 22:00, the first 4 hours hold two"
+    );
+    let daily = market.candles(Timeframe::D1, 1_000).unwrap();
+    assert_eq!(daily.len(), 41, "40 days from 22:00 touch 41");
+    assert_eq!(daily[1].volume, 240.0);
+    assert!(market.candles(Timeframe::M15, 10).is_err());
+
+    // Daily bars can't join an hourly market.
+    let days = dir.join("EURUSD_D1.csv");
+    fs::write(
+        &days,
+        "Date,Open,High,Low,Close
+2024-03-01,1,2,0.5,1.5
+2024-03-04,1.5,2,1,1.2
+2024-03-05,1.2,1.3,1,1.1
+",
+    )
+    .unwrap();
+    let daily_format = found(&sample(&days).unwrap()).format;
+    let error = import(&store, &[days], &daily_format, &options(), &mut |_| true).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("holds 1h bars, but these files have 1d bars"),
+        "{error}"
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 

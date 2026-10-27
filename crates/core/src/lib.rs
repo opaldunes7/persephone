@@ -11,6 +11,8 @@ pub mod time;
 
 use std::{fmt, str::FromStr};
 
+use crate::time::{NANOS_PER_DAY, civil_from_days, days_from_civil};
+
 /// Nanoseconds since the Unix epoch, UTC.
 pub type UnixNanos = u64;
 
@@ -25,7 +27,8 @@ pub struct Candle {
     pub volume: f64,
 }
 
-/// Bar duration. The set matches what crypto venues serve natively.
+/// Bar duration. The set matches what crypto venues serve natively. Weeks start on Monday
+/// and months on the 1st, both at midnight UTC, as Binance's do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Timeframe {
     M1,
@@ -35,10 +38,12 @@ pub enum Timeframe {
     H1,
     H4,
     D1,
+    W1,
+    MN1,
 }
 
 impl Timeframe {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::M1,
         Self::M5,
         Self::M15,
@@ -46,8 +51,12 @@ impl Timeframe {
         Self::H1,
         Self::H4,
         Self::D1,
+        Self::W1,
+        Self::MN1,
     ];
 
+    /// The bar's length; a month counts as 30 days here, so use [`open_time`](Self::open_time)
+    /// and [`close_time`](Self::close_time) for a bar's edges.
     #[must_use]
     pub const fn nanos(self) -> UnixNanos {
         const MINUTE: UnixNanos = 60_000_000_000;
@@ -59,10 +68,12 @@ impl Timeframe {
             Self::H1 => 60 * MINUTE,
             Self::H4 => 240 * MINUTE,
             Self::D1 => 1_440 * MINUTE,
+            Self::W1 => 7 * 1_440 * MINUTE,
+            Self::MN1 => 30 * 1_440 * MINUTE,
         }
     }
 
-    /// Short label, also the interval string Binance uses ("1m", "4h", ...).
+    /// Short label, also the interval string Binance uses ("1m", "4h", "1M", ...).
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -73,6 +84,54 @@ impl Timeframe {
             Self::H1 => "1h",
             Self::H4 => "4h",
             Self::D1 => "1d",
+            Self::W1 => "1w",
+            Self::MN1 => "1M",
+        }
+    }
+
+    /// When the bar holding `ts` opens.
+    #[must_use]
+    pub fn open_time(self, ts: UnixNanos) -> UnixNanos {
+        let day = (ts / NANOS_PER_DAY) as i64;
+        let start = |day: i64| day.max(0) as UnixNanos * NANOS_PER_DAY;
+        match self {
+            // 1970-01-05 was the first Monday.
+            Self::W1 => start(day - (day - 4).rem_euclid(7)),
+            Self::MN1 => {
+                let (year, month, _) = civil_from_days(day);
+                start(days_from_civil(year, month, 1))
+            }
+            _ => ts - ts % self.nanos(),
+        }
+    }
+
+    /// When the bar holding `ts` closes, which is when the next one opens.
+    #[must_use]
+    pub fn close_time(self, ts: UnixNanos) -> UnixNanos {
+        let open = self.open_time(ts);
+        match self {
+            Self::MN1 => {
+                let (year, month, _) = civil_from_days((open / NANOS_PER_DAY) as i64);
+                let (year, month) = if month == 12 {
+                    (year + 1, 1)
+                } else {
+                    (year, month + 1)
+                };
+                days_from_civil(year, month, 1) as UnixNanos * NANOS_PER_DAY
+            }
+            _ => open + self.nanos(),
+        }
+    }
+
+    /// Whether this timeframe's bars are made of whole bars of `shorter`: every timeframe up
+    /// to a day divides a day, and days make weeks and months, but weeks don't make months.
+    #[must_use]
+    pub fn is_made_of(self, shorter: Self) -> bool {
+        match (shorter, self) {
+            (Self::W1, other) => other == Self::W1,
+            (Self::MN1, other) => other == Self::MN1,
+            (_, Self::W1 | Self::MN1) => true,
+            (shorter, longer) => longer.nanos() % shorter.nanos() == 0,
         }
     }
 }
@@ -84,16 +143,18 @@ impl fmt::Display for Timeframe {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("unknown timeframe `{0}` (expected one of 1m, 5m, 15m, 30m, 1h, 4h, 1d)")]
+#[error("unknown timeframe `{0}` (expected one of 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1M)")]
 pub struct ParseTimeframeError(String);
 
 impl FromStr for Timeframe {
     type Err = ParseTimeframeError;
 
+    /// Case doesn't matter, except that `1m` is a minute and `1M` a month.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|tf| tf.label().eq_ignore_ascii_case(s))
+        let find =
+            |same: fn(&str, &str) -> bool| Self::ALL.into_iter().find(|tf| same(tf.label(), s));
+        find(|a, b| a == b)
+            .or_else(|| find(str::eq_ignore_ascii_case))
             .ok_or_else(|| ParseTimeframeError(s.to_owned()))
     }
 }
@@ -135,7 +196,7 @@ impl BarSpec {
     #[must_use]
     pub fn closes(self, candles: &[Candle]) -> Vec<UnixNanos> {
         match self {
-            Self::Time(tf) => candles.iter().map(|c| c.ts + tf.nanos()).collect(),
+            Self::Time(tf) => candles.iter().map(|c| tf.close_time(c.ts)).collect(),
             Self::Ticks(_) | Self::Volume(_) => {
                 let typical = self.typical_nanos(candles);
                 let mut closes: Vec<UnixNanos> = candles
@@ -271,7 +332,48 @@ mod tests {
             assert_eq!(tf.label().parse::<Timeframe>().unwrap(), tf);
         }
         assert_eq!("4H".parse::<Timeframe>().unwrap(), Timeframe::H4);
+        assert_eq!("1W".parse::<Timeframe>().unwrap(), Timeframe::W1);
+        assert_eq!("1m".parse::<Timeframe>().unwrap(), Timeframe::M1);
+        assert_eq!("1M".parse::<Timeframe>().unwrap(), Timeframe::MN1);
         assert!("2h".parse::<Timeframe>().is_err());
+    }
+
+    #[test]
+    fn weeks_start_on_monday_and_months_on_the_first() {
+        let at = |y, m, d, hour: u64| {
+            time::days_from_civil(y, m, d) as UnixNanos * NANOS_PER_DAY + hour * 3_600_000_000_000
+        };
+        // 2024-02-29 was a Thursday in a leap year.
+        let ts = at(2024, 2, 29, 13);
+        assert_eq!(Timeframe::W1.open_time(ts), at(2024, 2, 26, 0));
+        assert_eq!(Timeframe::W1.close_time(ts), at(2024, 3, 4, 0));
+        assert_eq!(
+            Timeframe::W1.open_time(at(2024, 3, 4, 0)),
+            at(2024, 3, 4, 0)
+        );
+        assert_eq!(Timeframe::MN1.open_time(ts), at(2024, 2, 1, 0));
+        assert_eq!(Timeframe::MN1.close_time(ts), at(2024, 3, 1, 0));
+        assert_eq!(
+            Timeframe::MN1.close_time(at(2023, 12, 31, 23)),
+            at(2024, 1, 1, 0)
+        );
+        // A week can straddle a year.
+        assert_eq!(
+            Timeframe::W1.open_time(at(2025, 1, 1, 0)),
+            at(2024, 12, 30, 0)
+        );
+        assert_eq!(Timeframe::H4.open_time(ts), at(2024, 2, 29, 12));
+        assert_eq!(Timeframe::H4.close_time(ts), at(2024, 2, 29, 16));
+        assert_eq!(Timeframe::W1.open_time(0), 0, "before the first Monday");
+    }
+
+    #[test]
+    fn longer_timeframes_are_made_of_shorter_ones() {
+        assert!(Timeframe::H4.is_made_of(Timeframe::M15));
+        assert!(Timeframe::W1.is_made_of(Timeframe::D1));
+        assert!(Timeframe::MN1.is_made_of(Timeframe::H4));
+        assert!(!Timeframe::MN1.is_made_of(Timeframe::W1));
+        assert!(Timeframe::W1.is_made_of(Timeframe::W1));
     }
 
     #[test]

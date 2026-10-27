@@ -71,8 +71,8 @@ struct BacktestArgs {
     /// With --local, fill orders on the bars instead of the ticks.
     #[arg(long, requires = "local")]
     bar_fills: bool,
-    /// Bars: a timeframe (1m, 5m, 15m, 30m, 1h, 4h, 1d), or for --local markets a bar every
-    /// so many ticks (1000t) or so much traded size (2.5v).
+    /// Bars: a timeframe (1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w, 1M), or for --local markets with
+    /// ticks a bar every so many ticks (1000t) or so much traded size (2.5v).
     #[arg(long, alias = "bars", default_value = "1h")]
     timeframe: BarSpec,
     /// How many days of history to test, ending now (or at the local market's last tick).
@@ -162,7 +162,7 @@ fn backtest(args: &BacktestArgs) -> anyhow::Result<()> {
                 anyhow::bail!("Binance serves time bars; tick and volume bars need --local");
             };
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
-            let end = now - now % tf.nanos();
+            let end = tf.open_time(now);
             let start = end.saturating_sub(args.days * NANOS_PER_DAY);
             let binance = BinanceClient::new()?;
             let instrument = binance.instrument(&args.symbol)?;
@@ -254,7 +254,9 @@ fn local_market(id: &str, tf: BarSpec, days: u64, bar_fills: bool) -> anyhow::Re
         taker: market.info.fee,
     };
     let instrument = market.instrument();
-    let ticks = (!bar_fills).then(|| Arc::new(market) as Arc<dyn TickFeed>);
+    // A market imported as bars has no ticks to fill on.
+    let has_ticks = market.info.kind.ticks().is_some();
+    let ticks = (has_ticks && !bar_fills).then(|| Arc::new(market) as Arc<dyn TickFeed>);
     Ok((instrument, candles, ticks, fee))
 }
 

@@ -163,6 +163,7 @@ fn timeframe_and_symbol_switches_keep_indicators() {
         &mut app,
         MenuMessage::Open(Page::Symbol {
             query: String::new(),
+            removing: None,
         }),
     );
     menu(&mut app, MenuMessage::QueryChanged("solusdt".into()));

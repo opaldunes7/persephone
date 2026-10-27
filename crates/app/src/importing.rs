@@ -1,5 +1,5 @@
-//! Importing CSV tick files dropped on a chart: the same detection and import as
-//! `persephone-cli import`, run off the UI thread, with progress.
+//! Importing CSV tick or bar files dropped on a chart or picked from its symbol search: the
+//! same detection and import as `persephone-cli import`, run off the UI thread, with progress.
 
 use std::{
     path::{Path, PathBuf},
@@ -15,6 +15,7 @@ use persephone_data::{
     import::{self, Format, MarketOptions, Overrides},
     store::Store,
 };
+use persephone_tiling::TileId;
 
 use crate::{Message, on_thread};
 
@@ -33,6 +34,22 @@ pub fn guess_symbol(path: &Path) -> String {
         .map(|c| c.to_ascii_uppercase())
         .take(32)
         .collect()
+}
+
+/// Asks for files to import into `tile` with the system's open panel.
+pub fn pick(tile: TileId) -> Task<Message> {
+    let dialog = rfd::AsyncFileDialog::new()
+        .set_title("Import ticks or bars")
+        .add_filter("CSV files", &["csv", "txt", "gz", "zip"])
+        .add_filter("All files", &["*"]);
+    Task::perform(dialog.pick_files(), move |picked| {
+        let files = picked
+            .unwrap_or_default()
+            .iter()
+            .map(|file| file.path().to_owned())
+            .collect();
+        Message::FilesPicked(tile, files)
+    })
 }
 
 /// Works out `path`'s layout on a worker thread.

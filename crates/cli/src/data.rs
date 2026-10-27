@@ -1,5 +1,5 @@
-//! `persephone-cli import` and `persephone-cli data`: CSV tick files into the local store, and
-//! looking after what's there.
+//! `persephone-cli import` and `persephone-cli data`: CSV tick or bar files into the local
+//! store, and looking after what's there.
 
 use std::{
     io::Write as _,
@@ -11,7 +11,6 @@ use anyhow::{Context, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use persephone_core::{
     UnixNanos,
-    tick::TickKind,
     time::{DateTime, NANOS_PER_DAY},
 };
 use persephone_data::{
@@ -56,7 +55,7 @@ pub struct ImportArgs {
     #[arg(long)]
     dry_run: bool,
 
-    /// Trades or quotes, if detection gets it wrong.
+    /// Trades, quotes or bars, if detection gets it wrong.
     #[arg(long, value_enum)]
     kind: Option<Kind>,
     /// The column separator.
@@ -90,12 +89,22 @@ pub struct ImportArgs {
     bid_size: Option<String>,
     #[arg(long)]
     ask_size: Option<String>,
+    /// A bar's prices; its volume is --size.
+    #[arg(long)]
+    open: Option<String>,
+    #[arg(long)]
+    high: Option<String>,
+    #[arg(long)]
+    low: Option<String>,
+    #[arg(long)]
+    close: Option<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Kind {
     Trades,
     Quotes,
+    Bars,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -113,7 +122,7 @@ enum TimeFormatArg {
 pub enum DataCommand {
     /// List the markets in the local store.
     List,
-    /// Delete a market and all its ticks.
+    /// Delete a market and everything stored for it (not the files it came from).
     Remove {
         /// SYMBOL.VENUE, as `data list` shows it.
         market: String,
@@ -229,7 +238,7 @@ fn import_files(
             println!("  {problem}");
         }
     }
-    println!("Open it from any chart: click → Symbol → Local.");
+    println!("Open it from any chart: click the chart's symbol and pick it under Local.");
     Ok(())
 }
 
@@ -348,6 +357,10 @@ fn overrides(args: &ImportArgs, zone: Option<Zone>) -> anyhow::Result<Overrides>
         (Role::Ask, &args.ask),
         (Role::BidSize, &args.bid_size),
         (Role::AskSize, &args.ask_size),
+        (Role::Open, &args.open),
+        (Role::High, &args.high),
+        (Role::Low, &args.low),
+        (Role::Close, &args.close),
     ] {
         if let Some(spec) = spec {
             columns.push((role, spec.clone()));
@@ -370,8 +383,9 @@ fn overrides(args: &ImportArgs, zone: Option<Zone>) -> anyhow::Result<Overrides>
             None
         },
         kind: args.kind.map(|k| match k {
-            Kind::Trades => TickKind::Trades,
-            Kind::Quotes => TickKind::Quotes,
+            Kind::Trades => import::Kind::Trades,
+            Kind::Quotes => import::Kind::Quotes,
+            Kind::Bars => import::Kind::Bars,
         }),
         time_format: args.time_format.map(|f| match f {
             TimeFormatArg::EpochSeconds => TimeFormat::EpochSeconds,
@@ -425,6 +439,21 @@ fn describe_tick(tick: &Tick, format: &Format) -> String {
             format!("{}  price {}{size}{side}", timestamp(t.ts), t.price)
         }
         Tick::Quote(q) => format!("{}  bid {}  ask {}", timestamp(q.ts), q.bid, q.ask),
+        Tick::Bar(b) => {
+            let volume = if format.columns.size.is_some() {
+                format!("  volume {}", b.volume)
+            } else {
+                String::new()
+            };
+            format!(
+                "{}  open {}  high {}  low {}  close {}{volume}",
+                timestamp(b.ts),
+                b.open,
+                b.high,
+                b.low,
+                b.close
+            )
+        }
     }
 }
 
@@ -435,13 +464,13 @@ pub fn run(command: &DataCommand) -> anyhow::Result<()> {
             let markets = store.markets();
             if markets.is_empty() {
                 println!(
-                    "The store is empty. Import CSV ticks with `persephone-cli import FILE --symbol SYMBOL`."
+                    "The store is empty. Import CSV ticks or bars with `persephone-cli import FILE --symbol SYMBOL`."
                 );
             }
             for market in markets {
                 let info = &market.info;
                 println!(
-                    "{:<24} {:<7} {:>14}  {} → {}  fee {}%",
+                    "{:<24} {:<9} {:>14}  {} → {}  fee {}%",
                     market.id(),
                     info.kind,
                     count(info.count),

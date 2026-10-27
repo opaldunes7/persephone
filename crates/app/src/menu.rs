@@ -10,11 +10,13 @@
 //!   Indicators ›, Strategy ›, Draw ›, Symbol ›, and a row of timeframe chips;
 //! - indicators: every built-in, grouped by where it's drawn, then loaded plugins;
 //! - strategies: every built-in strategy and plugin, with a one-line description;
-//! - symbol: a search box over markets in the local store and popular Binance pairs.
+//! - symbol: a search box over markets in the local store and popular Binance pairs, with an
+//!   Import row at the bottom and a way to delete a local market.
 //!
 //! The report opens from a chart's strategy summary: settings, full statistics, paper trading
-//! on live bars, and a remove button. Dropping CSV files on a chart opens the import panel: what was detected, the
-//! market to put the ticks in, and progress.
+//! on live bars, and a remove button. Dropping CSV files on a chart, or picking them from the
+//! symbol search's Import row, opens the import panel: what was detected, the market to put the
+//! ticks or bars in, and progress.
 
 use std::{
     path::{Path, PathBuf},
@@ -36,8 +38,8 @@ use persephone_core::{
     time::DateTime,
 };
 use persephone_data::{
-    import::{Detection, Progress, Summary},
-    store::MarketInfo,
+    import::{Detection, Kind, Progress, Summary},
+    store::{MarketInfo, MarketKind, Spacing},
 };
 use persephone_engine::{BacktestReport, live::LiveMode};
 use persephone_plugin_host::Plugins;
@@ -61,7 +63,7 @@ const PANEL_BORDER: Color = Color::from_rgb8(0x36, 0x3a, 0x45);
 const HOVER: Color = Color::from_rgb8(0x2a, 0x2e, 0x39);
 
 /// The most local markets the symbol page lists at once.
-const LOCAL_SHOWN: usize = 6;
+const LOCAL_SHOWN: usize = 8;
 
 /// Popular Binance pairs offered in the symbol search.
 const SYMBOLS: [&str; 14] = [
@@ -80,6 +82,7 @@ pub enum Page {
     Strategies,
     Symbol {
         query: String,
+        removing: Option<Removal>,
     },
     Draw,
     /// Tick and volume bars, for a local market: presets and a box for any count or size.
@@ -131,13 +134,14 @@ pub enum Popup {
     SymbolSearch {
         tile: TileId,
         query: String,
+        removing: Option<Removal>,
     },
     /// Every timeframe, dropping down from the header's timeframe.
     Timeframes {
         tile: TileId,
         at: Point,
     },
-    /// CSV files dropped on the tile, on their way into the local store.
+    /// CSV files dropped on the tile or picked for it, on their way into the local store.
     Import {
         tile: TileId,
         files: Vec<PathBuf>,
@@ -148,6 +152,18 @@ pub enum Popup {
         zone: String,
         error: Option<String>,
     },
+}
+
+/// A local market about to be deleted from the symbol search: its row asks first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Removal {
+    pub venue: String,
+    pub symbol: String,
+    /// What its files take on disk.
+    pub bytes: u64,
+    pub deleting: bool,
+    /// Why it can't be deleted, or why deleting failed.
+    pub error: Option<String>,
 }
 
 /// Where an import of dropped files stands.
@@ -175,11 +191,12 @@ impl Popup {
         }
     }
 
-    /// The import panel for `file`, dropped on `tile`, while its layout is worked out.
-    pub fn import(tile: TileId, file: PathBuf, symbol: String) -> Self {
+    /// The import panel for `files`, dropped on `tile` or picked for it, while the first one's
+    /// layout is worked out.
+    pub fn import(tile: TileId, files: Vec<PathBuf>, symbol: String) -> Self {
         Self::Import {
             tile,
-            files: vec![file],
+            files,
             state: ImportState::Detecting,
             symbol,
             venue: persephone_data::import::DEFAULT_VENUE.into(),
@@ -213,6 +230,18 @@ impl Popup {
     #[must_use]
     pub fn at_point(&self) -> Point {
         self.at()
+    }
+
+    /// The local market the symbol search is asking to delete, for the search popups.
+    pub fn removing_mut(&mut self) -> Option<&mut Option<Removal>> {
+        match self {
+            Self::Menu {
+                page: Page::Symbol { removing, .. },
+                ..
+            }
+            | Self::SymbolSearch { removing, .. } => Some(removing),
+            _ => None,
+        }
     }
 
     fn at(&self) -> Point {
@@ -296,6 +325,15 @@ pub enum MenuMessage {
         symbol: String,
     },
     SubmitSymbol,
+    /// Pick files to import from the symbol search.
+    PickFiles,
+    /// Ask before deleting a local market, then delete it or keep it.
+    AskRemoveLocal {
+        venue: String,
+        symbol: String,
+    },
+    RemoveLocal,
+    KeepLocal,
     /// The import panel's symbol and venue boxes, and its Import button.
     ImportSymbolChanged(String),
     ImportVenueChanged(String),
@@ -363,6 +401,8 @@ pub struct TileInfo<'a> {
     pub bars: BarSpec,
     /// For a local market, what its ticks are (so which bars it can have).
     pub tick_kind: Option<TickKind>,
+    /// For a market imported as bars, how far apart they are (so which timeframes it can show).
+    pub spacing: Option<Spacing>,
     pub specs: &'a [IndicatorSpec],
     pub strategy: Option<(&'a StrategySpec, &'a Run)>,
     /// Trading the strategy live: the session, if one ran, or why the chart can't.
@@ -415,7 +455,7 @@ pub fn view<'a>(
                 tile.plugins,
                 tile.plugin_dir,
             ),
-            Page::Symbol { query } => symbols(query, &tile),
+            Page::Symbol { query, removing } => symbols(query, removing.as_ref(), &tile),
             Page::Draw => draw_page(tile.drawings.len()),
             Page::Bars { input, error } => bars_page(&tile, input, error.as_deref()),
         },
@@ -440,7 +480,19 @@ pub fn view<'a>(
             zone,
             error,
             ..
-        } => import_panel(files, state, [symbol, venue, zone], error.as_deref()),
+        } => {
+            let existing = tile
+                .local_markets
+                .iter()
+                .find(|m| &m.symbol == symbol && &m.venue == venue);
+            import_panel(
+                files,
+                state,
+                [symbol, venue, zone],
+                existing,
+                error.as_deref(),
+            )
+        }
         Popup::Sweep {
             param,
             inputs,
@@ -452,7 +504,9 @@ pub fn view<'a>(
             }
             None => column![].into(),
         },
-        Popup::SymbolSearch { query, .. } => symbol_search(query, &tile),
+        Popup::SymbolSearch {
+            query, removing, ..
+        } => symbol_search(query, removing.as_ref(), &tile),
         Popup::Timeframes { .. } => timeframes(&tile),
         Popup::Drawing { index, .. } => match tile.drawings.get(*index) {
             Some(drawing) => container(
@@ -476,7 +530,7 @@ pub fn view<'a>(
             n => n + 2,
         },
         Popup::Timeframes { .. } => usize::from(tile.tick_kind.is_some()),
-        Popup::SymbolSearch { .. } => tile.local_markets.len().min(LOCAL_SHOWN) + 11,
+        Popup::SymbolSearch { .. } => tile.local_markets.len().min(LOCAL_SHOWN) + 14,
         Popup::Menu {
             page: Page::Indicators,
             ..
@@ -488,11 +542,11 @@ pub fn view<'a>(
         Popup::Menu {
             page: Page::Symbol { .. },
             ..
-        } => tile.local_markets.len().min(LOCAL_SHOWN) + 1,
+        } => tile.local_markets.len().min(LOCAL_SHOWN) + 4,
         Popup::Import {
             state: ImportState::Ready(detection),
             ..
-        } => detection.roles().len() + detection.notes.len(),
+        } => detection.roles().len() + detection.notes.len() + 2,
         // Sweep rows, notes (about two lines each) and the AI permission text.
         Popup::Report { .. } => {
             let sweep = tile.sweep.as_ref().map_or(0, |(_, rows)| rows.len() + 2);
@@ -583,15 +637,16 @@ fn active<'a>(tile: &TileInfo<'a>) -> Vec<Element<'a, MenuMessage>> {
 fn timeframes<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
     let mut page = column(Timeframe::ALL.into_iter().map(|tf| {
         let current = BarSpec::Time(tf) == tile.bars;
-        local_item(
-            timeframe_name(tf),
-            if current {
-                "✓".into()
-            } else {
-                tf.label().to_owned()
-            },
-            MenuMessage::SetTimeframe(tf),
-        )
+        let hint = if current {
+            "✓".into()
+        } else {
+            tf.label().to_owned()
+        };
+        if allowed(tile, tf) {
+            local_item(timeframe_name(tf), hint, MenuMessage::SetTimeframe(tf))
+        } else {
+            disabled_item(timeframe_name(tf), hint)
+        }
     }));
     if tile.tick_kind.is_some() {
         let current = match tile.bars {
@@ -619,20 +674,31 @@ const fn timeframe_name(tf: Timeframe) -> &'static str {
         Timeframe::H1 => "1 hour",
         Timeframe::H4 => "4 hours",
         Timeframe::D1 => "1 day",
+        Timeframe::W1 => "1 week",
+        Timeframe::MN1 => "1 month",
     }
+}
+
+/// Whether the tile's market can show `tf`: a market imported as bars only shows the
+/// timeframes its bars make.
+fn allowed(tile: &TileInfo<'_>, tf: Timeframe) -> bool {
+    tile.spacing.is_none_or(|spacing| spacing.allows(tf))
 }
 
 fn root<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
     let chips = row(Timeframe::ALL.into_iter().map(|tf| {
         let selected = BarSpec::Time(tf) == tile.bars;
-        button(text(tf.label()).size(12).center())
+        let chip_button = button(text(tf.label()).size(11).center())
             .padding([2, 0])
             .width(Fill)
-            .on_press(MenuMessage::SetTimeframe(tf))
-            .style(move |_, status| chip(selected, status))
-            .into()
+            .style(move |_, status| chip(selected, status));
+        if allowed(tile, tf) {
+            chip_button.on_press(MenuMessage::SetTimeframe(tf)).into()
+        } else {
+            chip_button.into()
+        }
     }))
-    .spacing(3);
+    .spacing(2);
 
     let strategy = tile
         .strategy
@@ -654,6 +720,7 @@ fn root<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
             tile.symbol,
             MenuMessage::Open(Page::Symbol {
                 query: String::new(),
+                removing: None,
             }),
         ),
         separator(),
@@ -800,7 +867,11 @@ fn plugin_note<'a>(dir: Option<&Path>, plugins: &Plugins) -> Option<Element<'a, 
     }
 }
 
-fn symbols<'a>(query: &'a str, tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
+fn symbols<'a>(
+    query: &'a str,
+    removing: Option<&'a Removal>,
+    tile: &TileInfo<'a>,
+) -> Element<'a, MenuMessage> {
     let input = text_input("Search, e.g. ETHUSDT", query)
         .id(symbol_input())
         .on_input(MenuMessage::QueryChanged)
@@ -809,14 +880,18 @@ fn symbols<'a>(query: &'a str, tile: &TileInfo<'a>) -> Element<'a, MenuMessage> 
         .size(12)
         .style(|_, status| input_style(status));
     column![back("Symbol"), container(input).padding([4, 6])]
-        .extend(symbol_matches(query, tile))
+        .extend(symbol_matches(query, removing, tile))
         .spacing(2)
         .into()
 }
 
 /// The header's symbol as a search box: typing narrows the dropdown under it, a click picks
 /// a market, and Enter opens whatever Binance pair is typed.
-fn symbol_search<'a>(query: &'a str, tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
+fn symbol_search<'a>(
+    query: &'a str,
+    removing: Option<&'a Removal>,
+    tile: &TileInfo<'a>,
+) -> Element<'a, MenuMessage> {
     let input = text_input(tile.symbol, query)
         .id(symbol_input())
         .on_input(MenuMessage::QueryChanged)
@@ -825,45 +900,43 @@ fn symbol_search<'a>(query: &'a str, tile: &TileInfo<'a>) -> Element<'a, MenuMes
         .size(theme::LEGEND_SIZE)
         .width(SEARCH_WIDTH)
         .style(|_, status| input_style(status));
-    let matches = column(symbol_matches(query, tile)).spacing(2);
+    let matches = column(symbol_matches(query, removing, tile)).spacing(2);
     // Touching the box, so the price line under it doesn't show through a gap.
     column![input, panel(matches.into(), SEARCH_WIDTH)]
         .spacing(1)
         .into()
 }
 
-/// Markets matching `query`: local ones first (when there are any), then Binance pairs, and a
-/// note that Enter opens any pair.
-fn symbol_matches<'a>(query: &str, tile: &TileInfo<'a>) -> Vec<Element<'a, MenuMessage>> {
+/// Markets matching `query`: local ones first (when there are any), each with a button to
+/// delete it, then Binance pairs, a note that Enter opens any pair, and the Import row.
+fn symbol_matches<'a>(
+    query: &str,
+    removing: Option<&'a Removal>,
+    tile: &TileInfo<'a>,
+) -> Vec<Element<'a, MenuMessage>> {
     let needle = query.trim().to_uppercase();
     let (current, venue) = (tile.symbol, tile.venue);
-    let local: Vec<Element<'a, MenuMessage>> = tile
+    let matching: Vec<&MarketInfo> = tile
         .local_markets
         .iter()
         .filter(|m| m.symbol.contains(&needle) || m.venue.contains(&needle))
+        .collect();
+    let mut local: Vec<Element<'a, MenuMessage>> = matching
+        .iter()
         .take(LOCAL_SHOWN)
-        .map(|m| {
-            let selected = m.symbol == current && Some(m.venue.as_str()) == venue;
-            let hint = if selected {
-                "current".to_owned()
-            } else {
-                format!(
-                    "{} · {} {}",
-                    m.venue,
-                    m.kind,
-                    DateTime::from_nanos(m.first).year
-                )
-            };
-            local_item(
-                &m.symbol,
-                hint,
-                MenuMessage::SetLocal {
-                    venue: m.venue.clone(),
-                    symbol: m.symbol.clone(),
-                },
-            )
+        .map(|m| match removing {
+            Some(removal) if removal.symbol == m.symbol && removal.venue == m.venue => {
+                confirm_removal(removal)
+            }
+            _ => local_row(m, m.symbol == current && Some(m.venue.as_str()) == venue),
         })
         .collect();
+    if matching.len() > LOCAL_SHOWN {
+        local.push(note_owned(format!(
+            "{} more; type to narrow",
+            matching.len() - LOCAL_SHOWN
+        )));
+    }
 
     let binance = SYMBOLS
         .into_iter()
@@ -886,7 +959,138 @@ fn symbol_matches<'a>(query: &str, tile: &TileInfo<'a>) -> Vec<Element<'a, MenuM
     }
     rows.extend(binance);
     rows.push(note("Enter loads any Binance spot pair"));
+    rows.push(separator());
+    rows.push(item(
+        "Import data…",
+        "ticks or bars · csv, gz, zip",
+        MenuMessage::PickFiles,
+    ));
     rows
+}
+
+/// A local market: its symbol, where it's from and what it holds, and a button to delete it.
+fn local_row<'a>(m: &'a MarketInfo, selected: bool) -> Element<'a, MenuMessage> {
+    let hint = if selected {
+        "current".to_owned()
+    } else {
+        format!(
+            "{} · {} {}",
+            m.venue,
+            m.kind,
+            DateTime::from_nanos(m.first).year
+        )
+    };
+    let open = local_item(
+        &m.symbol,
+        hint,
+        MenuMessage::SetLocal {
+            venue: m.venue.clone(),
+            symbol: m.symbol.clone(),
+        },
+    );
+    let remove = button(text("×").size(13).center())
+        .width(22)
+        .padding([1, 0])
+        .on_press(MenuMessage::AskRemoveLocal {
+            venue: m.venue.clone(),
+            symbol: m.symbol.clone(),
+        })
+        .style(|_, status| button::Style {
+            background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+                .then_some(Background::Color(HOVER)),
+            text_color: match status {
+                button::Status::Hovered | button::Status::Pressed => theme::DOWN,
+                _ => theme::TEXT_MUTED,
+            },
+            border: Border {
+                radius: 3.0.into(),
+                ..Border::default()
+            },
+            ..button::Style::default()
+        });
+    row![open, remove].spacing(2).align_y(iced::Center).into()
+}
+
+/// A local market's row while deleting it is being asked about.
+fn confirm_removal<'a>(removal: &'a Removal) -> Element<'a, MenuMessage> {
+    let id = format!("{}.{}", removal.symbol, removal.venue);
+    let question = match (&removal.error, removal.deleting) {
+        (Some(error), _) => text(error.as_str()).size(11).color(theme::DOWN),
+        (None, true) => text(format!("Deleting {id}…"))
+            .size(11)
+            .color(theme::TEXT_MUTED),
+        (None, false) => text(format!(
+            "Delete {id} ({})? The files you imported from stay.",
+            bytes(removal.bytes)
+        ))
+        .size(11)
+        .color(theme::TEXT_BRIGHT),
+    };
+    let small = |label: &'a str, on_press: Option<MenuMessage>, danger: bool| {
+        button(text(label).size(11).center())
+            .padding([2, 10])
+            .on_press_maybe(on_press)
+            .style(move |_, status| {
+                if danger {
+                    remove_style(status)
+                } else {
+                    chip(false, status)
+                }
+            })
+    };
+    let can_delete = removal.error.is_none() && !removal.deleting;
+    let buttons = row![
+        space::horizontal(),
+        small("Keep", Some(MenuMessage::KeepLocal), false),
+        small(
+            "Delete",
+            can_delete.then_some(MenuMessage::RemoveLocal),
+            true
+        ),
+    ]
+    .spacing(5);
+    container(column![question, buttons].spacing(4))
+        .padding([4, 8])
+        .style(|_| container::Style {
+            border: Border {
+                color: PANEL_BORDER,
+                width: 1.0,
+                radius: 3.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
+/// `1536` → `1.5 KB`, and so on up to gigabytes.
+fn bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["bytes", "KB", "MB", "GB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} bytes")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// A menu item that can't be picked, greyed out.
+fn disabled_item<'a>(label: &'a str, hint: String) -> Element<'a, MenuMessage> {
+    container(
+        row![
+            text(label).size(12).color(theme::TEXT_MUTED),
+            space::horizontal(),
+            text(hint).size(11).color(theme::TEXT_MUTED),
+        ]
+        .align_y(iced::Center),
+    )
+    .width(Fill)
+    .padding([3, 8])
+    .into()
 }
 
 /// A menu item whose hint is built for it.
@@ -1069,6 +1273,7 @@ fn import_panel<'a>(
     files: &'a [PathBuf],
     state: &'a ImportState,
     [symbol, venue, zone]: [&'a str; 3],
+    existing: Option<&'a MarketInfo>,
     error: Option<&'a str>,
 ) -> Element<'a, MenuMessage> {
     let name = files[0]
@@ -1079,7 +1284,7 @@ fn import_panel<'a>(
         n => format!("{name} and {} more", n - 1),
     };
     let muted = |content: String| text(content).size(11).color(theme::TEXT_MUTED);
-    let mut body = column![header("Import ticks"), muted(files_line)].spacing(5);
+    let mut body = column![header("Import data"), muted(files_line)].spacing(5);
 
     body = match state {
         ImportState::Detecting => body.push(muted("Reading the file…".into())),
@@ -1096,7 +1301,7 @@ fn import_panel<'a>(
                 let example = detection.example.get(i).map_or("", String::as_str);
                 body = body.push(
                     row![
-                        text(role.name())
+                        text(detection.role_name(role))
                             .size(12)
                             .width(70)
                             .color(theme::TEXT_MUTED),
@@ -1148,6 +1353,9 @@ fn import_panel<'a>(
                 ));
             }
             body = body.push(fields);
+            if let Some(market) = existing {
+                body = body.push(adds_to(market, detection));
+            }
             if let Some(error) = error {
                 body = body.push(text(error).size(11).color(theme::DOWN));
             }
@@ -1194,11 +1402,38 @@ fn import_panel<'a>(
                 }
             }
             body.push(muted(
-                "It's on this chart now, and under Symbol › Local.".into(),
+                "It's on this chart now, and in the symbol search under Local.".into(),
             ))
         }
     };
     container(body).padding([4, 6]).into()
+}
+
+/// What importing into the existing `market` does: adds to it, or can't, as it holds
+/// something else.
+fn adds_to<'a>(market: &MarketInfo, detection: &Detection) -> Element<'a, MenuMessage> {
+    let id = format!("{}.{}", market.symbol, market.venue);
+    let files = match (detection.format.kind, detection.spacing) {
+        (Kind::Bars, Some(spacing)) => Some(MarketKind::Bars(spacing)),
+        (Kind::Bars, None) => None,
+        (kind, _) => kind.ticks().map(MarketKind::Ticks),
+    };
+    match files {
+        Some(files) if files != market.kind => text(format!(
+            "{id} holds {}, but these files have {files}; give them another symbol or venue.",
+            market.kind
+        ))
+        .size(11)
+        .color(theme::DOWN),
+        _ => text(format!(
+            "Adds to {id} ({} → {}); times already there are replaced.",
+            DateTime::from_nanos(market.first).date(),
+            DateTime::from_nanos(market.last).date(),
+        ))
+        .size(11)
+        .color(theme::TEXT_MUTED),
+    }
+    .into()
 }
 
 /// `1234567` → `1,234,567`.
@@ -1624,25 +1859,34 @@ fn remove_button(label: &str, on_press: MenuMessage) -> Element<'_, MenuMessage>
         .width(Fill)
         .padding([3, 0])
         .on_press(on_press)
-        .style(|_, status| button::Style {
-            background: Some(Background::Color(
-                if matches!(status, button::Status::Hovered) {
-                    Color {
-                        a: 0.25,
-                        ..theme::DOWN
-                    }
-                } else {
-                    HOVER
-                },
-            )),
-            text_color: theme::TEXT_BRIGHT,
-            border: Border {
-                radius: 4.0.into(),
-                ..Border::default()
-            },
-            ..button::Style::default()
-        })
+        .style(|_, status| remove_style(status))
         .into()
+}
+
+/// A button that deletes something: red under the mouse.
+fn remove_style(status: button::Status) -> button::Style {
+    button::Style {
+        background: Some(Background::Color(
+            if matches!(status, button::Status::Hovered) {
+                Color {
+                    a: 0.25,
+                    ..theme::DOWN
+                }
+            } else {
+                HOVER
+            },
+        )),
+        text_color: if matches!(status, button::Status::Disabled) {
+            theme::TEXT_MUTED
+        } else {
+            theme::TEXT_BRIGHT
+        },
+        border: Border {
+            radius: 4.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    }
 }
 
 fn input_style(status: text_input::Status) -> text_input::Style {

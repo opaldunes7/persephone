@@ -76,10 +76,15 @@ fn main() -> anyhow::Result<()> {
 
 fn fetch(symbol: &str, timeframe: Timeframe) -> anyhow::Result<std::sync::Arc<ChartData>> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
-    let end = now - now % timeframe.nanos() + timeframe.nanos();
+    let end = timeframe.close_time(now);
     let binance = BinanceClient::new()?;
     let spec = binance.instrument(symbol)?;
-    let candles = binance.klines(symbol, timeframe, end - BARS * timeframe.nanos(), end)?;
+    let candles = binance.klines(
+        symbol,
+        timeframe,
+        end.saturating_sub(BARS * timeframe.nanos()),
+        end,
+    )?;
     Ok(ChartData::new(
         spec.symbol,
         spec.venue,

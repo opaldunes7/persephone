@@ -1,4 +1,4 @@
-//! Markets from the local tick store inside the app.
+//! Markets from the local store inside the app.
 
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use persephone_core::{
     strategy::BuiltInStrategy,
     tick::{Quote, TickKind, Ticks},
 };
-use persephone_data::store::{MarketInfo, MarketWriter, Store};
+use persephone_data::store::{BarWriter, MarketInfo, MarketKind, MarketWriter, Spacing, Store};
 use persephone_tiling::Layout;
 
 const START: UnixNanos = 1_388_966_400_000_000_000; // 2014-01-06
@@ -49,7 +49,7 @@ fn store(name: &str) -> Store {
             quote: "USD".into(),
             price_precision: 5,
             size_precision: 0,
-            kind: TickKind::Quotes,
+            kind: MarketKind::Ticks(TickKind::Quotes),
             fee: 0.0,
             first: 0,
             last: 0,
@@ -108,6 +108,7 @@ fn a_local_market_opens_from_the_menu_and_backtests_on_its_ticks() {
         &mut app,
         MenuMessage::Open(Page::Symbol {
             query: String::new(),
+            removing: None,
         }),
     );
     let _ = app.update(Message::Menu(MenuMessage::SetLocal {
@@ -288,6 +289,155 @@ fn a_missing_local_market_says_so() {
     std::fs::remove_dir_all(store.root()).unwrap();
 }
 
+/// Adds GOLD.TEST to `store`: 60 daily bars from Monday 2014-01-06.
+fn add_daily_bars(store: &Store) {
+    let market = store
+        .create(MarketInfo {
+            symbol: "GOLD".into(),
+            venue: "TEST".into(),
+            base: "GOLD".into(),
+            quote: "USD".into(),
+            price_precision: 2,
+            size_precision: 0,
+            kind: MarketKind::Bars(Spacing::Minutes(1_440)),
+            fee: 0.001,
+            first: 0,
+            last: 0,
+            count: 0,
+        })
+        .unwrap();
+    let bars = (0..60u64)
+        .map(|i| Candle {
+            ts: START + i * DAY,
+            open: 1_200.0 + i as f64,
+            high: 1_210.0 + i as f64,
+            low: 1_190.0 + i as f64,
+            close: 1_205.0 + i as f64,
+            volume: 100.0,
+        })
+        .collect();
+    let mut writer = BarWriter::new(market).unwrap();
+    writer.write_year(2014, bars).unwrap();
+    writer.finish().unwrap();
+}
+
+#[test]
+fn a_market_of_daily_bars_shows_daily_and_longer() {
+    let store = store("daily-bars");
+    add_daily_bars(&store);
+    let mut app = binance_app();
+    app.set_store(store.clone());
+
+    // An hourly chart moves up to daily bars, the shortest these make.
+    menu(
+        &mut app,
+        MenuMessage::SetLocal {
+            venue: "TEST".into(),
+            symbol: "GOLD".into(),
+        },
+    );
+    assert_eq!(app.tile_market(0), Some(("GOLD", Timeframe::D1.into())));
+    app.load_now();
+    assert_eq!(app.tile_chart(0).unwrap().data().candles.len(), 60);
+
+    menu(&mut app, MenuMessage::SetTimeframe(Timeframe::W1));
+    app.load_now();
+    assert_eq!(
+        app.tile_chart(0).unwrap().data().candles.len(),
+        9,
+        "60 days from a Monday"
+    );
+    menu(&mut app, MenuMessage::SetTimeframe(Timeframe::M15));
+    assert_eq!(
+        app.tile_market(0),
+        Some(("GOLD", Timeframe::D1.into())),
+        "too short for daily bars"
+    );
+
+    menu(
+        &mut app,
+        MenuMessage::SetStrategy(BuiltInStrategy::EmaCross),
+    );
+    let (_, request) = app.backtest_request(0).unwrap();
+    assert!(request.ticks.is_none(), "no ticks: fills on bars");
+    persephone_engine::run_backtest(&request).unwrap();
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
+
+#[test]
+fn removing_a_local_market_deletes_it_and_moves_its_charts() {
+    let store = store("remove");
+    add_daily_bars(&store);
+    let mut app = binance_app();
+    app.set_store(store.clone());
+    menu(
+        &mut app,
+        MenuMessage::SetLocal {
+            venue: "TEST".into(),
+            symbol: "EURUSD".into(),
+        },
+    );
+    menu(&mut app, MenuMessage::SetBars(BarSpec::Ticks(500)));
+    assert_eq!(app.tile_market(0), Some(("EURUSD", BarSpec::Ticks(500))));
+
+    let _ = app.update(Message::Chart(
+        0,
+        ChartMessage::SymbolClicked {
+            at: Point::new(40.0, 16.0),
+        },
+    ));
+    let _ = app.update(Message::Menu(MenuMessage::AskRemoveLocal {
+        venue: "TEST".into(),
+        symbol: "EURUSD".into(),
+    }));
+    let removal = match app.popup() {
+        Some(persephone::menu::Popup::SymbolSearch {
+            removing: Some(removal),
+            ..
+        }) => removal.clone(),
+        other => panic!("expected the question, got {other:?}"),
+    };
+    assert!(removal.bytes > 0 && removal.error.is_none());
+    let _ = app.update(Message::Menu(MenuMessage::KeepLocal));
+    assert!(matches!(
+        app.popup(),
+        Some(persephone::menu::Popup::SymbolSearch { removing: None, .. })
+    ));
+
+    let _ = app.update(Message::Menu(MenuMessage::AskRemoveLocal {
+        venue: "TEST".into(),
+        symbol: "EURUSD".into(),
+    }));
+    let _ = app.update(Message::Menu(MenuMessage::RemoveLocal));
+    assert!(matches!(
+        app.popup(),
+        Some(persephone::menu::Popup::SymbolSearch {
+            removing: Some(persephone::menu::Removal { deleting: true, .. }),
+            ..
+        })
+    ));
+    // What the deleting task does and sends back.
+    store.remove("TEST", "EURUSD").unwrap();
+    let _ = app.update(Message::LocalRemoved(
+        "TEST".into(),
+        "EURUSD".into(),
+        Ok(()),
+    ));
+    assert!(store.market("TEST", "EURUSD").is_err());
+    assert!(matches!(
+        app.popup(),
+        Some(persephone::menu::Popup::SymbolSearch { removing: None, .. })
+    ));
+    assert_eq!(
+        app.tile_market(0),
+        Some(("BTCUSDT", Timeframe::M1.into())),
+        "the chart moved to Binance, on time bars"
+    );
+    assert_eq!(app.tile_venue(0), None);
+    assert!(store.market("TEST", "GOLD").is_ok(), "the others stay");
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
+
 mod dropping {
     use std::{path::PathBuf, sync::Arc};
 
@@ -398,6 +548,31 @@ mod dropping {
                 .is_some_and(|c| !c.data().candles.is_empty())
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn picked_files_open_the_import_panel_on_their_chart() {
+        let mut app = binance_app();
+        app.set_store(Store::new(
+            std::env::temp_dir().join("persephone-unused-store"),
+        ));
+        let _ = app.update(Message::FilesPicked(0, Vec::new()));
+        assert!(app.popup().is_none(), "cancelled");
+        let _ = app.update(Message::FilesPicked(
+            0,
+            vec!["/data/XAUUSD_D1.csv".into(), "/data/XAUUSD_D1-2.csv".into()],
+        ));
+        let Some(Popup::Import {
+            files,
+            symbol,
+            tile,
+            ..
+        }) = app.popup()
+        else {
+            panic!("no import panel")
+        };
+        assert_eq!((files.len(), symbol.as_str(), *tile), (2, "XAUUSD", 0));
+        assert!(matches!(import_state(&app), ImportState::Detecting));
     }
 
     #[test]

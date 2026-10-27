@@ -35,13 +35,15 @@ time. Binance charts load the latest 5,000 bars of their timeframe.
   - **Strategy ›**: the strategy to backtest on this chart.
   - **Draw ›**: drawing tools.
   - **Symbol**: search Binance pairs and your imported markets. Enter opens any Binance spot
-    pair you type.
-  - **Timeframe**: 1m, 5m, 15m, 30m, 1h, 4h or 1d.
-  - **Tick & volume bars**: shown only for imported markets.
+    pair you type. **Import data…** at the bottom imports your own files.
+  - **Timeframe**: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M. Weeks start on Monday and months
+    on the 1st (UTC), as on Binance.
+  - **Tick & volume bars**: shown only for markets imported as ticks.
 - **The header** (top left, e.g. `BTCUSDT · 1h · BINANCE`):
   - Click the symbol and it becomes a search box, with matching markets (yours first, then
     Binance pairs) dropping down as you type. Click one to switch, press Enter to open
-    whatever Binance pair you typed, or press Esc to leave it as it was.
+    whatever Binance pair you typed, or press Esc to leave it as it was. **Import data…** at
+    the bottom imports files, and the **×** beside one of your markets deletes it.
   - Click the timeframe for a dropdown of every timeframe.
   - After the name, round tags: **Vol** for the volume bars, then one for each indicator.
     A tag is lit while its indicator is shown and outlined while it's hidden. Click a tag to
@@ -64,21 +66,26 @@ The window is tiled like Hyprland's dwindle layout. A new chart splits the focus
 its longer side, and closing a chart gives its space to its neighbour. Focus follows the
 mouse.
 
-| Keys (Mod = ⌥ Option on macOS, Alt elsewhere) | Action |
+| Keys | Action |
 |---|---|
-| Mod+Enter | new chart, showing the focused chart's market |
-| Mod+Q | close the focused chart |
-| Mod+H/J/K/L or arrows | move focus left/down/up/right |
-| Mod+Shift+H/J/K/L | swap with the neighbour in that direction |
-| Mod+Ctrl+H/J/K/L | move the divider |
-| Mod+T | toggle the split direction |
-| Mod+F | fullscreen the focused chart (again to restore) |
-| Mod+1…9 | switch to that workspace |
-| Mod+Shift+1…9 | move the focused chart to that workspace |
+| Ctrl+Enter | new chart, showing the focused chart's market |
+| Ctrl+Q | close the focused chart |
+| Ctrl+H/J/K/L or arrows | move focus left/down/up/right |
+| Ctrl+Shift+H/J/K/L | swap with the neighbour in that direction |
+| Ctrl+Alt+H/J/K/L (Option on a Mac) | move the divider |
+| Ctrl+T | toggle the split direction |
+| Ctrl+F | fullscreen the focused chart (again to restore) |
+| Ctrl+1…9 | switch to that workspace |
+| Ctrl+Shift+1…9 | move the focused chart to that workspace |
 
 Every chart also has three small buttons in the bottom-right corner, where the price and
 time axes meet: **+** adds a chart (split from this one), **◫** flips the split direction,
 and **✕** closes the chart. Hovering a button shows its shortcut.
+
+On a Mac, the system already uses Control with the arrow keys (Mission Control), so use
+Ctrl+H/J/K/L to move focus; the arrow versions only work where macOS doesn't take them. If
+Control+number is set to switch desktops in System Settings, it will do that instead of
+switching workspace.
 
 A workspace holds up to 16 charts. The border flashes red when something can't be done (a
 17th chart, closing the last one). Layouts, indicators, strategies and workspaces are saved
@@ -142,16 +149,36 @@ and zoom, show on every timeframe of the market, and are saved per market.
 
 ## Your own data
 
-### CSV tick files
+### Importing ticks or bars
 
-Drop CSV files (plain, `.gz` or `.zip`) on a chart. The import panel shows what it detected:
+Click a chart's symbol and choose **Import data…** at the bottom of the dropdown, or drop CSV
+files (plain, `.gz` or `.zip`) on a chart. The import panel shows what it detected:
 - separator and header;
 - time format and zone;
-- columns: time, price, size, side, or bid and ask;
-- trades or quotes;
+- columns: time, price, size, side; bid and ask; or open, high, low, close and volume;
+- trades, quotes, or bars and how far apart they are (`1h bars`, `1d bars`, `1M bars`);
 
-and boxes for the symbol, venue and time zone. Import streams the
-file to the local store, and the chart switches to the new market when it's done.
+and boxes for the symbol, venue and time zone. Import streams the files to the local store,
+and the chart switches to the new market when it's done. If the market already exists, the
+panel says the files add to it.
+
+- **Ticks** (trades or quotes) chart at every timeframe, can be cut into tick and volume bars,
+  and backtest on the ticks.
+- **Bars** of any spacing, from a minute to a month (MetaTrader, TradingView or Yahoo exports,
+  Binance klines, …), chart at their own timeframe and longer ones: daily bars show 1d, 1w and
+  1M, and the shorter timeframes are greyed out. A chart switched to them moves up to the
+  shortest they make. Their backtests fill on the bars. Bars less than a minute apart are
+  rolled up into 1-minute bars.
+
+Imported markets stay in the store, and in the symbol search under **Local**, until you
+delete them.
+
+### Deleting an imported market
+
+In the symbol search, click the **×** beside a market under **Local**. The row asks first and
+says how much space it frees. **Delete** removes Persephone's copy from the store. The files
+you imported from aren't touched, so you can import them again any time. Charts showing the
+market switch to BTCUSDT.
 
 From the command line:
 
@@ -165,18 +192,22 @@ persephone-cli data list                                          # what's in th
 - **Times:** epoch seconds, milliseconds, microseconds or nanoseconds; ISO-8601 and most
   year-first dates; day- or month-first dates; separate date and time columns.
 - **Numbers:** decimal commas.
-- **Columns:** chosen by header names, or by their values when there are no headers.
-- Anything it gets wrong can be overridden (`--time`, `--price`, `--kind`, `--time-format`,
-  …).
+- **Columns:** chosen by header names, or by their values when there are no headers (four
+  columns where the second is always highest and the third lowest are a bar's open, high,
+  low and close).
+- **Bar spacing:** the usual gap between rows, so daily files with weekends are still daily.
+- Anything it gets wrong can be overridden (`--time`, `--price`, `--open`, `--kind bars`,
+  `--time-format`, …).
 - `--save-profile NAME` remembers a layout and `--profile NAME` reuses it.
 - Importing the same span again replaces it rather than doubling it.
 
 Imported markets are named `SYMBOL.VENUE` (venue `LOCAL` unless you say otherwise). On the
-chart, they appear under **Symbol › Local**.
+chart, they appear under **Local** in the symbol search. `persephone-cli data remove
+SYMBOL.VENUE --yes` deletes one from the command line.
 
 ### Tick and volume bars
 
-Imported markets can also be cut into bars by activity instead of time. Open **Tick & volume
+Markets imported as ticks can also be cut into bars by activity instead of time. Open **Tick & volume
 bars** from the menu and type `1000t` (a bar every 1,000 ticks) or `2.5v` (a bar each time 2.5
 units trade; trades only). Each bar closes at its last tick, so strategies never act on a bar
 before it's complete.
@@ -287,7 +318,7 @@ Everything is in one folder:
 |---|---|
 | `layout.ron` | charts, indicators, strategies and workspaces |
 | `drawings.ron` | drawings, by market |
-| `store/VENUE/SYMBOL/` | imported ticks (Parquet, one file per day) and their 1-minute bars |
+| `store/VENUE/SYMBOL/` | imported ticks (Parquet, one file per day) and their 1-minute bars, or imported bars (one file per year) |
 | `plugins/` | plugin `.wasm` files and `.external` strategy addresses |
 | `models/` | ONNX models plugins can run |
 | `ai.json` | how plugins reach language models (optional) |

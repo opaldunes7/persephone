@@ -424,9 +424,8 @@ fn warm_up(signal: &mut dyn Signal, request: &LiveRequest) -> Result<(), EngineE
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
-    let step = request.timeframe.nanos();
     for candle in &request.history {
-        let close = candle.ts + step;
+        let close = request.timeframe.close_time(candle.ts);
         if close > now {
             break;
         }
@@ -506,8 +505,7 @@ impl Watcher for Reporter {
 
     fn bar(&mut self, bar: &Candle) {
         // Bars are stamped at their close (Binance's close is a millisecond early).
-        let step = self.timeframe.nanos();
-        let open = (bar.ts - 1) - (bar.ts - 1) % step;
+        let open = self.timeframe.open_time(bar.ts - 1);
         self.last_bar = Some(open);
         (self.events.borrow_mut())(LiveEvent::Bar(Candle { ts: open, ..*bar }));
     }

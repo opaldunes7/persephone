@@ -1,5 +1,6 @@
-//! Markets from the local store (ticks imported with `persephone-cli import`): charting their
-//! bars, and backtesting on their ticks when there aren't too many to replay.
+//! Markets from the local store (ticks or bars imported in the app or with
+//! `persephone-cli import`): charting their bars, and backtesting on their ticks when they
+//! have them and there aren't too many to replay.
 
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use persephone_core::{
     BarSpec,
     tick::{TickFeed, TickKind},
 };
-use persephone_data::store::Store;
+use persephone_data::store::{MarketKind, Store};
 use persephone_engine::FeeRates;
 
 use crate::{HISTORY_BARS, MarketData};
@@ -37,10 +38,16 @@ pub fn load(store: &Store, venue: &str, symbol: &str, bars: BarSpec) -> anyhow::
     let span = info.last.saturating_sub(info.first).max(1);
     let estimate = (info.count as f64 * to.saturating_sub(from) as f64 / span as f64) as u64;
     let at = match info.kind {
-        TickKind::Quotes => "the bid and ask",
-        TickKind::Trades => "the latest trade",
+        MarketKind::Ticks(TickKind::Quotes) => "the bid and ask",
+        MarketKind::Ticks(TickKind::Trades) => "the latest trade",
+        MarketKind::Bars(_) => "",
     };
-    let (ticks, fills) = if estimate <= TICK_FILL_LIMIT {
+    let (ticks, fills) = if info.kind.ticks().is_none() {
+        (
+            None,
+            "Orders fill on bars: this market was imported as bars.".to_owned(),
+        )
+    } else if estimate <= TICK_FILL_LIMIT {
         let feed: Arc<dyn TickFeed> = Arc::new(market.clone());
         (Some(feed), format!("Orders fill on ticks, at {at}"))
     } else {

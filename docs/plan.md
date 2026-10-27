@@ -89,18 +89,18 @@ persephone/
 - Moving or resizing tiles animates them with an eased transition from the old rectangle to the new one (about 150 ms), using iced 0.14's animation support. This is a custom layout widget, not iced's `PaneGrid`. *(Built:)* 180 ms ease-out, new tiles pop in from 88% size; tiles are absolutely positioned with `pin` inside a `stack`. A lone chart fills the window with no gap or border; focus follows the mouse, as on Hyprland.
 - The layout is saved to `~/Library/Application Support/persephone/layout.ron` and restored at launch. *(Built:)* saved after every structural change; launching with `persephone SYMBOL TIMEFRAME` starts a one-off single chart that isn't saved.
 
-**Keymap** (Mod = ⌥ Option on macOS, Alt elsewhere; ⌘ is avoided because macOS uses it):
+**Keymap** (every command is Control plus a key, changed from Option on request; ⌘ is avoided because macOS uses it):
 
 | Keys | Action |
 |---|---|
-| Mod+Enter | new chart (dwindle split) |
-| Mod+Q | close tile |
-| Mod+H/J/K/L or arrows | move focus |
-| Mod+Shift+H/J/K/L | swap tile |
-| Mod+Ctrl+H/J/K/L | resize |
-| Mod+T | toggle split axis |
-| Mod+F | fullscreen tile |
-| Mod+1..9 | switch workspace (Mod+Shift+1..9 moves the focused chart there) |
+| Ctrl+Enter | new chart (dwindle split) |
+| Ctrl+Q | close tile |
+| Ctrl+H/J/K/L or arrows | move focus |
+| Ctrl+Shift+H/J/K/L | swap tile |
+| Ctrl+Alt+H/J/K/L | resize |
+| Ctrl+T | toggle split axis |
+| Ctrl+F | fullscreen tile |
+| Ctrl+1..9 | switch workspace (Ctrl+Shift+1..9 moves the focused chart there) |
 
 ### 2. Chart (`crates/chart`)
 - **Viewport:** the x-axis counts bars, not clock time. Pan and zoom only change a uniform (offset and scale), so moving around never re-uploads data to the GPU.
@@ -223,6 +223,8 @@ world strategy {
   - **CLI:** `persephone-cli import FILES… --symbol EURUSD [--venue …] [--tz …] [--dry-run] [--profile …|--save-profile …]`, `persephone-cli data list|remove|dir`, and `backtest --local SYMBOL.VENUE [--bar-fills]`.
   - **App:** the symbol page has a Local section, local tiles are saved with their venue, the chart header marks them `(local)`, and `persephone EURUSD.LOCAL` opens one. Dropping CSV files on a chart opens an import panel showing what was detected, with symbol, venue and time zone boxes and live progress; when it finishes, the chart switches to the new market.
   - *(Built later:)* tick-count and volume bars for local markets (`1000t`, `2.5v`), and `persephone-cli fetch binance` for Binance's monthly or daily archives.
+  - *(Built later:)* **bar files and longer timeframes.** The importer also takes OHLC(V) bar files of any spacing from a minute to a month: header names (`open`/`o`, `high`, `low`, `close`) or, without a header, four neighbouring columns where the second is always highest and the third lowest. Date-only time columns are accepted for daily and longer bars. The spacing is the median gap between rows (`Spacing`: minutes that divide a day, a week or a month), worked out from the first file's sample at import too, so profiles stay spacing-free. Such a market is `"kind": "bars"` with a `"spacing"` in `market.json` (`MarketKind::Bars`), its bars stored as they are in `bars/<YYYY>.parquet`, moved to their spacing's open time; it charts at its spacing and the timeframes made of it, and backtests fill on bars. Charts gained `1w` (from Monday) and `1M` (from the 1st), UTC like Binance's; `Timeframe::open_time`/`close_time` give calendar-correct bar edges everywhere (roll-ups, closes, Binance paging), and weeks and months roll up across files through days. Live trading stays on 1m–1d.
+  - *(Built later:)* the symbol search ends with **Import data…**, which opens the system's file picker (`rfd`) and then the same import panel as dropping files; the panel says when the files add to an existing market, or can't because it holds something else. Each Local row has a **×** that asks first (with the space it frees), then deletes the market's folder from the store on a worker thread; charts showing it switch to BTCUSDT.
 
 ## Milestones (each ends with something you can run)
 
@@ -236,10 +238,10 @@ world strategy {
 | M5 | WASM plugins | WIT, SDK, host and hot reload. The example SMA indicator and EMA-cross strategy work as plugins. |
 | M6 | CSV tick import | Your files import, chart as aggregated bars, and run tick-level backtests. This doesn't depend on M2–M5 and can move earlier. |
 | M7 | ML and AI | `ml` (ONNX) and `ai` (LLM plus cache) capabilities, each with an example strategy. |
-| Later | Built after M7 | Workspaces (Mod+1..9), parameter-sweep grid, crosshair synced across tiles, paper and live trading through Nautilus's live node, drawing tools, tick and volume bars, Binance archive fetching, external strategies over a socket. See below. |
+| Later | Built after M7 | Workspaces (Ctrl+1..9), parameter-sweep grid, crosshair synced across tiles, paper and live trading through Nautilus's live node, drawing tools, tick and volume bars, Binance archive fetching, external strategies over a socket. See below. |
 
 ## Built after M7
-- **Workspaces:** Mod+1..9 switches between nine sets of tiles, each with its own layout; Mod+Shift+1..9 moves the focused chart. All of them are saved. Charts on hidden workspaces keep backtesting and catch up when shown.
+- **Workspaces:** Ctrl+1..9 switches between nine sets of tiles, each with its own layout; Ctrl+Shift+1..9 moves the focused chart. All of them are saved. Charts on hidden workspaces keep backtesting and catch up when shown.
 - **Synced crosshair:** hovering a bar shows a vertical line at the same time on every other chart, whatever its timeframe.
 - **Drawing tools:** trend lines, horizontal lines and rectangles from the menu's Draw page. They're anchored to time and price, so they show on every timeframe of the market, and they're saved per market. Click a drawing to remove it.
 - **Parameter sweeps:** "Sweep a parameter…" in a strategy's report opens 2–9 charts on a free workspace, one per value, and the report compares their returns.
@@ -281,7 +283,7 @@ world strategy {
   - **engine:** a headless EmaCross run through our wrapper gives the same fills and PnL as Nautilus's own example. The WASM ema-cross gives the same result as the native one.
 - **Headless smoke test:** `persephone-cli backtest --strategy plugins/examples/ema-cross.wasm --symbol BTCUSDT --tf 1m`.
 - **Manual app checklist** per milestone (`cargo run -p persephone`):
-  - Mod+Enter up to 16 tiles; the 17th is refused.
+  - Ctrl+Enter up to 16 tiles; the 17th is refused.
   - Focus, swap and resize all work.
   - Left-click → add RSI.
   - Add a strategy → markers and stats appear.

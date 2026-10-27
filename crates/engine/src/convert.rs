@@ -66,6 +66,8 @@ pub(crate) fn bar_type(id: InstrumentId, bars: BarSpec) -> Result<BarType, Engin
         BarSpec::Time(Timeframe::H1) => (1, BarAggregation::Hour),
         BarSpec::Time(Timeframe::H4) => (4, BarAggregation::Hour),
         BarSpec::Time(Timeframe::D1) => (1, BarAggregation::Day),
+        BarSpec::Time(Timeframe::W1) => (1, BarAggregation::Week),
+        BarSpec::Time(Timeframe::MN1) => (1, BarAggregation::Month),
         BarSpec::Ticks(n) => (n.max(1) as usize, BarAggregation::Tick),
         BarSpec::Volume(v) => (v.round().max(1.0) as usize, BarAggregation::Volume),
     };

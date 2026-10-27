@@ -179,7 +179,8 @@ impl Boundary {
     }
 }
 
-/// Full timestamp for the crosshair label, e.g. `Sun 25 Oct '26 17:00`.
+/// Full timestamp for the crosshair label, e.g. `Sun 25 Oct '26 17:00`, or `Oct '26` for
+/// monthly bars.
 #[must_use]
 pub fn crosshair_label(ts: u64, bars: BarSpec) -> String {
     const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
@@ -192,7 +193,8 @@ pub fn crosshair_label(ts: u64, bars: BarSpec) -> String {
         dt.year % 100
     );
     match bars {
-        BarSpec::Time(Timeframe::D1) => date,
+        BarSpec::Time(Timeframe::MN1) => format!("{} '{:02}", dt.month_name(), dt.year % 100),
+        BarSpec::Time(Timeframe::D1 | Timeframe::W1) => date,
         BarSpec::Time(_) => format!("{date}  {}", dt.time()),
         // Tick and volume bars can be seconds apart.
         BarSpec::Ticks(_) | BarSpec::Volume(_) => {
@@ -390,6 +392,10 @@ mod tests {
         assert_eq!(
             crosshair_label(1_792_886_400_000_000_000, Timeframe::D1.into()),
             "Sun 25 Oct '26"
+        );
+        assert_eq!(
+            crosshair_label(1_792_886_400_000_000_000, Timeframe::MN1.into()),
+            "Oct '26"
         );
         assert_eq!(format_price(80_806.014, 2), "80806.01");
     }

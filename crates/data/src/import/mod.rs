@@ -1,10 +1,10 @@
-//! Importing tick data from CSV files into the [store](crate::store).
+//! Importing ticks or bars from CSV files into the [store](crate::store).
 //!
 //! [`detect`] works out a file's layout from its first lines: the separator, whether there's
-//! a header, which columns hold the time, prices, sizes and aggressor side, and how the time
-//! is written. [`import`] then streams any number of files in that layout into a market a day
-//! at a time, so files bigger than memory are fine. A layout can be saved as a named profile
-//! and reused.
+//! a header, which columns hold the time, prices (or open, high, low and close), sizes and
+//! aggressor side, and how the time is written. [`import`] then streams any number of files in
+//! that layout into a market a day (or, for bars, a year) at a time, so files bigger than
+//! memory are fine. A layout can be saved as a named profile and reused.
 
 mod detect;
 mod source;
@@ -23,7 +23,7 @@ use std::{
 use anyhow::{Context, bail, ensure};
 use csv::ByteRecord;
 use persephone_core::{
-    UnixNanos,
+    Candle, UnixNanos,
     tick::{Aggressor, Quote, TickKind, Ticks, Trade},
 };
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,10 @@ pub use self::{
     source::sample,
     time::{TimeFormat, Zone},
 };
-use crate::store::{LocalMarket, MarketInfo, MarketWriter, Store, check_name, day_of};
+use crate::store::{
+    BarWriter, LocalMarket, MarketInfo, MarketKind, MarketWriter, Spacing, Store, check_name,
+    day_of, year_of,
+};
 
 /// The venue imported markets get unless told otherwise.
 pub const DEFAULT_VENUE: &str = "LOCAL";
@@ -47,13 +50,57 @@ pub struct Format {
     /// Numbers are written with a decimal comma (`1,2345`).
     #[serde(default)]
     pub decimal_comma: bool,
-    #[serde(with = "crate::store::kind_name")]
-    pub kind: TickKind,
+    pub kind: Kind,
     pub columns: Columns,
     pub time_format: TimeFormat,
     /// The zone of timestamps written without an offset.
     #[serde(default)]
     pub zone: Zone,
+}
+
+/// What a file's rows are: trades, quotes, or bars (open, high, low, close and maybe volume).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    Trades,
+    Quotes,
+    Bars,
+}
+
+impl Kind {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Trades => "trades",
+            Self::Quotes => "quotes",
+            Self::Bars => "bars",
+        }
+    }
+
+    /// The kind of tick, unless these are bars.
+    #[must_use]
+    pub const fn ticks(self) -> Option<TickKind> {
+        match self {
+            Self::Trades => Some(TickKind::Trades),
+            Self::Quotes => Some(TickKind::Quotes),
+            Self::Bars => None,
+        }
+    }
+}
+
+impl From<TickKind> for Kind {
+    fn from(kind: TickKind) -> Self {
+        match kind {
+            TickKind::Trades => Self::Trades,
+            TickKind::Quotes => Self::Quotes,
+        }
+    }
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
 }
 
 /// Which column holds what, counting from 0.
@@ -80,6 +127,15 @@ pub struct Columns {
     pub bid_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_size: Option<usize>,
+    /// A bar's prices; its volume is in `size`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close: Option<usize>,
 }
 
 /// How a side column names the aggressor.
@@ -96,11 +152,12 @@ pub enum SideFormat {
     Sign,
 }
 
-/// One parsed row.
+/// One parsed row: a tick, or a bar keyed by the time written in the file.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Tick {
     Trade(Trade),
     Quote(Quote),
+    Bar(Candle),
 }
 
 impl Tick {
@@ -109,6 +166,7 @@ impl Tick {
         match self {
             Self::Trade(t) => t.ts,
             Self::Quote(q) => q.ts,
+            Self::Bar(b) => b.ts,
         }
     }
 }
@@ -157,7 +215,7 @@ impl<'a> RowParser<'a> {
         .map_err(|e| format!("the time isn't readable ({e})"))?;
 
         match format.kind {
-            TickKind::Trades => {
+            Kind::Trades => {
                 let column = columns.price.ok_or("no price column")?;
                 let (price, price_decimals) = self.number(record, column, "price")?;
                 if price <= 0.0 {
@@ -189,7 +247,7 @@ impl<'a> RowParser<'a> {
                     size_decimals,
                 })
             }
-            TickKind::Quotes => {
+            Kind::Quotes => {
                 let (bid, bid_decimals) =
                     self.number(record, columns.bid.ok_or("no bid column")?, "bid")?;
                 let (ask, ask_decimals) =
@@ -213,6 +271,43 @@ impl<'a> RowParser<'a> {
                     }),
                     price_decimals: bid_decimals.max(ask_decimals),
                     size_decimals: bid_size_decimals.max(ask_size_decimals),
+                })
+            }
+            Kind::Bars => {
+                let mut price = |column: Option<usize>, what| {
+                    self.number(record, column.ok_or(format!("no {what} column"))?, what)
+                };
+                let (open, open_decimals) = price(columns.open, "open")?;
+                let (high, high_decimals) = price(columns.high, "high")?;
+                let (low, low_decimals) = price(columns.low, "low")?;
+                let (close, close_decimals) = price(columns.close, "close")?;
+                if open <= 0.0 || high <= 0.0 || low <= 0.0 || close <= 0.0 {
+                    return Err("open, high, low and close must be positive".into());
+                }
+                if high < low {
+                    return Err(format!("the high {high} is below the low {low}"));
+                }
+                let (volume, size_decimals) = match columns.size {
+                    Some(column) => self
+                        .number(record, column, "volume")
+                        .map(|(v, d)| (v.abs(), d))?,
+                    None => (0.0, 0),
+                };
+                Ok(Parsed {
+                    // Rounding in some exports leaves the open or close a hair outside.
+                    tick: Tick::Bar(Candle {
+                        ts,
+                        open,
+                        high: high.max(open).max(close),
+                        low: low.min(open).min(close),
+                        close,
+                        volume,
+                    }),
+                    price_decimals: open_decimals
+                        .max(high_decimals)
+                        .max(low_decimals)
+                        .max(close_decimals),
+                    size_decimals,
                 })
             }
         }
@@ -282,8 +377,8 @@ pub struct MarketOptions {
     /// Worked out from the symbol when not given (`EURUSD` → EUR / USD).
     pub base: Option<String>,
     pub quote: Option<String>,
-    /// Fee rate per fill; 0.1% for trades and 0 for quotes (the spread is the cost) when not
-    /// given.
+    /// Fee rate per fill; 0.1% for trades and bars, and 0 for quotes (the spread is the cost)
+    /// when not given.
     pub fee: Option<f64>,
 }
 
@@ -323,7 +418,8 @@ const MAX_HELD: usize = 20_000_000;
 /// # Errors
 ///
 /// Returns an error if a file can't be read, most of a file's rows don't match the format,
-/// the market holds the other kind of tick, or the store can't be written.
+/// the market holds something else (the other kind of tick, or bars of another spacing), or
+/// the store can't be written.
 pub fn import(
     store: &Store,
     files: &[PathBuf],
@@ -332,9 +428,9 @@ pub fn import(
     progress: &mut dyn FnMut(&Progress) -> bool,
 ) -> anyhow::Result<Summary> {
     ensure!(!files.is_empty(), "no files to import");
-    let market = open_market(store, format.kind, options)?;
-    let mut writer = MarketWriter::new(market);
-    let mut days = DayBuffer::new(format.kind);
+    let kind = market_kind(store, files, format, options)?;
+    let market = open_market(store, kind, options)?;
+    let mut sink = Sink::new(market)?;
     let mut stats = Stats::default();
 
     let total = files
@@ -371,7 +467,7 @@ pub fn import(
                     Ok(parsed) => {
                         good += 1;
                         stats.add(&parsed);
-                        days.push(parsed.tick, &mut writer)?;
+                        sink.push(parsed.tick)?;
                     }
                     // A header can repeat at the top of every file.
                     Err(_) if first_row && format.header => {}
@@ -405,8 +501,7 @@ pub fn import(
         })?;
     }
 
-    days.flush(&mut writer)?;
-    let mut market = writer.finish()?;
+    let mut market = sink.finish()?;
     market.info.price_precision = market.info.price_precision.max(stats.price_decimals);
     market.info.size_precision = market.info.size_precision.max(stats.size_decimals);
     market.save_info()?;
@@ -427,9 +522,56 @@ pub fn import(
     })
 }
 
+/// What the files will make: their kind of tick, or bars spaced as the first file's are.
+fn market_kind(
+    store: &Store,
+    files: &[PathBuf],
+    format: &Format,
+    options: &MarketOptions,
+) -> anyhow::Result<MarketKind> {
+    if let Some(kind) = format.kind.ticks() {
+        return Ok(MarketKind::Ticks(kind));
+    }
+    let times = sample_times(&sample(&files[0])?, format);
+    match Spacing::from_times(&times) {
+        Some((spacing, _)) => Ok(MarketKind::Bars(spacing)),
+        // One bar can still join a market that has bars.
+        None => store
+            .market(&options.venue, &options.symbol)
+            .ok()
+            .map(|market| market.info.kind)
+            .filter(|kind| kind.spacing().is_some())
+            .with_context(|| {
+                format!(
+                    "can't tell how far apart the bars in {} are; it needs at least two",
+                    files[0].display()
+                )
+            }),
+    }
+}
+
+/// The times of the rows in a file's sample that `format` reads.
+#[must_use]
+pub fn sample_times(sample: &str, format: &Format) -> Vec<UnixNanos> {
+    let mut csv = csv::ReaderBuilder::new()
+        .delimiter(format.delimiter as u8)
+        .has_headers(format.header)
+        .flexible(true)
+        .from_reader(sample.as_bytes());
+    let mut parser = RowParser::new(format);
+    let mut record = ByteRecord::new();
+    let mut times = Vec::new();
+    while let Ok(true) = csv.read_byte_record(&mut record) {
+        if let Ok(parsed) = parser.parse(&record) {
+            times.push(parsed.tick.ts());
+        }
+    }
+    times
+}
+
 fn open_market(
     store: &Store,
-    kind: TickKind,
+    kind: MarketKind,
     options: &MarketOptions,
 ) -> anyhow::Result<LocalMarket> {
     check_name("symbol", &options.symbol)?;
@@ -465,8 +607,8 @@ fn open_market(
         size_precision: 0,
         kind,
         fee: options.fee.unwrap_or(match kind {
-            TickKind::Trades => 0.001,
-            TickKind::Quotes => 0.0,
+            MarketKind::Ticks(TickKind::Quotes) => 0.0,
+            MarketKind::Ticks(TickKind::Trades) | MarketKind::Bars(_) => 0.001,
         }),
         first: 0,
         last: 0,
@@ -521,6 +663,94 @@ impl Stats {
     }
 }
 
+/// Where parsed rows go: ticks a day at a time, or bars a year at a time.
+enum Sink {
+    Ticks(DayBuffer, MarketWriter),
+    Bars(YearBuffer, BarWriter),
+}
+
+impl Sink {
+    fn new(market: LocalMarket) -> anyhow::Result<Self> {
+        Ok(match market.info.kind {
+            MarketKind::Ticks(kind) => Self::Ticks(DayBuffer::new(kind), MarketWriter::new(market)),
+            MarketKind::Bars(spacing) => {
+                Self::Bars(YearBuffer::new(spacing), BarWriter::new(market)?)
+            }
+        })
+    }
+
+    fn push(&mut self, tick: Tick) -> anyhow::Result<()> {
+        match self {
+            Self::Ticks(days, writer) => days.push(tick, writer),
+            Self::Bars(years, writer) => years.push(tick, writer),
+        }
+    }
+
+    fn finish(self) -> anyhow::Result<LocalMarket> {
+        match self {
+            Self::Ticks(mut days, mut writer) => {
+                days.flush(&mut writer)?;
+                writer.finish()
+            }
+            Self::Bars(mut years, mut writer) => {
+                years.flush(&mut writer)?;
+                writer.finish()
+            }
+        }
+    }
+}
+
+/// Holds bars by UTC year (of their open, by the market's spacing) until the file has moved
+/// past that year.
+struct YearBuffer {
+    spacing: Spacing,
+    years: BTreeMap<i64, Vec<Candle>>,
+    held: usize,
+    newest: Option<i64>,
+}
+
+impl YearBuffer {
+    fn new(spacing: Spacing) -> Self {
+        Self {
+            spacing,
+            years: BTreeMap::new(),
+            held: 0,
+            newest: None,
+        }
+    }
+
+    fn push(&mut self, tick: Tick, writer: &mut BarWriter) -> anyhow::Result<()> {
+        let Tick::Bar(mut bar) = tick else {
+            bail!("a file mixed bars and ticks");
+        };
+        bar.ts = self.spacing.open_time(bar.ts);
+        let year = year_of(bar.ts);
+        self.years.entry(year).or_default().push(bar);
+        self.held += 1;
+
+        if self.newest.is_none_or(|newest| year > newest) {
+            self.newest = Some(year);
+            let kept = self.years.split_off(&(year - 1));
+            for (done, bars) in std::mem::replace(&mut self.years, kept) {
+                self.held -= bars.len();
+                writer.write_year(done, bars)?;
+            }
+        }
+        if self.held >= MAX_HELD {
+            self.flush(writer)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, writer: &mut BarWriter) -> anyhow::Result<()> {
+        for (year, bars) in std::mem::take(&mut self.years) {
+            writer.write_year(year, bars)?;
+        }
+        self.held = 0;
+        Ok(())
+    }
+}
+
 /// Holds ticks by UTC day until the file has moved past that day.
 struct DayBuffer {
     kind: TickKind,
@@ -549,7 +779,7 @@ impl DayBuffer {
         ) {
             (Ticks::Trades(trades), Tick::Trade(t)) => trades.push(t),
             (Ticks::Quotes(quotes), Tick::Quote(q)) => quotes.push(q),
-            _ => bail!("a file mixed trades and quotes"),
+            _ => bail!("a file mixed different kinds of rows"),
         }
         self.held += 1;
 

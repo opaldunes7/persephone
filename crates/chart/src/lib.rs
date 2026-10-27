@@ -335,7 +335,7 @@ impl ChartState {
         let candles = &self.data.candles;
         let i = candles.partition_point(|c| c.ts <= ts).checked_sub(1)?;
         let end = match self.data.bars {
-            BarSpec::Time(tf) => candles[i].ts + tf.nanos(),
+            BarSpec::Time(tf) => tf.close_time(candles[i].ts),
             // Tick and volume bars last until the next one opens.
             BarSpec::Ticks(_) | BarSpec::Volume(_) => candles
                 .get(i + 1)
