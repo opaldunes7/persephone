@@ -1,7 +1,7 @@
 //! Axis tick placement and labels.
 
 use persephone_core::{
-    Candle, Timeframe,
+    BarSpec, Candle, Timeframe,
     time::{DateTime, NANOS_PER_DAY, NANOS_PER_MINUTE},
 };
 
@@ -101,16 +101,12 @@ impl Interval {
 /// Month and year boundaries always compete for a spot and win over finer ones, as on
 /// TradingView, so a daily chart reads "Jul … 14 … Aug" instead of arbitrary two-week marks.
 #[must_use]
-pub fn time_ticks(
-    candles: &[Candle],
-    projection: &Projection,
-    timeframe: Timeframe,
-) -> Vec<TimeTick> {
+pub fn time_ticks(candles: &[Candle], projection: &Projection, bar_nanos: u64) -> Vec<TimeTick> {
     let bars_per_gap = f64::from(TIME_GAP) / projection.spacing;
-    let min_nanos = (bars_per_gap * timeframe.nanos() as f64) as u64;
+    let min_nanos = (bars_per_gap * bar_nanos as f64) as u64;
     let interval = Interval::ALL
         .into_iter()
-        .find(|i| i.approx_nanos() >= min_nanos.max(timeframe.nanos()))
+        .find(|i| i.approx_nanos() >= min_nanos.max(bar_nanos))
         .unwrap_or(Interval::Year);
 
     let start = projection.visible.start.max(1);
@@ -185,7 +181,7 @@ impl Boundary {
 
 /// Full timestamp for the crosshair label, e.g. `Sun 25 Oct '26 17:00`.
 #[must_use]
-pub fn crosshair_label(ts: u64, timeframe: Timeframe) -> String {
+pub fn crosshair_label(ts: u64, bars: BarSpec) -> String {
     const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
     let dt = DateTime::from_nanos(ts);
     let weekday = WEEKDAYS[((ts / NANOS_PER_DAY) % 7) as usize];
@@ -195,10 +191,13 @@ pub fn crosshair_label(ts: u64, timeframe: Timeframe) -> String {
         dt.month_name(),
         dt.year % 100
     );
-    if timeframe == Timeframe::D1 {
-        date
-    } else {
-        format!("{date}  {}", dt.time())
+    match bars {
+        BarSpec::Time(Timeframe::D1) => date,
+        BarSpec::Time(_) => format!("{date}  {}", dt.time()),
+        // Tick and volume bars can be seconds apart.
+        BarSpec::Ticks(_) | BarSpec::Volume(_) => {
+            format!("{date}  {}:{:02}", dt.time(), ts / 1_000_000_000 % 60)
+        }
     }
 }
 
@@ -301,7 +300,7 @@ mod tests {
         let mut vp = Viewport::new(data.len());
         vp.spacing = 6.0;
         let p = Projection::new(&vp, &data, 800.0, 400.0);
-        let ticks = time_ticks(&data, &p, Timeframe::H1);
+        let ticks = time_ticks(&data, &p, Timeframe::H1.nanos());
 
         assert!(!ticks.is_empty());
         assert!(
@@ -352,7 +351,7 @@ mod tests {
         let mut vp = Viewport::new(data.len());
         vp.spacing = 6.0;
         let p = Projection::new(&vp, &data, 1_200.0, 400.0);
-        let ticks = time_ticks(&data, &p, Timeframe::D1);
+        let ticks = time_ticks(&data, &p, Timeframe::D1.nanos());
         let labels: Vec<_> = ticks.iter().map(|t| t.label.as_str()).collect();
 
         for month in ["Jun", "Jul", "Aug", "Sep"] {
@@ -385,11 +384,11 @@ mod tests {
     #[test]
     fn crosshair_labels() {
         assert_eq!(
-            crosshair_label(1_792_947_600_000_000_000, Timeframe::H1),
+            crosshair_label(1_792_947_600_000_000_000, Timeframe::H1.into()),
             "Sun 25 Oct '26  17:00"
         );
         assert_eq!(
-            crosshair_label(1_792_886_400_000_000_000, Timeframe::D1),
+            crosshair_label(1_792_886_400_000_000_000, Timeframe::D1.into()),
             "Sun 25 Oct '26"
         );
         assert_eq!(format_price(80_806.014, 2), "80806.01");

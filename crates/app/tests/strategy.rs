@@ -229,3 +229,222 @@ fn strategies_are_saved_and_restored() {
     assert!(matches!(run, Run::Waiting), "reruns once bars arrive");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+mod sweeps {
+    use iced::Point;
+    use persephone::{
+        Message,
+        keymap::Action,
+        menu::{MenuMessage, Popup},
+    };
+    use persephone_chart::ChartMessage;
+    use persephone_core::strategy::BuiltInStrategy;
+
+    fn with_strategy() -> persephone::Persephone {
+        let mut app = super::app();
+        let _ = app.update(Message::Chart(
+            0,
+            ChartMessage::Clicked {
+                at: Point::new(9.0, 9.0),
+            },
+        ));
+        let _ = app.update(Message::Menu(MenuMessage::SetStrategy(
+            BuiltInStrategy::EmaCross,
+        )));
+        let _ = app.update(Message::OpenReport(0));
+        let _ = app.update(Message::Menu(MenuMessage::OpenSweep));
+        app
+    }
+
+    #[test]
+    fn a_sweep_opens_a_chart_per_value_on_a_fresh_workspace() {
+        let mut app = with_strategy();
+        let Some(Popup::Sweep { param, inputs, .. }) = app.popup() else {
+            panic!("no sweep popup")
+        };
+        assert_eq!(*param, 0);
+        assert_eq!(
+            inputs,
+            &["5".to_owned(), "20".to_owned(), "4".to_owned()],
+            "Fast 10: half to double"
+        );
+
+        let _ = app.update(Message::Menu(MenuMessage::StartSweep));
+        assert!(app.popup().is_none());
+        assert_eq!(app.workspace(), 2);
+        let tiles = app.layout().tiles();
+        let fast: Vec<f64> = tiles
+            .iter()
+            .map(|&id| app.tile_strategy(id).unwrap().0.params[0])
+            .collect();
+        assert_eq!(fast, vec![5.0, 10.0, 15.0, 20.0]);
+        assert!(
+            tiles
+                .iter()
+                .all(|&id| app.tile_market(id) == app.tile_market(tiles[0]))
+        );
+        assert_eq!(
+            app.workspaces(),
+            vec![1, 2],
+            "the original stays on workspace 1"
+        );
+    }
+
+    #[test]
+    fn a_sweep_explains_bad_ranges_and_full_workspaces() {
+        let mut app = with_strategy();
+        let _ = app.update(Message::Menu(MenuMessage::SweepInput(2, "40".into())));
+        let _ = app.update(Message::Menu(MenuMessage::StartSweep));
+        let Some(Popup::Sweep { error, .. }) = app.popup() else {
+            panic!()
+        };
+        assert!(
+            error.as_deref().is_some_and(|e| e.contains("2 to 9")),
+            "{error:?}"
+        );
+
+        let _ = app.update(Message::Menu(MenuMessage::SweepParam(1)));
+        let Some(Popup::Sweep { inputs, .. }) = app.popup() else {
+            panic!()
+        };
+        assert_eq!(inputs[0], "15", "Slow 30: from 15");
+
+        let mut full = super::app();
+        for n in 2..=9 {
+            let _ = full.update(Message::Key(Action::Workspace(n)));
+        }
+        let _ = full.update(Message::Key(Action::Workspace(1)));
+        let _ = full.update(Message::Chart(
+            0,
+            ChartMessage::Clicked {
+                at: Point::new(9.0, 9.0),
+            },
+        ));
+        let _ = full.update(Message::Menu(MenuMessage::SetStrategy(
+            BuiltInStrategy::EmaCross,
+        )));
+        let _ = full.update(Message::OpenReport(0));
+        let _ = full.update(Message::Menu(MenuMessage::OpenSweep));
+        let _ = full.update(Message::Menu(MenuMessage::StartSweep));
+        let Some(Popup::Sweep { error, .. }) = full.popup() else {
+            panic!()
+        };
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|e| e.contains("every workspace")),
+            "{error:?}"
+        );
+    }
+}
+
+mod live {
+    use std::time::Duration;
+
+    use iced::futures::{StreamExt, executor::block_on};
+    use iced_runtime::{Action, task::into_stream};
+    use persephone::live::LiveState;
+    use persephone_engine::live::LiveMode;
+
+    use super::*;
+
+    /// Bars after the app's 1,500, swinging fast enough for EMA crosses.
+    fn more_bars(n: u64) -> Vec<Candle> {
+        (1_500..1_500 + n)
+            .map(|i| {
+                let p = 50_000.0 + 2_500.0 * ((i - 1_500) as f64 / 6.0).sin();
+                Candle {
+                    ts: i * Timeframe::H1.nanos(),
+                    open: p - 5.0,
+                    high: p + 25.0,
+                    low: p - 25.0,
+                    close: p + 5.0,
+                    volume: 3.0,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn paper_trading_from_the_report_follows_live_bars() {
+        let mut app = app();
+        set_strategy(&mut app, BuiltInStrategy::EmaCross);
+        finish_backtest(&mut app);
+        let replay = more_bars(80);
+        app.rehearse_live(replay.clone(), Duration::from_millis(3));
+
+        let _ = app.update(Message::OpenReport(0));
+        let task = app.update(Message::Menu(MenuMessage::GoLive(LiveMode::Paper)));
+        assert_eq!(app.tile_live(0).unwrap().state, LiveState::Connecting);
+        let mut events = into_stream(task).expect("the session's events");
+
+        // Deliver the session's events as the app would; stop once every bar is in. (The
+        // backtest reruns they ask for are left out; one runs at the end.)
+        let mut stopped = false;
+        while let Some(action) = block_on(events.next()) {
+            let Action::Output(message) = action else {
+                continue;
+            };
+            let _ = app.update(message);
+            let bars = app.tile_chart(0).unwrap().data().candles.len();
+            if bars == 1_500 + replay.len() && !stopped {
+                let _ = app.update(Message::Menu(MenuMessage::StopLive));
+                assert_eq!(app.tile_live(0).unwrap().state, LiveState::Stopping);
+                stopped = true;
+            }
+        }
+
+        let live = app.tile_live(0).unwrap();
+        assert_eq!(live.state, LiveState::Stopped(None));
+        assert_eq!(live.since, Some(replay[0].ts));
+        assert!(live.fills.len() >= 3, "{} fills", live.fills.len());
+        assert!(
+            live.book.position.abs() < 1e-9,
+            "stopping closed the position"
+        );
+        assert_eq!(live.book.fills, live.fills.len());
+
+        // The chart has the new bars, and its markers from the session start are the session's.
+        let chart = app.tile_chart(0).unwrap();
+        let markers: Vec<_> = chart
+            .trades()
+            .expect("trades")
+            .markers
+            .iter()
+            .filter(|m| m.bar >= 1_500)
+            .map(|m| (chart.data().candles[m.bar].ts, m.price))
+            .collect();
+        let fills: Vec<_> = live.fills.iter().map(|f| (f.bar, f.price)).collect();
+        assert_eq!(markers, fills);
+
+        finish_backtest(&mut app);
+        let Run::Done(report) = run_state(&app) else {
+            panic!()
+        };
+        assert_eq!(
+            report.equity.len(),
+            1_580,
+            "the backtest covers the live bars too"
+        );
+    }
+
+    #[test]
+    fn new_settings_end_the_session() {
+        let mut app = app();
+        set_strategy(&mut app, BuiltInStrategy::EmaCross);
+        finish_backtest(&mut app);
+        app.rehearse_live(more_bars(1_000), Duration::from_millis(50));
+        let _ = app.update(Message::OpenReport(0));
+        let _events = app.update(Message::Menu(MenuMessage::GoLive(LiveMode::Paper)));
+        assert!(app.tile_live(0).unwrap().is_active());
+
+        let _ = app.update(Message::Menu(MenuMessage::StrategyParamChanged(
+            0,
+            "8".into(),
+        )));
+        assert!(
+            app.tile_live(0).is_none(),
+            "the session ran the old settings"
+        );
+    }
+}

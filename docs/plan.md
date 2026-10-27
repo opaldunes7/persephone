@@ -100,7 +100,7 @@ persephone/
 | Mod+Ctrl+H/J/K/L | resize |
 | Mod+T | toggle split axis |
 | Mod+F | fullscreen tile |
-| Mod+1..9 | workspaces (added later) |
+| Mod+1..9 | switch workspace (Mod+Shift+1..9 moves the focused chart there) |
 
 ### 2. Chart (`crates/chart`)
 - **Viewport:** the x-axis counts bars, not clock time. Pan and zoom only change a uniform (offset and scale), so moving around never re-uploads data to the GPU.
@@ -193,7 +193,7 @@ world strategy {
 - **`ai`:** `complete(request)` sends a request to an LLM provider (Claude, OpenAI, or local models through Ollama).
   - During backtests, a record/replay cache keyed by the hash of model, prompt and params makes reruns deterministic and free.
   - The look-ahead warning above is built into the report.
-- **Later escape hatch:** an "external strategy" that talks to any process over a local socket and runs in lockstep during backtests. This covers full Python ML stacks or agent frameworks.
+- **Later escape hatch:** an "external strategy" that talks to any process over a local socket and runs in lockstep during backtests. This covers full Python ML stacks or agent frameworks. *(Built after M7; see below.)*
 - *(Built in M7:)* both are WIT imports the host serves: `ml` for indicators and strategies, `ai` for strategies. The SDK wraps them as `persephone_sdk::ml::run` and `persephone_sdk::ai::complete`.
   - **Models** (`persephone_ml::models`): **tract** instead of `ort`. It's pure Rust, so there's no ONNX Runtime library to download at build time, and it's deterministic on the CPU. It covers what strategy models use, including ONNX-ML tree ensembles for gradient-boosting exports, though fewer operators than ONNX Runtime and no CoreML. `run(name, tensor)` loads `…/persephone/models/<name>.onnx`, compiles it once per input shape, recompiles when the file changes, and returns every output as f32. `persephone_ml::models::logistic_regression` writes a small ONNX model without Python, used by the tests and by `persephone-cli models example`.
   - **Language models** (`persephone_ml::ai`): model names choose the provider. `claude-…` goes to the Messages API over raw HTTPS (there's no Rust SDK). `openai/…` and `ollama/…` go to OpenAI-compatible chat endpoints.
@@ -222,7 +222,7 @@ world strategy {
   - **Importer** (`persephone_data::import`): detection reads the first 256 KB. It works out the separator (`,` `;` tab `|`), the header row, decimal commas, and the time column and format: epoch s/ms/µs/ns, year-first text in any spelling (`2014-01-02T03:04:05.123Z`, `2014.01.02 03:04:05`, HistData's `20140102 030405123`), day- or month-first dates, or separate date and time columns. Offsets written in the text are honoured, and `--tz` takes a fixed offset or an IANA zone with daylight saving. Header names pick columns when recognisable; otherwise values do: ids rise every row, a bid and ask stay close with one always on top, finer epoch units beat trade ids that look like seconds, and true/false is Binance's `is_buyer_maker`. Tested on Bitcoincharts, Binance trades and aggTrades, HistData, TrueFX, Dukascopy, GainCapital, Kraken and MetaTrader-style exports. Files can be plain, `.gz` or `.zip` and stream a day at a time (4.8M rows/s on a release build). Rows that don't fit are skipped and reported with their line numbers, and layouts save as profiles. Columns, kind, separator, header and time format can all be overridden.
   - **CLI:** `persephone-cli import FILES… --symbol EURUSD [--venue …] [--tz …] [--dry-run] [--profile …|--save-profile …]`, `persephone-cli data list|remove|dir`, and `backtest --local SYMBOL.VENUE [--bar-fills]`.
   - **App:** the symbol page has a Local section, local tiles are saved with their venue, the chart header marks them `(local)`, and `persephone EURUSD.LOCAL` opens one. Dropping CSV files on a chart opens an import panel showing what was detected, with symbol, venue and time zone boxes and live progress; when it finishes, the chart switches to the new market.
-  - Not built yet: tick-count and volume bars, and fetching Binance's monthly archives (they already import, being zipped CSVs).
+  - *(Built later:)* tick-count and volume bars for local markets (`1000t`, `2.5v`), and `persephone-cli fetch binance` for Binance's monthly or daily archives.
 
 ## Milestones (each ends with something you can run)
 
@@ -236,7 +236,26 @@ world strategy {
 | M5 | WASM plugins | WIT, SDK, host and hot reload. The example SMA indicator and EMA-cross strategy work as plugins. |
 | M6 | CSV tick import | Your files import, chart as aggregated bars, and run tick-level backtests. This doesn't depend on M2–M5 and can move earlier. |
 | M7 | ML and AI | `ml` (ONNX) and `ai` (LLM plus cache) capabilities, each with an example strategy. |
-| Later | | Workspaces (Mod+1..9), parameter-sweep grid, crosshair synced across tiles, paper and live trading through Nautilus's live node, drawing tools. |
+| Later | Built after M7 | Workspaces (Mod+1..9), parameter-sweep grid, crosshair synced across tiles, paper and live trading through Nautilus's live node, drawing tools, tick and volume bars, Binance archive fetching, external strategies over a socket. See below. |
+
+## Built after M7
+- **Workspaces:** Mod+1..9 switches between nine sets of tiles, each with its own layout; Mod+Shift+1..9 moves the focused chart. All of them are saved. Charts on hidden workspaces keep backtesting and catch up when shown.
+- **Synced crosshair:** hovering a bar shows a vertical line at the same time on every other chart, whatever its timeframe.
+- **Drawing tools:** trend lines, horizontal lines and rectangles from the menu's Draw page. They're anchored to time and price, so they show on every timeframe of the market, and they're saved per market. Click a drawing to remove it.
+- **Parameter sweeps:** "Sweep a parameter…" in a strategy's report opens 2–9 charts on a free workspace, one per value, and the report compares their returns.
+- **Tick and volume bars:** local markets can be cut into a bar every N ticks or every so much traded size. These bars close at their last tick, so backtests never see a bar before it's complete.
+- **Binance archives:** `persephone-cli fetch binance BTCUSDT --from 2024-01 --to 2024-06` downloads data.binance.vision's monthly (or daily) aggTrades or trades, checks each file against its published SHA-256, and imports them.
+- **Paper and live trading** (`persephone_engine::live`, behind the engine's `live` feature):
+  - The same strategies run on Nautilus's `LiveNode`, on Binance's public kline streams, which need no keys.
+  - Paper orders fill in Nautilus's sandbox, the same way backtest orders do. A test replays bars through the live node and checks the fills against a backtest of the same bars.
+  - **App:** a strategy's report has "Paper trade on live bars". It warms the strategy up on the latest bars, appends closed bars to the chart, shows the session's trades from where it started, and puts its profit in the chart's corner. "Trade on Binance's testnet" appears when `BINANCE_TESTNET_API_KEY` and `BINANCE_TESTNET_API_SECRET` are set.
+  - **CLI:** `persephone-cli live [--testnet | --real-money]`. Real money needs `BINANCE_API_KEY`/`BINANCE_API_SECRET` and the exact confirmation phrase typed at a terminal, and it's only in the CLI.
+  - Keys are read by Nautilus from the environment, never by Persephone.
+  - On spot accounts (testnet and real money), strategies go flat instead of short. Stopping a session closes its position.
+- **External strategies** (`persephone_plugin_host::external`):
+  - A `NAME.external` file in the plugins folder names a process listening on TCP or a Unix socket. It speaks JSON lines: `describe`, `start`, one `bar` at a time, then `end`.
+  - Persephone waits for each answer, so a backtest runs in lockstep. External strategies appear alongside the plugins and work everywhere they do: backtests, sweeps and live sessions.
+  - `plugins/external/ema_cross.py` is a standard-library Python example. `persephone-cli backtest --external tcp://127.0.0.1:7878` runs one headless.
 
 ## Risks
 - **Nautilus API churn** (0.x, v2 still a release candidate). Pin to an exact version and keep everything Nautilus inside `engine`. Expect some upgrade work every few releases, and read the crate examples, because the Rust docs are thinner than the Python ones.

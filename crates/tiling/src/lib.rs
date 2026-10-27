@@ -279,11 +279,18 @@ impl Layout {
     /// One tile, id 0.
     #[must_use]
     pub fn new() -> Self {
+        Self::starting_at(0)
+    }
+
+    /// One tile with id `first`; later tiles count up from there. Layouts started far apart
+    /// never share ids.
+    #[must_use]
+    pub fn starting_at(first: TileId) -> Self {
         Self {
-            root: Node::Leaf(0),
-            focused: 0,
+            root: Node::Leaf(first),
+            focused: first,
             fullscreen: false,
-            next_id: 1,
+            next_id: first + 1,
         }
     }
 
@@ -552,6 +559,14 @@ mod tests {
     use super::*;
 
     const WIDE: Rect = Rect::new(0.0, 0.0, 1600.0, 900.0);
+
+    #[test]
+    fn layouts_can_start_their_ids_anywhere() {
+        let mut layout = Layout::starting_at(1 << 20);
+        assert_eq!(layout.tiles(), vec![1 << 20]);
+        assert_eq!(layout.insert(WIDE).unwrap(), (1 << 20) + 1);
+        assert!(layout.is_valid());
+    }
 
     fn ids_at(layout: &Layout, area: Rect) -> Vec<(TileId, (f32, f32, f32, f32))> {
         layout

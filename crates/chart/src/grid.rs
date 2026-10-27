@@ -68,7 +68,7 @@ impl<Message> canvas::Program<Message> for Grid<'_> {
                         }
                     }
                 }
-                for tick in ticks::time_ticks(&data.candles, &panes.price, data.timeframe) {
+                for tick in ticks::time_ticks(&data.candles, &panes.price, data.typical_nanos) {
                     let x = panes.price.x(tick.index as f64).round();
                     let color = if tick.major {
                         theme::GRID_MAJOR

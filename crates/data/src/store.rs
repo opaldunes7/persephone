@@ -28,7 +28,7 @@ use parquet::{
     schema::types::ColumnPath,
 };
 use persephone_core::{
-    Candle, InstrumentSpec, Timeframe, UnixNanos,
+    BarSpec, Candle, InstrumentSpec, Timeframe, UnixNanos,
     tick::{self, Aggressor, Quote, TickFeed, TickKind, Ticks, Trade},
     time::{NANOS_PER_DAY, civil_from_days},
 };
@@ -248,6 +248,35 @@ impl LocalMarket {
         let excess = candles.len().saturating_sub(max);
         candles.drain(..excess);
         Ok(candles)
+    }
+
+    /// The latest `max` bars of `spec`. Time bars come from the 1-minute bars; tick and volume
+    /// bars from the ticks of the latest days (as many as it takes), counted from the first
+    /// tick of the earliest day read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a file can't be read.
+    pub fn candles_by(&self, spec: BarSpec, max: usize) -> anyhow::Result<Vec<Candle>> {
+        if let BarSpec::Time(timeframe) = spec {
+            return self.candles(timeframe, max);
+        }
+        let days = self.days();
+        let mut take = 1;
+        loop {
+            let Some(&first) = days.get(days.len().saturating_sub(take)) else {
+                return Ok(Vec::new());
+            };
+            let ticks = self.read_ticks(first as u64 * NANOS_PER_DAY, self.info.last + 1)?;
+            let mut bars = tick::bars_by(&ticks, spec);
+            if bars.len() >= max || take >= days.len() {
+                let excess = bars.len().saturating_sub(max);
+                bars.drain(..excess);
+                return Ok(bars);
+            }
+            // Read more days, doubling, so the total work stays within twice the last read.
+            take = (take * 2).min(days.len());
+        }
     }
 
     /// Every tick with `start <= ts < end`, oldest first.
@@ -759,6 +788,36 @@ mod tests {
         let reopened = store.market("LOCAL", "EURUSD").unwrap();
         assert_eq!(reopened.info, market.info);
         assert_eq!(store.markets().len(), 1);
+        fs::remove_dir_all(store.root()).unwrap();
+    }
+
+    #[test]
+    fn tick_and_volume_bars_come_from_the_latest_ticks() {
+        let store = temp_store("tick-bars");
+        let market = store.create(info(TickKind::Trades)).unwrap();
+        let mut writer = MarketWriter::new(market);
+        for day in 20_000..20_010 {
+            writer.write_day(day, trades(day, 0..1_440, 1.0)).unwrap();
+        }
+        let market = writer.finish().unwrap();
+
+        let bars = market.candles_by(BarSpec::Ticks(100), 50).unwrap();
+        assert_eq!(bars.len(), 50);
+        // 50 bars take four days of ticks (5,760 from tick 8,640), so the last bar opens on tick
+        // 8,640 + 5,700.
+        assert_eq!(
+            bars[49].ts,
+            market.read_ticks(0, u64::MAX).unwrap().ts(14_340)
+        );
+        assert_eq!(
+            market.candles_by(BarSpec::Ticks(100), 1_000).unwrap().len(),
+            144,
+            "every tick read"
+        );
+        // Each trade has size 1, so 60 traded makes a bar.
+        let by_volume = market.candles_by(BarSpec::Volume(60.0), 10).unwrap();
+        assert!(by_volume.iter().all(|b| b.volume == 60.0));
+        assert_eq!(market.candles_by(Timeframe::H1.into(), 5).unwrap().len(), 5);
         fs::remove_dir_all(store.root()).unwrap();
     }
 

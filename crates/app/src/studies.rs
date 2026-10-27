@@ -4,10 +4,10 @@
 use iced::Color;
 use persephone_chart::{FillMark, Placement, Study, StudyLine, Trades, theme};
 use persephone_core::{
-    Candle,
+    Candle, UnixNanos,
     indicator::{BuiltIn, IndicatorInfo, IndicatorKind, IndicatorSpec, OutputStyle},
 };
-use persephone_engine::BacktestReport;
+use persephone_engine::{BacktestReport, Fill, live::LiveFill};
 use persephone_plugin_host::Plugins;
 
 const BLUE: Color = Color::from_rgb8(0x29, 0x62, 0xff);
@@ -73,14 +73,18 @@ pub fn build(specs: &[IndicatorSpec], candles: &[Candle], plugins: &Plugins) -> 
         .collect()
 }
 
-/// The strategy's equity curve as a pane, with the starting balance as a dashed level.
-pub fn equity(report: &BacktestReport) -> Study {
+/// The strategy's equity curve as a pane, with the starting balance as a dashed level. A
+/// report shorter than `bars` (live bars have arrived since) carries its last value on.
+pub fn equity(report: &BacktestReport, bars: usize) -> Study {
+    let mut values = report.equity.clone();
+    let last = values.last().copied().unwrap_or(report.starting_balance);
+    values.resize(bars.max(values.len()), last);
     Study {
         label: "Equity".into(),
         placement: Placement::Pane,
         lines: vec![StudyLine {
             name: "Equity".into(),
-            values: report.equity.clone(),
+            values,
             color: EQUITY,
             style: OutputStyle::Line,
         }],
@@ -104,6 +108,43 @@ pub fn trades(report: &BacktestReport, bars: usize) -> Trades {
         })
         .collect();
     Trades::from_fills(&fills, bars)
+}
+
+/// The backtest's trades up to where a live session started, then the session's own (it
+/// started flat, so its positions are worked out from its fills alone).
+pub fn live_trades(
+    backtest: &[Fill],
+    live: &[LiveFill],
+    since: UnixNanos,
+    candles: &[Candle],
+) -> Trades {
+    let cut = candles.partition_point(|c| c.ts < since);
+    let before: Vec<FillMark> = backtest
+        .iter()
+        .filter(|f| f.bar < cut)
+        .map(|f| FillMark {
+            bar: f.bar,
+            side: f.side,
+            price: f.price,
+            qty: f.qty,
+        })
+        .collect();
+    let after: Vec<FillMark> = live
+        .iter()
+        .map(|f| FillMark {
+            bar: candles
+                .partition_point(|c| c.ts < f.bar)
+                .min(candles.len().saturating_sub(1)),
+            side: f.side,
+            price: f.price,
+            qty: f.qty,
+        })
+        .collect();
+    let mut trades = Trades::from_fills(&before, cut);
+    let session = Trades::from_fills(&after, candles.len());
+    trades.markers.extend(session.markers);
+    trades.spans.extend(session.spans);
+    trades
 }
 
 /// One color per output. Moving averages, channels and plugin lines take the next palette

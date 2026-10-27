@@ -9,6 +9,8 @@
 
 mod convert;
 pub mod indicators;
+#[cfg(feature = "live")]
+pub mod live;
 mod report;
 mod strategies;
 
@@ -28,7 +30,7 @@ use nautilus_model::{
     types::{Currency, Money},
 };
 use persephone_core::{
-    Candle, InstrumentSpec, Timeframe,
+    BarSpec, Candle, InstrumentSpec, UnixNanos,
     signal::{Signal, SignalFactory},
     strategy::{StrategyKind, StrategySpec},
     tick::{TickFeed, Ticks},
@@ -44,7 +46,8 @@ use crate::strategies::{SignalStrategy, builtins};
 #[derive(Clone, Debug)]
 pub struct BacktestRequest {
     pub instrument: InstrumentSpec,
-    pub timeframe: Timeframe,
+    /// How the candles were cut (time, ticks or volume); decides when each bar closes.
+    pub bars: BarSpec,
     /// Bars to replay, oldest first.
     pub candles: Vec<Candle>,
     pub strategy: StrategySpec,
@@ -113,13 +116,9 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
     engine.add_venue(venue_config(request, quote, request.ticks.is_none())?)?;
     engine.add_instrument(&instrument)?;
 
-    let bar_type = convert::bar_type(instrument_id, request.timeframe)?;
-    let bars = convert::bars(
-        &request.candles,
-        bar_type,
-        &request.instrument,
-        request.timeframe,
-    )?;
+    let closes = request.bars.closes(&request.candles);
+    let bar_type = convert::bar_type(instrument_id, request.bars)?;
+    let bars = convert::bars(&request.candles, &closes, bar_type, &request.instrument)?;
 
     let strategy = &request.strategy;
     strategy.validate().map_err(EngineError::InvalidRequest)?;
@@ -154,14 +153,18 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
             engine.add_data(bars, None, true, true)?;
             engine.run(None, None, None, false)?;
         }
-        Some(feed) => run_on_ticks(
-            &mut engine,
-            feed.as_ref(),
-            bars,
-            request,
-            instrument_id,
-            &failure,
-        )?,
+        Some(feed) => {
+            let end = closes.last().copied().unwrap_or_default();
+            run_on_ticks(
+                &mut engine,
+                feed.as_ref(),
+                bars,
+                request,
+                end,
+                instrument_id,
+                &failure,
+            )?;
+        }
     }
     if let Some(message) = failure.take() {
         engine.dispose();
@@ -173,7 +176,7 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
         &result,
         fills.take(),
         &request.candles,
-        request.timeframe,
+        &closes,
         request.starting_balance,
         &request.instrument.quote,
     );
@@ -203,12 +206,11 @@ fn run_on_ticks(
     feed: &dyn TickFeed,
     bars: Vec<Data>,
     request: &BacktestRequest,
+    end: UnixNanos,
     id: InstrumentId,
     failure: &Rc<RefCell<Option<String>>>,
 ) -> Result<(), EngineError> {
-    let step = request.timeframe.nanos();
     let first = request.candles[0].ts;
-    let end = request.candles[request.candles.len() - 1].ts + step;
     let spec = &request.instrument;
 
     let mut bars = bars.into_iter().peekable();

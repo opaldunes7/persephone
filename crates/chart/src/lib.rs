@@ -9,6 +9,7 @@
 //! Every layer derives the same [`Projection`] from the [`ChartState`] and its bounds, so they
 //! line up exactly without sharing anything mutable.
 
+pub mod drawing;
 pub mod study;
 pub mod theme;
 pub mod ticks;
@@ -28,8 +29,11 @@ use iced::{
     Element, Length, Padding, Point, Size,
     widget::{canvas, container, shader, stack},
 };
-use persephone_core::{Candle, Timeframe};
+#[cfg(test)]
+use persephone_core::Timeframe;
+use persephone_core::{BarSpec, Candle, UnixNanos};
 
+pub use drawing::{Anchor, Drawing, Tool};
 pub use study::{OutputStyle, Placement, Study, StudyLine};
 pub use trades::{FillMark, PositionSpan, TradeMarker, Trades};
 pub use viewport::{Projection, Viewport};
@@ -50,7 +54,10 @@ fn next_id() -> u64 {
 pub struct ChartData {
     pub symbol: String,
     pub venue: String,
-    pub timeframe: Timeframe,
+    /// How the bars are cut: by time, ticks or volume.
+    pub bars: BarSpec,
+    /// A bar's usual length, for spacing time labels and placing times beyond the data.
+    pub typical_nanos: UnixNanos,
     /// Decimal places for price labels.
     pub price_precision: u8,
     /// Bars, oldest first.
@@ -64,18 +71,32 @@ impl ChartData {
     pub fn new(
         symbol: impl Into<String>,
         venue: impl Into<String>,
-        timeframe: Timeframe,
+        bars: impl Into<BarSpec>,
         price_precision: u8,
         candles: Vec<Candle>,
     ) -> Arc<Self> {
+        let bars = bars.into();
         Arc::new(Self {
             symbol: symbol.into(),
             venue: venue.into(),
-            timeframe,
+            typical_nanos: bars.typical_nanos(&candles),
+            bars,
             price_precision,
             candles,
             generation: next_id(),
         })
+    }
+
+    /// The same market with other bars (say, one more that just closed).
+    #[must_use]
+    pub fn with_candles(&self, candles: Vec<Candle>) -> Arc<Self> {
+        Self::new(
+            self.symbol.clone(),
+            self.venue.clone(),
+            self.bars,
+            self.price_precision,
+            candles,
+        )
     }
 }
 
@@ -98,6 +119,13 @@ pub enum ChartMessage {
     Clicked { at: Point },
     /// A left click on study `study`'s legend.
     StudyClicked { study: usize, at: Point },
+    /// The bar under the cursor changed (its open time), or the cursor left (`None`). The chart
+    /// ignores it; the app moves the other charts' crosshairs to the same time.
+    Hovered { ts: Option<UnixNanos> },
+    /// A click while drawing, at this time and price; [`ChartState::place`] takes it.
+    Placed(Anchor),
+    /// A left click on drawing `index`.
+    DrawingClicked { index: usize, at: Point },
 }
 
 /// One chart: its data and indicators, what part of it is on screen, and cached layers.
@@ -112,6 +140,11 @@ pub struct ChartState {
     trades: Option<Trades>,
     viewport: Viewport,
     grid_cache: canvas::Cache,
+    /// A time hovered on another chart, shown as a crosshair line here.
+    linked: Option<UnixNanos>,
+    drawings: Arc<Vec<Drawing>>,
+    /// The tool being used, and its first click if it needs two.
+    tool: Option<(Tool, Option<Anchor>)>,
 }
 
 /// The price pane and one pane per indicator that wants its own, for one frame.
@@ -150,7 +183,113 @@ impl ChartState {
             studies_generation: next_id(),
             trades: None,
             grid_cache: canvas::Cache::new(),
+            linked: None,
+            drawings: Arc::new(Vec::new()),
+            tool: None,
         }
+    }
+
+    #[must_use]
+    pub fn drawings(&self) -> &[Drawing] {
+        &self.drawings
+    }
+
+    pub fn set_drawings(&mut self, drawings: Vec<Drawing>) {
+        self.drawings = Arc::new(drawings);
+    }
+
+    /// The next clicks draw with `tool` instead of opening the menu.
+    pub fn start_drawing(&mut self, tool: Tool) {
+        self.tool = Some((tool, None));
+    }
+
+    pub fn cancel_drawing(&mut self) {
+        self.tool = None;
+    }
+
+    #[must_use]
+    pub fn drawing_tool(&self) -> Option<Tool> {
+        self.tool.map(|(tool, _)| tool)
+    }
+
+    /// Takes a click made while drawing; returns the finished drawing once it has all its
+    /// clicks (and stops drawing).
+    pub fn place(&mut self, anchor: Anchor) -> Option<Drawing> {
+        let (tool, first) = self.tool?;
+        match tool.complete(first, anchor) {
+            Some(drawing) => {
+                self.tool = None;
+                Some(drawing)
+            }
+            None => {
+                self.tool = Some((tool, Some(anchor)));
+                None
+            }
+        }
+    }
+
+    /// Where `ts` falls on the bar axis: bar `i` opens at `i`; in a gap between bars the time
+    /// spreads across it, and outside the data it's spaced by the timeframe.
+    #[must_use]
+    pub fn index_of_time(&self, ts: UnixNanos) -> f64 {
+        let candles = &self.data.candles;
+        let step = self.data.typical_nanos as f64;
+        let Some(first) = candles.first() else {
+            return 0.0;
+        };
+        let i = candles.partition_point(|c| c.ts <= ts);
+        if i == 0 {
+            return (ts as f64 - first.ts as f64) / step;
+        }
+        let i = i - 1;
+        let span = candles
+            .get(i + 1)
+            .map_or(step, |next| (next.ts - candles[i].ts) as f64);
+        i as f64 + (ts - candles[i].ts) as f64 / span
+    }
+
+    /// The time at a point on the bar axis; the inverse of [`index_of_time`](Self::index_of_time).
+    #[must_use]
+    pub fn time_of_index(&self, index: f64) -> UnixNanos {
+        let candles = &self.data.candles;
+        let step = self.data.typical_nanos as f64;
+        let Some(first) = candles.first() else {
+            return 0;
+        };
+        let last = candles.len() - 1;
+        if index < 0.0 {
+            return (first.ts as f64 + index * step).max(0.0) as UnixNanos;
+        }
+        let i = (index.floor() as usize).min(last);
+        let span = candles
+            .get(i + 1)
+            .map_or(step, |next| (next.ts - candles[i].ts) as f64);
+        candles[i].ts + ((index - i as f64) * span).round() as UnixNanos
+    }
+
+    /// Shows a crosshair at `ts` (hovered on another chart), or none.
+    pub fn set_linked_time(&mut self, ts: Option<UnixNanos>) {
+        self.linked = ts;
+    }
+
+    #[must_use]
+    pub fn linked_time(&self) -> Option<UnixNanos> {
+        self.linked
+    }
+
+    /// The bar whose period contains `ts`, if the data covers it.
+    #[must_use]
+    pub fn bar_at_time(&self, ts: UnixNanos) -> Option<usize> {
+        let candles = &self.data.candles;
+        let i = candles.partition_point(|c| c.ts <= ts).checked_sub(1)?;
+        let end = match self.data.bars {
+            BarSpec::Time(tf) => candles[i].ts + tf.nanos(),
+            // Tick and volume bars last until the next one opens.
+            BarSpec::Ticks(_) | BarSpec::Volume(_) => candles
+                .get(i + 1)
+                .map_or(candles[i].ts + self.data.typical_nanos, |next| next.ts),
+        };
+        (ts < end).then_some(i)
     }
 
     #[must_use]
@@ -181,6 +320,17 @@ impl ChartState {
         &self.data
     }
 
+    /// Swaps in new bars for the same market, keeping the view where it is, or, if it showed
+    /// the latest bar, moving along with the bars added after it.
+    pub fn set_data(&mut self, data: Arc<ChartData>) {
+        let old = self.data.candles.len() as f64;
+        if self.viewport.right >= old - 1.0 {
+            self.viewport.right += data.candles.len() as f64 - old;
+        }
+        self.data = data;
+        self.grid_cache.clear();
+    }
+
     #[must_use]
     pub fn viewport(&self) -> &Viewport {
         &self.viewport
@@ -197,7 +347,11 @@ impl ChartState {
             } => self.viewport.zoom(factor, from_right, plot_width, len),
             ChartMessage::ScalePrice { dy } => self.viewport.scale_price(dy),
             ChartMessage::ResetPriceScale => self.viewport.reset_price(),
-            ChartMessage::Clicked { .. } | ChartMessage::StudyClicked { .. } => return,
+            ChartMessage::Clicked { .. }
+            | ChartMessage::StudyClicked { .. }
+            | ChartMessage::Hovered { .. }
+            | ChartMessage::Placed(_)
+            | ChartMessage::DrawingClicked { .. } => return,
         }
         self.grid_cache.clear();
     }
@@ -277,4 +431,125 @@ fn plot_size(size: Size) -> Size {
         (size.width - PRICE_AXIS_WIDTH).max(0.0),
         (size.height - TIME_AXIS_HEIGHT).max(0.0),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn times_find_the_bar_that_contains_them() {
+        let hour = Timeframe::H1.nanos();
+        // Hourly bars with a gap: 0h, 1h, then 5h.
+        let candles = [0, 1, 5]
+            .iter()
+            .map(|&h| Candle {
+                ts: h * hour,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: 1.0,
+            })
+            .collect();
+        let chart = ChartState::new(ChartData::new("X", "Y", Timeframe::H1, 2, candles));
+        assert_eq!(chart.bar_at_time(0), Some(0));
+        assert_eq!(
+            chart.bar_at_time(hour + 59 * 60_000_000_000),
+            Some(1),
+            "a minute inside 1h"
+        );
+        assert_eq!(chart.bar_at_time(3 * hour), None, "the gap has no bar");
+        assert_eq!(chart.bar_at_time(5 * hour + 1), Some(2));
+        assert_eq!(chart.bar_at_time(6 * hour), None, "past the last bar");
+    }
+
+    #[test]
+    fn times_and_bar_positions_convert_both_ways() {
+        let hour = Timeframe::H1.nanos();
+        let candles = [10, 11, 15]
+            .iter()
+            .map(|&h| Candle {
+                ts: h * hour,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: 1.0,
+            })
+            .collect();
+        let chart = ChartState::new(ChartData::new("X", "Y", Timeframe::H1, 2, candles));
+        assert_eq!(chart.index_of_time(11 * hour), 1.0);
+        assert_eq!(chart.index_of_time(10 * hour + hour / 2), 0.5);
+        assert_eq!(
+            chart.index_of_time(13 * hour),
+            1.5,
+            "a gap spreads across one step"
+        );
+        assert_eq!(
+            chart.index_of_time(8 * hour),
+            -2.0,
+            "before the data, an hour a step"
+        );
+        assert_eq!(chart.index_of_time(17 * hour), 4.0, "after it too");
+        for ts in [8 * hour, 10 * hour, 13 * hour, 15 * hour + 7, 20 * hour] {
+            assert_eq!(chart.time_of_index(chart.index_of_time(ts)), ts);
+        }
+    }
+
+    #[test]
+    fn drawing_takes_its_clicks_then_stops() {
+        let candles = vec![Candle {
+            ts: 0,
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 1.0,
+        }];
+        let mut chart = ChartState::new(ChartData::new("X", "Y", Timeframe::H1, 2, candles));
+        let (a, b) = (Anchor { ts: 0, price: 1.0 }, Anchor { ts: 5, price: 2.0 });
+        assert_eq!(chart.place(a), None, "not drawing");
+        chart.start_drawing(Tool::TrendLine);
+        assert_eq!(chart.place(a), None, "one more click");
+        assert_eq!(chart.place(b), Some(Drawing::TrendLine { from: a, to: b }));
+        assert_eq!(chart.drawing_tool(), None);
+        chart.start_drawing(Tool::Rectangle);
+        chart.cancel_drawing();
+        assert_eq!(chart.place(a), None);
+    }
+
+    #[test]
+    fn new_bars_keep_the_view_or_follow_the_latest() {
+        let bars = |n: u64| -> Vec<Candle> {
+            (0..n)
+                .map(|i| Candle {
+                    ts: i,
+                    open: 1.0,
+                    high: 1.0,
+                    low: 1.0,
+                    close: 1.0,
+                    volume: 1.0,
+                })
+                .collect()
+        };
+        let data = ChartData::new("X", "Y", Timeframe::H1, 2, bars(100));
+        let mut chart = ChartState::new(Arc::clone(&data));
+        let right = chart.viewport().right;
+        chart.set_data(data.with_candles(bars(101)));
+        assert_eq!(
+            chart.viewport().right,
+            right + 1.0,
+            "following the latest bar"
+        );
+        assert_eq!(chart.data().candles.len(), 101);
+
+        chart.update(ChartMessage::Pan {
+            dx: 400.0,
+            plot_width: 800.0,
+        });
+        let right = chart.viewport().right;
+        chart.set_data(data.with_candles(bars(102)));
+        assert_eq!(chart.viewport().right, right, "looking back in time");
+    }
 }

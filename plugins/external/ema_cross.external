@@ -1,0 +1,3 @@
+# Where ema_cross.py listens. Copy this file into Persephone's plugins folder
+# (`persephone-cli plugin dir`) while the script runs.
+tcp://127.0.0.1:7878

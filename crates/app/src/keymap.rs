@@ -12,6 +12,8 @@
 //! | Mod+Ctrl+H/J/K/L      | move the divider           |
 //! | Mod+T                 | toggle split direction     |
 //! | Mod+F                 | fullscreen                 |
+//! | Mod+1…9               | switch workspace           |
+//! | Mod+Shift+1…9         | move chart to workspace    |
 
 use iced::keyboard::{
     Modifiers,
@@ -28,6 +30,10 @@ pub enum Action {
     Resize(Direction),
     ToggleSplit,
     Fullscreen,
+    /// Show workspace 1 to 9.
+    Workspace(u8),
+    /// Move the focused chart to workspace 1 to 9.
+    MoveToWorkspace(u8),
 }
 
 impl Action {
@@ -45,6 +51,14 @@ pub fn action(key: Physical, modifiers: Modifiers, repeat: bool) -> Option<Actio
     let Physical::Code(code) = key else {
         return None;
     };
+    if let Some(n) = digit(code) {
+        let action = match (modifiers.shift(), modifiers.control()) {
+            (false, false) => Action::Workspace(n),
+            (true, false) => Action::MoveToWorkspace(n),
+            _ => return None,
+        };
+        return (!repeat).then_some(action);
+    }
 
     let action = match direction(code) {
         Some(d) if modifiers.shift() => Action::Swap(d),
@@ -60,6 +74,22 @@ pub fn action(key: Physical, modifiers: Modifiers, repeat: bool) -> Option<Actio
         },
     };
     (!repeat || action.repeats()).then_some(action)
+}
+
+fn digit(code: Code) -> Option<u8> {
+    let n = match code {
+        Code::Digit1 => 1,
+        Code::Digit2 => 2,
+        Code::Digit3 => 3,
+        Code::Digit4 => 4,
+        Code::Digit5 => 5,
+        Code::Digit6 => 6,
+        Code::Digit7 => 7,
+        Code::Digit8 => 8,
+        Code::Digit9 => 9,
+        _ => return None,
+    };
+    Some(n)
 }
 
 fn direction(code: Code) -> Option<Direction> {
@@ -100,6 +130,12 @@ mod tests {
         );
         assert_eq!(press(Code::KeyT, alt), Some(Action::ToggleSplit));
         assert_eq!(press(Code::KeyF, alt), Some(Action::Fullscreen));
+        assert_eq!(press(Code::Digit3, alt), Some(Action::Workspace(3)));
+        assert_eq!(
+            press(Code::Digit9, alt | Modifiers::SHIFT),
+            Some(Action::MoveToWorkspace(9))
+        );
+        assert_eq!(press(Code::Digit0, alt), None, "workspaces are 1 to 9");
     }
 
     #[test]
@@ -135,5 +171,6 @@ mod tests {
             "holding Mod+Enter opens one chart"
         );
         assert_eq!(held(Code::KeyL, Modifiers::ALT | Modifiers::SHIFT), None);
+        assert_eq!(held(Code::Digit2, Modifiers::ALT), None);
     }
 }

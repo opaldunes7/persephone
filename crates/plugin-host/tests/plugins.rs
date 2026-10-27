@@ -203,7 +203,7 @@ fn request(strategy: StrategySpec, plugin: Option<Arc<dyn SignalFactory>>) -> Ba
             price_precision: 2,
             size_precision: 5,
         },
-        timeframe: Timeframe::H1,
+        bars: Timeframe::H1.into(),
         candles: candles(1_500),
         strategy,
         plugin,

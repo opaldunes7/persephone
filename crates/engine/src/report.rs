@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use nautilus_backtest::result::BacktestResult;
-use persephone_core::{Candle, Side, Timeframe, UnixNanos, signal::Note};
+#[cfg(test)]
+use persephone_core::Timeframe;
+use persephone_core::{Candle, Side, UnixNanos, signal::Note};
 
 /// A fill as the strategy saw it, before it is matched to a bar.
 #[derive(Clone, Copy, Debug)]
@@ -88,11 +90,11 @@ pub(crate) fn build(
     result: &BacktestResult,
     raw: Vec<RawFill>,
     candles: &[Candle],
-    timeframe: Timeframe,
+    closes: &[UnixNanos],
     starting_balance: f64,
     quote: &str,
 ) -> BacktestReport {
-    let fills = assign_bars(&raw, candles, timeframe);
+    let fills = assign_bars(&raw, closes);
     let equity = equity_curve(&fills, candles, starting_balance);
     BacktestReport {
         max_drawdown: max_drawdown(&equity),
@@ -114,12 +116,12 @@ pub(crate) fn build(
     }
 }
 
-/// Matches each fill to the last candle that had closed by then (fills happen on a bar's
-/// close, which Nautilus stamps as the bar's time).
-fn assign_bars(raw: &[RawFill], candles: &[Candle], timeframe: Timeframe) -> Vec<Fill> {
+/// Matches each fill to the last bar that had closed by then (fills happen on a bar's close,
+/// which Nautilus stamps as the bar's time). `closes` are the bars' close times, in order.
+fn assign_bars(raw: &[RawFill], closes: &[UnixNanos]) -> Vec<Fill> {
     raw.iter()
         .map(|f| {
-            let closed = candles.partition_point(|c| c.ts + timeframe.nanos() <= f.ts);
+            let closed = closes.partition_point(|&close| close <= f.ts);
             Fill {
                 ts: f.ts,
                 bar: closed.saturating_sub(1),
@@ -226,8 +228,9 @@ mod tests {
             qty: 1.0,
             fee: 0.0,
         }];
+        let closes: Vec<u64> = data.iter().map(|c| c.ts + tf).collect();
         assert_eq!(
-            assign_bars(&raw, &data, Timeframe::M1)[0].bar,
+            assign_bars(&raw, &closes)[0].bar,
             1,
             "bar 1 closes at 2 minutes"
         );

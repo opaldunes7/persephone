@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use persephone_chart::ChartData;
 use persephone_core::{
-    Timeframe,
+    BarSpec,
     tick::{TickFeed, TickKind},
 };
 use persephone_data::store::Store;
@@ -22,20 +22,18 @@ pub const TICK_FILL_LIMIT: u64 = 10_000_000;
 /// # Errors
 ///
 /// Returns an error if the market doesn't exist, can't be read or has no data yet.
-pub fn load(
-    store: &Store,
-    venue: &str,
-    symbol: &str,
-    timeframe: Timeframe,
-) -> anyhow::Result<MarketData> {
+pub fn load(store: &Store, venue: &str, symbol: &str, bars: BarSpec) -> anyhow::Result<MarketData> {
     let market = store.market(venue, symbol)?;
-    let candles = market.candles(timeframe, HISTORY_BARS as usize)?;
+    let candles = market.candles_by(bars, HISTORY_BARS as usize)?;
     anyhow::ensure!(!candles.is_empty(), "{} has no data yet", market.id());
     let info = &market.info;
 
     // Ticks aren't spread evenly, but the chart's share of the market's span is a fair guess.
     let from = candles[0].ts.max(info.first);
-    let to = (candles[candles.len() - 1].ts + timeframe.nanos()).min(info.last + 1);
+    let to = bars
+        .closes(&candles)
+        .last()
+        .map_or(info.last + 1, |&close| close.min(info.last + 1));
     let span = info.last.saturating_sub(info.first).max(1);
     let estimate = (info.count as f64 * to.saturating_sub(from) as f64 / span as f64) as u64;
     let at = match info.kind {
@@ -59,7 +57,7 @@ pub fn load(
     let data = ChartData::new(
         info.symbol.clone(),
         format!("{} (local)", info.venue),
-        timeframe,
+        bars,
         info.price_precision,
         candles,
     );

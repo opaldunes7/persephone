@@ -10,7 +10,7 @@ use persephone::{
 };
 use persephone_chart::{ChartData, ChartMessage};
 use persephone_core::{
-    Candle, Side, Timeframe, UnixNanos,
+    BarSpec, Candle, Side, Timeframe, UnixNanos,
     strategy::BuiltInStrategy,
     tick::{Quote, TickKind, Ticks},
 };
@@ -116,7 +116,7 @@ fn a_local_market_opens_from_the_menu_and_backtests_on_its_ticks() {
     }));
     app.load_now();
     assert_eq!(app.tile_venue(0), Some("TEST"));
-    assert_eq!(app.tile_market(0), Some(("EURUSD", Timeframe::H1)));
+    assert_eq!(app.tile_market(0), Some(("EURUSD", Timeframe::H1.into())));
     let chart = app.tile_chart(0).expect("the bars loaded");
     assert_eq!(chart.data().candles.len(), 4 * 24);
 
@@ -163,6 +163,62 @@ fn a_local_market_opens_from_the_menu_and_backtests_on_its_ticks() {
 }
 
 #[test]
+fn local_markets_can_use_tick_bars() {
+    let store = store("tick-bars");
+    let mut app = binance_app();
+    app.set_store(store.clone());
+    menu(
+        &mut app,
+        MenuMessage::SetLocal {
+            venue: "TEST".into(),
+            symbol: "EURUSD".into(),
+        },
+    );
+    app.load_now();
+
+    menu(
+        &mut app,
+        MenuMessage::Open(Page::Bars {
+            input: String::new(),
+            error: None,
+        }),
+    );
+    let _ = app.update(Message::Menu(MenuMessage::BarsInput("2.5v".into())));
+    let _ = app.update(Message::Menu(MenuMessage::SubmitBars));
+    let Some(persephone::menu::Popup::Menu {
+        page: Page::Bars { error, .. },
+        ..
+    }) = app.popup()
+    else {
+        panic!("the bars page stays open")
+    };
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|e| e.contains("no traded size")),
+        "{error:?}"
+    );
+
+    let _ = app.update(Message::Menu(MenuMessage::SetBars(BarSpec::Ticks(500))));
+    app.load_now();
+    assert_eq!(app.tile_market(0), Some(("EURUSD", BarSpec::Ticks(500))));
+    let chart = app.tile_chart(0).expect("the tick bars loaded");
+    // Four days of a quote every 20 s: 17,280 quotes, so 34 full bars and the rest.
+    assert_eq!(chart.data().candles.len(), 35);
+    assert_eq!(chart.data().bars, BarSpec::Ticks(500));
+
+    menu(
+        &mut app,
+        MenuMessage::SetStrategy(BuiltInStrategy::EmaCross),
+    );
+    let (_, request) = app.backtest_request(0).unwrap();
+    assert_eq!(request.bars, BarSpec::Ticks(500));
+    assert!(request.ticks.is_some());
+    persephone_engine::run_backtest(&request).unwrap();
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
+
+#[test]
 fn saved_layouts_remember_local_markets() {
     let store = store("saved");
     let dir = store.root().join("layout");
@@ -170,6 +226,8 @@ fn saved_layouts_remember_local_markets() {
     persist::save(
         &path,
         &Saved {
+            workspace: 1,
+            others: Vec::new(),
             layout: Layout::new(),
             tiles: vec![SavedTile {
                 id: 0,

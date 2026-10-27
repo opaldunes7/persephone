@@ -9,7 +9,7 @@ use nautilus_model::{
     types::{Currency, Price, Quantity},
 };
 use persephone_core::{
-    Candle, InstrumentSpec, Timeframe,
+    BarSpec, Candle, InstrumentSpec, Timeframe,
     tick::{Aggressor, Quote, Trade},
 };
 
@@ -55,37 +55,42 @@ pub(crate) fn currency(code: &str) -> Result<Currency, EngineError> {
     Ok(currency)
 }
 
-pub(crate) fn bar_type(id: InstrumentId, timeframe: Timeframe) -> Result<BarType, EngineError> {
-    let (step, aggregation) = match timeframe {
-        Timeframe::M1 => (1, BarAggregation::Minute),
-        Timeframe::M5 => (5, BarAggregation::Minute),
-        Timeframe::M15 => (15, BarAggregation::Minute),
-        Timeframe::M30 => (30, BarAggregation::Minute),
-        Timeframe::H1 => (1, BarAggregation::Hour),
-        Timeframe::H4 => (4, BarAggregation::Hour),
-        Timeframe::D1 => (1, BarAggregation::Day),
+pub(crate) fn bar_type(id: InstrumentId, bars: BarSpec) -> Result<BarType, EngineError> {
+    // The bars come from outside Nautilus, so this only names them; volume steps are whole
+    // numbers there.
+    let (step, aggregation) = match bars {
+        BarSpec::Time(Timeframe::M1) => (1, BarAggregation::Minute),
+        BarSpec::Time(Timeframe::M5) => (5, BarAggregation::Minute),
+        BarSpec::Time(Timeframe::M15) => (15, BarAggregation::Minute),
+        BarSpec::Time(Timeframe::M30) => (30, BarAggregation::Minute),
+        BarSpec::Time(Timeframe::H1) => (1, BarAggregation::Hour),
+        BarSpec::Time(Timeframe::H4) => (4, BarAggregation::Hour),
+        BarSpec::Time(Timeframe::D1) => (1, BarAggregation::Day),
+        BarSpec::Ticks(n) => (n.max(1) as usize, BarAggregation::Tick),
+        BarSpec::Volume(v) => (v.round().max(1.0) as usize, BarAggregation::Volume),
     };
     let spec = BarSpecification::new_checked(step, aggregation, PriceType::Last)?;
     Ok(BarType::new(id, spec, AggregationSource::External))
 }
 
-/// Converts candles to Nautilus bars.
+/// Converts candles to Nautilus bars, stamped with `closes`.
 ///
-/// Nautilus stamps a bar with its **close** time, while [`Candle::ts`] is the open time. Shifting
-/// by one timeframe keeps a strategy from seeing a bar before it has closed. Bars get a deep
+/// Nautilus stamps a bar with its **close** time, while [`Candle::ts`] is the open time;
+/// stamping the close keeps a strategy from seeing a bar before it has closed. Bars get a deep
 /// book like ticks do: Nautilus caps bar fills at the bar's volume, which for bars made from
 /// quotes is only a count of quotes.
 pub(crate) fn bars(
     candles: &[Candle],
+    closes: &[u64],
     bar_type: BarType,
     spec: &InstrumentSpec,
-    timeframe: Timeframe,
 ) -> Result<Vec<Data>, EngineError> {
     let px = |v: f64| Price::new(v, spec.price_precision);
     candles
         .iter()
-        .map(|c| {
-            let closed_at = UnixNanos::from(c.ts + timeframe.nanos());
+        .zip(closes)
+        .map(|(c, &close)| {
+            let closed_at = UnixNanos::from(close);
             let bar = Bar::new_checked(
                 bar_type,
                 px(c.open),

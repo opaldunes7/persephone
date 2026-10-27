@@ -10,9 +10,12 @@
 //! Outside the sandbox, plugins can reach only what [`Services`] hands them: ONNX models from
 //! the models folder, and language models for strategies the user has allowed.
 //!
+//! Strategies can also run in a process of their own, reached over a socket: see [`external`].
+//!
 //! This crate knows nothing about Nautilus: strategies are handed to the engine as a
 //! [`SignalFactory`].
 
+pub mod external;
 mod services;
 
 use std::{
@@ -60,6 +63,12 @@ pub use services::Services;
 
 use indicator_world::persephone::plugin::types as wit;
 
+/// Whether `path` is a plugin file: a component, or a strategy running elsewhere.
+fn is_plugin(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext == "wasm" || ext == "external")
+}
+
 /// Most memory a plugin instance may use.
 pub const MEMORY_LIMIT: usize = 256 << 20;
 /// Instruction budget for describing a plugin.
@@ -95,7 +104,8 @@ pub enum Plugin {
     Strategy(Arc<StrategyPlugin>),
 }
 
-/// Every plugin in a folder, by id (file name without `.wasm`), plus files that failed.
+/// Every plugin in a folder, by id (file name without `.wasm` or `.external`), plus files that
+/// failed.
 #[derive(Clone, Debug, Default)]
 pub struct Plugins {
     pub indicators: BTreeMap<String, Arc<IndicatorPlugin>>,
@@ -157,7 +167,7 @@ impl Host {
         };
         let mut paths: Vec<PathBuf> = entries
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|ext| ext == "wasm"))
+            .filter(|p| is_plugin(p))
             .collect();
         paths.sort();
 
@@ -180,12 +190,16 @@ impl Host {
         plugins
     }
 
-    /// Loads one plugin file (compiling it unless it's cached and unchanged).
+    /// Loads one plugin file (compiling it unless it's cached and unchanged). A `.external`
+    /// file names a strategy running elsewhere, which is asked to describe itself.
     ///
     /// # Errors
     ///
     /// Returns a message if the file isn't a valid Persephone plugin.
     pub fn load(&self, path: &Path) -> Result<Plugin, String> {
+        if path.extension().is_some_and(|ext| ext == "external") {
+            return self.load_external(path);
+        }
         let modified = std::fs::metadata(path)
             .and_then(|m| m.modified())
             .map_err(|e| format!("can't read {}: {e}", path.display()))?;
@@ -207,6 +221,45 @@ impl Host {
             .expect("cache lock")
             .insert(path.to_owned(), (modified, plugin.clone()));
         Ok(plugin)
+    }
+
+    fn load_external(&self, path: &Path) -> Result<Plugin, String> {
+        let id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .ok_or_else(|| format!("{} has no file name", path.display()))?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("can't read {}: {e}", path.display()))?;
+        let address = external::Address::parse(&text)?;
+        self.external(id, address)
+            .map(Plugin::Strategy)
+            .map_err(|e| {
+                format!("{e} (start the strategy's process, then save this file to retry)")
+            })
+    }
+
+    /// The strategy running at `address`, once it has described itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if it can't be reached or doesn't describe itself properly.
+    pub fn external(
+        &self,
+        id: impl Into<String>,
+        address: external::Address,
+    ) -> Result<Arc<StrategyPlugin>, String> {
+        let description = external::describe(&address)?;
+        Ok(Arc::new(StrategyPlugin {
+            id: id.into(),
+            info: Arc::new(StrategyInfo::new(
+                description.name,
+                description.description,
+                description.params,
+            )),
+            uses_ai: false,
+            backend: Backend::External(address),
+            services: Arc::clone(&self.services),
+        }))
     }
 
     /// Works out which world a component exports and asks it to describe itself.
@@ -255,8 +308,10 @@ impl Host {
                 id,
                 info: Arc::new(StrategyInfo::new(info.name, info.description, params)),
                 uses_ai,
-                engine: self.engine.clone(),
-                pre: strategy,
+                backend: Backend::Wasm {
+                    engine: self.engine.clone(),
+                    pre: strategy,
+                },
                 services: Arc::clone(&self.services),
             })));
         }
@@ -328,9 +383,17 @@ pub struct StrategyPlugin {
     pub info: Arc<StrategyInfo>,
     /// It asks language models, so it needs the user's permission.
     pub uses_ai: bool,
-    engine: Engine,
-    pre: strategy_world::StrategyPre<State>,
+    backend: Backend,
     services: Arc<Services>,
+}
+
+enum Backend {
+    Wasm {
+        engine: Engine,
+        pre: strategy_world::StrategyPre<State>,
+    },
+    /// A process listening at this address.
+    External(external::Address),
 }
 
 impl fmt::Debug for StrategyPlugin {
@@ -343,6 +406,15 @@ impl fmt::Debug for StrategyPlugin {
 }
 
 impl StrategyPlugin {
+    /// Where it runs, for a strategy in a process of its own.
+    #[must_use]
+    pub fn address(&self) -> Option<&external::Address> {
+        match &self.backend {
+            Backend::External(address) => Some(address),
+            Backend::Wasm { .. } => None,
+        }
+    }
+
     /// Whether it may call language models.
     #[must_use]
     pub fn ai_allowed(&self) -> bool {
@@ -357,6 +429,10 @@ impl StrategyPlugin {
 
 impl SignalFactory for StrategyPlugin {
     fn create(&self, params: &[f64]) -> Result<Box<dyn Signal>, String> {
+        let (engine, pre) = match &self.backend {
+            Backend::Wasm { engine, pre } => (engine, pre),
+            Backend::External(address) => return external::start(address, params),
+        };
         let ai = self.services.ai_for(&self.id);
         let access = Access {
             models: self.services.models.clone(),
@@ -364,9 +440,8 @@ impl SignalFactory for StrategyPlugin {
             ai: ai.clone(),
             ai_allowed: self.ai_allowed(),
         };
-        let mut store = sandbox(&self.engine, START_FUEL, access)?;
-        let bindings = self
-            .pre
+        let mut store = sandbox(engine, START_FUEL, access)?;
+        let bindings = pre
             .instantiate(&mut store)
             .map_err(|e| failure(&store, &e))?;
         bindings

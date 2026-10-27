@@ -14,6 +14,10 @@
 //! the SMA / z-score plugin indicators, `w` sets the EMA Cross plugin strategy, `u` the LLM
 //! Daily one (`U` allows it to ask models) and `P` opens the strategy page. Backtests run to completion before the snapshot.
 //!
+//! `R` paper trades the focused chart's strategy on a replay of its last 120 bars (as if they
+//! came next), with the report open. `O` opens the sweep popup from the report and `Y` starts the sweep. `G` draws a trend line, a horizontal line and a box on the focused chart, and `c` hovers a
+//! bar on it so the other charts show the synced crosshair.
+//!
 //! With `SNAPSHOT_STORE` naming a local tick store, `L` / `M` open its first / second market
 //! (menu open), `D` drops the file named by `SNAPSHOT_DROP` on the focused chart (detecting its
 //! layout here) and `I` imports it.
@@ -32,13 +36,14 @@ use persephone::{
     keymap::Action,
     menu::{ImportState, MenuMessage, Page, Popup},
 };
-use persephone_chart::{ChartData, ChartMessage};
-use persephone_core::{Timeframe, indicator::BuiltIn, strategy::BuiltInStrategy};
+use persephone_chart::{Anchor, ChartData, ChartMessage, Tool};
+use persephone_core::{Candle, Timeframe, indicator::BuiltIn, strategy::BuiltInStrategy};
 use persephone_data::{
     binance::BinanceClient,
     import::{self, MarketOptions, Overrides},
     store::Store,
 };
+use persephone_engine::live::LiveMode;
 use persephone_plugin_host::{Host, Plugin, Plugins};
 use persephone_tiling::Direction;
 
@@ -68,6 +73,17 @@ fn main() -> anyhow::Result<()> {
         let focused = app.layout().focused();
         match c {
             'D' => drop_file(&mut app)?,
+            'G' => draw_examples(&mut app, focused),
+            'R' => rehearse_live(&mut app, focused)?,
+            'c' => {
+                let chart = app.tile_chart(focused).context("the chart has no bars")?;
+                let candles = &chart.data().candles;
+                let ts = candles[candles.len().saturating_sub(60)].ts;
+                let _ = app.update(Message::Chart(
+                    focused,
+                    ChartMessage::Hovered { ts: Some(ts) },
+                ));
+            }
             'I' => import_dropped(&mut app, store.as_ref().context("set SNAPSHOT_STORE")?)?,
             'L' | 'M' => {
                 let markets = store.as_ref().context("set SNAPSHOT_STORE")?.markets();
@@ -143,12 +159,62 @@ fn message(c: char, focused: u32) -> anyhow::Result<Message> {
         'y' => menu(MenuMessage::SetStrategy(BuiltInStrategy::RsiReversion)),
         'z' => menu(MenuMessage::SetStrategy(BuiltInStrategy::DonchianBreakout)),
         'r' => Ok(Message::OpenReport(focused)),
+        'O' => menu(MenuMessage::OpenSweep),
+        'Y' => menu(MenuMessage::StartSweep),
         'a' => menu(MenuMessage::AddPluginIndicator("sma".into())),
         'b' => menu(MenuMessage::AddPluginIndicator("zscore".into())),
         'w' => menu(MenuMessage::SetPluginStrategy("ema_cross".into())),
         'u' => menu(MenuMessage::SetPluginStrategy("llm_daily".into())),
         'U' => menu(MenuMessage::AllowAi(true)),
         other => bail!("unknown script action `{other}`"),
+    }
+}
+
+/// A trend line under the last stretch of lows, a line at the latest close, and a box around a
+/// range, on chart `id`.
+fn draw_examples(app: &mut Persephone, id: u32) {
+    let Some(chart) = app.tile_chart(id) else {
+        return;
+    };
+    let candles = chart.data().candles.clone();
+    let n = candles.len();
+    if n < 200 {
+        return;
+    }
+    let at = |i: usize, price: f64| Anchor {
+        ts: candles[i].ts,
+        price,
+    };
+    let (box_low, box_high) = candles[n - 110..n - 70]
+        .iter()
+        .fold((f64::MAX, f64::MIN), |(lo, hi), c| {
+            (lo.min(c.low), hi.max(c.high))
+        });
+    let drawings = [
+        (
+            Tool::TrendLine,
+            vec![
+                at(n - 180, candles[n - 180].low),
+                at(n - 20, candles[n - 20].low),
+            ],
+        ),
+        (Tool::HorizontalLine, vec![at(n - 1, candles[n - 1].close)]),
+        (
+            Tool::Rectangle,
+            vec![at(n - 110, box_high), at(n - 70, box_low)],
+        ),
+    ];
+    for (tool, anchors) in drawings {
+        let _ = app.update(Message::Chart(
+            id,
+            ChartMessage::Clicked {
+                at: Point::new(5.0, 5.0),
+            },
+        ));
+        let _ = app.update(Message::Menu(MenuMessage::Draw(tool)));
+        for anchor in anchors {
+            let _ = app.update(Message::Chart(id, ChartMessage::Placed(anchor)));
+        }
     }
 }
 
@@ -194,6 +260,60 @@ fn import_dropped(app: &mut Persephone, store: &Store) -> anyhow::Result<()> {
 }
 
 /// Runs every backtest the app is waiting on, here instead of on a worker thread.
+/// Paper trades tile `id`'s strategy on its last 120 bars replayed as the next ones, until all
+/// are in. The session keeps running; the snapshot shows it mid-way.
+fn rehearse_live(app: &mut Persephone, id: u32) -> anyhow::Result<()> {
+    use iced::futures::{StreamExt, executor::block_on};
+    use iced_runtime::{Action, task::into_stream};
+
+    let candles = app
+        .tile_chart(id)
+        .context("the chart has no bars")?
+        .data()
+        .candles
+        .clone();
+    let n = candles.len();
+    anyhow::ensure!(n > 130, "too few bars to replay");
+    let step = candles[n - 1].ts - candles[n - 2].ts;
+    let offset = candles[n - 1].open - candles[n - 121].open;
+    let replay: Vec<Candle> = candles[n - 121..n - 1]
+        .iter()
+        .enumerate()
+        .map(|(i, c)| Candle {
+            ts: candles[n - 1].ts + i as u64 * step,
+            open: c.open + offset,
+            high: c.high + offset,
+            low: c.low + offset,
+            close: c.close + offset,
+            volume: c.volume,
+        })
+        .collect();
+    let wanted = n - 1 + replay.len();
+    app.rehearse_live(replay, Duration::from_millis(2));
+    let _ = app.update(Message::OpenReport(id));
+    let task = app.update(Message::Menu(MenuMessage::GoLive(LiveMode::Paper)));
+    let mut events = into_stream(task).context("no live session started")?;
+    while let Some(action) = block_on(events.next()) {
+        if let Action::Output(message) = action {
+            let _ = app.update(message);
+        }
+        if app
+            .tile_chart(id)
+            .is_some_and(|c| c.data().candles.len() >= wanted)
+        {
+            break;
+        }
+    }
+    // Bring the backtest up to the replayed bars too.
+    if let Some((generation, request)) = app.backtest_request(id) {
+        let result = persephone_engine::run_backtest(&request)
+            .map(std::sync::Arc::new)
+            .map_err(|e| e.to_string());
+        let _ = app.update(Message::BacktestDone(id, generation, result));
+    }
+    Ok(())
+}
+
 fn finish_backtests(app: &mut Persephone) {
     for id in app.layout().tiles() {
         if !matches!(app.tile_strategy(id), Some((_, Run::Running))) {

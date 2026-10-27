@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use persephone_core::{
-    InstrumentSpec, Side, Timeframe, UnixNanos,
+    BarSpec, InstrumentSpec, Side, Timeframe, UnixNanos,
     strategy::{BuiltInStrategy, StrategySpec},
     tick::{self, Aggressor, Quote, TickFeed, TickKind, Ticks, Trade},
 };
@@ -103,7 +103,7 @@ fn request(feed: &Arc<Wave>, with_ticks: bool) -> BacktestRequest {
     feed.calls.lock().unwrap().clear();
     BacktestRequest {
         instrument: eurusd(),
-        timeframe: Timeframe::M15,
+        bars: Timeframe::M15.into(),
         candles: tick::bars(&all, Timeframe::M15),
         strategy: StrategySpec::with_params(BuiltInStrategy::EmaCross, &[10.0, 30.0, 10.0]),
         plugin: None,
@@ -124,7 +124,7 @@ fn quotes_fill_buys_at_the_ask_and_sells_at_the_bid() {
     let report = run(&request);
     assert!(report.fills.len() >= 6, "{} fills", report.fills.len());
 
-    let step = request.timeframe.nanos();
+    let step = Timeframe::M15.nanos();
     for fill in &report.fills {
         let quote = Wave::quote(feed.last_at(fill.ts));
         let expected = match fill.side {
@@ -213,4 +213,32 @@ fn unreadable_ticks_fail_the_run() {
     request.ticks = Some(Arc::new(Broken));
     let error = run_backtest(&request).unwrap_err();
     assert!(error.to_string().contains("disk on fire"), "{error}");
+}
+
+#[test]
+fn tick_bars_decide_after_their_last_tick() {
+    let feed = Arc::new(Wave::new(TickKind::Quotes, 10 * SECOND, 10));
+    let all = feed.ticks(START, feed.end()).unwrap();
+    let mut request = request(&feed, true);
+    request.bars = BarSpec::Ticks(90);
+    request.candles = tick::bars_by(&all, request.bars);
+    let report = run(&request);
+    assert!(report.fills.len() >= 4, "{} fills", report.fills.len());
+    let closes = request.bars.closes(&request.candles);
+    for fill in &report.fills {
+        // Decided when bar `fill.bar` was over (just before the next one opens) and filled
+        // then, at the bar's last quote: never a quote from a later bar.
+        assert_eq!(fill.ts, closes[fill.bar], "{fill:?}");
+        let quote = Wave::quote(feed.last_at(fill.ts));
+        assert!(quote.ts < request.candles[fill.bar + 1].ts);
+        let expected = if fill.side == Side::Buy {
+            quote.ask
+        } else {
+            quote.bid
+        };
+        assert!(
+            (fill.price - expected).abs() < 1e-9,
+            "{fill:?} vs {quote:?}"
+        );
+    }
 }

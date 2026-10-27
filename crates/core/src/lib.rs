@@ -98,6 +98,148 @@ impl FromStr for Timeframe {
     }
 }
 
+/// How bars are cut: by time, or (from ticks) every so many ticks or every so much traded
+/// size. Tick and volume bars need a market with ticks (the local store).
+#[derive(Clone, Copy, Debug)]
+pub enum BarSpec {
+    Time(Timeframe),
+    /// A bar every `n` ticks.
+    Ticks(u32),
+    /// A bar each time this much size has traded (trades only; quotes have no size).
+    Volume(f64),
+}
+
+impl BarSpec {
+    /// The timeframe of time bars.
+    #[must_use]
+    pub const fn timeframe(self) -> Option<Timeframe> {
+        match self {
+            Self::Time(tf) => Some(tf),
+            Self::Ticks(_) | Self::Volume(_) => None,
+        }
+    }
+
+    /// Short form, also how it's saved and typed: `15m`, `1000t`, `2.5v`.
+    #[must_use]
+    pub fn label(self) -> String {
+        match self {
+            Self::Time(tf) => tf.label().to_owned(),
+            Self::Ticks(n) => format!("{n}t"),
+            Self::Volume(v) => format!("{v}v"),
+        }
+    }
+
+    /// When each bar closes. Time bars close a timeframe after they open. Tick and volume bars
+    /// close just before the next one opens, so a strategy sees a bar only after its last tick;
+    /// the last bar closes a typical bar length after it opens.
+    #[must_use]
+    pub fn closes(self, candles: &[Candle]) -> Vec<UnixNanos> {
+        match self {
+            Self::Time(tf) => candles.iter().map(|c| c.ts + tf.nanos()).collect(),
+            Self::Ticks(_) | Self::Volume(_) => {
+                let typical = self.typical_nanos(candles);
+                let mut closes: Vec<UnixNanos> = candles
+                    .windows(2)
+                    .map(|w| w[1].ts.saturating_sub(1).max(w[0].ts))
+                    .collect();
+                if let Some(last) = candles.last() {
+                    closes.push(last.ts + typical);
+                }
+                closes
+            }
+        }
+    }
+
+    /// A bar's usual length: the timeframe, or the median gap between bar opens.
+    #[must_use]
+    pub fn typical_nanos(self, candles: &[Candle]) -> UnixNanos {
+        if let Self::Time(tf) = self {
+            return tf.nanos();
+        }
+        let mut gaps: Vec<UnixNanos> = candles.windows(2).map(|w| w[1].ts - w[0].ts).collect();
+        if gaps.is_empty() {
+            return Timeframe::M1.nanos();
+        }
+        let middle = gaps.len() / 2;
+        *gaps.select_nth_unstable(middle).1.max(&mut 1)
+    }
+}
+
+impl From<Timeframe> for BarSpec {
+    fn from(tf: Timeframe) -> Self {
+        Self::Time(tf)
+    }
+}
+
+impl PartialEq for BarSpec {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Time(a), Self::Time(b)) => a == b,
+            (Self::Ticks(a), Self::Ticks(b)) => a == b,
+            (Self::Volume(a), Self::Volume(b)) => a.to_bits() == b.to_bits(),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for BarSpec {}
+
+impl std::hash::Hash for BarSpec {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Time(tf) => tf.hash(state),
+            Self::Ticks(n) => n.hash(state),
+            Self::Volume(v) => v.to_bits().hash(state),
+        }
+    }
+}
+
+impl fmt::Display for BarSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Time(tf) => write!(f, "{tf}"),
+            Self::Ticks(n) => write!(f, "{n} ticks"),
+            Self::Volume(v) => write!(f, "{v} volume"),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "unknown bars `{0}` (a timeframe such as 1m or 4h, ticks such as 1000t, or volume such as 2.5v)"
+)]
+pub struct ParseBarSpecError(String);
+
+impl FromStr for BarSpec {
+    type Err = ParseBarSpecError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if let Ok(tf) = s.parse::<Timeframe>() {
+            return Ok(Self::Time(tf));
+        }
+        let error = || ParseBarSpecError(s.to_owned());
+        if let Some(n) = s.strip_suffix(['t', 'T']) {
+            let n: u32 = n.trim().parse().map_err(|_| error())?;
+            return if n >= 2 {
+                Ok(Self::Ticks(n))
+            } else {
+                Err(error())
+            };
+        }
+        if let Some(v) = s.strip_suffix(['v', 'V']) {
+            let v: f64 = v.trim().parse().map_err(|_| error())?;
+            return if v.is_finite() && v > 0.0 {
+                Ok(Self::Volume(v))
+            } else {
+                Err(error())
+            };
+        }
+        Err(error())
+    }
+}
+
 /// What the engine needs to know about a spot instrument.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstrumentSpec {
@@ -130,6 +272,48 @@ mod tests {
         }
         assert_eq!("4H".parse::<Timeframe>().unwrap(), Timeframe::H4);
         assert!("2h".parse::<Timeframe>().is_err());
+    }
+
+    #[test]
+    fn bar_specs_parse_and_print() {
+        for text in ["15m", "1000t", "2.5v", "4h"] {
+            assert_eq!(text.parse::<BarSpec>().unwrap().label(), text);
+        }
+        assert_eq!("1000T".parse::<BarSpec>().unwrap(), BarSpec::Ticks(1000));
+        assert_eq!(BarSpec::Ticks(500).to_string(), "500 ticks");
+        assert!(
+            "1t".parse::<BarSpec>().is_err(),
+            "a bar per tick is just ticks"
+        );
+        assert!("0v".parse::<BarSpec>().is_err());
+        assert!("2h".parse::<BarSpec>().is_err());
+    }
+
+    #[test]
+    fn irregular_bars_close_just_before_the_next_opens() {
+        let candle = |ts| Candle {
+            ts,
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 1.0,
+        };
+        let candles = [candle(100), candle(130), candle(200), candle(240)];
+        assert_eq!(
+            BarSpec::Ticks(10).closes(&candles),
+            vec![129, 199, 239, 280]
+        );
+        assert_eq!(
+            BarSpec::Ticks(10).typical_nanos(&candles),
+            40,
+            "the median gap"
+        );
+        let minute = Timeframe::M1.nanos();
+        assert_eq!(
+            BarSpec::Time(Timeframe::M1).closes(&[candle(0)]),
+            vec![minute]
+        );
     }
 
     #[test]

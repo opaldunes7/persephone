@@ -15,11 +15,16 @@ publish = false
 # releases, and every nautilus-* crate must agree on the same version.
 nautilus-analysis = "=0.66.0"
 nautilus-backtest = "=0.66.0"
+# Binance and the sandbox only for live trading; their default features would switch every
+# crate to high-precision values.
+nautilus-binance = { version = "=0.66.0", default-features = false }
 nautilus-common = "=0.66.0"
 nautilus-core = "=0.66.0"
 nautilus-execution = "=0.66.0"
 nautilus-indicators = "=0.66.0"
+nautilus-live = "=0.66.0"
 nautilus-model = "=0.66.0"
+nautilus-sandbox = { version = "=0.66.0", default-features = false }
 nautilus-trading = "=0.66.0"
 
 persephone-chart = { path = "crates/chart" }
@@ -31,6 +36,7 @@ persephone-plugin-host = { path = "crates/plugin-host" }
 persephone-tiling = { path = "crates/tiling" }
 
 anyhow = "1"
+async-trait = "0.1"
 arrow-array = "60"
 arrow-schema = "60"
 bytemuck = { version = "1", features = ["derive"] }
@@ -49,7 +55,10 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 rust_decimal = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
+# Only to run Nautilus's live node, which is async.
+tokio = { version = "1", features = ["rt", "time", "macros"] }
 # ONNX inference in pure Rust (no native runtime to download), for plugins' models; prost
 # is tract's own protobuf crate, for writing small models.
 tract-onnx = { version = "0.23", default-features = false }

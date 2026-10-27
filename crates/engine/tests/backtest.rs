@@ -38,7 +38,7 @@ fn sine_candles(n: usize) -> Vec<Candle> {
 fn request(candles: Vec<Candle>, strategy: StrategySpec) -> BacktestRequest {
     BacktestRequest {
         instrument: btcusdt(),
-        timeframe: Timeframe::H1,
+        bars: Timeframe::H1.into(),
         candles,
         strategy,
         plugin: None,

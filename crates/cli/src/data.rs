@@ -15,6 +15,7 @@ use persephone_core::{
     time::{DateTime, NANOS_PER_DAY},
 };
 use persephone_data::{
+    archive,
     import::{
         self, DEFAULT_VENUE, Detection, Format, MarketOptions, Overrides, Progress, Role, Tick,
         TimeFormat, Zone,
@@ -162,9 +163,19 @@ pub fn import(args: &ImportArgs) -> anyhow::Result<()> {
         quote: args.quote.as_ref().map(|q| q.to_uppercase()),
         fee: args.fee,
     };
+    import_files(&store, &args.files, &format, &options)
+}
+
+/// Streams `files` into the store with progress, then says what's there.
+fn import_files(
+    store: &Store,
+    files: &[PathBuf],
+    format: &Format,
+    options: &MarketOptions,
+) -> anyhow::Result<()> {
     println!(
         "\nImporting {} file(s) into {}.{} …",
-        args.files.len(),
+        files.len(),
         options.symbol,
         options.venue
     );
@@ -188,7 +199,7 @@ pub fn import(args: &ImportArgs) -> anyhow::Result<()> {
         }
         true
     };
-    let summary = import::import(&store, &args.files, &format, &options, &mut show_progress)?;
+    let summary = import::import(store, files, format, options, &mut show_progress)?;
     eprintln!("\r{:60}\r", "");
 
     let market = &summary.market;
@@ -220,6 +231,109 @@ pub fn import(args: &ImportArgs) -> anyhow::Result<()> {
     }
     println!("Open it from any chart: click → Symbol → Local.");
     Ok(())
+}
+
+#[derive(Subcommand)]
+pub enum FetchSource {
+    /// Binance's monthly or daily trade archives (data.binance.vision), downloaded, checked
+    /// against their published checksums and imported as SYMBOL.BINANCE.
+    Binance {
+        /// A Binance spot symbol, e.g. BTCUSDT.
+        symbol: String,
+        /// The first month (2024-01) or day (2024-01-15).
+        #[arg(long)]
+        from: String,
+        /// The last month or day; just the first if left out.
+        #[arg(long)]
+        to: Option<String>,
+        /// Every single trade, instead of trades merged by price and taker (much bigger).
+        #[arg(long)]
+        all_trades: bool,
+        /// Keep the downloaded zip files.
+        #[arg(long)]
+        keep: bool,
+        #[arg(long, hide = true, default_value = archive::ARCHIVE_URL)]
+        archive_url: String,
+    },
+}
+
+pub fn fetch(source: &FetchSource) -> anyhow::Result<()> {
+    let FetchSource::Binance {
+        symbol,
+        from,
+        to,
+        all_trades,
+        keep,
+        archive_url,
+    } = source;
+    let symbol = symbol.to_uppercase();
+    let periods = archive::periods(from, to.as_deref().unwrap_or(from))?;
+    let kind = if *all_trades {
+        archive::Kind::Trades
+    } else {
+        archive::Kind::AggTrades
+    };
+    let downloads = dirs::data_dir()
+        .context("no data folder on this system")?
+        .join("persephone")
+        .join("downloads");
+    // Monthly archives run to gigabytes: no overall time limit.
+    let http = reqwest::blocking::Client::builder()
+        .user_agent(concat!("persephone/", env!("CARGO_PKG_VERSION")))
+        .timeout(None)
+        .build()?;
+
+    let mut files = Vec::new();
+    for period in periods {
+        let name = archive::file_name(&symbol, kind, period);
+        let dest = downloads.join(&name);
+        if dest.exists() {
+            println!("{name}: already downloaded");
+            files.push(dest);
+            continue;
+        }
+        let mut shown = Instant::now() - Duration::from_secs(1);
+        let mut progress = |done: u64, total: Option<u64>| {
+            if shown.elapsed() >= Duration::from_millis(250) {
+                shown = Instant::now();
+                let of = total.map_or(String::new(), |t| format!(" of {} MB", t >> 20));
+                eprint!("\r{name}: {} MB{of}   ", done >> 20);
+                let _ = std::io::stderr().flush();
+            }
+        };
+        let url = archive::url(archive_url, &symbol, kind, period);
+        if archive::download(&http, &url, &dest, &mut progress)? {
+            eprintln!("\r{:70}\r{name}: downloaded and checked", "");
+            files.push(dest);
+        } else {
+            eprintln!(
+                "\r{:70}\r{name}: not published (no trades then, or not out yet)",
+                ""
+            );
+        }
+    }
+    anyhow::ensure!(
+        !files.is_empty(),
+        "none of those archives exist; check the symbol and dates"
+    );
+
+    let sample = import::sample(&files[0])?;
+    let detection = import::detect(&sample, &Overrides::default())?;
+    show(&detection);
+    let options = MarketOptions {
+        symbol,
+        venue: "BINANCE".into(),
+        base: None,
+        quote: None,
+        fee: None,
+    };
+    let result = import_files(&store()?, &files, &detection.format, &options);
+    if !keep {
+        for file in &files {
+            let _ = std::fs::remove_file(file);
+        }
+    }
+    result
 }
 
 fn overrides(args: &ImportArgs, zone: Option<Zone>) -> anyhow::Result<Overrides> {

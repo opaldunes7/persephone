@@ -10,8 +10,10 @@ publish.workspace = true
 persephone-core.workspace = true
 persephone-ml.workspace = true
 rand.workspace = true
+serde_json.workspace = true
 wasmtime.workspace = true
 wasmtime-wasi.workspace = true
 
 [dev-dependencies]
 persephone-engine.workspace = true
+serde_json.workspace = true

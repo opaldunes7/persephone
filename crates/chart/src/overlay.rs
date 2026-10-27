@@ -20,7 +20,9 @@ use iced::{
 use persephone_core::Side;
 
 use crate::{
-    ChartData, ChartMessage, ChartState, PRICE_AXIS_WIDTH, Panes, TIME_AXIS_HEIGHT, plot_size,
+    ChartData, ChartMessage, ChartState, PRICE_AXIS_WIDTH, Panes, TIME_AXIS_HEIGHT,
+    drawing::{Anchor, Drawing, distance_to_segment},
+    plot_size,
     study::Placement,
     theme,
     ticks::{self, format_price, format_value, step_decimals},
@@ -35,6 +37,8 @@ const MONO_ADVANCE: f32 = 0.62;
 const LEGEND_X: f32 = 12.0;
 const LEGEND_ROW: f32 = 20.0;
 const TAG_HEIGHT: f32 = 18.0;
+/// How close a click must land to a drawing's line to pick it.
+const NEAR_DRAWING: f32 = 6.0;
 
 pub(crate) struct Overlay<'a> {
     pub(crate) chart: &'a ChartState,
@@ -45,6 +49,8 @@ pub(crate) struct Interaction {
     drag: Drag,
     hovering: bool,
     last_axis_click: Option<Instant>,
+    /// The open time of the bar under the cursor, as last told to the app.
+    hovered_ts: Option<u64>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -112,16 +118,27 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
                 Drag::Press { start } => {
                     state.drag = Drag::Idle;
                     let panes = self.chart.panes(plot);
+                    if self.chart.tool.is_some() {
+                        // While drawing, clicks on the prices place points.
+                        if !panes.price.contains_y(start.y) {
+                            return Some(canvas::Action::capture());
+                        }
+                        let anchor = anchor_at(self.chart, &panes.price, start);
+                        return Some(
+                            canvas::Action::publish(ChartMessage::Placed(anchor)).and_capture(),
+                        );
+                    }
                     let bar = panes.price.bar_at(start.x, self.chart.data.candles.len());
-                    let message = match legend_rows(self.chart, &panes, bar)
+                    let study = legend_rows(self.chart, &panes, bar)
                         .into_iter()
-                        .find(|row| row.contains(start))
-                    {
-                        Some(row) => ChartMessage::StudyClicked {
+                        .find(|row| row.contains(start));
+                    let message = match (study, drawing_at(self.chart, &panes.price, start)) {
+                        (Some(row), _) => ChartMessage::StudyClicked {
                             study: row.study,
                             at: start,
                         },
-                        None => ChartMessage::Clicked { at: start },
+                        (None, Some(index)) => ChartMessage::DrawingClicked { index, at: start },
+                        (None, None) => ChartMessage::Clicked { at: start },
                     };
                     Some(canvas::Action::publish(message).and_capture())
                 }
@@ -159,6 +176,17 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
                         Some(canvas::Action::publish(message).and_capture())
                     }
                     Drag::Idle => {
+                        // Tell the app when the hovered bar changes, so other charts follow.
+                        let candles = &self.chart.data.candles;
+                        let ts = local
+                            .filter(|p| in_plot(*p, plot))
+                            .and_then(|p| self.chart.panes(plot).price.bar_at(p.x, candles.len()))
+                            .map(|i| candles[i].ts);
+                        if ts != state.hovered_ts {
+                            state.hovered_ts = ts;
+                            state.hovering = local.is_some();
+                            return Some(canvas::Action::publish(ChartMessage::Hovered { ts }));
+                        }
                         // Redraw the crosshair while hovering, and once more on the way out.
                         let was_hovering = std::mem::replace(&mut state.hovering, local.is_some());
                         (local.is_some() || was_hovering).then(canvas::Action::request_redraw)
@@ -167,6 +195,9 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
             }
             Event::Mouse(mouse::Event::CursorLeft) => {
                 state.hovering = false;
+                if state.hovered_ts.take().is_some() {
+                    return Some(canvas::Action::publish(ChartMessage::Hovered { ts: None }));
+                }
                 Some(canvas::Action::request_redraw())
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
@@ -215,6 +246,12 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
             .position_in(bounds)
             .filter(|c| in_plot(*c, plot) && !matches!(state.drag, Drag::Price { .. }));
         let hovered_bar = hovered.and_then(|c| panes.price.bar_at(c.x, data.candles.len()));
+        // Another chart's hovered time, shown when this one isn't hovered.
+        let linked_bar = hovered
+            .is_none()
+            .then(|| self.chart.linked.and_then(|ts| self.chart.bar_at_time(ts)))
+            .flatten();
+        let shown_bar = hovered_bar.or(linked_bar);
 
         // Tags are laid out before the axis labels so labels under them can make way: iced
         // draws all text above all fills, so a tag can't simply cover a label.
@@ -239,8 +276,8 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
             .into_iter()
             .flatten()
             .collect();
-        let time_tag = hovered_bar.map(|i| {
-            let text = ticks::crosshair_label(data.candles[i].ts, data.timeframe);
+        let time_tag = shown_bar.map(|i| {
+            let text = ticks::crosshair_label(data.candles[i].ts, data.bars);
             let half = time_tag_width(&text) / 2.0;
             let center = panes
                 .price
@@ -274,8 +311,11 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
         draw_time_labels(&mut frame, data, &panes.price, plot, time_tag.as_ref());
         draw_last_price_line(&mut frame, data, &panes.price, plot);
         draw_trade_markers(&mut frame, self.chart, &panes.price);
+        draw_drawings(&mut frame, self.chart, &panes.price, plot, hovered);
         if let Some(c) = hovered {
             draw_crosshair(&mut frame, &panes, plot, c, hovered_bar);
+        } else if let Some(i) = linked_bar {
+            draw_linked_line(&mut frame, &panes, plot, i);
         }
         for tag in price_tags {
             draw_price_tag(&mut frame, plot, tag);
@@ -284,7 +324,7 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
             draw_time_tag(&mut frame, plot, tag);
         }
 
-        let legend_bar = hovered_bar.or(data.candles.len().checked_sub(1));
+        let legend_bar = shown_bar.or(data.candles.len().checked_sub(1));
         if let Some(i) = legend_bar {
             draw_price_legend(&mut frame, data, i, plot.width);
         }
@@ -484,7 +524,7 @@ fn draw_time_labels(
 ) {
     // Half the width of a typical "HH:MM" label, so neighbours of the time tag clear it too.
     let label_half = 3.0 * theme::TEXT_SIZE * MONO_ADVANCE;
-    for tick in ticks::time_ticks(&data.candles, price, data.timeframe) {
+    for tick in ticks::time_ticks(&data.candles, price, data.typical_nanos) {
         let x = price.x(tick.index as f64);
         let hidden = time_tag.is_some_and(|tag| {
             (tag.center - x).abs() < time_tag_width(&tag.text) / 2.0 + label_half
@@ -616,6 +656,129 @@ fn draw_crosshair(frame: &mut Frame, panes: &Panes, plot: Size, cursor: Point, b
     }
 }
 
+/// The time and price under `p`.
+fn anchor_at(chart: &ChartState, price: &Projection, p: Point) -> Anchor {
+    Anchor {
+        ts: chart.time_of_index(price.index_at(p.x)),
+        price: price.price_at(p.y),
+    }
+}
+
+fn pixel(chart: &ChartState, price: &Projection, anchor: Anchor) -> (f32, f32) {
+    (
+        price.x(chart.index_of_time(anchor.ts)),
+        price.y(anchor.price),
+    )
+}
+
+/// The four corners of a box, in order around it.
+fn corners(a: (f32, f32), b: (f32, f32)) -> [(f32, f32); 4] {
+    [a, (b.0, a.1), b, (a.0, b.1)]
+}
+
+/// The drawing whose line passes near `p`, topmost first. Boxes are picked by their edges, so
+/// clicks inside one still open the menu.
+fn drawing_at(chart: &ChartState, price: &Projection, p: Point) -> Option<usize> {
+    if !price.contains_y(p.y) {
+        return None;
+    }
+    let at = (p.x, p.y);
+    let near = |a, b| distance_to_segment(at, a, b) <= NEAR_DRAWING;
+    chart
+        .drawings
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, drawing)| match drawing {
+            Drawing::TrendLine { from, to } => {
+                near(pixel(chart, price, *from), pixel(chart, price, *to))
+            }
+            Drawing::HorizontalLine { price: level } => {
+                (price.y(*level) - p.y).abs() <= NEAR_DRAWING
+            }
+            Drawing::Rectangle { from, to } => {
+                let c = corners(pixel(chart, price, *from), pixel(chart, price, *to));
+                (0..4).any(|i| near(c[i], c[(i + 1) % 4]))
+            }
+        })
+        .map(|(i, _)| i)
+}
+
+/// The chart's drawings, plus the one being drawn following the cursor, on the price pane.
+fn draw_drawings(
+    frame: &mut Frame,
+    chart: &ChartState,
+    price: &Projection,
+    plot: Size,
+    cursor: Option<Point>,
+) {
+    let mut shown: Vec<(Drawing, bool)> = chart.drawings.iter().map(|d| (*d, false)).collect();
+    if let (Some((tool, first)), Some(cursor)) = (chart.tool, cursor)
+        && price.contains_y(cursor.y)
+    {
+        let latest = anchor_at(chart, price, cursor);
+        shown.extend(tool.complete(first, latest).map(|d| (d, true)));
+    }
+    if shown.is_empty() {
+        return;
+    }
+    let pane = Rectangle::new(
+        Point::new(0.0, price.offset),
+        Size::new(plot.width, price.height),
+    );
+    frame.with_clip(pane, |frame| {
+        // The clip moves the origin to the pane's corner.
+        let at = |(x, y): (f32, f32)| Point::new(x, y - price.offset);
+        for (drawing, draft) in shown {
+            let color = if draft {
+                Color {
+                    a: 0.7,
+                    ..theme::ACCENT
+                }
+            } else {
+                theme::ACCENT
+            };
+            let stroke = Stroke::default().with_color(color).with_width(1.5);
+            match drawing {
+                Drawing::TrendLine { from, to } => {
+                    let (a, b) = (pixel(chart, price, from), pixel(chart, price, to));
+                    frame.stroke(&Path::line(at(a), at(b)), stroke);
+                }
+                Drawing::HorizontalLine { price: level } => {
+                    let y = price.y(level);
+                    frame.stroke(&Path::line(at((0.0, y)), at((plot.width, y))), stroke);
+                }
+                Drawing::Rectangle { from, to } => {
+                    let (a, b) = (pixel(chart, price, from), pixel(chart, price, to));
+                    let top_left = at((a.0.min(b.0), a.1.min(b.1)));
+                    let size = Size::new((a.0 - b.0).abs(), (a.1 - b.1).abs());
+                    frame.fill_rectangle(
+                        top_left,
+                        size,
+                        Color {
+                            a: 0.12,
+                            ..theme::ACCENT
+                        },
+                    );
+                    frame.stroke(&Path::rectangle(top_left, size), stroke);
+                }
+            }
+        }
+    });
+}
+
+/// Another chart's crosshair time: the vertical line alone, across every pane.
+fn draw_linked_line(frame: &mut Frame, panes: &Panes, plot: Size, bar: usize) {
+    let x = panes.price.x(bar as f64).round() + 0.5;
+    if x < 0.0 || x > plot.width {
+        return;
+    }
+    frame.stroke(
+        &Path::line(Point::new(x, 0.0), Point::new(x, plot.height)),
+        dashed(theme::CROSSHAIR, &[4.0, 4.0]),
+    );
+}
+
 fn draw_price_tag(frame: &mut Frame, plot: Size, tag: &Tag) {
     frame.fill_rectangle(
         Point::new(plot.width + 1.0, tag.center - TAG_HEIGHT / 2.0),
@@ -653,7 +816,7 @@ fn draw_price_legend(frame: &mut Frame, data: &ChartData, i: usize, plot_width: 
     let c = &data.candles[i];
     label_with(
         frame,
-        format!("{} · {} · {}", data.symbol, data.timeframe, data.venue),
+        format!("{} · {} · {}", data.symbol, data.bars, data.venue),
         Point::new(LEGEND_X, 16.0),
         theme::TEXT_BRIGHT,
         theme::LEGEND_SIZE,

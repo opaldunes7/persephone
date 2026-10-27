@@ -174,7 +174,7 @@ mod restore {
         // First launch: nothing saved yet, so one default chart.
         let (mut app, _loads) = Persephone::start(&[], Some(path.clone()));
         assert_eq!(app.layout().len(), 1);
-        assert_eq!(app.tile_market(0), Some(("BTCUSDT", Timeframe::M1)));
+        assert_eq!(app.tile_market(0), Some(("BTCUSDT", Timeframe::M1.into())));
 
         let _ = app.update(Message::Key(Action::NewTile));
         let _ = app.update(Message::Key(Action::NewTile));
@@ -186,7 +186,10 @@ mod restore {
         // Next launch picks up the same tiles, splits and focus.
         let (restored, _loads) = Persephone::start(&[], Some(path.clone()));
         assert_eq!(restored.layout(), app.layout());
-        assert_eq!(restored.tile_market(2), Some(("BTCUSDT", Timeframe::M1)));
+        assert_eq!(
+            restored.tile_market(2),
+            Some(("BTCUSDT", Timeframe::M1.into()))
+        );
 
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
@@ -195,11 +198,11 @@ mod restore {
     fn arguments_start_a_one_off_chart() {
         let args = ["ethusdt".to_string(), "4h".to_string()];
         let (mut app, _loads) = Persephone::start(&args, None);
-        assert_eq!(app.tile_market(0), Some(("ETHUSDT", Timeframe::H4)));
+        assert_eq!(app.tile_market(0), Some(("ETHUSDT", Timeframe::H4.into())));
         let _ = app.update(Message::Key(Action::NewTile));
         assert_eq!(
             app.tile_market(1),
-            Some(("ETHUSDT", Timeframe::H4)),
+            Some(("ETHUSDT", Timeframe::H4.into())),
             "new charts copy the focused one"
         );
     }
@@ -212,5 +215,148 @@ mod restore {
         let (app, _loads) = Persephone::start(&[], Some(path.clone()));
         assert_eq!(app.layout().len(), 1);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn hovering_one_chart_moves_the_others_crosshair() {
+    let mut app = app();
+    press(&mut app, Action::NewTile);
+    press(&mut app, Action::NewTile);
+    let ts = 42 * Timeframe::M1.nanos();
+    let _ = app.update(Message::Chart(
+        0,
+        persephone_chart::ChartMessage::Hovered { ts: Some(ts) },
+    ));
+    let linked = |app: &Persephone, id| app.tile_chart(id).unwrap().linked_time();
+    assert_eq!(
+        linked(&app, 0),
+        None,
+        "the hovered chart draws its own crosshair"
+    );
+    assert_eq!(linked(&app, 1), Some(ts));
+    assert_eq!(linked(&app, 2), Some(ts));
+
+    let _ = app.update(Message::Chart(
+        0,
+        persephone_chart::ChartMessage::Hovered { ts: None },
+    ));
+    assert_eq!(linked(&app, 1), None, "leaving the chart clears them");
+}
+
+mod workspaces {
+    use std::sync::Arc;
+
+    use persephone::{Message, Persephone, keymap::Action, menu::MenuMessage};
+    use persephone_core::strategy::BuiltInStrategy;
+    use persephone_engine::BacktestReport;
+
+    use super::{app, press, rect, settle};
+
+    #[test]
+    fn each_workspace_keeps_its_own_charts() {
+        let mut app = app();
+        press(&mut app, Action::NewTile);
+        settle(&mut app);
+        let first = app.layout().tiles();
+        let first_rects: Vec<_> = first.iter().map(|&id| rect(&app, id)).collect();
+
+        press(&mut app, Action::Workspace(2));
+        assert_eq!(app.workspace(), 2);
+        assert_eq!(
+            app.layout().len(),
+            1,
+            "a new workspace opens with one chart"
+        );
+        let second = app.layout().tiles()[0];
+        assert!(
+            !first.contains(&second),
+            "ids never clash across workspaces"
+        );
+        assert!(
+            app.tile_chart(second).is_some(),
+            "it shows the same market straight away"
+        );
+        assert!(app.title().contains("workspace 2"), "{}", app.title());
+        assert!(app.is_animating(), "the badge shows for a moment");
+
+        press(&mut app, Action::Workspace(1));
+        assert_eq!(app.layout().tiles(), first);
+        let back: Vec<_> = first.iter().map(|&id| rect(&app, id)).collect();
+        assert_eq!(back, first_rects);
+        assert_eq!(app.workspaces(), vec![1, 2]);
+        press(&mut app, Action::Workspace(1));
+        assert_eq!(
+            app.workspaces(),
+            vec![1, 2],
+            "switching to the current one does nothing"
+        );
+    }
+
+    #[test]
+    fn charts_move_between_workspaces_but_the_last_one_stays() {
+        let mut app = app();
+        press(&mut app, Action::MoveToWorkspace(3));
+        assert_eq!(app.layout().len(), 1, "the only chart can't leave");
+        assert_eq!(app.workspaces(), vec![1]);
+
+        press(&mut app, Action::NewTile);
+        press(&mut app, Action::NewTile);
+        press(&mut app, Action::MoveToWorkspace(3));
+        assert_eq!(app.layout().len(), 2);
+        press(&mut app, Action::MoveToWorkspace(3));
+        assert_eq!(app.layout().len(), 1);
+
+        press(&mut app, Action::Workspace(3));
+        assert_eq!(app.layout().len(), 2, "both arrived");
+        assert!(
+            app.layout()
+                .tiles()
+                .iter()
+                .all(|&id| app.tile_chart(id).is_some())
+        );
+    }
+
+    #[test]
+    fn backtests_finishing_elsewhere_land_on_their_chart() {
+        let mut app = app();
+        let _ = app.update(Message::Chart(
+            0,
+            persephone_chart::ChartMessage::Clicked {
+                at: iced::Point::new(50.0, 50.0),
+            },
+        ));
+        let _ = app.update(Message::Menu(MenuMessage::SetStrategy(
+            BuiltInStrategy::EmaCross,
+        )));
+        let (generation, _) = app.backtest_request(0).unwrap();
+
+        press(&mut app, Action::Workspace(2));
+        let report = Arc::new(BacktestReport::default());
+        let _ = app.update(Message::BacktestDone(0, generation, Ok(report)));
+        press(&mut app, Action::Workspace(1));
+        assert!(matches!(
+            app.tile_strategy(0).unwrap().1,
+            persephone::Run::Done(_)
+        ));
+    }
+
+    #[test]
+    fn workspaces_are_saved_and_restored() {
+        let dir =
+            std::env::temp_dir().join(format!("persephone-workspaces-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("layout.ron");
+        let (mut app, _) = Persephone::start(&[], Some(path.clone()));
+        press(&mut app, Action::NewTile);
+        press(&mut app, Action::Workspace(4));
+        press(&mut app, Action::NewTile);
+        press(&mut app, Action::NewTile);
+
+        let (restored, _) = Persephone::start(&[], Some(path));
+        assert_eq!(restored.workspace(), 4);
+        assert_eq!(restored.layout().len(), 3);
+        assert_eq!(restored.workspaces(), vec![1, 4]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

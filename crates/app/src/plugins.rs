@@ -76,7 +76,8 @@ pub fn save_grants(path: &Path, grants: &BTreeSet<String>) -> io::Result<()> {
     fs::write(path, serde_json::to_string_pretty(grants)? + "\n")
 }
 
-/// Emits [`Message::PluginsChanged`] whenever a `.wasm` file in `dir` changes.
+/// Emits [`Message::PluginsChanged`] whenever a plugin file in `dir` (`.wasm`, or `.external`
+/// for a strategy running elsewhere) changes.
 pub fn watch(dir: &Path) -> impl Stream<Item = Message> + use<> {
     let dir = dir.to_path_buf();
     iced::stream::channel(8, async move |mut output: mpsc::Sender<Message>| {
@@ -102,7 +103,8 @@ pub fn watch(dir: &Path) -> impl Stream<Item = Message> + use<> {
 }
 
 fn is_plugin(path: &Path) -> bool {
-    path.extension().is_some_and(|ext| ext == "wasm")
+    path.extension()
+        .is_some_and(|ext| ext == "wasm" || ext == "external")
 }
 
 /// How an indicator is named in a saved layout.

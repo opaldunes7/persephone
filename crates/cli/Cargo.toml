@@ -12,10 +12,16 @@ path = "src/main.rs"
 [dependencies]
 persephone-core.workspace = true
 persephone-data.workspace = true
-persephone-engine.workspace = true
+persephone-engine = { workspace = true, features = ["live"] }
 persephone-ml.workspace = true
 persephone-plugin-host.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true
+reqwest.workspace = true
 serde_json.workspace = true
+
+[lints.rust]
+# With Nautilus's live node linked in, macOS's linker notes that the debug binary's unwind
+# tables are too big for its compact format; harmless.
+linker_messages = "allow"

@@ -29,12 +29,40 @@ fn data() -> Arc<ChartData> {
     ChartData::new("TESTUSDT", "SIM", Timeframe::M1, 2, candles)
 }
 
-/// Runs `steps` against a fresh chart and returns the published messages.
+/// Runs `steps` against a fresh chart and returns the published messages, leaving out the
+/// hover reports (crosshair sync) that every mouse move over a new bar sends.
 fn interact(steps: impl FnOnce(&mut Simulator<'_, ChartMessage>)) -> Vec<ChartMessage> {
+    interact_all(steps)
+        .into_iter()
+        .filter(|m| !matches!(m, ChartMessage::Hovered { .. }))
+        .collect()
+}
+
+fn interact_all(steps: impl FnOnce(&mut Simulator<'_, ChartMessage>)) -> Vec<ChartMessage> {
     let chart = ChartState::new(data());
     let mut ui = Simulator::with_size(Settings::default(), (WIDTH, HEIGHT), chart.view());
     steps(&mut ui);
     ui.into_messages().collect()
+}
+
+#[test]
+fn hovering_reports_each_new_bar_once_and_leaving() {
+    let messages = interact_all(|ui| {
+        move_to(ui, 300.0, 200.0);
+        move_to(ui, 300.5, 210.0); // the same bar
+        move_to(ui, 340.0, 200.0);
+        ui.simulate([Event::Mouse(mouse::Event::CursorLeft)]);
+    });
+    let hovers: Vec<Option<u64>> = messages
+        .iter()
+        .filter_map(|m| match m {
+            ChartMessage::Hovered { ts } => Some(*ts),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hovers.len(), 3, "{hovers:?}");
+    assert!(hovers[0].is_some() && hovers[1].is_some() && hovers[0] != hovers[1]);
+    assert_eq!(hovers[2], None);
 }
 
 fn move_to(ui: &mut Simulator<'_, ChartMessage>, x: f32, y: f32) {
@@ -197,7 +225,9 @@ mod clicks {
     ) -> Vec<ChartMessage> {
         let mut ui = Simulator::with_size(Settings::default(), (WIDTH, HEIGHT), chart.view());
         steps(&mut ui);
-        ui.into_messages().collect()
+        ui.into_messages()
+            .filter(|m| !matches!(m, ChartMessage::Hovered { .. }))
+            .collect()
     }
 
     #[test]

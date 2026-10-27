@@ -10,14 +10,23 @@ publish.workspace = true
 persephone-core.workspace = true
 
 nautilus-backtest.workspace = true
+nautilus-binance = { workspace = true, optional = true }
 nautilus-common.workspace = true
 nautilus-core.workspace = true
 nautilus-execution.workspace = true
 nautilus-indicators.workspace = true
+nautilus-live = { workspace = true, optional = true }
 nautilus-model.workspace = true
+nautilus-sandbox = { workspace = true, optional = true }
 nautilus-trading.workspace = true
 
 anyhow.workspace = true
+async-trait = { workspace = true, optional = true }
 log.workspace = true
 rust_decimal.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+
+[features]
+# Paper and live trading through Nautilus's live node (Binance data, sandbox or Binance fills).
+live = ["dep:nautilus-binance", "dep:nautilus-live", "dep:nautilus-sandbox", "dep:async-trait", "dep:tokio"]

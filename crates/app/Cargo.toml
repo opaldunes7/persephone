@@ -10,7 +10,7 @@ publish.workspace = true
 persephone-chart.workspace = true
 persephone-core.workspace = true
 persephone-data.workspace = true
-persephone-engine.workspace = true
+persephone-engine = { workspace = true, features = ["live"] }
 persephone-ml.workspace = true
 persephone-plugin-host.workspace = true
 persephone-tiling.workspace = true
@@ -24,3 +24,10 @@ serde_json.workspace = true
 
 [dev-dependencies]
 iced_test = "0.14"
+# To run the tasks a live session hands back, in tests.
+iced_runtime = "0.14"
+
+[lints.rust]
+# With Nautilus's live node linked in, macOS's linker notes that the debug binary's unwind
+# tables are too big for its compact format; harmless.
+linker_messages = "allow"

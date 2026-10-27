@@ -145,6 +145,76 @@ pub fn bars(ticks: &Ticks, timeframe: Timeframe) -> Vec<Candle> {
     builder.finish()
 }
 
+/// Aggregates ticks (oldest first) into bars of `spec`: time bars as [`bars`] does, or a bar
+/// every so many ticks, or each time so much size has traded. Volume bars from quotes (which
+/// have no size) come out empty.
+#[must_use]
+pub fn bars_by(ticks: &Ticks, spec: crate::BarSpec) -> Vec<Candle> {
+    use crate::BarSpec;
+    match spec {
+        BarSpec::Time(timeframe) => bars(ticks, timeframe),
+        BarSpec::Ticks(n) => {
+            let n = n.max(1) as usize;
+            let mut out = Vec::new();
+            let mut count = 0;
+            let mut push = |ts: UnixNanos, price: f64, volume: f64| {
+                extend(&mut out, count == 0, ts, price, volume);
+                count = (count + 1) % n;
+            };
+            match ticks {
+                Ticks::Trades(trades) => {
+                    for t in trades {
+                        push(t.ts, t.price, if t.size > 0.0 { t.size } else { 1.0 });
+                    }
+                }
+                Ticks::Quotes(quotes) => {
+                    for q in quotes {
+                        push(q.ts, q.mid(), 1.0);
+                    }
+                }
+            }
+            out
+        }
+        BarSpec::Volume(threshold) => {
+            let Ticks::Trades(trades) = ticks else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            let mut filled = threshold; // start a bar on the first trade
+            for t in trades {
+                let size = if t.size > 0.0 { t.size } else { 1.0 };
+                let new = filled >= threshold;
+                if new {
+                    filled = 0.0;
+                }
+                extend(&mut out, new, t.ts, t.price, size);
+                filled += size;
+            }
+            out
+        }
+    }
+}
+
+/// Starts a bar at this tick, or adds the tick to the last one.
+fn extend(bars: &mut Vec<Candle>, new: bool, ts: UnixNanos, price: f64, volume: f64) {
+    match bars.last_mut() {
+        Some(bar) if !new => {
+            bar.high = bar.high.max(price);
+            bar.low = bar.low.min(price);
+            bar.close = price;
+            bar.volume += volume;
+        }
+        _ => bars.push(Candle {
+            ts,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume,
+        }),
+    }
+}
+
 /// Rolls bars (oldest first) up into a longer `timeframe`. Every [`Timeframe`] divides a day,
 /// so bars of the shorter timeframe never straddle a longer one.
 #[must_use]
@@ -263,6 +333,30 @@ mod tests {
         let mid = bars_from(Ticks::Quotes(vec![quote(0, 1.0, 1.2), quote(1, 1.3, 1.5)]));
         assert!((mid.open - 1.1).abs() < 1e-12 && (mid.close - 1.4).abs() < 1e-12);
         assert_eq!(mid.volume, 2.0);
+    }
+
+    #[test]
+    fn tick_and_volume_bars() {
+        let trades = Ticks::Trades(
+            [(1.0, 1.0), (3.0, 2.0), (2.0, 0.5), (5.0, 0.5), (4.0, 3.0)]
+                .iter()
+                .enumerate()
+                .map(|(i, &(price, size))| trade(i as UnixNanos, price, size))
+                .collect(),
+        );
+        let by_two = bars_by(&trades, crate::BarSpec::Ticks(2));
+        assert_eq!(by_two.len(), 3);
+        assert_eq!(
+            (by_two[0].open, by_two[0].high, by_two[0].close),
+            (1.0, 3.0, 3.0)
+        );
+        assert_eq!(by_two[2].ts, 4, "the last bar is the leftover tick");
+
+        // A bar closes once 2.5 has traded.
+        let by_volume = bars_by(&trades, crate::BarSpec::Volume(2.5));
+        let volumes: Vec<f64> = by_volume.iter().map(|b| b.volume).collect();
+        assert_eq!(volumes, vec![3.0, 4.0]);
+        assert!(bars_by(&Ticks::Quotes(Vec::new()), crate::BarSpec::Volume(1.0)).is_empty());
     }
 
     #[test]

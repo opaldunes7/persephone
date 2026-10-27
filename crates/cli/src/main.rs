@@ -1,7 +1,9 @@
-//! `persephone-cli`: headless tools for Persephone: backtests, importing CSV tick data,
-//! scaffolding, building and installing plugins, and setting up their models and AI access.
+//! `persephone-cli`: headless tools for Persephone: backtests, paper and live trading,
+//! importing CSV tick data, scaffolding, building and installing plugins, and setting up their
+//! models and AI access.
 
 mod data;
+mod live;
 mod ml;
 mod plugin;
 
@@ -14,13 +16,15 @@ use std::{
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use persephone_core::{
-    Candle, InstrumentSpec, Side, Timeframe, UnixNanos,
-    strategy::{BuiltInStrategy, StrategySpec},
-    tick::TickFeed,
+    BarSpec, Candle, InstrumentSpec, Side, UnixNanos,
+    signal::SignalFactory,
+    strategy::{BuiltInStrategy, StrategyKind, StrategySpec},
+    tick::{self, TickFeed},
     time::{DateTime, NANOS_PER_DAY},
 };
 use persephone_data::{binance::BinanceClient, store::Store};
 use persephone_engine::{BacktestReport, BacktestRequest, FeeRates, spawn_backtest};
+use persephone_plugin_host::{Host, external};
 
 #[derive(Parser)]
 #[command(name = "persephone-cli", version, about)]
@@ -31,13 +35,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run a built-in strategy on Binance spot bars, or on a market from the local store.
+    /// Backtest a strategy on Binance spot bars, or on a market from the local store.
     Backtest(BacktestArgs),
+    /// Trade a strategy on Binance bars as they close: on paper (the default), on
+    /// Binance's testnet, or with real money.
+    Live(live::LiveArgs),
     /// Import CSV tick files (trades or quotes) into the local store.
     Import(Box<data::ImportArgs>),
     /// List or remove markets in the local store.
     #[command(subcommand)]
     Data(data::DataCommand),
+    /// Download market data archives and import them into the local store.
+    #[command(subcommand)]
+    Fetch(data::FetchSource),
     /// Create, build and install WebAssembly plugins.
     #[command(subcommand)]
     Plugin(plugin::PluginCommand),
@@ -61,9 +71,10 @@ struct BacktestArgs {
     /// With --local, fill orders on the bars instead of the ticks.
     #[arg(long, requires = "local")]
     bar_fills: bool,
-    /// Bar timeframe: 1m, 5m, 15m, 30m, 1h, 4h or 1d.
-    #[arg(long, default_value = "1h")]
-    timeframe: Timeframe,
+    /// Bars: a timeframe (1m, 5m, 15m, 30m, 1h, 4h, 1d), or for --local markets a bar every
+    /// so many ticks (1000t) or so much traded size (2.5v).
+    #[arg(long, alias = "bars", default_value = "1h")]
+    timeframe: BarSpec,
     /// How many days of history to test, ending now (or at the local market's last tick).
     #[arg(long, default_value_t = 90)]
     days: u64,
@@ -74,6 +85,10 @@ struct BacktestArgs {
     /// slow, size %). Missing ones keep their defaults.
     #[arg(long, value_delimiter = ',')]
     params: Vec<f64>,
+    /// Run a strategy in a process of its own instead, listening at this address
+    /// (tcp://HOST:PORT or unix://PATH); see plugins/external.
+    #[arg(long)]
+    external: Option<String>,
     /// Starting balance in the quote asset (e.g. USDT).
     #[arg(long, default_value_t = 100_000.0)]
     balance: f64,
@@ -92,6 +107,28 @@ enum Fees {
     Zero,
 }
 
+/// The strategy to run: a built-in, or the one listening at `external`, with `params`.
+fn strategy(
+    kind: BuiltInStrategy,
+    params: &[f64],
+    external: Option<&str>,
+) -> anyhow::Result<(StrategySpec, Option<Arc<dyn SignalFactory>>)> {
+    let Some(address) = external else {
+        return Ok((StrategySpec::with_params(kind, params), None));
+    };
+    let address = external::Address::parse(address).map_err(anyhow::Error::msg)?;
+    let host = Host::new().map_err(anyhow::Error::msg)?;
+    let plugin = host
+        .external("external", address)
+        .map_err(anyhow::Error::msg)?;
+    let spec = StrategySpec::from_info(
+        StrategyKind::Plugin(plugin.id.clone()),
+        Arc::clone(&plugin.info),
+        params,
+    );
+    Ok((spec, Some(plugin)))
+}
+
 fn parse_strategy(id: &str) -> Result<BuiltInStrategy, String> {
     BuiltInStrategy::from_id(id).ok_or_else(|| {
         let ids: Vec<_> = BuiltInStrategy::ALL.iter().map(|s| s.id()).collect();
@@ -105,8 +142,10 @@ fn parse_strategy(id: &str) -> Result<BuiltInStrategy, String> {
 fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Backtest(args) => backtest(&args),
+        Command::Live(args) => live::live(&args),
         Command::Import(args) => data::import(&args),
         Command::Data(command) => data::run(&command),
+        Command::Fetch(source) => data::fetch(&source),
         Command::Plugin(command) => plugin::run(&command),
         Command::Models(command) => ml::models(&command),
         Command::Ai(command) => ml::ai(&command),
@@ -119,6 +158,9 @@ fn backtest(args: &BacktestArgs) -> anyhow::Result<()> {
     let (instrument, candles, ticks, own_fee) = match &args.local {
         Some(id) => local_market(id, tf, args.days, args.bar_fills)?,
         None => {
+            let Some(tf) = tf.timeframe() else {
+                anyhow::bail!("Binance serves time bars; tick and volume bars need --local");
+            };
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
             let end = now - now % tf.nanos();
             let start = end.saturating_sub(args.days * NANOS_PER_DAY);
@@ -137,7 +179,7 @@ fn backtest(args: &BacktestArgs) -> anyhow::Result<()> {
         instrument.symbol
     );
 
-    let strategy = StrategySpec::with_params(args.strategy, &args.params);
+    let (strategy, plugin) = strategy(args.strategy, &args.params, args.external.as_deref())?;
     println!(
         "{}.{} {tf} · {} → {} · {} bars · {strategy} · {}% per position · fills on {}",
         instrument.symbol,
@@ -152,10 +194,10 @@ fn backtest(args: &BacktestArgs) -> anyhow::Result<()> {
     let quote = instrument.quote.clone();
     let request = BacktestRequest {
         instrument,
-        timeframe: tf,
+        bars: tf,
         candles,
         strategy,
-        plugin: None,
+        plugin,
         ticks,
         starting_balance: args.balance,
         fees: match args.fees {
@@ -189,14 +231,24 @@ type Loaded = (
 );
 
 /// The last `days` of a stored market's bars, and its ticks unless `bar_fills`.
-fn local_market(id: &str, tf: Timeframe, days: u64, bar_fills: bool) -> anyhow::Result<Loaded> {
+fn local_market(id: &str, tf: BarSpec, days: u64, bar_fills: bool) -> anyhow::Result<Loaded> {
     let (symbol, venue) = id
         .rsplit_once('.')
         .with_context(|| format!("`{id}` should be SYMBOL.VENUE"))?;
     let root = Store::default_root().context("no data folder on this system")?;
     let market = Store::new(root).market(&venue.to_uppercase(), &symbol.to_uppercase())?;
-    let max_bars = (days * NANOS_PER_DAY).div_ceil(tf.nanos()) as usize;
-    let candles = market.candles(tf, max_bars)?;
+    let candles = match tf {
+        BarSpec::Time(timeframe) => {
+            let max_bars = (days * NANOS_PER_DAY).div_ceil(timeframe.nanos()) as usize;
+            market.candles(timeframe, max_bars)?
+        }
+        // Tick and volume bars come straight from the ticks.
+        BarSpec::Ticks(_) | BarSpec::Volume(_) => {
+            let to = market.info.last + 1;
+            let ticks = market.read_ticks(to.saturating_sub(days * NANOS_PER_DAY), to)?;
+            tick::bars_by(&ticks, tf)
+        }
+    };
     let fee = FeeRates {
         maker: market.info.fee,
         taker: market.info.fee,
@@ -232,6 +284,13 @@ fn print_summary(report: &BacktestReport, quote: &str) {
     print_section("PnL", &report.pnl);
     print_section("Returns", &report.returns);
     print_section("General", &report.general);
+    if !report.notes.is_empty() {
+        println!("Notes");
+        for note in &report.notes {
+            println!("  {}{}", if note.warning { "! " } else { "" }, note.text);
+        }
+        println!();
+    }
 }
 
 fn print_section(title: &str, stats: &BTreeMap<String, f64>) {

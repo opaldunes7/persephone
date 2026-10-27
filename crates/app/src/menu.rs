@@ -7,8 +7,8 @@
 //! - strategies: every built-in strategy and plugin, with a one-line description;
 //! - symbol: a search box over markets in the local store and popular Binance pairs.
 //!
-//! The report opens from a chart's strategy summary: settings, full statistics and a remove
-//! button. Dropping CSV files on a chart opens the import panel: what was detected, the
+//! The report opens from a chart's strategy summary: settings, full statistics, paper trading
+//! on live bars, and a remove button. Dropping CSV files on a chart opens the import panel: what was detected, the
 //! market to put the ticks in, and progress.
 
 use std::{
@@ -20,22 +20,26 @@ use iced::{
     Background, Border, Color, Element, Fill, Point, Shadow, Size, Vector,
     widget::{Id, button, column, container, opaque, pin, row, rule, space, text, text_input},
 };
-use persephone_chart::theme;
+use persephone_chart::{Tool, theme};
 use persephone_core::{
-    Timeframe,
+    BarSpec, Timeframe,
     indicator::{BuiltIn, IndicatorSpec, Param, Placement},
     strategy::{BuiltInStrategy, StrategyKind, StrategySpec},
+    tick::TickKind,
     time::DateTime,
 };
 use persephone_data::{
     import::{Detection, Progress, Summary},
     store::MarketInfo,
 };
-use persephone_engine::BacktestReport;
+use persephone_engine::{BacktestReport, live::LiveMode};
 use persephone_plugin_host::Plugins;
 use persephone_tiling::TileId;
 
-use crate::Run;
+use crate::{
+    Run,
+    live::{Live, LiveState},
+};
 
 pub const WIDTH: f32 = 248.0;
 pub const REPORT_WIDTH: f32 = 300.0;
@@ -65,7 +69,15 @@ pub enum Page {
     Root,
     Indicators,
     Strategies,
-    Symbol { query: String },
+    Symbol {
+        query: String,
+    },
+    Draw,
+    /// Tick and volume bars, for a local market: presets and a box for any count or size.
+    Bars {
+        input: String,
+        error: Option<String>,
+    },
 }
 
 /// What's open, if anything. Positions are in tile-content coordinates.
@@ -90,6 +102,21 @@ pub enum Popup {
         /// What's typed in each strategy parameter box, valid or not.
         inputs: Vec<String>,
         error: Option<String>,
+    },
+    /// Setting up a sweep of the tile's strategy: which parameter, and its range.
+    Sweep {
+        tile: TileId,
+        at: Point,
+        param: usize,
+        /// What's typed for from, to, and how many charts.
+        inputs: [String; 3],
+        error: Option<String>,
+    },
+    /// A drawing that was clicked: what it is, and a remove button.
+    Drawing {
+        tile: TileId,
+        index: usize,
+        at: Point,
     },
     /// CSV files dropped on the tile, on their way into the local store.
     Import {
@@ -121,6 +148,8 @@ impl Popup {
             Self::Menu { tile, .. }
             | Self::Settings { tile, .. }
             | Self::Report { tile, .. }
+            | Self::Drawing { tile, .. }
+            | Self::Sweep { tile, .. }
             | Self::Import { tile, .. } => *tile,
         }
     }
@@ -159,16 +188,26 @@ impl Popup {
         }
     }
 
+    /// Where the popup is pinned, in tile-content coordinates.
+    #[must_use]
+    pub fn at_point(&self) -> Point {
+        self.at()
+    }
+
     fn at(&self) -> Point {
         match self {
-            Self::Menu { at, .. } | Self::Settings { at, .. } | Self::Report { at, .. } => *at,
+            Self::Menu { at, .. }
+            | Self::Settings { at, .. }
+            | Self::Report { at, .. }
+            | Self::Drawing { at, .. }
+            | Self::Sweep { at, .. } => *at,
             Self::Import { .. } => Point::new(24.0, 48.0),
         }
     }
 
     fn width(&self) -> f32 {
         match self {
-            Self::Report { .. } => REPORT_WIDTH,
+            Self::Report { .. } | Self::Sweep { .. } => REPORT_WIDTH,
             Self::Import { .. } => IMPORT_WIDTH,
             _ => WIDTH,
         }
@@ -181,7 +220,7 @@ impl Popup {
         match self {
             Self::Menu {
                 page: Page::Root, ..
-            } => 190.0,
+            } => 260.0,
             Self::Menu {
                 page: Page::Indicators,
                 ..
@@ -195,8 +234,17 @@ impl Popup {
                 ..
             } => 330.0,
             Self::Settings { inputs, .. } => 110.0 + 40.0 * inputs.len() as f32,
-            Self::Report { inputs, .. } => 360.0 + 40.0 * inputs.len() as f32,
+            Self::Report { inputs, .. } => 360.0 + 40.0 * inputs.len() as f32 + extra,
             Self::Import { .. } => 300.0 + extra,
+            Self::Menu {
+                page: Page::Draw, ..
+            } => 230.0,
+            Self::Menu {
+                page: Page::Bars { .. },
+                ..
+            } => 260.0,
+            Self::Drawing { .. } => 110.0,
+            Self::Sweep { .. } => 300.0,
         }
     }
 }
@@ -208,6 +256,10 @@ pub enum MenuMessage {
     /// A plugin indicator, by id.
     AddPluginIndicator(String),
     SetTimeframe(Timeframe),
+    /// Tick or volume bars, from a preset or what was typed on the bars page.
+    SetBars(BarSpec),
+    BarsInput(String),
+    SubmitBars,
     QueryChanged(String),
     SetSymbol(String),
     /// A market from the local store.
@@ -223,6 +275,16 @@ pub enum MenuMessage {
     StartImport,
     /// Lets the tile's strategy plugin ask language models, or stops it.
     AllowAi(bool),
+    /// Start drawing with a tool on the tile.
+    Draw(Tool),
+    /// The sweep popup: open it, pick the parameter, edit from / to / charts, and go.
+    OpenSweep,
+    SweepParam(usize),
+    SweepInput(usize, String),
+    StartSweep,
+    /// Remove the clicked drawing, or every drawing on the tile's market.
+    RemoveDrawing,
+    ClearDrawings,
     ParamChanged(usize, String),
     RemoveStudy,
     SetStrategy(BuiltInStrategy),
@@ -230,6 +292,9 @@ pub enum MenuMessage {
     SetPluginStrategy(String),
     StrategyParamChanged(usize, String),
     RemoveStrategy,
+    /// Trade the tile's strategy on live bars, or stop.
+    GoLive(LiveMode),
+    StopLive,
     Close,
 }
 
@@ -238,20 +303,56 @@ pub struct TileInfo<'a> {
     pub symbol: &'a str,
     /// The local store's venue, for a stored market.
     pub venue: Option<&'a str>,
-    /// Quote currency for money figures.
+    /// Quote currency for money figures, and the base asset for positions.
     pub quote: &'a str,
+    pub base: &'a str,
     /// How the market's backtests fill orders, when worth saying.
     pub fills: Option<&'a str>,
     /// Markets in the local store, for the symbol page.
     pub local_markets: &'a [MarketInfo],
     /// For a strategy plugin that asks language models: whether it may.
     pub ai_allowed: Option<bool>,
-    pub timeframe: Timeframe,
+    /// The tile's market's drawings.
+    pub drawings: &'a [persephone_chart::Drawing],
+    /// The workspace a new sweep would open on, if one is free.
+    pub free_workspace: Option<u8>,
+    /// The sweep this tile belongs to: the parameter's name and each value's outcome.
+    pub sweep: Option<(&'a str, Vec<SweepRow>)>,
+    /// How the tile's bars are cut.
+    pub bars: BarSpec,
+    /// For a local market, what its ticks are (so which bars it can have).
+    pub tick_kind: Option<TickKind>,
     pub specs: &'a [IndicatorSpec],
     pub strategy: Option<(&'a StrategySpec, &'a Run)>,
+    /// Trading the strategy live: the session, if one ran, or why the chart can't.
+    pub live: LiveInfo<'a>,
     pub plugins: &'a Plugins,
     /// Where plugin files go, to tell people.
     pub plugin_dir: Option<&'a Path>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct LiveInfo<'a> {
+    pub session: Option<&'a Live>,
+    /// Why the chart can't trade live, if it can't.
+    pub unavailable: Option<&'static str>,
+    /// Binance testnet keys are set.
+    pub testnet: bool,
+}
+
+/// One value of a sweep, for the report's comparison.
+pub struct SweepRow {
+    pub value: String,
+    /// The return, once its backtest is done.
+    pub result: SweepResult,
+    /// It's the tile the report is open on.
+    pub current: bool,
+}
+
+pub enum SweepResult {
+    Running,
+    Return(f64),
+    Failed,
 }
 
 /// The popup, pinned at `origin` (the tile content's top-left in the window) plus its own
@@ -272,6 +373,8 @@ pub fn view<'a>(
                 tile.plugin_dir,
             ),
             Page::Symbol { query } => symbols(query, &tile),
+            Page::Draw => draw_page(tile.drawings.len()),
+            Page::Bars { input, error } => bars_page(&tile, input, error.as_deref()),
         },
         Popup::Settings {
             study,
@@ -295,6 +398,29 @@ pub fn view<'a>(
             error,
             ..
         } => import_panel(files, state, [symbol, venue, zone], error.as_deref()),
+        Popup::Sweep {
+            param,
+            inputs,
+            error,
+            ..
+        } => match tile.strategy {
+            Some((spec, _)) => {
+                sweep_panel(spec, *param, inputs, error.as_deref(), tile.free_workspace)
+            }
+            None => column![].into(),
+        },
+        Popup::Drawing { index, .. } => match tile.drawings.get(*index) {
+            Some(drawing) => container(
+                column![
+                    header(drawing.name()),
+                    remove_button("Remove drawing", MenuMessage::RemoveDrawing)
+                ]
+                .spacing(8),
+            )
+            .padding([6, 8])
+            .into(),
+            None => column![].into(),
+        },
     };
 
     let extra = match popup {
@@ -314,6 +440,25 @@ pub fn view<'a>(
             state: ImportState::Ready(detection),
             ..
         } => detection.roles().len() + detection.notes.len(),
+        // Sweep rows, notes (about two lines each) and the AI permission text.
+        Popup::Report { .. } => {
+            let sweep = tile.sweep.as_ref().map_or(0, |(_, rows)| rows.len() + 2);
+            let notes = match tile.strategy {
+                Some((_, Run::Done(report))) => 2 * report.notes.len(),
+                _ => 0,
+            };
+            let ai = match tile.ai_allowed {
+                Some(false) => 4,
+                Some(true) => 1,
+                None => 0,
+            };
+            let live = match tile.live.session {
+                Some(live) if live.is_active() => 4,
+                Some(_) => 5,
+                None => 2,
+            };
+            sweep + notes + ai + live
+        }
         _ => 0,
     };
     let at = popup.at();
@@ -329,7 +474,7 @@ pub fn view<'a>(
 
 fn root<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
     let chips = row(Timeframe::ALL.into_iter().map(|tf| {
-        let selected = tf == tile.timeframe;
+        let selected = BarSpec::Time(tf) == tile.bars;
         button(text(tf.label()).size(12).center())
             .padding([4, 0])
             .width(Fill)
@@ -342,9 +487,10 @@ fn root<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
     let strategy = tile
         .strategy
         .map_or("None", |(spec, _)| spec.info.name.as_str());
-    column![
+    let mut page = column![
         item("Indicators", "›", MenuMessage::Open(Page::Indicators)),
         item("Strategy", strategy, MenuMessage::Open(Page::Strategies)),
+        item("Draw", "›", MenuMessage::Open(Page::Draw)),
         item(
             "Symbol",
             tile.symbol,
@@ -355,9 +501,23 @@ fn root<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
         separator(),
         section("Timeframe"),
         container(chips).padding([2, 6]),
-    ]
-    .spacing(2)
-    .into()
+    ];
+    // Local markets have ticks, so they can also be cut by tick count or volume.
+    if tile.tick_kind.is_some() {
+        let current = match tile.bars {
+            BarSpec::Time(_) => "›".to_owned(),
+            other => format!("{}  ›", other.label()),
+        };
+        page = page.push(local_item(
+            "Tick & volume bars",
+            current,
+            MenuMessage::Open(Page::Bars {
+                input: String::new(),
+                error: None,
+            }),
+        ));
+    }
+    page.spacing(2).into()
 }
 
 fn indicators<'a>(plugins: &'a Plugins, dir: Option<&'a Path>) -> Element<'a, MenuMessage> {
@@ -414,11 +574,11 @@ fn strategies<'a>(
     });
     let from_plugins = plugins.strategies.values().map(move |plugin| {
         let selected = current == Some(&StrategyKind::Plugin(plugin.id.clone()));
-        // Worth knowing before picking it: it sends prompts out.
-        let description = if plugin.uses_ai {
-            format!("{} · asks AI models", plugin.info.description)
-        } else {
-            plugin.info.description.clone()
+        // Worth knowing before picking it: it sends prompts out, or runs elsewhere.
+        let description = match plugin.address() {
+            _ if plugin.uses_ai => format!("{} · asks AI models", plugin.info.description),
+            Some(address) => format!("{} · runs at {address}", plugin.info.description),
+            None => plugin.info.description.clone(),
         };
         strategy_choice(
             &plugin.info.name,
@@ -557,6 +717,165 @@ fn local_item<'a>(label: &'a str, hint: String, on_press: MenuMessage) -> Elemen
     .on_press(on_press)
     .style(|_, status| item_style(status))
     .into()
+}
+
+/// Which parameter to sweep, over what range, and how many charts.
+fn sweep_panel<'a>(
+    spec: &'a StrategySpec,
+    param: usize,
+    inputs: &'a [String; 3],
+    error: Option<&'a str>,
+    free_workspace: Option<u8>,
+) -> Element<'a, MenuMessage> {
+    let chips = row(spec.info.params.iter().enumerate().map(|(i, p)| {
+        button(text(p.name.as_ref()).size(12).center())
+            .padding([4, 8])
+            .on_press(MenuMessage::SweepParam(i))
+            .style(move |_, status| chip(i == param, status))
+            .into()
+    }))
+    .spacing(4)
+    .wrap();
+    let field = |i: usize, label: &'a str| {
+        column![
+            text(label).size(11).color(theme::TEXT_MUTED),
+            text_input("", &inputs[i])
+                .on_input(move |v| MenuMessage::SweepInput(i, v))
+                .on_submit(MenuMessage::StartSweep)
+                .padding([5, 8])
+                .size(13)
+                .style(|_, status| input_style(status)),
+        ]
+        .spacing(3)
+    };
+    let parsed = (
+        inputs[0].trim().parse::<f64>(),
+        inputs[1].trim().parse::<f64>(),
+        inputs[2].trim().parse::<usize>(),
+    );
+    let preview = match (parsed, spec.info.params.get(param)) {
+        ((Ok(from), Ok(to), Ok(charts)), Some(p)) => {
+            crate::sweep::values(p, from, to, charts).map(|values| {
+                values
+                    .iter()
+                    .map(|v| crate::sweep::label(*v))
+                    .collect::<Vec<_>>()
+            })
+        }
+        _ => Err("type numbers for from, to and charts".to_owned()),
+    };
+
+    let mut body = column![
+        header(&spec.info.name),
+        text("Sweep").size(11).color(theme::TEXT_MUTED),
+        chips,
+        row![field(0, "From"), field(1, "To"), field(2, "Charts")].spacing(8),
+    ]
+    .spacing(8);
+    body = match &preview {
+        Ok(values) => body.push(
+            text(format!(
+                "{}: {}",
+                spec.info.params[param].name,
+                values.join(", ")
+            ))
+            .size(12)
+            .color(theme::TEXT_BRIGHT),
+        ),
+        Err(message) => body.push(text(message.clone()).size(11).color(theme::DOWN)),
+    };
+    if let Some(error) = error {
+        body = body.push(text(error).size(11).color(theme::DOWN));
+    }
+    let go = match (free_workspace, &preview) {
+        (Some(n), Ok(values)) => button(
+            text(format!("Open {} charts on workspace {n}", values.len()))
+                .size(12)
+                .width(Fill)
+                .center(),
+        )
+        .on_press(MenuMessage::StartSweep),
+        (None, _) => button(
+            text("Every workspace is in use")
+                .size(12)
+                .width(Fill)
+                .center(),
+        ),
+        (_, Err(_)) => button(text("Open charts").size(12).width(Fill).center()),
+    };
+    container(
+        body.push(
+            go.width(Fill)
+                .padding([5, 0])
+                .style(|_, status| chip(true, status)),
+        ),
+    )
+    .padding([6, 8])
+    .into()
+}
+
+/// Tick and volume bars for a local market: tick presets and a box for any count or size.
+fn bars_page<'a>(
+    tile: &TileInfo<'a>,
+    input: &'a str,
+    error: Option<&'a str>,
+) -> Element<'a, MenuMessage> {
+    let current = tile.bars;
+    let chips = row([100, 500, 1_000, 5_000].into_iter().map(|n| {
+        let bars = BarSpec::Ticks(n);
+        button(text(bars.label()).size(12).center())
+            .padding([4, 0])
+            .width(Fill)
+            .on_press(MenuMessage::SetBars(bars))
+            .style(move |_, status| chip(bars == current, status))
+            .into()
+    }))
+    .spacing(3);
+    let trades = tile.tick_kind == Some(TickKind::Trades);
+    let placeholder = if trades {
+        "e.g. 2000t or 2.5v"
+    } else {
+        "e.g. 2000t"
+    };
+    let input = text_input(placeholder, input)
+        .on_input(MenuMessage::BarsInput)
+        .on_submit(MenuMessage::SubmitBars)
+        .padding([7, 10])
+        .size(13)
+        .style(|_, status| input_style(status));
+    let mut page = column![
+        back("Tick & volume bars"),
+        section("A bar every"),
+        container(chips).padding([2, 6]),
+        container(input).padding([4, 6]),
+    ];
+    if let Some(error) = error {
+        page = page.push(container(text(error).size(11).color(theme::DOWN)).padding([0, 10]));
+    }
+    let explain = if trades {
+        "Type ticks (1000t) or traded size (2.5v), then Enter"
+    } else {
+        "Type a number of ticks (1000t), then Enter"
+    };
+    page.push(note(explain)).spacing(2).into()
+}
+
+/// The drawing tools, and a way to clear the market's drawings.
+fn draw_page<'a>(drawings: usize) -> Element<'a, MenuMessage> {
+    let tools = Tool::ALL
+        .into_iter()
+        .map(|tool| item(tool.name(), tool.hint(), MenuMessage::Draw(tool)));
+    let mut page = column![back("Draw")].extend(tools);
+    if drawings > 0 {
+        page = page.push(separator()).push(item(
+            "Remove all drawings",
+            "",
+            MenuMessage::ClearDrawings,
+        ));
+    }
+    page.push(note("Esc stops drawing; click a drawing to remove it"))
+        .spacing(2)
+        .into()
 }
 
 fn import_panel<'a>(
@@ -758,6 +1077,43 @@ fn report<'a>(
         Run::Failed(message) => body.push(text(message.as_str()).size(12).color(theme::DOWN)),
         Run::Done(report) => body.extend(statistics(report, quote)),
     };
+    if let Some((name, rows)) = &tile.sweep {
+        body = body.push(separator()).push(
+            text(format!("Sweep of {name}"))
+                .size(12)
+                .color(theme::TEXT_BRIGHT),
+        );
+        for row in rows {
+            let (result, color) = match row.result {
+                SweepResult::Running => ("…".to_owned(), theme::TEXT_MUTED),
+                SweepResult::Failed => ("failed".to_owned(), theme::DOWN),
+                SweepResult::Return(r) => (
+                    format!("{:+.2}%", r * 100.0),
+                    if r >= 0.0 { theme::UP } else { theme::DOWN },
+                ),
+            };
+            let marker = if row.current { "  ◂" } else { "" };
+            body = body.push(row![
+                text(format!("{}{marker}", row.value))
+                    .size(12)
+                    .font(iced::Font::MONOSPACE)
+                    .color(theme::TEXT),
+                space::horizontal(),
+                text(result)
+                    .size(12)
+                    .font(iced::Font::MONOSPACE)
+                    .color(color),
+            ]);
+        }
+    }
+    if tile.sweep.is_none() && !spec.info.params.is_empty() {
+        body = body.push(
+            button(text("Sweep a parameter…").size(11).color(theme::TEXT_MUTED))
+                .padding([2, 0])
+                .on_press(MenuMessage::OpenSweep)
+                .style(|_, _| button::Style::default()),
+        );
+    }
     if let Run::Done(report) = run {
         for note in &report.notes {
             let color = if note.warning {
@@ -768,6 +1124,9 @@ fn report<'a>(
             body = body.push(text(note.text.as_str()).size(11).color(color));
         }
     }
+    body = body
+        .push(separator())
+        .extend(live_section(&tile.live, quote, tile.base));
     body = match tile.ai_allowed {
         Some(false) => body
             .push(
@@ -799,6 +1158,92 @@ fn report<'a>(
     )))
     .padding([6, 8])
     .into()
+}
+
+/// Paper (or testnet) trading the strategy on live bars: how a session is going, with a stop
+/// button, or the buttons that start one.
+fn live_section<'a>(live: &LiveInfo<'a>, quote: &str, base: &str) -> Vec<Element<'a, MenuMessage>> {
+    let line = |label: String, value: String, color: Color| -> Element<'a, MenuMessage> {
+        row![
+            text(label).size(12).color(theme::TEXT),
+            space::horizontal(),
+            text(value)
+                .size(12)
+                .color(color)
+                .font(iced::Font::MONOSPACE),
+        ]
+        .into()
+    };
+    let mut rows = Vec::new();
+    if let Some(session) = live.session {
+        let pnl = session.book.pnl();
+        let color = if pnl >= 0.0 { theme::UP } else { theme::DOWN };
+        rows.push(line("Live".into(), session.status(), theme::TEXT_BRIGHT));
+        rows.push(line("Profit".into(), format!("{pnl:+.2} {quote}"), color));
+        rows.push(line(
+            "Position".into(),
+            format!(
+                "{} {base} · {} fills",
+                amount(session.book.position),
+                session.book.fills
+            ),
+            theme::TEXT_BRIGHT,
+        ));
+        if let LiveState::Stopped(Some(error)) = &session.state {
+            rows.push(text(error.clone()).size(11).color(theme::DOWN).into());
+        } else if let Some(problem) = &session.problem {
+            rows.push(text(problem.clone()).size(11).color(theme::DOWN).into());
+        }
+        if session.is_active() {
+            rows.push(wide_button(
+                "Stop and close the position",
+                MenuMessage::StopLive,
+            ));
+            return rows;
+        }
+    }
+    match live.unavailable {
+        Some(reason) => rows.push(text(reason).size(11).color(theme::TEXT_MUTED).into()),
+        None => {
+            rows.push(wide_button(
+                "Paper trade on live bars",
+                MenuMessage::GoLive(LiveMode::Paper),
+            ));
+            if live.testnet {
+                rows.push(
+                    button(
+                        text("Trade on Binance's testnet")
+                            .size(11)
+                            .color(theme::TEXT_MUTED),
+                    )
+                    .padding([2, 0])
+                    .on_press(MenuMessage::GoLive(LiveMode::Testnet))
+                    .style(|_, _| button::Style::default())
+                    .into(),
+                );
+            }
+        }
+    }
+    rows
+}
+
+/// A signed quantity without float noise: `+0.12525`, `-3`, `0`.
+fn amount(value: f64) -> String {
+    let rounded = format!("{value:+.8}");
+    let trimmed = rounded.trim_end_matches('0').trim_end_matches('.');
+    match trimmed {
+        "+" | "-" | "+0" | "-0" => "0".into(),
+        other => other.to_owned(),
+    }
+}
+
+fn wide_button(label: &str, on_press: MenuMessage) -> Element<'_, MenuMessage> {
+    button(text(label).size(12).width(Fill).center())
+        .width(Fill)
+        .padding([5, 0])
+        .on_press(on_press)
+        .style(|_, status| chip(true, status))
+        .into()
 }
 
 /// Label/value rows for a finished backtest.
@@ -1064,5 +1509,18 @@ fn chip(selected: bool, status: button::Status) -> button::Style {
             ..Border::default()
         },
         ..button::Style::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::amount;
+
+    #[test]
+    fn amounts_drop_float_noise() {
+        assert_eq!(amount(0.125_249_999_999_999_94), "+0.12525");
+        assert_eq!(amount(-3.0), "-3");
+        assert_eq!(amount(1e-12), "0");
+        assert_eq!(amount(-0.0), "0");
     }
 }

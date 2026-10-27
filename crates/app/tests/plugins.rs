@@ -191,6 +191,8 @@ fn saved_plugins_wait_for_their_plugin_then_resolve() {
     persist::save(
         &path,
         &Saved {
+            workspace: 1,
+            others: Vec::new(),
             layout: Layout::new(),
             tiles: vec![SavedTile {
                 id: 0,

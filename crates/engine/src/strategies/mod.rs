@@ -12,3 +12,5 @@ pub(crate) mod builtins;
 pub(crate) mod signal;
 
 pub(crate) use signal::SignalStrategy;
+#[cfg(feature = "live")]
+pub(crate) use signal::Watcher;

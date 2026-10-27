@@ -149,7 +149,7 @@ fn timeframe_and_symbol_switches_keep_indicators() {
 
     click(&mut app);
     menu(&mut app, MenuMessage::SetTimeframe(Timeframe::H1));
-    assert_eq!(app.tile_market(0), Some(("TESTUSDT", Timeframe::H1)));
+    assert_eq!(app.tile_market(0), Some(("TESTUSDT", Timeframe::H1.into())));
     assert!(app.tile_chart(0).is_none(), "loading the new timeframe");
     assert_eq!(app.tile_indicators(0).unwrap().len(), 1);
 
@@ -162,7 +162,7 @@ fn timeframe_and_symbol_switches_keep_indicators() {
     );
     menu(&mut app, MenuMessage::QueryChanged("solusdt".into()));
     menu(&mut app, MenuMessage::SubmitSymbol);
-    assert_eq!(app.tile_market(0), Some(("SOLUSDT", Timeframe::H1)));
+    assert_eq!(app.tile_market(0), Some(("SOLUSDT", Timeframe::H1.into())));
     assert!(app.popup().is_none());
 }
 
@@ -189,4 +189,94 @@ fn indicators_are_saved_and_restored() {
         &[IndicatorSpec::new(BuiltIn::Stochastic)]
     );
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+mod drawing {
+    use iced::Point;
+    use persephone::{
+        Message, Persephone,
+        keymap::Action,
+        menu::{MenuMessage, Page, Popup},
+    };
+    use persephone_chart::{Anchor, ChartMessage, Drawing, Tool};
+    use persephone_core::Timeframe;
+
+    fn open_menu(app: &mut Persephone, id: u32) {
+        let _ = app.update(Message::Chart(
+            id,
+            ChartMessage::Clicked {
+                at: Point::new(80.0, 80.0),
+            },
+        ));
+    }
+
+    #[test]
+    fn drawings_follow_their_market_and_can_be_removed() {
+        let mut app = super::app();
+        let _ = app.update(Message::Key(Action::NewTile));
+        // The second chart: same market, another timeframe.
+        open_menu(&mut app, 1);
+        let _ = app.update(Message::Menu(MenuMessage::SetTimeframe(Timeframe::H1)));
+
+        open_menu(&mut app, 0);
+        let _ = app.update(Message::Menu(MenuMessage::Open(Page::Draw)));
+        let _ = app.update(Message::Menu(MenuMessage::Draw(Tool::TrendLine)));
+        assert!(app.popup().is_none(), "the menu closes to draw");
+        assert_eq!(
+            app.tile_chart(0).unwrap().drawing_tool(),
+            Some(Tool::TrendLine)
+        );
+
+        let (a, b) = (
+            Anchor { ts: 0, price: 1.0 },
+            Anchor {
+                ts: 3_600_000_000_000,
+                price: 2.0,
+            },
+        );
+        let _ = app.update(Message::Chart(0, ChartMessage::Placed(a)));
+        let _ = app.update(Message::Chart(0, ChartMessage::Placed(b)));
+        let line = Drawing::TrendLine { from: a, to: b };
+        assert_eq!(app.tile_chart(0).unwrap().drawings(), &[line]);
+        // The 1h chart may still be loading; once it has bars it gets the same drawings.
+
+        let _ = app.update(Message::Chart(
+            0,
+            ChartMessage::DrawingClicked {
+                index: 0,
+                at: Point::new(10.0, 10.0),
+            },
+        ));
+        assert!(matches!(app.popup(), Some(Popup::Drawing { index: 0, .. })));
+        let _ = app.update(Message::Menu(MenuMessage::RemoveDrawing));
+        assert!(app.tile_chart(0).unwrap().drawings().is_empty());
+    }
+
+    #[test]
+    fn escape_stops_drawing() {
+        let mut app = super::app();
+        open_menu(&mut app, 0);
+        let _ = app.update(Message::Menu(MenuMessage::Draw(Tool::HorizontalLine)));
+        let _ = app.update(Message::Escape);
+        assert_eq!(app.tile_chart(0).unwrap().drawing_tool(), None);
+    }
+
+    #[test]
+    fn drawings_are_saved_next_to_the_layout() {
+        let dir = std::env::temp_dir().join(format!("persephone-drawings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("layout.ron");
+        let drawings = persephone::persist::Drawings::from([(
+            "binance/BTCUSDT".to_owned(),
+            vec![Drawing::HorizontalLine { price: 50_000.0 }],
+        )]);
+        persephone::persist::save_drawings(&dir.join("drawings.ron"), &drawings).unwrap();
+        assert_eq!(
+            persephone::persist::load_drawings(&dir.join("drawings.ron")),
+            drawings
+        );
+        let (app, _) = Persephone::start(&[], Some(path));
+        assert_eq!(app.layout().len(), 1, "starts fine with drawings saved");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
