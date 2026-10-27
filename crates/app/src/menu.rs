@@ -242,37 +242,37 @@ impl Popup {
     /// A generous guess at the panel's height, for keeping it on screen. `extra` counts rows a
     /// page adds for plugins.
     fn height(&self, extra: usize) -> f32 {
-        let extra = 30.0 * extra as f32;
+        let extra = 22.0 * extra as f32;
         match self {
             Self::Menu {
                 page: Page::Root, ..
-            } => 260.0 + extra,
-            Self::SymbolSearch { .. } => 70.0 + extra,
-            Self::Timeframes { .. } => 250.0 + extra,
+            } => 195.0 + extra,
+            Self::SymbolSearch { .. } => 60.0 + extra,
+            Self::Timeframes { .. } => 180.0 + extra,
             Self::Menu {
                 page: Page::Indicators,
                 ..
-            } => 400.0 + extra,
+            } => 290.0 + extra,
             Self::Menu {
                 page: Page::Strategies,
                 ..
-            } => 270.0 + extra,
+            } => 200.0 + extra,
             Self::Menu {
                 page: Page::Symbol { .. },
                 ..
-            } => 330.0,
-            Self::Settings { inputs, .. } => 110.0 + 40.0 * inputs.len() as f32,
-            Self::Report { inputs, .. } => 360.0 + 40.0 * inputs.len() as f32 + extra,
-            Self::Import { .. } => 300.0 + extra,
+            } => 245.0,
+            Self::Settings { inputs, .. } => 85.0 + 30.0 * inputs.len() as f32,
+            Self::Report { inputs, .. } => 265.0 + 30.0 * inputs.len() as f32 + extra,
+            Self::Import { .. } => 230.0 + extra,
             Self::Menu {
                 page: Page::Draw, ..
-            } => 230.0,
+            } => 170.0,
             Self::Menu {
                 page: Page::Bars { .. },
                 ..
-            } => 260.0,
-            Self::Drawing { .. } => 110.0,
-            Self::Sweep { .. } => 300.0,
+            } => 195.0,
+            Self::Drawing { .. } => 80.0,
+            Self::Sweep { .. } => 225.0,
         }
     }
 }
@@ -458,9 +458,9 @@ pub fn view<'a>(
                     header(drawing.name()),
                     remove_button("Remove drawing", MenuMessage::RemoveDrawing)
                 ]
-                .spacing(8),
+                .spacing(5),
             )
-            .padding([6, 8])
+            .padding([4, 6])
             .into(),
             None => column![].into(),
         },
@@ -539,12 +539,12 @@ fn active<'a>(tile: &TileInfo<'a>) -> Vec<Element<'a, MenuMessage>> {
         container(
             checkbox(shown)
                 .label(label)
-                .size(14)
-                .text_size(13)
-                .spacing(8)
+                .size(12)
+                .text_size(12)
+                .spacing(5)
                 .on_toggle(move |on| MenuMessage::Show(what, on)),
         )
-        .padding([4, 10])
+        .padding([2, 8])
         .into()
     };
     let mut rows: Vec<Element<'a, MenuMessage>> = tile
@@ -624,7 +624,7 @@ fn root<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
     let chips = row(Timeframe::ALL.into_iter().map(|tf| {
         let selected = BarSpec::Time(tf) == tile.bars;
         button(text(tf.label()).size(12).center())
-            .padding([4, 0])
+            .padding([2, 0])
             .width(Fill)
             .on_press(MenuMessage::SetTimeframe(tf))
             .style(move |_, status| chip(selected, status))
@@ -762,7 +762,7 @@ fn strategy_choice<'a>(
     button(
         column![
             row![
-                text(name).size(13),
+                text(name).size(12),
                 space::horizontal(),
                 text(if selected { "current" } else { "" })
                     .size(12)
@@ -773,7 +773,7 @@ fn strategy_choice<'a>(
         .spacing(2),
     )
     .width(Fill)
-    .padding([6, 10])
+    .padding([3, 8])
     .on_press(on_press)
     .style(|_, status| item_style(status))
     .into()
@@ -798,8 +798,8 @@ fn symbols<'a>(query: &'a str, tile: &TileInfo<'a>) -> Element<'a, MenuMessage> 
         .id(symbol_input())
         .on_input(MenuMessage::QueryChanged)
         .on_submit(MenuMessage::SubmitSymbol)
-        .padding([7, 10])
-        .size(13)
+        .padding([4, 8])
+        .size(12)
         .style(|_, status| input_style(status));
     column![back("Symbol"), container(input).padding([4, 6])]
         .extend(symbol_matches(query, tile))
@@ -886,14 +886,14 @@ fn symbol_matches<'a>(query: &str, tile: &TileInfo<'a>) -> Vec<Element<'a, MenuM
 fn local_item<'a>(label: &'a str, hint: String, on_press: MenuMessage) -> Element<'a, MenuMessage> {
     button(
         row![
-            text(label).size(13),
+            text(label).size(12),
             space::horizontal(),
-            text(hint).size(12).color(theme::TEXT_MUTED),
+            text(hint).size(11).color(theme::TEXT_MUTED),
         ]
         .align_y(iced::Center),
     )
     .width(Fill)
-    .padding([6, 10])
+    .padding([3, 8])
     .on_press(on_press)
     .style(|_, status| item_style(status))
     .into()
@@ -922,8 +922,8 @@ fn sweep_panel<'a>(
             text_input("", &inputs[i])
                 .on_input(move |v| MenuMessage::SweepInput(i, v))
                 .on_submit(MenuMessage::StartSweep)
-                .padding([5, 8])
-                .size(13)
+                .padding([3, 6])
+                .size(12)
                 .style(|_, status| input_style(status)),
         ]
         .spacing(3)
@@ -949,9 +949,9 @@ fn sweep_panel<'a>(
         header(&spec.info.name),
         text("Sweep").size(11).color(theme::TEXT_MUTED),
         chips,
-        row![field(0, "From"), field(1, "To"), field(2, "Charts")].spacing(8),
+        row![field(0, "From"), field(1, "To"), field(2, "Charts")].spacing(5),
     ]
-    .spacing(8);
+    .spacing(5);
     body = match &preview {
         Ok(values) => body.push(
             text(format!(
@@ -986,11 +986,11 @@ fn sweep_panel<'a>(
     container(
         body.push(
             go.width(Fill)
-                .padding([5, 0])
+                .padding([3, 0])
                 .style(|_, status| chip(true, status)),
         ),
     )
-    .padding([6, 8])
+    .padding([4, 6])
     .into()
 }
 
@@ -1004,7 +1004,7 @@ fn bars_page<'a>(
     let chips = row([100, 500, 1_000, 5_000].into_iter().map(|n| {
         let bars = BarSpec::Ticks(n);
         button(text(bars.label()).size(12).center())
-            .padding([4, 0])
+            .padding([2, 0])
             .width(Fill)
             .on_press(MenuMessage::SetBars(bars))
             .style(move |_, status| chip(bars == current, status))
@@ -1020,8 +1020,8 @@ fn bars_page<'a>(
     let input = text_input(placeholder, input)
         .on_input(MenuMessage::BarsInput)
         .on_submit(MenuMessage::SubmitBars)
-        .padding([7, 10])
-        .size(13)
+        .padding([4, 8])
+        .size(12)
         .style(|_, status| input_style(status));
     let mut page = column![
         back("Tick & volume bars"),
@@ -1071,8 +1071,8 @@ fn import_panel<'a>(
         1 => name,
         n => format!("{name} and {} more", n - 1),
     };
-    let muted = |content: String| text(content).size(12).color(theme::TEXT_MUTED);
-    let mut body = column![header("Import ticks"), muted(files_line)].spacing(8);
+    let muted = |content: String| text(content).size(11).color(theme::TEXT_MUTED);
+    let mut body = column![header("Import ticks"), muted(files_line)].spacing(5);
 
     body = match state {
         ImportState::Detecting => body.push(muted("Reading the file…".into())),
@@ -1099,7 +1099,7 @@ fn import_panel<'a>(
                             .font(iced::Font::MONOSPACE)
                             .color(theme::TEXT_BRIGHT),
                     ]
-                    .spacing(8),
+                    .spacing(5),
                 );
             }
             for note in &detection.notes {
@@ -1109,8 +1109,8 @@ fn import_panel<'a>(
                 text_input(placeholder, value)
                     .on_input(on_input)
                     .on_submit(MenuMessage::StartImport)
-                    .padding([5, 8])
-                    .size(13)
+                    .padding([3, 6])
+                    .size(12)
                     .style(|_, status| input_style(status))
             };
             let mut fields = row![
@@ -1145,9 +1145,9 @@ fn import_panel<'a>(
                 body = body.push(text(error).size(11).color(theme::DOWN));
             }
             body.push(
-                button(text("Import").size(13).width(Fill).center())
+                button(text("Import").size(12).width(Fill).center())
                     .width(Fill)
-                    .padding([6, 0])
+                    .padding([3, 0])
                     .on_press(MenuMessage::StartImport)
                     .style(|_, status| chip(true, status)),
             )
@@ -1191,7 +1191,7 @@ fn import_panel<'a>(
             ))
         }
     };
-    container(body).padding([6, 8]).into()
+    container(body).padding([4, 6]).into()
 }
 
 /// `1234567` → `1,234,567`.
@@ -1218,12 +1218,12 @@ fn settings<'a>(
             inputs,
             MenuMessage::ParamChanged,
         ))
-        .spacing(8);
+        .spacing(5);
     if let Some(error) = error {
         body = body.push(text(error).size(11).color(theme::DOWN));
     }
     container(body.push(remove_button("Remove", MenuMessage::RemoveStudy)))
-        .padding([6, 8])
+        .padding([4, 6])
         .into()
 }
 
@@ -1242,7 +1242,7 @@ fn report<'a>(
             inputs,
             MenuMessage::StrategyParamChanged,
         ))
-        .spacing(8);
+        .spacing(5);
     if let Some(error) = error {
         body = body.push(text(error).size(11).color(theme::DOWN));
     }
@@ -1253,7 +1253,7 @@ fn report<'a>(
                 .size(12)
                 .color(theme::TEXT_MUTED),
         ),
-        Run::Running => body.push(text("Backtesting…").size(12).color(theme::TEXT_MUTED)),
+        Run::Running => body.push(text("Backtesting…").size(11).color(theme::TEXT_MUTED)),
         Run::Failed(message) => body.push(text(message.as_str()).size(12).color(theme::DOWN)),
         Run::Done(report) => body.extend(statistics(report, quote)),
     };
@@ -1317,7 +1317,7 @@ fn report<'a>(
             .push(
                 button(text("Allow it to ask AI models").size(12).width(Fill).center())
                     .width(Fill)
-                    .padding([5, 0])
+                    .padding([3, 0])
                     .on_press(MenuMessage::AllowAi(true))
                     .style(|_, status| chip(true, status)),
             ),
@@ -1336,7 +1336,7 @@ fn report<'a>(
         "Remove strategy",
         MenuMessage::RemoveStrategy,
     )))
-    .padding([6, 8])
+    .padding([4, 6])
     .into()
 }
 
@@ -1420,7 +1420,7 @@ fn amount(value: f64) -> String {
 fn wide_button(label: &str, on_press: MenuMessage) -> Element<'_, MenuMessage> {
     button(text(label).size(12).width(Fill).center())
         .width(Fill)
-        .padding([5, 0])
+        .padding([3, 0])
         .on_press(on_press)
         .style(|_, status| chip(true, status))
         .into()
@@ -1487,7 +1487,7 @@ fn statistics<'a>(report: &BacktestReport, quote: &str) -> Vec<Element<'a, MenuM
 /// A popover title with a close button.
 fn header(title: &str) -> Element<'_, MenuMessage> {
     row![
-        text(title).size(13).color(theme::TEXT_BRIGHT),
+        text(title).size(12).color(theme::TEXT_BRIGHT),
         space::horizontal(),
         button(text("✕").size(12))
             .padding([2, 6])
@@ -1516,12 +1516,12 @@ fn param_rows<'a>(
                     .width(90),
                 text_input("", value)
                     .on_input(move |v| on_change(i, v))
-                    .padding([5, 8])
-                    .size(13)
+                    .padding([3, 6])
+                    .size(12)
                     .style(|_, status| input_style(status)),
             ]
             .align_y(iced::Center)
-            .spacing(8)
+            .spacing(5)
             .into()
         })
         .collect()
@@ -1529,7 +1529,7 @@ fn param_rows<'a>(
 
 fn panel<'a>(content: Element<'a, MenuMessage>, width: f32) -> Element<'a, MenuMessage> {
     container(content)
-        .padding(6)
+        .padding(4)
         .width(width)
         .style(|_| container::Style {
             background: Some(Background::Color(PANEL)),
@@ -1552,14 +1552,14 @@ fn panel<'a>(content: Element<'a, MenuMessage>, width: f32) -> Element<'a, MenuM
 fn item<'a>(label: &'a str, hint: &'a str, on_press: MenuMessage) -> Element<'a, MenuMessage> {
     button(
         row![
-            text(label).size(13),
+            text(label).size(12),
             space::horizontal(),
-            text(hint).size(12).color(theme::TEXT_MUTED)
+            text(hint).size(11).color(theme::TEXT_MUTED)
         ]
         .align_y(iced::Center),
     )
     .width(Fill)
-    .padding([6, 10])
+    .padding([3, 8])
     .on_press(on_press)
     .style(|_, status| item_style(status))
     .into()
@@ -1568,11 +1568,11 @@ fn item<'a>(label: &'a str, hint: &'a str, on_press: MenuMessage) -> Element<'a,
 fn back(title: &str) -> Element<'_, MenuMessage> {
     button(
         text(format!("‹  {title}"))
-            .size(13)
+            .size(12)
             .color(theme::TEXT_BRIGHT),
     )
     .width(Fill)
-    .padding([6, 10])
+    .padding([3, 8])
     .on_press(MenuMessage::Open(Page::Root))
     .style(|_, status| item_style(status))
     .into()
@@ -1581,23 +1581,23 @@ fn back(title: &str) -> Element<'_, MenuMessage> {
 fn section(title: &str) -> Element<'_, MenuMessage> {
     container(text(title.to_uppercase()).size(10).color(theme::TEXT_MUTED))
         .padding(iced::Padding {
-            top: 6.0,
-            right: 10.0,
-            bottom: 2.0,
-            left: 10.0,
+            top: 4.0,
+            right: 8.0,
+            bottom: 1.0,
+            left: 8.0,
         })
         .into()
 }
 
 fn note(content: &str) -> Element<'_, MenuMessage> {
     container(text(content).size(11).color(theme::TEXT_MUTED))
-        .padding([4, 10])
+        .padding([2, 8])
         .into()
 }
 
 fn note_owned<'a>(content: String) -> Element<'a, MenuMessage> {
     container(text(content).size(11).color(theme::TEXT_MUTED))
-        .padding([4, 10])
+        .padding([2, 8])
         .into()
 }
 
@@ -1608,14 +1608,14 @@ fn separator<'a>() -> Element<'a, MenuMessage> {
         fill_mode: rule::FillMode::Full,
         snap: true,
     }))
-    .padding([4, 0])
+    .padding([2, 0])
     .into()
 }
 
 fn remove_button(label: &str, on_press: MenuMessage) -> Element<'_, MenuMessage> {
     button(text(label).size(12).center())
         .width(Fill)
-        .padding([6, 0])
+        .padding([3, 0])
         .on_press(on_press)
         .style(|_, status| button::Style {
             background: Some(Background::Color(
