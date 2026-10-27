@@ -257,7 +257,10 @@ world strategy {
   of matches; clicking the timeframe drops down the timeframes. The
   time axis drags like the price axis. The menu starts with an **Active** list that shows or
   hides each indicator, the strategy and the drawings, saved with the layout. Each indicator
-  also has a round tag after the chart's name that shows or hides it with one click.
+  also has a round tag after the chart's name that shows or hides it with one click, and so
+  does volume (the first tag).
+- **Corner buttons:** each chart has **+** (new chart), **◫** (flip split) and **✕** (close)
+  in the corner between its axes, each naming its shortcut on hover.
 - **External strategies** (`persephone_plugin_host::external`):
   - A `NAME.external` file in the plugins folder names a process listening on TCP or a Unix socket. It speaks JSON lines: `describe`, `start`, one `bar` at a time, then `end`.
   - Persephone waits for each answer, so a backtest runs in lockstep. External strategies appear alongside the plugins and work everywhere they do: backtests, sweeps and live sessions.

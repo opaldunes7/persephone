@@ -52,6 +52,44 @@ fn a_lone_chart_fills_the_window() {
 }
 
 #[test]
+fn a_charts_corner_buttons_act_on_that_chart() {
+    let mut app = app();
+    press(&mut app, Action::NewTile);
+    press(&mut app, Action::NewTile);
+    assert_eq!(app.layout().len(), 3);
+    let tiles = app.layout().tiles();
+    let (first, last) = (tiles[0], tiles[2]);
+    assert_eq!(app.layout().focused(), last);
+
+    // The first chart's "+" splits the first chart, not the focused one.
+    let _ = app.update(Message::TileButton(first, Action::NewTile));
+    assert_eq!(app.layout().len(), 4);
+    let added = *app
+        .layout()
+        .tiles()
+        .iter()
+        .find(|t| !tiles.contains(t))
+        .unwrap();
+    settle(&mut app);
+    let (fx, fy, fw, fh) = rect(&app, first);
+    let (ax, ay, aw, ah) = rect(&app, added);
+    assert!(
+        fw * fh < 0.3 * WINDOW.width * WINDOW.height,
+        "the first chart gave up half its room"
+    );
+    assert!(
+        (fx - ax).abs() < 1.0 || (fy - ay).abs() < 1.0,
+        "beside it: {fx},{fy} vs {ax},{ay}"
+    );
+    assert!(aw > 0.0 && ah > 0.0);
+
+    // "✕" closes that chart.
+    let _ = app.update(Message::TileButton(added, Action::CloseTile));
+    assert_eq!(app.layout().len(), 3);
+    assert!(!app.layout().tiles().contains(&added));
+}
+
+#[test]
 fn new_charts_dwindle_with_gaps_and_animate_in() {
     let mut app = app();
     press(&mut app, Action::NewTile);

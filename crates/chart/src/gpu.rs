@@ -141,7 +141,8 @@ impl Primitive {
             up_volume: [0.0; 4],
             down_volume: [0.0; 4],
         };
-        let vol_sy = if price.max_volume > 0.0 {
+        // Hidden volume draws its bars at zero height.
+        let vol_sy = if chart.volume && price.max_volume > 0.0 {
             (f64::from(price.height * VOLUME_HEIGHT) / price.max_volume) as f32
         } else {
             0.0

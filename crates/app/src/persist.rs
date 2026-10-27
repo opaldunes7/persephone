@@ -55,6 +55,9 @@ pub struct SavedTile {
     /// The Active list has hidden the market's drawings on this chart.
     #[serde(default, skip_serializing_if = "is_false")]
     pub drawings_hidden: bool,
+    /// The Active list has hidden the volume bars on this chart.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub volume_hidden: bool,
 }
 
 /// A built-in strategy by id (e.g. "ema-cross") with its parameters. Unknown ids are skipped.
@@ -209,6 +212,7 @@ mod tests {
                         hidden: false,
                     }),
                     drawings_hidden: false,
+                    volume_hidden: false,
                 },
                 SavedTile {
                     id: 1,
@@ -218,6 +222,7 @@ mod tests {
                     indicators: Vec::new(),
                     strategy: None,
                     drawings_hidden: true,
+                    volume_hidden: false,
                 },
             ],
         }

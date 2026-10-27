@@ -7,7 +7,7 @@
 //! SCRIPT is one character per action: `n` new chart, `q` close, `h`/`j`/`k`/`l` focus,
 //! `H`/`J`/`K`/`L` swap, `<`/`>`/`^`/`v` move a divider, `t` toggle split, `f` fullscreen;
 //! `m` right-clicks the focused chart (opening its menu), `S` / `T` click the header's symbol
-//! / timeframe, `X` clicks the first indicator tag in the header, `E` types "ETH" into the symbol search, `A` unchecks the first item in the menu's Active list, `i` opens the indicator page, `s`
+//! / timeframe, `X` clicks the first header tag (volume), `E` types "ETH" into the symbol search, `A` unchecks the first item in the menu's Active list, `i` opens the indicator page, `s`
 //! the symbol page, `1`-`8` add a built-in indicator (in menu order), `e` opens the first
 //! indicator's settings; `x`/`y`/`z` set the EMA Cross / RSI Reversion / Donchian Breakout
 //! strategy (menu open) and `r` opens the focused chart's strategy report. With the example
@@ -22,6 +22,7 @@
 //! With `SNAPSHOT_STORE` naming a local tick store, `L` / `M` open its first / second market
 //! (menu open), `D` drops the file named by `SNAPSHOT_DROP` on the focused chart (detecting its
 //! layout here) and `I` imports it.
+//! `SNAPSHOT_HOVER=X,Y` moves the mouse there before the snapshot, to show a tooltip.
 //! AT_MS freezes the clock that many milliseconds after the last action (default: settled),
 //! to look at animation frames. iced appends the renderer name to the file name.
 
@@ -107,6 +108,15 @@ fn main() -> anyhow::Result<()> {
     let _ = app.update(Message::Tick(frozen));
 
     let mut ui = iced_test::Simulator::with_size(Settings::default(), WINDOW, app.view());
+    // SNAPSHOT_HOVER=X,Y puts the mouse there first (to show a tooltip).
+    if let Ok(at) = std::env::var("SNAPSHOT_HOVER") {
+        let (x, y) = at.split_once(',').context("SNAPSHOT_HOVER is X,Y")?;
+        let position = Point::new(x.trim().parse()?, y.trim().parse()?);
+        ui.point_at(position);
+        ui.simulate([iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+            position,
+        })]);
+    }
     let snapshot = ui.snapshot(&Theme::Dark)?;
     remove_previous(Path::new(&out))?;
     snapshot.matches_image(&out)?;

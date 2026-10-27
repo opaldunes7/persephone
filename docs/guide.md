@@ -28,8 +28,8 @@ time. Binance charts load the latest 5,000 bars of their timeframe.
 ## Charts
 
 - **Right-click** opens the menu:
-  - **Active**: everything on the chart (indicators, the strategy, drawings), each with a
-    checkbox. Unchecking hides it without removing it; checking brings it back at once.
+  - **Active**: everything on the chart (volume, indicators, the strategy, drawings), each
+    with a checkbox. Unchecking hides it without removing it; checking brings it back at once.
     What's hidden is saved with the layout.
   - **Indicators ›**: the built-ins, then plugin indicators.
   - **Strategy ›**: the strategy to backtest on this chart.
@@ -43,9 +43,10 @@ time. Binance charts load the latest 5,000 bars of their timeframe.
     Binance pairs) dropping down as you type. Click one to switch, press Enter to open
     whatever Binance pair you typed, or press Esc to leave it as it was.
   - Click the timeframe for a dropdown of every timeframe.
-  - After the name, a round tag for each indicator on the chart: lit while it's shown,
-    outlined while it's hidden. Click a tag to hide or show that indicator (the same as its
-    box in the Active list).
+  - After the name, round tags: **Vol** for the volume bars, then one for each indicator.
+    A tag is lit while its indicator is shown and outlined while it's hidden. Click a tag to
+    hide or show it (the same as its box in the Active list). **Indicators › Volume** also
+    brings volume back.
   - A left click anywhere else on the chart closes what's open.
 - **Drag** pans and **scroll** zooms.
 - **Dragging the price axis** stretches prices; double-click it to fit prices again.
@@ -74,6 +75,10 @@ mouse.
 | Mod+F | fullscreen the focused chart (again to restore) |
 | Mod+1…9 | switch to that workspace |
 | Mod+Shift+1…9 | move the focused chart to that workspace |
+
+Every chart also has three small buttons in the bottom-right corner, where the price and
+time axes meet: **+** adds a chart (split from this one), **◫** flips the split direction,
+and **✕** closes the chart. Hovering a button shows its shortcut.
 
 A workspace holds up to 16 charts. The border flashes red when something can't be done (a
 17th chart, closing the last one). Layouts, indicators, strategies and workspaces are saved

@@ -120,11 +120,12 @@ fn header_text(data: &ChartData) -> String {
 fn header_layout(chart: &ChartState, plot_width: f32) -> HeaderLayout {
     let data = &chart.data;
     let width = |text: &str| text_width(text, theme::LEGEND_SIZE, Font::default());
-    let symbol_end = LEGEND_X + width(&data.symbol);
+    let start = LEGEND_X;
+    let symbol_end = start + width(&data.symbol);
     let before_timeframe = format!("{} · ", data.symbol);
-    let timeframe_start = LEGEND_X + width(&before_timeframe);
-    let timeframe_end = LEGEND_X + width(&format!("{before_timeframe}{}", data.bars));
-    let mut x = LEGEND_X + width(&header_text(data)) + 12.0;
+    let timeframe_start = start + width(&before_timeframe);
+    let timeframe_end = start + width(&format!("{before_timeframe}{}", data.bars));
+    let mut x = start + width(&header_text(data)) + 12.0;
     let mut tags = Vec::new();
     for tag in &chart.tags {
         let w = text_width(&tag.label, theme::TEXT_SIZE, Font::default()) + 2.0 * TAG_PADDING;
@@ -135,7 +136,7 @@ fn header_layout(chart: &ChartState, plot_width: f32) -> HeaderLayout {
         x += w + TAG_GAP;
     }
     HeaderLayout {
-        symbol: (LEGEND_X, symbol_end),
+        symbol: (start, symbol_end),
         timeframe: (timeframe_start, timeframe_end),
         tags,
     }

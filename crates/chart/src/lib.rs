@@ -185,6 +185,8 @@ pub struct ChartState {
     tool: Option<(Tool, Option<Anchor>)>,
     /// Round tags after the header's name, one per indicator.
     tags: Vec<HeaderTag>,
+    /// Volume bars along the bottom of the price pane.
+    volume: bool,
 }
 
 /// A round tag in the chart's header naming an indicator, lit while it's shown. Clicking one
@@ -235,6 +237,7 @@ impl ChartState {
             drawings: Arc::new(Vec::new()),
             tool: None,
             tags: Vec::new(),
+            volume: true,
         }
     }
 
@@ -367,6 +370,16 @@ impl ChartState {
     #[must_use]
     pub fn tags(&self) -> &[HeaderTag] {
         &self.tags
+    }
+
+    #[must_use]
+    pub fn shows_volume(&self) -> bool {
+        self.volume
+    }
+
+    /// Shows or hides the volume bars.
+    pub fn set_volume(&mut self, shown: bool) {
+        self.volume = shown;
     }
 
     /// The header's indicator tags, in order.

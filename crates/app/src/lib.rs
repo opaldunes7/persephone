@@ -39,10 +39,12 @@ use iced::{
         self,
         key::{Code, Physical},
     },
-    widget::{button, container, mouse_area, operation, pin, row, stack, text},
+    widget::{button, container, mouse_area, operation, pin, row, stack, text, tooltip},
     window,
 };
-use persephone_chart::{ChartData, ChartMessage, ChartState, HeaderTag, PRICE_AXIS_WIDTH, theme};
+use persephone_chart::{
+    ChartData, ChartMessage, ChartState, HeaderTag, PRICE_AXIS_WIDTH, TIME_AXIS_HEIGHT, theme,
+};
 use persephone_core::{
     BarSpec, Candle, InstrumentSpec, Timeframe,
     indicator::{IndicatorKind, IndicatorSpec},
@@ -174,6 +176,8 @@ pub struct Hidden {
     /// Its trades, equity pane and summary.
     pub strategy: bool,
     pub drawings: bool,
+    /// The volume bars.
+    pub volume: bool,
 }
 
 /// The charts of a workspace that isn't on screen.
@@ -275,6 +279,8 @@ pub enum Message {
     LiveHistory(TileId, u64, Result<MarketData, String>),
     /// What a live session did: tile, session, event.
     Live(TileId, u64, LiveEvent),
+    /// One of a chart's corner buttons: the same as its shortcut, on that chart.
+    TileButton(TileId, Action),
 }
 
 impl Persephone {
@@ -648,12 +654,18 @@ impl Persephone {
             }
             Message::Chart(_, ChartMessage::Clicked { .. }) => self.popup = None,
             Message::Chart(id, ChartMessage::TagClicked { tag }) => {
-                // A tag shows or hides its indicator, like its box in the Active list.
-                if let Some(tile) = self.tiles.get_mut(&id)
-                    && tag < tile.indicators.len()
-                    && !tile.hidden.indicators.remove(&tag)
-                {
-                    tile.hidden.indicators.insert(tag);
+                // A tag shows or hides volume (the first) or an indicator, like its box in the
+                // Active list.
+                if let Some(tile) = self.tiles.get_mut(&id) {
+                    match tag.checked_sub(1) {
+                        None => tile.hidden.volume = !tile.hidden.volume,
+                        Some(i) if i < tile.indicators.len() => {
+                            if !tile.hidden.indicators.remove(&i) {
+                                tile.hidden.indicators.insert(i);
+                            }
+                        }
+                        Some(_) => {}
+                    }
                 }
                 self.restudy(id);
                 self.save();
@@ -757,6 +769,10 @@ impl Persephone {
                 }
             }
             Message::Key(action) => return self.act(action),
+            Message::TileButton(id, action) => {
+                self.layout.focus(id);
+                return self.act(action);
+            }
             Message::Hover(id) => {
                 self.layout.focus(id);
             }
@@ -1652,6 +1668,7 @@ impl Persephone {
                             tile.hidden.indicators.insert(index);
                         }
                         Active::Strategy => tile.hidden.strategy = !shown,
+                        Active::Volume => tile.hidden.volume = !shown,
                         Active::Drawings => tile.hidden.drawings = !shown,
                     }
                 }
@@ -2038,15 +2055,23 @@ impl Persephone {
             .map(|(_, spec)| spec.clone())
             .collect();
         let mut built = studies::build(&shown, &data.candles, &self.plugins);
-        // Every indicator gets a round tag in the header, lit while it's shown.
+        // Volume, then every indicator, gets a round tag in the header, lit while it's shown.
+        chart.set_volume(!tile.hidden.volume);
+        let volume = HeaderTag {
+            label: "Vol".into(),
+            shown: !tile.hidden.volume,
+        };
         chart.set_tags(
-            tile.indicators
-                .iter()
-                .enumerate()
-                .map(|(i, spec)| HeaderTag {
-                    label: spec.to_string(),
-                    shown: !tile.hidden.indicators.contains(&i),
-                })
+            std::iter::once(volume)
+                .chain(
+                    tile.indicators
+                        .iter()
+                        .enumerate()
+                        .map(|(i, spec)| HeaderTag {
+                            label: spec.to_string(),
+                            shown: !tile.hidden.indicators.contains(&i),
+                        }),
+                )
                 .collect(),
         );
         // A report a bar or two short is the last one, while a rerun catches up with live bars.
@@ -2329,6 +2354,17 @@ impl Persephone {
                 });
             content = stack![content, summary].into();
         }
+        // In the corner where the price and time axes meet.
+        let buttons = container(tile_buttons(id))
+            .align_right(Fill)
+            .align_bottom(Fill)
+            .padding(Padding {
+                top: 0.0,
+                right: (PRICE_AXIS_WIDTH - TILE_BUTTONS_WIDTH) / 2.0,
+                bottom: (TIME_AXIS_HEIGHT - 20.0) / 2.0,
+                left: 0.0,
+            });
+        content = stack![content, buttons].into();
         if focused && self.drop_hint {
             let hint = container(
                 text("Drop CSV tick files to import them into this chart")
@@ -2364,6 +2400,78 @@ impl Persephone {
             .y(rect.y)
             .into()
     }
+}
+
+/// One corner button's width, and all three together, 2px apart.
+const TILE_BUTTON: f32 = 22.0;
+const TILE_BUTTONS_WIDTH: f32 = 3.0 * TILE_BUTTON + 4.0;
+
+/// A chart's corner buttons: a new chart (split from this one), flip the split, and close.
+/// Hovering one names it with its shortcut.
+fn tile_buttons<'a>(id: TileId) -> Element<'a, Message> {
+    let modifier = if cfg!(target_os = "macos") {
+        "⌥"
+    } else {
+        "Alt+"
+    };
+    let one =
+        |icon: &'a str, size: f32, what: &str, key: &str, action: Action| -> Element<'a, Message> {
+            let tip = container(
+                row![
+                    text(what.to_owned()).size(12).color(theme::TEXT_BRIGHT),
+                    text(format!("{modifier}{key}"))
+                        .size(12)
+                        .color(theme::TEXT_MUTED)
+                        .font(iced::Font::MONOSPACE),
+                ]
+                .spacing(8),
+            )
+            .padding([3, 7])
+            .style(|_| container::Style {
+                background: Some(Background::Color(theme::LABEL_BACKGROUND)),
+                border: Border {
+                    radius: 4.0.into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            });
+            let control = button(text(icon).size(size).center())
+                .width(TILE_BUTTON)
+                .height(20)
+                .padding(0)
+                .on_press(Message::TileButton(id, action))
+                .style(|_, status| {
+                    let (background, border, text) = match status {
+                        button::Status::Hovered => {
+                            (theme::CROSSHAIR, theme::CROSSHAIR, Color::WHITE)
+                        }
+                        button::Status::Pressed => (theme::ACCENT, theme::ACCENT, Color::WHITE),
+                        _ => (
+                            theme::AXIS_LINE,
+                            theme::LABEL_BACKGROUND,
+                            theme::TEXT_BRIGHT,
+                        ),
+                    };
+                    button::Style {
+                        background: Some(Background::Color(background)),
+                        text_color: text,
+                        border: Border {
+                            color: border,
+                            width: 1.0,
+                            radius: 3.0.into(),
+                        },
+                        ..button::Style::default()
+                    }
+                });
+            tooltip(control, tip, tooltip::Position::Top).gap(4).into()
+        };
+    row![
+        one("+", 17.0, "New chart", "Enter", Action::NewTile),
+        one("◫", 14.0, "Flip split direction", "T", Action::ToggleSplit),
+        one("✕", 13.0, "Close chart", "Q", Action::CloseTile),
+    ]
+    .spacing(2)
+    .into()
 }
 
 /// The clickable strategy summary in a chart's top-right corner: name and headline numbers,
@@ -2531,6 +2639,7 @@ fn restore_tile(t: &SavedTile) -> Restored {
     };
     let mut hidden = Hidden {
         drawings: t.drawings_hidden,
+        volume: t.volume_hidden,
         ..Hidden::default()
     };
     let mut indicators = Vec::new();
@@ -2573,6 +2682,7 @@ fn saved_tiles(tiles: &BTreeMap<TileId, Tile>) -> Vec<SavedTile> {
                 hidden: tile.hidden.strategy,
             }),
             drawings_hidden: tile.hidden.drawings,
+            volume_hidden: tile.hidden.volume,
         })
         .collect()
 }

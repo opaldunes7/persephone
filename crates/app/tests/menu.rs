@@ -312,15 +312,17 @@ mod active {
                 .map(|t| (t.label.clone(), t.shown))
                 .collect()
         };
+        let on = |label: &str, shown| (label.to_owned(), shown);
         assert_eq!(
             tags(&app),
-            [("EMA 21".into(), true), ("RSI 14".into(), true)]
+            [on("Vol", true), on("EMA 21", true), on("RSI 14", true)]
         );
 
-        let _ = app.update(Message::Chart(0, ChartMessage::TagClicked { tag: 0 }));
+        // Tag 0 is volume; the indicators follow.
+        let _ = app.update(Message::Chart(0, ChartMessage::TagClicked { tag: 1 }));
         assert_eq!(
             tags(&app),
-            [("EMA 21".into(), false), ("RSI 14".into(), true)]
+            [on("Vol", true), on("EMA 21", false), on("RSI 14", true)]
         );
         assert_eq!(
             labels(&app),
@@ -329,8 +331,12 @@ mod active {
         );
         assert!(app.popup().is_none(), "no menu needed");
 
-        let _ = app.update(Message::Chart(0, ChartMessage::TagClicked { tag: 0 }));
+        let _ = app.update(Message::Chart(0, ChartMessage::TagClicked { tag: 1 }));
         assert_eq!(labels(&app), ["EMA 21", "RSI 14"]);
+
+        let _ = app.update(Message::Chart(0, ChartMessage::TagClicked { tag: 0 }));
+        assert!(!app.tile_chart(0).unwrap().shows_volume());
+        assert!(app.tile_hidden(0).unwrap().volume);
     }
 
     #[test]
@@ -375,11 +381,12 @@ mod active {
         click(&mut first);
         menu(&mut first, MenuMessage::Show(Active::Indicator(1), false));
         menu(&mut first, MenuMessage::Show(Active::Drawings, false));
+        menu(&mut first, MenuMessage::Show(Active::Volume, false));
 
         let (restored, _loads) = Persephone::start(&[], Some(path));
         let hidden = restored.tile_hidden(0).unwrap();
         assert_eq!(hidden.indicators.iter().copied().collect::<Vec<_>>(), [1]);
-        assert!(hidden.drawings && !hidden.strategy);
+        assert!(hidden.drawings && hidden.volume && !hidden.strategy);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

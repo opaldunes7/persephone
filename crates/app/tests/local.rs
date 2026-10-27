@@ -237,6 +237,7 @@ fn saved_layouts_remember_local_markets() {
                 indicators: Vec::new(),
                 strategy: None,
                 drawings_hidden: false,
+                volume_hidden: false,
             }],
         },
     )

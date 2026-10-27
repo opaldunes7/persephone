@@ -252,7 +252,7 @@ impl Popup {
             Self::Menu {
                 page: Page::Indicators,
                 ..
-            } => 290.0 + extra,
+            } => 312.0 + extra,
             Self::Menu {
                 page: Page::Strategies,
                 ..
@@ -331,6 +331,8 @@ pub enum MenuMessage {
 /// Something on a chart that the Active list can hide.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Active {
+    /// The volume bars.
+    Volume,
     /// The indicator at this index.
     Indicator(usize),
     Strategy,
@@ -530,7 +532,9 @@ pub fn view<'a>(
 
 /// How many rows the Active list has.
 fn active_count(tile: &TileInfo<'_>) -> usize {
-    tile.specs.len() + usize::from(tile.strategy.is_some()) + usize::from(!tile.drawings.is_empty())
+    1 + tile.specs.len()
+        + usize::from(tile.strategy.is_some())
+        + usize::from(!tile.drawings.is_empty())
 }
 
 /// Everything on the chart, each with a checkbox that shows or hides it.
@@ -547,17 +551,15 @@ fn active<'a>(tile: &TileInfo<'a>) -> Vec<Element<'a, MenuMessage>> {
         .padding([2, 8])
         .into()
     };
-    let mut rows: Vec<Element<'a, MenuMessage>> = tile
-        .specs
-        .iter()
-        .enumerate()
-        .map(|(i, spec)| {
+    let volume = toggle("Volume".into(), !tile.hidden.volume, Active::Volume);
+    let mut rows: Vec<Element<'a, MenuMessage>> = std::iter::once(volume)
+        .chain(tile.specs.iter().enumerate().map(|(i, spec)| {
             toggle(
                 spec.to_string(),
                 !tile.hidden.indicators.contains(&i),
                 Active::Indicator(i),
             )
-        })
+        }))
         .collect();
     if let Some((spec, _)) = tile.strategy {
         rows.push(toggle(
@@ -703,6 +705,11 @@ fn indicators<'a>(plugins: &'a Plugins, dir: Option<&'a Path>) -> Element<'a, Me
     });
 
     column![back("Indicators"), section("On the chart")]
+        .push(item(
+            "Volume",
+            "Vol",
+            MenuMessage::Show(Active::Volume, true),
+        ))
         .extend(group(Placement::Overlay))
         .push(section("In a pane below"))
         .extend(group(Placement::Pane))
