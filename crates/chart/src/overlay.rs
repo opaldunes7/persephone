@@ -92,38 +92,132 @@ fn on_time_axis(p: Point, plot: Size) -> bool {
     p.x < plot.width && p.y >= plot.height
 }
 
-/// A clickable part of the header line ("BTCUSDT · 1h · BINANCE").
+/// A clickable part of the header: the symbol, the timeframe, or an indicator tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HeaderPart {
     Symbol,
     Timeframe,
+    Tag(usize),
 }
 
-/// The header part under `p`, if any. The header's font is proportional, so widths are
-/// estimated, generously, from the characters.
-fn header_part(data: &ChartData, p: Point) -> Option<HeaderPart> {
-    if !(4.0..=28.0).contains(&p.y) {
+/// Where the header's parts are, measured the way the renderer lays the text out.
+struct HeaderLayout {
+    symbol: (f32, f32),
+    timeframe: (f32, f32),
+    /// Each tag's left and right edges; tags that don't fit are left out.
+    tags: Vec<(f32, f32)>,
+}
+
+const HEADER_Y: f32 = 16.0;
+const TAG_HEIGHT_PX: f32 = 18.0;
+const TAG_PADDING: f32 = 8.0;
+const TAG_GAP: f32 = 6.0;
+
+fn header_text(data: &ChartData) -> String {
+    format!("{} · {} · {}", data.symbol, data.bars, data.venue)
+}
+
+fn header_layout(chart: &ChartState, plot_width: f32) -> HeaderLayout {
+    let data = &chart.data;
+    let width = |text: &str| text_width(text, theme::LEGEND_SIZE, Font::default());
+    let symbol_end = LEGEND_X + width(&data.symbol);
+    let before_timeframe = format!("{} · ", data.symbol);
+    let timeframe_start = LEGEND_X + width(&before_timeframe);
+    let timeframe_end = LEGEND_X + width(&format!("{before_timeframe}{}", data.bars));
+    let mut x = LEGEND_X + width(&header_text(data)) + 12.0;
+    let mut tags = Vec::new();
+    for tag in &chart.tags {
+        let w = text_width(&tag.label, theme::TEXT_SIZE, Font::default()) + 2.0 * TAG_PADDING;
+        if x + w > plot_width - 8.0 {
+            break;
+        }
+        tags.push((x, x + w));
+        x += w + TAG_GAP;
+    }
+    HeaderLayout {
+        symbol: (LEGEND_X, symbol_end),
+        timeframe: (timeframe_start, timeframe_end),
+        tags,
+    }
+}
+
+/// The header part under `p`, if any.
+fn header_part(chart: &ChartState, plot_width: f32, p: Point) -> Option<HeaderPart> {
+    if (p.y - HEADER_Y).abs() > 12.0 {
         return None;
     }
-    let width = |text: &str| {
-        text.chars()
-            .map(|c| match c {
-                'A'..='Z' | '0'..='9' => 0.68,
-                '.' | ',' | ' ' => 0.3,
-                _ => 0.56,
-            })
-            .sum::<f32>()
-            * theme::LEGEND_SIZE
-    };
-    let symbol_end = LEGEND_X + width(&data.symbol);
-    let timeframe_start = symbol_end + width(" · ");
-    let timeframe_end = timeframe_start + width(&data.bars.to_string());
-    if (LEGEND_X - 4.0..=symbol_end + 3.0).contains(&p.x) {
+    let layout = header_layout(chart, plot_width);
+    let within = |(from, to): (f32, f32), slop: f32| (from - slop..=to + slop).contains(&p.x);
+    if let Some(i) = layout.tags.iter().position(|&span| within(span, 0.0)) {
+        Some(HeaderPart::Tag(i))
+    } else if within(layout.symbol, 3.0) {
         Some(HeaderPart::Symbol)
-    } else if (timeframe_start - 3.0..=timeframe_end + 4.0).contains(&p.x) {
+    } else if within(layout.timeframe, 3.0) {
         Some(HeaderPart::Timeframe)
     } else {
         None
+    }
+}
+
+/// How wide `content` is drawn at `size` in `font`, measured by the renderer's own text
+/// layout so things placed after a label never overlap it. Results are cached.
+fn text_width(content: &str, size: f32, font: Font) -> f32 {
+    use std::{cell::RefCell, collections::HashMap};
+
+    use iced::advanced::text::{self as advanced, Paragraph as _};
+
+    type Paragraph = <Renderer as advanced::Renderer>::Paragraph;
+    thread_local! {
+        static WIDTHS: RefCell<HashMap<(String, u32), f32>> = RefCell::new(HashMap::new());
+    }
+    let key = (content.to_owned(), size.to_bits());
+    if let Some(width) = WIDTHS.with(|w| w.borrow().get(&key).copied()) {
+        return width;
+    }
+    let paragraph = Paragraph::with_text(advanced::Text {
+        content,
+        bounds: Size::INFINITE,
+        size: Pixels(size),
+        line_height: advanced::LineHeight::default(),
+        font,
+        align_x: Alignment::Default,
+        align_y: alignment::Vertical::Top,
+        shaping: advanced::Shaping::default(),
+        wrapping: advanced::Wrapping::None,
+    });
+    let width = paragraph.min_width();
+    WIDTHS.with(|w| w.borrow_mut().insert(key, width));
+    width
+}
+
+/// The indicator tags: lit while shown, outlined and dimmed while hidden, lighter under the
+/// cursor.
+fn draw_tags(frame: &mut Frame, chart: &ChartState, layout: &HeaderLayout, hovered: Option<Point>) {
+    for (tag, &(from, to)) in chart.tags.iter().zip(&layout.tags) {
+        let top_left = Point::new(from, HEADER_Y - TAG_HEIGHT_PX / 2.0);
+        let size = Size::new(to - from, TAG_HEIGHT_PX);
+        let path = Path::rounded_rectangle(top_left, size, (TAG_HEIGHT_PX / 2.0).into());
+        let hot = hovered.is_some_and(|p| {
+            (from..=to).contains(&p.x) && (p.y - HEADER_Y).abs() <= TAG_HEIGHT_PX / 2.0
+        });
+        let (fill, text) = match (tag.shown, hot) {
+            (true, false) => (Some(theme::LABEL_BACKGROUND), theme::TEXT_BRIGHT),
+            (true, true) => (Some(theme::CROSSHAIR), Color::WHITE),
+            (false, false) => (None, theme::TEXT_MUTED),
+            (false, true) => (Some(theme::AXIS_LINE), theme::TEXT),
+        };
+        match fill {
+            Some(color) => frame.fill(&path, color),
+            None => frame.stroke(&path, Stroke::default().with_color(theme::LABEL_BACKGROUND)),
+        }
+        label_with(
+            frame,
+            tag.label.clone(),
+            Point::new(from + TAG_PADDING, HEADER_Y),
+            text,
+            theme::TEXT_SIZE,
+            Font::default(),
+        );
     }
 }
 
@@ -195,9 +289,10 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
                     let study = legend_rows(self.chart, &panes, bar)
                         .into_iter()
                         .find(|row| row.contains(start));
-                    let header = header_part(&self.chart.data, start);
+                    let header = header_part(self.chart, plot.width, start);
                     let drawing = drawing_at(self.chart, &panes.price, start);
                     let message = match (header, study, drawing) {
+                        (Some(HeaderPart::Tag(tag)), _, _) => ChartMessage::TagClicked { tag },
                         (Some(HeaderPart::Symbol), _, _) => {
                             ChartMessage::SymbolClicked { at: start }
                         }
@@ -420,6 +515,8 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
         if let Some(i) = legend_bar {
             draw_price_legend(&mut frame, data, i, plot.width);
         }
+        let header = header_layout(self.chart, plot.width);
+        draw_tags(&mut frame, self.chart, &header, cursor.position_in(bounds));
         for row in legend_rows(self.chart, &panes, legend_bar) {
             row.draw(&mut frame, plot.width);
         }
@@ -441,7 +538,7 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
             Drag::Idle | Drag::Press { .. } => match cursor.position_in(bounds) {
                 Some(p) if on_price_axis(p, plot) => mouse::Interaction::ResizingVertically,
                 Some(p) if on_time_axis(p, plot) => mouse::Interaction::ResizingHorizontally,
-                Some(p) if header_part(&self.chart.data, p).is_some() => {
+                Some(p) if header_part(self.chart, plot.width, p).is_some() => {
                     mouse::Interaction::Pointer
                 }
                 Some(p) if in_plot(p, plot) => {
@@ -913,8 +1010,8 @@ fn draw_price_legend(frame: &mut Frame, data: &ChartData, i: usize, plot_width: 
     let c = &data.candles[i];
     label_with(
         frame,
-        format!("{} · {} · {}", data.symbol, data.bars, data.venue),
-        Point::new(LEGEND_X, 16.0),
+        header_text(data),
+        Point::new(LEGEND_X, HEADER_Y),
         theme::TEXT_BRIGHT,
         theme::LEGEND_SIZE,
         Font::default(),

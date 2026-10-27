@@ -7,7 +7,7 @@
 //! SCRIPT is one character per action: `n` new chart, `q` close, `h`/`j`/`k`/`l` focus,
 //! `H`/`J`/`K`/`L` swap, `<`/`>`/`^`/`v` move a divider, `t` toggle split, `f` fullscreen;
 //! `m` right-clicks the focused chart (opening its menu), `S` / `T` click the header's symbol
-//! / timeframe, `E` types "ETH" into the symbol search, `A` unchecks the first item in the menu's Active list, `i` opens the indicator page, `s`
+//! / timeframe, `X` clicks the first indicator tag in the header, `E` types "ETH" into the symbol search, `A` unchecks the first item in the menu's Active list, `i` opens the indicator page, `s`
 //! the symbol page, `1`-`8` add a built-in indicator (in menu order), `e` opens the first
 //! indicator's settings; `x`/`y`/`z` set the EMA Cross / RSI Reversion / Donchian Breakout
 //! strategy (menu open) and `r` opens the focused chart's strategy report. With the example
@@ -174,6 +174,7 @@ fn message(c: char, focused: u32) -> anyhow::Result<Message> {
         )),
         'A' => menu(MenuMessage::Show(Active::Indicator(0), false)),
         'E' => menu(MenuMessage::QueryChanged("ETH".into())),
+        'X' => Ok(Message::Chart(focused, ChartMessage::TagClicked { tag: 0 })),
         'O' => menu(MenuMessage::OpenSweep),
         'Y' => menu(MenuMessage::StartSweep),
         'a' => menu(MenuMessage::AddPluginIndicator("sma".into())),

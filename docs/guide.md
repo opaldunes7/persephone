@@ -43,6 +43,9 @@ time. Binance charts load the latest 5,000 bars of their timeframe.
     Binance pairs) dropping down as you type. Click one to switch, press Enter to open
     whatever Binance pair you typed, or press Esc to leave it as it was.
   - Click the timeframe for a dropdown of every timeframe.
+  - After the name, a round tag for each indicator on the chart: lit while it's shown,
+    outlined while it's hidden. Click a tag to hide or show that indicator (the same as its
+    box in the Active list).
   - A left click anywhere else on the chart closes what's open.
 - **Drag** pans and **scroll** zooms.
 - **Dragging the price axis** stretches prices; double-click it to fit prices again.

@@ -300,6 +300,40 @@ mod active {
     }
 
     #[test]
+    fn header_tags_list_the_indicators_and_toggle_them() {
+        let mut app = app();
+        add(&mut app, BuiltIn::Ema);
+        add(&mut app, BuiltIn::Rsi);
+        let tags = |app: &Persephone| -> Vec<(String, bool)> {
+            app.tile_chart(0)
+                .unwrap()
+                .tags()
+                .iter()
+                .map(|t| (t.label.clone(), t.shown))
+                .collect()
+        };
+        assert_eq!(
+            tags(&app),
+            [("EMA 21".into(), true), ("RSI 14".into(), true)]
+        );
+
+        let _ = app.update(Message::Chart(0, ChartMessage::TagClicked { tag: 0 }));
+        assert_eq!(
+            tags(&app),
+            [("EMA 21".into(), false), ("RSI 14".into(), true)]
+        );
+        assert_eq!(
+            labels(&app),
+            ["RSI 14"],
+            "hidden, like unchecking it in Active"
+        );
+        assert!(app.popup().is_none(), "no menu needed");
+
+        let _ = app.update(Message::Chart(0, ChartMessage::TagClicked { tag: 0 }));
+        assert_eq!(labels(&app), ["EMA 21", "RSI 14"]);
+    }
+
+    #[test]
     fn removing_an_indicator_keeps_the_others_hidden_state() {
         let mut app = app();
         for kind in [BuiltIn::Ema, BuiltIn::Sma, BuiltIn::Rsi] {

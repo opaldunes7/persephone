@@ -63,7 +63,8 @@ any keyboard layout.
 | Esc | close a menu, stop drawing |
 
 On a chart: right-click for the menu. Click the symbol in the top-left header to search for
-another market right there, or the timeframe for a dropdown of the others. Drag to pan and scroll to zoom. Drag the price axis to stretch prices
+another market right there, or the timeframe for a dropdown of the others. The round tags
+after the name are the chart's indicators: click one to hide or show it. Drag to pan and scroll to zoom. Drag the price axis to stretch prices
 and the time axis to stretch time; double-click either to reset it.
 
 ## Documentation

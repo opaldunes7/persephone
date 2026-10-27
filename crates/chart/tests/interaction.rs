@@ -221,7 +221,7 @@ mod clicks {
     use iced::{Point, Settings};
     use iced_test::Simulator;
     use persephone_chart::{
-        ChartMessage, ChartState, OutputStyle, Placement, Study, StudyLine, theme,
+        ChartMessage, ChartState, HeaderTag, OutputStyle, Placement, Study, StudyLine, theme,
     };
 
     use super::{HEIGHT, WIDTH, data, move_to, press, release, right_click};
@@ -280,24 +280,40 @@ mod clicks {
     }
 
     #[test]
-    fn the_headers_symbol_and_timeframe_are_clickable() {
-        // "TESTUSDT · 1m · SIM": the symbol, then the timeframe, then the venue (just a click).
-        let chart = ChartState::new(data());
+    fn the_headers_symbol_timeframe_and_tags_are_clickable() {
+        // "TESTUSDT · 1m · SIM", then a tag per indicator. Click along the header line and
+        // note what each stretch is.
+        let mut chart = ChartState::new(data());
+        chart.set_tags(vec![
+            HeaderTag {
+                label: "EMA 21".into(),
+                shown: true,
+            },
+            HeaderTag {
+                label: "RSI 14".into(),
+                shown: false,
+            },
+        ]);
         let messages = clicks(&chart, |ui| {
-            for x in [40.0, 105.0, 160.0] {
-                move_to(ui, x, 16.0);
+            for x in (14..420).step_by(3) {
+                move_to(ui, x as f32, 16.0);
                 press(ui);
                 release(ui);
             }
         });
-        match &messages[..] {
-            [
-                ChartMessage::SymbolClicked { .. },
-                ChartMessage::TimeframeClicked { .. },
-                ChartMessage::Clicked { .. },
-            ] => {}
-            other => panic!("unexpected {other:?}"),
+        let mut parts: Vec<String> = Vec::new();
+        for message in messages {
+            let part = match message {
+                ChartMessage::SymbolClicked { .. } => "symbol".to_owned(),
+                ChartMessage::TimeframeClicked { .. } => "timeframe".to_owned(),
+                ChartMessage::TagClicked { tag } => format!("tag {tag}"),
+                _ => continue, // plain clicks between them, and on the venue
+            };
+            if parts.last() != Some(&part) {
+                parts.push(part);
+            }
         }
+        assert_eq!(parts, ["symbol", "timeframe", "tag 0", "tag 1"]);
     }
 
     #[test]

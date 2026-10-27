@@ -42,7 +42,7 @@ use iced::{
     widget::{button, container, mouse_area, operation, pin, row, stack, text},
     window,
 };
-use persephone_chart::{ChartData, ChartMessage, ChartState, PRICE_AXIS_WIDTH, theme};
+use persephone_chart::{ChartData, ChartMessage, ChartState, HeaderTag, PRICE_AXIS_WIDTH, theme};
 use persephone_core::{
     BarSpec, Candle, InstrumentSpec, Timeframe,
     indicator::{IndicatorKind, IndicatorSpec},
@@ -647,6 +647,17 @@ impl Persephone {
                 });
             }
             Message::Chart(_, ChartMessage::Clicked { .. }) => self.popup = None,
+            Message::Chart(id, ChartMessage::TagClicked { tag }) => {
+                // A tag shows or hides its indicator, like its box in the Active list.
+                if let Some(tile) = self.tiles.get_mut(&id)
+                    && tag < tile.indicators.len()
+                    && !tile.hidden.indicators.remove(&tag)
+                {
+                    tile.hidden.indicators.insert(tag);
+                }
+                self.restudy(id);
+                self.save();
+            }
             Message::Chart(id, ChartMessage::SymbolClicked { .. }) => {
                 self.popup = Some(Popup::SymbolSearch {
                     tile: id,
@@ -2027,6 +2038,17 @@ impl Persephone {
             .map(|(_, spec)| spec.clone())
             .collect();
         let mut built = studies::build(&shown, &data.candles, &self.plugins);
+        // Every indicator gets a round tag in the header, lit while it's shown.
+        chart.set_tags(
+            tile.indicators
+                .iter()
+                .enumerate()
+                .map(|(i, spec)| HeaderTag {
+                    label: spec.to_string(),
+                    shown: !tile.hidden.indicators.contains(&i),
+                })
+                .collect(),
+        );
         // A report a bar or two short is the last one, while a rerun catches up with live bars.
         let len = data.candles.len();
         let strategy = tile.strategy.as_ref().filter(|_| !tile.hidden.strategy);

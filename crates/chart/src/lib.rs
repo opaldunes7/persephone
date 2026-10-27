@@ -135,6 +135,10 @@ pub enum ChartMessage {
     TimeframeClicked {
         at: Point,
     },
+    /// A click on one of the header's indicator tags (see [`ChartState::set_tags`]).
+    TagClicked {
+        tag: usize,
+    },
     /// Time-axis drag by `dx` pixels: right widens the bars (fewer on screen), left narrows
     /// them. The newest bar on screen stays put.
     ScaleTime {
@@ -179,6 +183,16 @@ pub struct ChartState {
     drawings: Arc<Vec<Drawing>>,
     /// The tool being used, and its first click if it needs two.
     tool: Option<(Tool, Option<Anchor>)>,
+    /// Round tags after the header's name, one per indicator.
+    tags: Vec<HeaderTag>,
+}
+
+/// A round tag in the chart's header naming an indicator, lit while it's shown. Clicking one
+/// publishes [`ChartMessage::TagClicked`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeaderTag {
+    pub label: String,
+    pub shown: bool,
 }
 
 /// The price pane and one pane per indicator that wants its own, for one frame.
@@ -220,6 +234,7 @@ impl ChartState {
             linked: None,
             drawings: Arc::new(Vec::new()),
             tool: None,
+            tags: Vec::new(),
         }
     }
 
@@ -350,6 +365,17 @@ impl ChartState {
     }
 
     #[must_use]
+    pub fn tags(&self) -> &[HeaderTag] {
+        &self.tags
+    }
+
+    /// The header's indicator tags, in order.
+    pub fn set_tags(&mut self, tags: Vec<HeaderTag>) {
+        self.tags = tags;
+        self.grid_cache.clear();
+    }
+
+    #[must_use]
     pub fn data(&self) -> &Arc<ChartData> {
         &self.data
     }
@@ -388,6 +414,7 @@ impl ChartState {
             ChartMessage::RightClicked { .. }
             | ChartMessage::Clicked { .. }
             | ChartMessage::SymbolClicked { .. }
+            | ChartMessage::TagClicked { .. }
             | ChartMessage::TimeframeClicked { .. }
             | ChartMessage::StudyClicked { .. }
             | ChartMessage::Hovered { .. }
