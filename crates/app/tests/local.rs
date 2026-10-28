@@ -5,6 +5,7 @@ use std::sync::Arc;
 use iced::{Point, Size};
 use persephone::{
     Message, Persephone, Run,
+    backtest::{Edit, PanelMessage, Precision},
     menu::{MenuMessage, Page},
     persist::{self, Saved, SavedTile},
 };
@@ -88,6 +89,15 @@ pub(crate) fn binance_app() -> Persephone {
     )
 }
 
+/// Opens the backtest panel from the strategy report and switches to High precision.
+fn high_precision(app: &mut Persephone) {
+    let _ = app.update(Message::OpenReport(0));
+    let _ = app.update(Message::Menu(MenuMessage::OpenBacktest));
+    let _ = app.update(Message::Backtest(PanelMessage::Edit(Edit::Precision(
+        Precision::High,
+    ))));
+}
+
 fn menu(app: &mut Persephone, message: MenuMessage) {
     let _ = app.update(Message::Chart(
         0,
@@ -138,10 +148,16 @@ fn a_local_market_opens_from_the_menu_and_backtests_on_its_ticks() {
         &mut app,
         MenuMessage::SetStrategy(BuiltInStrategy::EmaCross),
     );
+    let (_, request) = app.backtest_request(0).expect("a backtest to run");
+    assert!(
+        request.ticks.is_none(),
+        "Standard precision fills on the bars"
+    );
+    high_precision(&mut app);
     let (generation, request) = app.backtest_request(0).expect("a backtest to run");
     assert!(
         request.ticks.is_some(),
-        "a few hundred thousand quotes: fills on ticks"
+        "High precision, and a few hundred thousand quotes: fills on ticks"
     );
     assert_eq!(request.fees.taker, 0.0, "the market's own fee");
     let report = persephone_engine::run_backtest(&request).unwrap();
@@ -214,6 +230,13 @@ fn local_markets_can_use_tick_bars() {
     );
     let (_, request) = app.backtest_request(0).unwrap();
     assert_eq!(request.bars, BarSpec::Ticks(500));
+    assert!(
+        request.ticks.is_none(),
+        "Standard: tick bars fill on themselves"
+    );
+    persephone_engine::run_backtest(&request).unwrap();
+    high_precision(&mut app);
+    let (_, request) = app.backtest_request(0).unwrap();
     assert!(request.ticks.is_some());
     persephone_engine::run_backtest(&request).unwrap();
     std::fs::remove_dir_all(store.root()).unwrap();
@@ -239,6 +262,8 @@ fn saved_layouts_remember_local_markets() {
                 strategy: None,
                 drawings_hidden: false,
                 volume_hidden: false,
+                span: None,
+                backtest: None,
             }],
         },
     )
@@ -435,6 +460,254 @@ fn removing_a_local_market_deletes_it_and_moves_its_charts() {
     );
     assert_eq!(app.tile_venue(0), None);
     assert!(store.market("TEST", "GOLD").is_ok(), "the others stay");
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
+
+#[test]
+fn a_span_loads_its_bars_and_bars_before_it_to_warm_up_on() {
+    let store = store("span");
+    let mut app = binance_app();
+    app.set_store(store.clone());
+    menu(
+        &mut app,
+        MenuMessage::SetLocal {
+            venue: "TEST".into(),
+            symbol: "EURUSD".into(),
+        },
+    );
+    menu(
+        &mut app,
+        MenuMessage::SetStrategy(BuiltInStrategy::EmaCross),
+    );
+    app.load_now();
+    let _ = app.update(Message::OpenReport(0));
+    let _ = app.update(Message::Menu(MenuMessage::OpenBacktest));
+    assert!(app.panel().is_some());
+
+    // The third day, picked with the slider (handles snap to the hour).
+    let hour = Timeframe::H1.nanos();
+    let _ = app.update(Message::Backtest(PanelMessage::SpanDragged(
+        START + 2 * DAY + 10,
+        START + 3 * DAY + 10,
+    )));
+    let _ = app.update(Message::Backtest(PanelMessage::SpanReleased));
+    assert_eq!(app.tile_span(0), Some((START + 2 * DAY, START + 3 * DAY)));
+    app.load_now();
+    let chart = app.tile_chart(0).expect("the span's bars");
+    assert_eq!(
+        chart.data().candles.len(),
+        72,
+        "the span and two days before it"
+    );
+    assert_eq!(chart.data().candles[0].ts, START);
+    let (_, request) = app.backtest_request(0).unwrap();
+    assert_eq!(request.trade_from, START + 2 * DAY);
+    let report = persephone_engine::run_backtest(&request).unwrap();
+    assert!(report.fills.iter().all(|f| f.ts > START + 2 * DAY));
+
+    let _ = app.update(Message::Backtest(PanelMessage::Latest));
+    assert_eq!(app.tile_span(0), None);
+    app.load_now();
+    assert_eq!(app.tile_chart(0).unwrap().data().candles.len(), 4 * 24);
+    assert_eq!(hour * 24, DAY);
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
+
+#[test]
+fn saved_layouts_keep_spans_and_backtest_settings() {
+    let store = store("saved-span");
+    let dir = store.root().join("layout");
+    let path = dir.join("layout.ron");
+    let mut settings = persephone::backtest::Settings::default();
+    settings.apply(Edit::Precision(Precision::High));
+    settings.apply(Edit::Latency(true));
+    persist::save(
+        &path,
+        &Saved {
+            workspace: 1,
+            others: Vec::new(),
+            layout: Layout::new(),
+            tiles: vec![SavedTile {
+                id: 0,
+                local: Some("TEST".into()),
+                symbol: "EURUSD".into(),
+                timeframe: "1h".into(),
+                indicators: Vec::new(),
+                strategy: None,
+                drawings_hidden: false,
+                volume_hidden: false,
+                span: Some((START + DAY, START + 2 * DAY)),
+                backtest: Some(settings),
+            }],
+        },
+    )
+    .unwrap();
+
+    let (mut app, _loads) = Persephone::start(&[], Some(path.clone()));
+    app.set_store(store.clone());
+    app.load_now();
+    assert_eq!(app.tile_span(0), Some((START + DAY, START + 2 * DAY)));
+    assert_eq!(app.tile_chart(0).unwrap().data().candles.len(), 48);
+
+    // Saving writes them back.
+    menu(
+        &mut app,
+        MenuMessage::SetStrategy(BuiltInStrategy::EmaCross),
+    );
+    let saved = persist::load(&path).unwrap();
+    let tile = &saved.tiles[0];
+    assert_eq!(tile.span, Some((START + DAY, START + 2 * DAY)));
+    let back = tile.backtest.as_ref().expect("settings kept");
+    assert_eq!(back.precision, Precision::High);
+    assert!(back.latency.on);
+    let (_, request) = app.backtest_request(0).unwrap();
+    assert_eq!(request.sim.latency_ms, 100);
+    assert!(request.ticks.is_some(), "High precision: on the ticks");
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
+
+/// Opens the backtest panel on tile 0 at High precision, seeks to `at`, and returns the bars
+/// shown and the one forming.
+fn high_precision_at(app: &mut Persephone, at: UnixNanos) -> (usize, Option<Candle>) {
+    high_precision(app);
+    let _ = app.update(Message::Backtest(PanelMessage::Seek(at)));
+    let playhead = app
+        .tile_chart(0)
+        .unwrap()
+        .playhead()
+        .copied()
+        .expect("a playhead");
+    (playhead.bars, playhead.forming)
+}
+
+#[test]
+fn high_precision_builds_bars_from_ticks() {
+    let store = store("high-ticks");
+    let mut app = binance_app();
+    app.set_store(store.clone());
+    menu(
+        &mut app,
+        MenuMessage::SetLocal {
+            venue: "TEST".into(),
+            symbol: "EURUSD".into(),
+        },
+    );
+    menu(
+        &mut app,
+        MenuMessage::SetStrategy(BuiltInStrategy::EmaCross),
+    );
+    app.load_now();
+    // Half past noon on the second day: 36 hours have closed and the 37th is half built.
+    let noon = START + DAY + 12 * 3_600_000_000_000;
+    let (bars, forming) = high_precision_at(&mut app, noon + 1_800_000_000_000);
+    assert_eq!(bars, 36);
+    let forming = forming.expect("a bar forming");
+    assert_eq!(forming.ts, noon);
+    let last = quote(noon + 1_800_000_000_000 - EVERY);
+    assert!(
+        (forming.close - last.mid()).abs() < 1e-9,
+        "the latest quote's mid"
+    );
+    assert_eq!(forming.volume, 90.0, "90 quotes in half an hour");
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
+
+#[test]
+fn high_precision_fills_on_and_builds_from_minutes() {
+    let store = store("high-minutes");
+    // MINUTES.TEST: two days of 1-minute bars rising a little each minute.
+    let market = store
+        .create(MarketInfo {
+            symbol: "MINUTES".into(),
+            venue: "TEST".into(),
+            base: "MIN".into(),
+            quote: "USD".into(),
+            price_precision: 2,
+            size_precision: 0,
+            kind: MarketKind::Bars(Spacing::Minutes(1)),
+            fee: 0.0,
+            first: 0,
+            last: 0,
+            count: 0,
+        })
+        .unwrap();
+    let minute = Timeframe::M1.nanos();
+    let bars = (0..2 * 1_440u64)
+        .map(|i| {
+            let p = 100.0 + (i as f64 / 90.0).sin() * 5.0 + i as f64 * 0.001;
+            Candle {
+                ts: START + i * minute,
+                open: p,
+                high: p + 0.2,
+                low: p - 0.2,
+                close: p + 0.1,
+                volume: 1.0,
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut writer = BarWriter::new(market).unwrap();
+    writer.write_year(2014, bars.clone()).unwrap();
+    writer.finish().unwrap();
+
+    let mut app = binance_app();
+    app.set_store(store.clone());
+    menu(
+        &mut app,
+        MenuMessage::SetLocal {
+            venue: "TEST".into(),
+            symbol: "MINUTES".into(),
+        },
+    );
+    menu(
+        &mut app,
+        MenuMessage::SetStrategy(BuiltInStrategy::EmaCross),
+    );
+    app.load_now();
+    high_precision(&mut app);
+    app.load_fine_now(0);
+    let (_, request) = app.backtest_request(0).unwrap();
+    assert_eq!(request.fill_bars.as_ref().map(|b| b.len()), Some(2 * 1_440));
+    persephone_engine::run_backtest(&request).unwrap();
+
+    // Twenty minutes into the fifth hour: those minutes, and nothing after.
+    let fifth = START + 4 * 3_600_000_000_000;
+    let (shown, forming) = high_precision_at(&mut app, fifth + 20 * minute);
+    assert_eq!(shown, 4);
+    let forming = forming.unwrap();
+    let inside = &bars[240..260];
+    assert_eq!(forming.open, inside[0].open);
+    assert_eq!(forming.close, inside[19].close);
+    assert_eq!(forming.volume, 20.0);
+    let high = inside.iter().map(|b| b.high).fold(f64::MIN, f64::max);
+    assert_eq!(forming.high, high);
+    std::fs::remove_dir_all(store.root()).unwrap();
+}
+
+#[test]
+fn high_precision_follows_a_simulated_path_without_finer_data() {
+    let store = store("high-simulated");
+    add_daily_bars(&store);
+    let mut app = binance_app();
+    app.set_store(store.clone());
+    menu(
+        &mut app,
+        MenuMessage::SetLocal {
+            venue: "TEST".into(),
+            symbol: "GOLD".into(),
+        },
+    );
+    menu(
+        &mut app,
+        MenuMessage::SetStrategy(BuiltInStrategy::EmaCross),
+    );
+    app.load_now();
+    // A third of the way through day 10: down to its low, not yet up to its high.
+    let (shown, forming) = high_precision_at(&mut app, START + 10 * DAY + DAY / 3);
+    assert_eq!(shown, 10);
+    let forming = forming.unwrap();
+    assert_eq!((forming.open, forming.low), (1_210.0, 1_200.0));
+    assert_eq!(forming.high, 1_210.0, "the high comes later");
+    assert!(app.backtest_request(0).unwrap().1.fill_bars.is_none());
     std::fs::remove_dir_all(store.root()).unwrap();
 }
 

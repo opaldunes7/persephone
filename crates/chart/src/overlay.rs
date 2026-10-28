@@ -31,7 +31,7 @@ use crate::{
     study::Placement,
     theme,
     ticks::{self, format_price, format_value, step_decimals},
-    viewport::Projection,
+    viewport::{Projection, VOLUME_HEIGHT},
 };
 
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
@@ -286,7 +286,7 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
                             canvas::Action::publish(ChartMessage::Placed(anchor)).and_capture(),
                         );
                     }
-                    let bar = panes.price.bar_at(start.x, self.chart.data.candles.len());
+                    let bar = panes.price.bar_at(start.x, self.chart.shown_len());
                     let study = legend_rows(self.chart, &panes, bar)
                         .into_iter()
                         .find(|row| row.contains(start));
@@ -365,11 +365,12 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
                     }
                     Drag::Idle => {
                         // Tell the app when the hovered bar changes, so other charts follow.
-                        let candles = &self.chart.data.candles;
+                        let chart = self.chart;
                         let ts = local
                             .filter(|p| in_plot(*p, plot))
-                            .and_then(|p| self.chart.panes(plot).price.bar_at(p.x, candles.len()))
-                            .map(|i| candles[i].ts);
+                            .and_then(|p| chart.panes(plot).price.bar_at(p.x, chart.shown_len()))
+                            .and_then(|i| chart.shown_bar(i))
+                            .map(|c| c.ts);
                         if ts != state.hovered_ts {
                             state.hovered_ts = ts;
                             state.hovering = local.is_some();
@@ -433,7 +434,7 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
         let hovered = cursor
             .position_in(bounds)
             .filter(|c| in_plot(*c, plot) && !matches!(state.drag, Drag::Price { .. }));
-        let hovered_bar = hovered.and_then(|c| panes.price.bar_at(c.x, data.candles.len()));
+        let hovered_bar = hovered.and_then(|c| panes.price.bar_at(c.x, self.chart.shown_len()));
         // Another chart's hovered time, shown when this one isn't hovered.
         let linked_bar = hovered
             .is_none()
@@ -455,7 +456,7 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
                 background: theme::LABEL_BACKGROUND,
             })
         });
-        let last_tag = last_price_tag(data, &panes.price).filter(|last| {
+        let last_tag = last_price_tag(self.chart, &panes.price).filter(|last| {
             crosshair_tag
                 .as_ref()
                 .is_none_or(|c| !c.overlaps(last.center))
@@ -464,18 +465,18 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
             .into_iter()
             .flatten()
             .collect();
-        let time_tag = shown_bar.map(|i| {
-            let text = ticks::crosshair_label(data.candles[i].ts, data.bars);
+        let time_tag = shown_bar.and_then(|i| {
+            let text = ticks::crosshair_label(self.chart.shown_bar(i)?.ts, data.bars);
             let half = time_tag_width(&text) / 2.0;
             let center = panes
                 .price
                 .x(i as f64)
                 .clamp(half, (plot.width - half).max(half));
-            Tag {
+            Some(Tag {
                 center,
                 text,
                 background: theme::LABEL_BACKGROUND,
-            }
+            })
         });
 
         frame.fill_rectangle(
@@ -496,8 +497,15 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
             );
         }
         draw_value_labels(&mut frame, data, &panes, plot, &price_tags);
-        draw_time_labels(&mut frame, data, &panes.price, plot, time_tag.as_ref());
-        draw_last_price_line(&mut frame, data, &panes.price, plot);
+        draw_time_labels(
+            &mut frame,
+            self.chart,
+            &panes.price,
+            plot,
+            time_tag.as_ref(),
+        );
+        draw_forming(&mut frame, self.chart, &panes.price);
+        draw_last_price_line(&mut frame, self.chart, &panes.price, plot);
         draw_trade_markers(&mut frame, self.chart, &panes.price);
         draw_drawings(&mut frame, self.chart, &panes.price, plot, hovered);
         if let Some(c) = hovered {
@@ -512,9 +520,9 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
             draw_time_tag(&mut frame, plot, tag);
         }
 
-        let legend_bar = shown_bar.or(data.candles.len().checked_sub(1));
+        let legend_bar = shown_bar.or(self.chart.shown_len().checked_sub(1));
         if let Some(i) = legend_bar {
-            draw_price_legend(&mut frame, data, i, plot.width);
+            draw_price_legend(&mut frame, self.chart, i, plot.width);
         }
         let header = header_layout(self.chart, plot.width);
         draw_tags(&mut frame, self.chart, &header, cursor.position_in(bounds));
@@ -544,7 +552,7 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
                 }
                 Some(p) if in_plot(p, plot) => {
                     let panes = self.chart.panes(plot);
-                    let bar = panes.price.bar_at(p.x, self.chart.data.candles.len());
+                    let bar = panes.price.bar_at(p.x, self.chart.shown_len());
                     if legend_rows(self.chart, &panes, bar)
                         .iter()
                         .any(|row| row.contains(p))
@@ -634,6 +642,8 @@ impl LegendRow {
 /// top of their pane. Values are for bar `bar` (the hovered or newest one).
 fn legend_rows(chart: &ChartState, panes: &Panes, bar: Option<usize>) -> Vec<LegendRow> {
     let precision = chart.data.price_precision;
+    // A bar still forming has no indicator values yet; show the last whole bar's.
+    let bar = bar.map(|i| i.min(chart.candles().len().saturating_sub(1)));
     let mut overlay_y = 60.0;
     let mut rows = Vec::new();
 
@@ -712,14 +722,14 @@ fn draw_value_labels(
 
 fn draw_time_labels(
     frame: &mut Frame,
-    data: &ChartData,
+    chart: &ChartState,
     price: &Projection,
     plot: Size,
     time_tag: Option<&Tag>,
 ) {
     // Half the width of a typical "HH:MM" label, so neighbours of the time tag clear it too.
     let label_half = 3.0 * theme::TEXT_SIZE * MONO_ADVANCE;
-    for tick in ticks::time_ticks(&data.candles, price, data.typical_nanos) {
+    for tick in ticks::time_ticks(chart.candles(), price, chart.data.typical_nanos) {
         let x = price.x(tick.index as f64);
         let hidden = time_tag.is_some_and(|tag| {
             (tag.center - x).abs() < time_tag_width(&tag.text) / 2.0 + label_half
@@ -741,12 +751,12 @@ fn draw_time_labels(
     }
 }
 
-fn last_price_tag(data: &ChartData, price: &Projection) -> Option<Tag> {
-    let last = data.candles.last()?;
+fn last_price_tag(chart: &ChartState, price: &Projection) -> Option<Tag> {
+    let last = chart.last_shown()?;
     let y = price.y(last.close);
     price.contains_y(y).then(|| Tag {
         center: y,
-        text: format_price(last.close, data.price_precision),
+        text: format_price(last.close, chart.data.price_precision),
         background: if last.close >= last.open {
             theme::UP
         } else {
@@ -755,8 +765,8 @@ fn last_price_tag(data: &ChartData, price: &Projection) -> Option<Tag> {
     })
 }
 
-fn draw_last_price_line(frame: &mut Frame, data: &ChartData, price: &Projection, plot: Size) {
-    let Some(last) = data.candles.last() else {
+fn draw_last_price_line(frame: &mut Frame, chart: &ChartState, price: &Projection, plot: Size) {
+    let Some(last) = chart.last_shown() else {
         return;
     };
     let y = price.y(last.close);
@@ -775,6 +785,44 @@ fn draw_last_price_line(frame: &mut Frame, data: &ChartData, price: &Projection,
     );
 }
 
+/// The bar a playback is building. The GPU only holds whole bars, so it's drawn here, looking
+/// the same.
+fn draw_forming(frame: &mut Frame, chart: &ChartState, price: &Projection) {
+    let Some(c) = chart.forming() else { return };
+    let x = price.x(chart.candles().len() as f64);
+    let half_bar = price.spacing as f32 / 2.0;
+    if x + half_bar < 0.0 || x - half_bar > price.width {
+        return;
+    }
+    let up = c.close >= c.open;
+    let body = ((price.spacing * 0.7).floor() as f32).max(1.0);
+    if chart.shows_volume() && price.max_volume > 0.0 {
+        let height = price.height * VOLUME_HEIGHT * (c.volume / price.max_volume) as f32;
+        frame.fill_rectangle(
+            Point::new(x - body / 2.0, price.offset + price.height - height),
+            Size::new(body, height),
+            if up {
+                theme::UP_VOLUME
+            } else {
+                theme::DOWN_VOLUME
+            },
+        );
+    }
+    let color = if up { theme::UP } else { theme::DOWN };
+    let (high, low) = (price.y(c.high), price.y(c.low));
+    frame.fill_rectangle(
+        Point::new(x.floor(), high),
+        Size::new(1.0, (low - high).max(1.0)),
+        color,
+    );
+    let (top, bottom) = (price.y(c.open.max(c.close)), price.y(c.open.min(c.close)));
+    frame.fill_rectangle(
+        Point::new(x - body / 2.0, top),
+        Size::new(body, (bottom - top).max(1.0)),
+        color,
+    );
+}
+
 /// An arrow under the bar for each buy and over it for each sell, labelled with the position
 /// it leaves when bars are wide enough for text.
 fn draw_trade_markers(frame: &mut Frame, chart: &ChartState, price: &Projection) {
@@ -788,7 +836,7 @@ fn draw_trade_markers(frame: &mut Frame, chart: &ChartState, price: &Projection)
         .iter()
         .take_while(|m| m.bar < price.visible.end)
     {
-        let Some(candle) = chart.data.candles.get(marker.bar) else {
+        let Some(candle) = chart.candles().get(marker.bar) else {
             continue;
         };
         let x = price.x(marker.bar as f64);
@@ -1007,8 +1055,9 @@ fn draw_time_tag(frame: &mut Frame, plot: Size, tag: &Tag) {
 
 /// `BTCUSDT · 1m · BINANCE` and the O/H/L/C/change line for bar `i`. Fields that would run
 /// past the plot are left out, so narrow tiles show what fits.
-fn draw_price_legend(frame: &mut Frame, data: &ChartData, i: usize, plot_width: f32) {
-    let c = &data.candles[i];
+fn draw_price_legend(frame: &mut Frame, chart: &ChartState, i: usize, plot_width: f32) {
+    let data = &chart.data;
+    let Some(c) = chart.shown_bar(i) else { return };
     label_with(
         frame,
         header_text(data),
@@ -1018,7 +1067,10 @@ fn draw_price_legend(frame: &mut Frame, data: &ChartData, i: usize, plot_width: 
         Font::default(),
     );
 
-    let prev_close = i.checked_sub(1).map_or(c.open, |j| data.candles[j].close);
+    let prev_close = i
+        .checked_sub(1)
+        .and_then(|j| chart.shown_bar(j))
+        .map_or(c.open, |p| p.close);
     let change = c.close - prev_close;
     let color = if c.close >= c.open {
         theme::UP

@@ -13,7 +13,9 @@ strategies can paper trade on live Binance bars.
 - **Tiling**, fixed like Hyprland's dwindle layout: up to 16 charts per workspace, nine
   workspaces, all saved.
 - **Backtests** on Nautilus, with trade markers, an equity pane, a full report, and parameter
-  sweeps compared side by side.
+  sweeps compared side by side. A backtest panel picks the span from the market's whole
+  history, plays the run back bar by bar at any speed from real time up, and sets costs,
+  slippage, latency, leverage, direction, trading sessions and intra-bar precision.
 - **Your own indicators and strategies** as sandboxed WebAssembly plugins (Rust SDK), which
   can run ONNX models and ask language models, or as any process (Python, …) reached over a
   socket.

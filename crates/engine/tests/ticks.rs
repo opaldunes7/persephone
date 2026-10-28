@@ -7,7 +7,9 @@ use persephone_core::{
     strategy::{BuiltInStrategy, StrategySpec},
     tick::{self, Aggressor, Quote, TickFeed, TickKind, Ticks, Trade},
 };
-use persephone_engine::{BacktestReport, BacktestRequest, FeeRates, run_backtest};
+use persephone_engine::{
+    BacktestReport, BacktestRequest, FeeRates, SimSettings, TradingRules, run_backtest,
+};
 
 const START: UnixNanos = 1_388_966_400_000_000_000; // 2014-01-06, a Monday
 const DAY: UnixNanos = 86_400_000_000_000;
@@ -110,6 +112,10 @@ fn request(feed: &Arc<Wave>, with_ticks: bool) -> BacktestRequest {
         ticks: with_ticks.then(|| Arc::clone(feed) as Arc<dyn TickFeed>),
         starting_balance: 100_000.0,
         fees: FeeRates::ZERO,
+        sim: SimSettings::default(),
+        rules: TradingRules::default(),
+        trade_from: 0,
+        fill_bars: None,
     }
 }
 

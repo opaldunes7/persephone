@@ -18,6 +18,7 @@ backtests, sweeps, and paper and live trading.
 - [ONNX models](#onnx-models)
 - [Language models](#language-models)
 - [External strategies](#external-strategies)
+- [Backtest plugins (planned)](#backtest-plugins-planned)
 
 ## A first plugin
 
@@ -314,3 +315,24 @@ cp plugins/external/ema_cross.external "$(persephone-cli plugin dir)/"
 
 "EMA Cross (Python)" then shows up with the strategies. Replace `EmaCross.on_bar` with
 anything: pandas, scikit-learn, PyTorch, a call to an agent.
+
+## Backtest plugins (planned)
+
+The backtest panel's settings fix what's the same everywhere: capital, a commission, a constant
+slippage and spread, latency, leverage, direction and trading sessions. What depends on the
+market, the broker or your own theory will be plugins. None of these kinds exist yet; the
+settings sheet lists them so you can see where they'll go.
+
+| Kind | Would see | Would decide | For example |
+|---|---|---|---|
+| Slippage model | each order, and the bar or ticks it meets | how far its fill price moves | slippage growing fast once an order is more than 5% of the bar's volume |
+| Fill model | each order, and the best bid and ask | the liquidity it can take: a simulated order book | partial fills; limit orders that fill only once the price trades through them |
+| Spread and latency | the time, and data you bring (such as an economic calendar) | the spread to assume and how late orders arrive | spreads 10 pips wider and orders 200 ms late when CPI is released |
+| Position sizing | the account, the market's recent bars and each signal | how big the position is | Kelly, volatility or ATR targeting, risk per trade |
+| Holding costs | positions held over each rollover | what they cost | your broker's historical swap or funding rates |
+| Commission schedule | each fill and the volume traded so far | its fee | fees that fall as monthly volume grows |
+| Session calendar | the date | whether the market is open | exchange holidays and half days |
+
+The stock slippage, spread and latency already sit on the simulated exchange's own fill and
+latency hooks, which take any model, so plugins of the first three kinds will replace the stock
+settings there rather than adding a second mechanism.

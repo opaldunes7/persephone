@@ -7,6 +7,7 @@ chart, in the strategy report, and in `persephone-cli`. This guide walks through
 - [Charts](#charts)
 - [Tiles and workspaces](#tiles-and-workspaces)
 - [Strategies and backtests](#strategies-and-backtests)
+- [The backtest panel](#the-backtest-panel)
 - [Parameter sweeps](#parameter-sweeps)
 - [Drawings](#drawings)
 - [Your own data](#your-own-data)
@@ -101,9 +102,9 @@ Pick a strategy from **Strategy ›** and it backtests on the chart's bars at on
 | RSI Reversion | long when RSI climbs back above Oversold, short when it falls back below Overbought | Length, Oversold, Overbought |
 | Donchian Breakout | long on a close above the last N bars' high, short below their low | Length |
 
-Every strategy also has **Size %**: each position is worth that share of the 100,000
-starting balance (in the quote currency, e.g. USDT). Plugin and external strategies are
-listed below the built-ins.
+Every strategy also has **Size %**: each position is worth that share of the starting capital
+(100,000 in the quote currency, e.g. USDT, unless the [backtest panel](#the-backtest-panel)
+says otherwise). Plugin and external strategies are listed below the built-ins.
 
 The chart then shows:
 - arrows at every fill, labelled with the position they leave (Long, Short, Close);
@@ -121,9 +122,55 @@ Notes from the strategy go at the bottom, such as a language model's look-ahead 
   uses the fee set at import, `--fee`).
 - A strategy decides when a bar has closed, and its market order fills at that close, never
   earlier.
-- On imported tick data, orders fill on the ticks that follow instead (at the ask or bid for
-  quotes, at the trade price for trades). The report says which.
-- Changing the timeframe, symbol or parameters reruns the backtest.
+- With **High** intra-bar precision (in the backtest panel's settings), orders fill on what
+  happened inside the bars instead: the ticks that follow on imported tick data (at the ask or
+  bid for quotes, the trade price for trades), or 1-minute bars elsewhere. The report says
+  which.
+- Changing the timeframe, symbol, parameters or backtest settings reruns the backtest.
+
+## The backtest panel
+
+Click **Backtest** in a strategy's report. A panel opens across the top of the window for that
+chart (it gets a blue outline):
+- **Start**, **Pause**, **⟲** (back to the start) and **Step** (one bar), with the return,
+  drawdown and trades so far, and the equity curve as far as the playback has got.
+- **Span**: two handles over the market's whole history (prices on a log scale behind them).
+  Drag a handle to move one end, or the top of the bar between them to move both; when you
+  let go, the chart loads that span and backtests it. Strategies warm up on up to 500 bars
+  before the span without trading. Click between the handles to jump the playback there.
+  **Latest bars** goes back to the chart's latest bars.
+- **Speed**: a long slider from real time (1×) on the left, through 10× in the middle, to
+  1,000,000× and **Max** (the rest of the span in two seconds) on the right. The left half is
+  for fine control at slow speeds. Scroll over it to nudge it; the readout says how many bars
+  go by a second.
+- **⚙** opens the settings, **✕** closes the panel, and dragging its bottom edge resizes it.
+
+Playback reveals a finished backtest: the backtest runs once over the span, and playing,
+pausing, stepping or changing speed never reruns it. While it plays, the chart shows only the
+bars that had closed by then, with their trades and equity, and the strategy summary waits
+until it's over.
+
+### Backtest settings
+
+Each setting has its own switch, and **Stock settings** turns them all off at once, for an
+ideal run to compare against. They're saved with each chart.
+
+| Setting | What it does |
+|---|---|
+| Starting capital | The account's cash, in the quote currency; paper trading starts with it too. |
+| Commission | A percentage of each fill, or a flat amount per order, instead of the market's own fee. |
+| Slippage | Every market order fills this many ticks worse. |
+| Spread | A spread assumed for bar and trade data (quotes have their own): buys pay the larger half of it, sells the rest. |
+| Latency | Orders reach the venue this many milliseconds late. |
+| Leverage | A position is worth capital × Size % × leverage. Margin calls aren't simulated. |
+| Intra-bar precision | **Standard** fills at the bars, and playback shows each bar as it closes: fast and light, best for long spans. **High** fills on ticks or 1-minute bars, and at slow speeds playback builds each bar as it formed, from the ticks (imported tick data), 1-minute bars (Binance, and 1-minute imports; they load in the background) or, with nothing finer, a simulated path from open through low and high to close. |
+| Direction | Long only, or short only; the other side's signals close positions instead. |
+| Trading session | Weekdays, a time window and a time zone (e.g. America/New_York, daylight saving included). Outside it, signals can close positions but not open them; optionally, positions close when it ends. |
+
+Direction and the trading session apply to paper trading too. Position sizing models, dynamic
+slippage, order-book fills, news-driven spreads and latency, holding costs, commission
+schedules and exchange calendars are listed as plugins to come; see
+[the plugin guide](plugins.md#backtest-plugins-planned).
 
 ## Parameter sweeps
 

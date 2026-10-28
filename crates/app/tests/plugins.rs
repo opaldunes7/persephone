@@ -211,6 +211,8 @@ fn saved_plugins_wait_for_their_plugin_then_resolve() {
                 }),
                 drawings_hidden: false,
                 volume_hidden: false,
+                span: None,
+                backtest: None,
             }],
         },
     )

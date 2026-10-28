@@ -115,6 +115,9 @@ pub(crate) struct Primitive {
     panes: Vec<View>,
     spacing: f32,
     visible: Range<u32>,
+    /// While a playback runs, how far right (from the plot's left) studies may draw: lines up
+    /// to the last whole bar's center, histograms and bands to its right edge.
+    study_clip: Option<(f32, f32)>,
 }
 
 impl Primitive {
@@ -163,6 +166,10 @@ impl Primitive {
             } else {
                 0..0
             },
+            study_clip: chart.playhead().map(|_| {
+                let last = chart.candles().len() as f64 - 1.0;
+                (price.x(last) + LINE_WIDTH, price.x(last + 0.5))
+            }),
         }
     }
 }
@@ -224,6 +231,11 @@ impl shader::Primitive for Primitive {
             };
             queue.write_buffer(&gpu.uniform, 0, bytemuck::bytes_of(&view));
             gpu.scissor = scissor(bounds, pane.top, pane.height, scale, target);
+            let clip = |x: f32| clip_right(gpu.scissor, bounds.x + x.max(0.0), scale);
+            (gpu.line_scissor, gpu.bar_scissor) = match self.study_clip {
+                Some((lines, bars)) => (clip(lines), clip(bars)),
+                None => (gpu.scissor, gpu.scissor),
+            };
         }
         buffers.used = true;
     }
@@ -241,10 +253,17 @@ impl shader::Primitive for Primitive {
             if width == 0 || height == 0 {
                 continue;
             }
-            pass.set_scissor_rect(x, y, width, height);
             pass.set_bind_group(0, &gpu.bind_group, &[]);
+            // Each draw gets its own scissor: a playback clips studies at the last whole bar.
+            let set_scissor = |pass: &mut wgpu::RenderPass<'_>, [x, y, width, height]: [u32; 4]| {
+                pass.set_scissor_rect(x, y, width.max(1), height);
+                width > 0
+            };
 
-            draw_instances(pass, &pipeline.bands, buffers.bands.get(k));
+            if set_scissor(pass, gpu.bar_scissor) {
+                draw_instances(pass, &pipeline.bands, buffers.bands.get(k));
+            }
+            pass.set_scissor_rect(x, y, width, height);
             if k == 0
                 && let Some(bars) = &buffers.bars
             {
@@ -254,8 +273,12 @@ impl shader::Primitive for Primitive {
                 pass.set_pipeline(&pipeline.candles);
                 pass.draw(0..12, self.visible.clone());
             }
-            draw_instances(pass, &pipeline.hists, buffers.hists.get(k));
-            draw_instances(pass, &pipeline.segments, buffers.segments.get(k));
+            if set_scissor(pass, gpu.bar_scissor) {
+                draw_instances(pass, &pipeline.hists, buffers.hists.get(k));
+            }
+            if set_scissor(pass, gpu.line_scissor) {
+                draw_instances(pass, &pipeline.segments, buffers.segments.get(k));
+            }
         }
         true
     }
@@ -279,6 +302,13 @@ fn draw_instances(
 }
 
 /// The physical-pixel rect of a pane, clamped to the render target.
+/// `scissor` cut off at `right` (logical pixels, like the bounds).
+fn clip_right(scissor: [u32; 4], right: f32, scale: f32) -> [u32; 4] {
+    let [x, y, width, height] = scissor;
+    let edge = ((right * scale).ceil().max(0.0) as u32).clamp(x, x + width);
+    [x, y, edge - x, height]
+}
+
 fn scissor(bounds: &Rectangle, top: f32, height: f32, scale: f32, target: (u32, u32)) -> [u32; 4] {
     let (tw, th) = (target.0 as f32, target.1 as f32);
     let x0 = (bounds.x * scale).floor().clamp(0.0, tw);
@@ -422,6 +452,9 @@ struct PaneBinding {
     bind_group: wgpu::BindGroup,
     /// x, y, width, height in physical pixels.
     scissor: [u32; 4],
+    /// The scissor for study lines, and for histograms and bands, clipped during a playback.
+    line_scissor: [u32; 4],
+    bar_scissor: [u32; 4],
 }
 
 impl ChartBuffers {
@@ -551,6 +584,8 @@ impl ChartBuffers {
                 uniform,
                 bind_group,
                 scissor: [0; 4],
+                line_scissor: [0; 4],
+                bar_scissor: [0; 4],
             });
         }
     }

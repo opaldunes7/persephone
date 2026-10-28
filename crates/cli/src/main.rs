@@ -23,7 +23,9 @@ use persephone_core::{
     time::{DateTime, NANOS_PER_DAY},
 };
 use persephone_data::{binance::BinanceClient, store::Store};
-use persephone_engine::{BacktestReport, BacktestRequest, FeeRates, spawn_backtest};
+use persephone_engine::{
+    BacktestReport, BacktestRequest, FeeRates, SimSettings, TradingRules, spawn_backtest,
+};
 use persephone_plugin_host::{Host, external};
 
 #[derive(Parser)]
@@ -205,6 +207,10 @@ fn backtest(args: &BacktestArgs) -> anyhow::Result<()> {
             Some(Fees::Binance) => FeeRates::BINANCE_SPOT,
             Some(Fees::Zero) => FeeRates::ZERO,
         },
+        sim: SimSettings::default(),
+        rules: TradingRules::default(),
+        trade_from: 0,
+        fill_bars: None,
     };
 
     let run_started = Instant::now();

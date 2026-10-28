@@ -15,9 +15,9 @@ use nautilus_trading::{
     nautilus_strategy,
     strategy::{Strategy, StrategyConfig, StrategyCore},
 };
-use persephone_core::{Candle, Side, signal::Signal};
+use persephone_core::{Candle, Side, UnixNanos, signal::Signal};
 
-use crate::report::RawFill;
+use crate::{report::RawFill, settings::TradingRules};
 
 /// Hears what a live strategy sees and does, as it happens.
 pub(crate) trait Watcher {
@@ -47,6 +47,9 @@ pub(crate) struct SignalStrategy {
     failure: Rc<RefCell<Option<String>>>,
     /// Flat instead of short, for spot accounts that can't borrow.
     long_only: bool,
+    rules: TradingRules,
+    /// Bars closing up to here only warm the signal up.
+    trade_from: UnixNanos,
     watcher: Option<Box<dyn Watcher>>,
 }
 
@@ -69,8 +72,18 @@ impl SignalStrategy {
             fills,
             failure,
             long_only: false,
+            rules: TradingRules::default(),
+            trade_from: 0,
             watcher: None,
         }
+    }
+
+    /// Trades by `rules`, and only on bars closing after `trade_from`; earlier ones warm the
+    /// signal up.
+    pub(crate) fn ruled(mut self, rules: TradingRules, trade_from: UnixNanos) -> Self {
+        self.rules = rules;
+        self.trade_from = trade_from;
+        self
     }
 
     /// For live trading: reports to `watcher` as things happen, goes flat instead of short
@@ -182,15 +195,32 @@ impl DataActor for SignalStrategy {
         if let Some(watcher) = &mut self.watcher {
             watcher.bar(&candle);
         }
-        let target = match wanted {
-            Ok(Some(target)) if self.long_only => target.max(0),
-            Ok(Some(target)) => target,
-            Ok(None) => return Ok(()),
+        let wanted = match wanted {
+            Ok(wanted) => wanted,
             Err(message) => {
                 self.report(format!("the strategy failed: {message}"));
                 *self.failure.borrow_mut() = Some(message);
                 return Ok(());
             }
+        };
+        // Bars are stamped with their close: the moment an order would go out.
+        if candle.ts <= self.trade_from {
+            return Ok(());
+        }
+        let held = if self.position > 0.0 {
+            1
+        } else if self.position < 0.0 {
+            -1
+        } else {
+            0
+        };
+        let Some(target) = self.rules.target(wanted, held, candle.ts) else {
+            return Ok(());
+        };
+        let target = if self.long_only {
+            target.max(0)
+        } else {
+            target
         };
         // Stopping a live session closes the position; nothing new meanwhile.
         if self.holds(target) || candle.close <= 0.0 || self.is_exiting() {

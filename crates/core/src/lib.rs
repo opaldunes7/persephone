@@ -119,7 +119,7 @@ impl Timeframe {
                 };
                 days_from_civil(year, month, 1) as UnixNanos * NANOS_PER_DAY
             }
-            _ => open + self.nanos(),
+            _ => open.saturating_add(self.nanos()),
         }
     }
 

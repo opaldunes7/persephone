@@ -19,6 +19,10 @@
 //! came next), with the report open. `O` opens the sweep popup from the report and `Y` starts the sweep. `G` draws a trend line, a horizontal line and a box on the focused chart, and `c` hovers a
 //! bar on it so the other charts show the synced crosshair.
 //!
+//! `B` opens the focused chart's backtest panel, `p` moves its playback halfway through the bars
+//! (at speed `SNAPSHOT_SPEED`, 0 to 1, when set), `V` switches it to High precision (loading its
+//! 1-minute bars) and `g` opens its settings sheet.
+//!
 //! With `SNAPSHOT_STORE` naming a local store, `L` / `M` open its first / second market
 //! (menu open), `Z` asks to delete its first market (symbol search open), `D` drops the file
 //! named by `SNAPSHOT_DROP` on the focused chart (detecting its layout here) and `I` imports it.
@@ -35,6 +39,7 @@ use anyhow::{Context, bail};
 use iced::{Point, Settings, Size, Theme};
 use persephone::{
     Message, Persephone, Run,
+    backtest::PanelMessage,
     keymap::Action,
     menu::{Active, ImportState, MenuMessage, Page, Popup},
 };
@@ -65,7 +70,12 @@ fn main() -> anyhow::Result<()> {
     let symbol = args.next().unwrap_or_else(|| "BTCUSDT".into());
     let timeframe: Timeframe = args.next().as_deref().unwrap_or("15m").parse()?;
 
-    let mut app = Persephone::preloaded(fetch(&symbol, timeframe)?, WINDOW);
+    // Offline, a made-up market stands in, so local markets can still be shown.
+    let data = fetch(&symbol, timeframe).unwrap_or_else(|error| {
+        eprintln!("Binance unreachable ({error:#}); starting from a made-up {symbol}");
+        made_up(&symbol, timeframe)
+    });
+    let mut app = Persephone::preloaded(data, WINDOW);
     let _ = app.set_plugins(example_plugins()?);
     let store = std::env::var_os("SNAPSHOT_STORE").map(Store::new);
     if let Some(store) = &store {
@@ -87,6 +97,38 @@ fn main() -> anyhow::Result<()> {
                 ));
             }
             'I' => import_dropped(&mut app, store.as_ref().context("set SNAPSHOT_STORE")?)?,
+            'B' => {
+                let _ = app.update(Message::OpenReport(focused));
+                let _ = app.update(Message::Menu(MenuMessage::OpenBacktest));
+                app.load_history_now();
+            }
+            'p' => {
+                // Halfway through the chart's bars, at the speed SNAPSHOT_SPEED (0 to 1).
+                let candles = &app
+                    .tile_chart(focused)
+                    .context("the chart has no bars")?
+                    .data()
+                    .candles;
+                // Halfway into the middle bar, so High precision shows it half built.
+                let data = app
+                    .tile_chart(focused)
+                    .context("the chart has no bars")?
+                    .data();
+                let middle = candles[candles.len() / 2].ts + data.typical_nanos / 2;
+                if let Ok(speed) = std::env::var("SNAPSHOT_SPEED") {
+                    let _ = app.update(Message::Backtest(PanelMessage::Speed(speed.parse()?)));
+                }
+                let _ = app.update(Message::Backtest(PanelMessage::Seek(middle)));
+            }
+            'V' => {
+                let _ = app.update(Message::Backtest(PanelMessage::Edit(
+                    persephone::backtest::Edit::Precision(persephone::backtest::Precision::High),
+                )));
+                app.load_fine_now(focused);
+            }
+            'g' => {
+                let _ = app.update(Message::Backtest(PanelMessage::ToggleSettings));
+            }
             'Z' => {
                 let markets = store.as_ref().context("set SNAPSHOT_STORE")?.markets();
                 let market = markets.first().context("the store is empty")?;
@@ -401,6 +443,31 @@ fn fetch(symbol: &str, timeframe: Timeframe) -> anyhow::Result<std::sync::Arc<Ch
         spec.price_precision,
         candles,
     ))
+}
+
+/// 2,000 bars of a slow wave around 80,000, ending now.
+fn made_up(symbol: &str, timeframe: Timeframe) -> std::sync::Arc<ChartData> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let start = timeframe.open_time(now) - 2_000 * timeframe.nanos();
+    let mut close = 80_000.0;
+    let candles = (0..2_000u64)
+        .map(|i| {
+            let t = i as f64;
+            let open = close;
+            close = open + 120.0 * (t / 40.0).sin() + 30.0 * (t * 12.9898).sin();
+            Candle {
+                ts: start + i * timeframe.nanos(),
+                open,
+                high: open.max(close) + 40.0,
+                low: open.min(close) - 40.0,
+                close,
+                volume: 5.0 + 20.0 * (t * 7.77).sin().abs(),
+            }
+        })
+        .collect();
+    ChartData::new(symbol, "BINANCE", timeframe, 2, candles)
 }
 
 /// `matches_image` only writes when the file is missing, so clear old snapshots first.

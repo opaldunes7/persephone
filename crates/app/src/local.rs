@@ -6,26 +6,39 @@ use std::sync::Arc;
 
 use persephone_chart::ChartData;
 use persephone_core::{
-    BarSpec,
+    BarSpec, UnixNanos,
     tick::{TickFeed, TickKind},
 };
 use persephone_data::store::{MarketKind, Store};
 use persephone_engine::FeeRates;
 
-use crate::{HISTORY_BARS, MarketData};
+use crate::{HISTORY_BARS, MarketData, backtest::WARM_UP_BARS};
 
 /// The most ticks a chart's backtest replays (about 8 s in a release build). Past this, its
 /// orders fill on the bars.
 pub const TICK_FILL_LIMIT: u64 = 10_000_000;
 
-/// Reads a stored market's latest bars, with its ticks for backtests.
+/// Reads a stored market's latest bars, or those of `span` and some before it to warm
+/// strategies up on, with its ticks for backtests.
 ///
 /// # Errors
 ///
 /// Returns an error if the market doesn't exist, can't be read or has no data yet.
-pub fn load(store: &Store, venue: &str, symbol: &str, bars: BarSpec) -> anyhow::Result<MarketData> {
+pub fn load(
+    store: &Store,
+    venue: &str,
+    symbol: &str,
+    bars: BarSpec,
+    span: Option<(UnixNanos, UnixNanos)>,
+) -> anyhow::Result<MarketData> {
     let market = store.market(venue, symbol)?;
-    let candles = market.candles_by(bars, HISTORY_BARS as usize)?;
+    let candles = match span {
+        Some((from, to)) => {
+            let warm_up = bars.timeframe().map_or(0, |tf| WARM_UP_BARS * tf.nanos());
+            market.candles_between(bars, from.saturating_sub(warm_up), to)?
+        }
+        None => market.candles_by(bars, HISTORY_BARS as usize)?,
+    };
     anyhow::ensure!(!candles.is_empty(), "{} has no data yet", market.id());
     let info = &market.info;
 

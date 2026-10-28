@@ -38,9 +38,12 @@ impl<Message> canvas::Program<Message> for Grid<'_> {
 
                 if let Some(trades) = &self.chart.trades {
                     let price = &panes.price;
-                    for span in &trades.spans {
+                    // A playback shades only as far as it has got.
+                    let shown = self.chart.shown_len();
+                    for span in trades.spans.iter().filter(|s| s.from < shown) {
                         let left = price.x(span.from as f64).max(0.0);
-                        let right = price.x(span.to as f64).min(plot.width);
+                        let to = span.to.min(shown - 1);
+                        let right = price.x(to as f64).min(plot.width);
                         if right > left {
                             let tint = if span.long {
                                 theme::LONG_SHADE
@@ -68,7 +71,9 @@ impl<Message> canvas::Program<Message> for Grid<'_> {
                         }
                     }
                 }
-                for tick in ticks::time_ticks(&data.candles, &panes.price, data.typical_nanos) {
+                for tick in
+                    ticks::time_ticks(self.chart.candles(), &panes.price, data.typical_nanos)
+                {
                     let x = panes.price.x(tick.index as f64).round();
                     let color = if tick.major {
                         theme::GRID_MAJOR

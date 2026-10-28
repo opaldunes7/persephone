@@ -11,7 +11,9 @@ mod convert;
 pub mod indicators;
 #[cfg(feature = "live")]
 pub mod live;
+mod models;
 mod report;
+mod settings;
 mod strategies;
 
 use std::{cell::RefCell, rc::Rc, sync::Arc, thread};
@@ -21,7 +23,12 @@ use nautilus_backtest::{
     engine::BacktestEngine,
 };
 use nautilus_common::logging::logger::LoggerConfig;
-use nautilus_execution::models::fee::{FeeModelAny, MakerTakerFeeModel};
+use nautilus_core::DurationNanos;
+use nautilus_execution::models::{
+    fee::{FeeModelAny, FixedFeeModel, MakerTakerFeeModel},
+    fill::FillModelHandle,
+    latency::{LatencyModelHandle, StaticLatencyModel},
+};
 use nautilus_model::{
     data::{Data, DataBatch, HasTsInit},
     enums::{AccountType, BookType, OmsType},
@@ -30,7 +37,7 @@ use nautilus_model::{
     types::{Currency, Money},
 };
 use persephone_core::{
-    BarSpec, Candle, InstrumentSpec, UnixNanos,
+    BarSpec, Candle, InstrumentSpec, Timeframe, UnixNanos,
     signal::{Signal, SignalFactory},
     strategy::{StrategyKind, StrategySpec},
     tick::{TickFeed, Ticks},
@@ -39,8 +46,12 @@ use persephone_core::{
 use rust_decimal::Decimal;
 
 pub use report::{BacktestReport, Fill};
+pub use settings::{Direction, Session, SimSettings, TradingRules};
 
-use crate::strategies::{SignalStrategy, builtins};
+use crate::{
+    models::CostFillModel,
+    strategies::{SignalStrategy, builtins},
+};
 
 /// Everything needed to run one backtest.
 #[derive(Clone, Debug)]
@@ -60,6 +71,14 @@ pub struct BacktestRequest {
     /// Starting cash, in the instrument's quote currency.
     pub starting_balance: f64,
     pub fees: FeeRates,
+    /// Flat fees, slippage, spread, latency and leverage.
+    pub sim: SimSettings,
+    pub rules: TradingRules,
+    /// The strategy sees bars closing up to here without trading on them, to warm up.
+    pub trade_from: UnixNanos,
+    /// 1-minute bars spanning the candles, for orders to fill on when there are no ticks; the
+    /// strategy still decides on the candles.
+    pub fill_bars: Option<Arc<Vec<Candle>>>,
 }
 
 /// Maker/taker fee rates as fractions (0.001 = 0.1%).
@@ -108,6 +127,12 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
         return Err(EngineError::NoData);
     }
 
+    if !(request.sim.leverage >= 1.0 && request.sim.leverage.is_finite()) {
+        return Err(EngineError::InvalidRequest(format!(
+            "leverage must be 1 or more, not {}",
+            request.sim.leverage
+        )));
+    }
     let mut engine = BacktestEngine::new(engine_config())?;
 
     let instrument = convert::instrument(&request.instrument)?;
@@ -117,12 +142,28 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
     engine.add_instrument(&instrument)?;
 
     let closes = request.bars.closes(&request.candles);
-    let bar_type = convert::bar_type(instrument_id, request.bars)?;
-    let bars = convert::bars(&request.candles, &closes, bar_type, &request.instrument)?;
+    let bar_type = match (request.bars, &request.ticks) {
+        (BarSpec::Ticks(_) | BarSpec::Volume(_), None) => convert::untimed_bar_type(instrument_id)?,
+        (bars, _) => convert::bar_type(instrument_id, bars)?,
+    };
+    let mut bars = convert::bars(&request.candles, &closes, bar_type, &request.instrument)?;
+    // Nautilus fills on the finest bars it's given. They go first so that, of bars closing
+    // at the same moment, the finer one is matched before the strategy acts on the other.
+    if let Some(fine) = request
+        .fill_bars
+        .as_ref()
+        .filter(|_| request.ticks.is_none())
+    {
+        let minute: BarSpec = Timeframe::M1.into();
+        let fine_type = convert::bar_type(instrument_id, minute)?;
+        let mut all = convert::bars(fine, &minute.closes(fine), fine_type, &request.instrument)?;
+        all.append(&mut bars);
+        bars = all;
+    }
 
     let strategy = &request.strategy;
     strategy.validate().map_err(EngineError::InvalidRequest)?;
-    let notional = request.starting_balance * strategy.size_fraction();
+    let notional = request.starting_balance * strategy.size_fraction() * request.sim.leverage;
     let last_close = request.candles.last().map_or(0.0, |c| c.close);
     convert::quantity(notional / last_close, &request.instrument)?;
 
@@ -139,14 +180,17 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
     let fills = Rc::new(RefCell::new(Vec::new()));
     let failure = Rc::new(RefCell::new(None));
     let signal = Rc::new(RefCell::new(signal));
-    engine.add_strategy(SignalStrategy::new(
-        bar_type,
-        Rc::clone(&signal),
-        notional,
-        request.instrument.size_precision,
-        Rc::clone(&fills),
-        Rc::clone(&failure),
-    ))?;
+    engine.add_strategy(
+        SignalStrategy::new(
+            bar_type,
+            Rc::clone(&signal),
+            notional,
+            request.instrument.size_precision,
+            Rc::clone(&fills),
+            Rc::clone(&failure),
+        )
+        .ruled(request.rules.clone(), request.trade_from),
+    )?;
 
     match &request.ticks {
         None => {
@@ -287,10 +331,17 @@ fn venue_config(
     quote: Currency,
     bar_execution: bool,
 ) -> Result<SimulatedVenueConfig, EngineError> {
-    let rate = |r: f64| {
-        Decimal::try_from(r).map_err(|e| EngineError::InvalidRequest(format!("fee rate {r}: {e}")))
+    let decimal = |what: &str, v: f64| {
+        Decimal::try_from(v).map_err(|e| EngineError::InvalidRequest(format!("{what} {v}: {e}")))
     };
-    let fees = MakerTakerFeeModel::new(rate(request.fees.maker)?, rate(request.fees.taker)?);
+    let sim = &request.sim;
+    let fees = match sim.fee_per_order {
+        Some(fee) => FeeModelAny::Fixed(FixedFeeModel::new(Money::new(fee, quote), Some(true))?),
+        None => FeeModelAny::MakerTaker(MakerTakerFeeModel::new(
+            decimal("fee rate", request.fees.maker)?,
+            decimal("fee rate", request.fees.taker)?,
+        )),
+    };
 
     // Margin + netting lets the EMA cross flip between long and short on a spot pair.
     let config = SimulatedVenueConfig::builder()
@@ -299,7 +350,17 @@ fn venue_config(
         .account_type(AccountType::Margin)
         .book_type(BookType::L1_MBP)
         .starting_balances(vec![Money::new(request.starting_balance, quote)])
-        .fee_model(FeeModelAny::MakerTaker(fees).into())
+        .default_leverage(decimal("leverage", sim.leverage)?)
+        .fee_model(fees.into())
+        .fill_model(FillModelHandle::new(CostFillModel::new(
+            sim.slippage_ticks,
+            sim.spread_ticks,
+        )))
+        .maybe_latency_model((sim.latency_ms > 0).then(|| {
+            let latency = DurationNanos::new(u64::from(sim.latency_ms) * 1_000_000);
+            let none = DurationNanos::new(0);
+            LatencyModelHandle::new(StaticLatencyModel::new(latency, none, none, none))
+        }))
         .bar_execution(bar_execution)
         .build()
         .map_err(|e| EngineError::InvalidRequest(format!("venue config: {e}")))?;

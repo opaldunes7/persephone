@@ -135,19 +135,39 @@ impl Projection {
         width: f32,
         height: f32,
     ) -> Self {
+        Self::price_with(viewport, candles, None, overlays, width, height)
+    }
+
+    /// [`price`](Self::price), also fitting `forming`, a bar being built just after
+    /// `candles`, when it's on screen.
+    #[must_use]
+    pub fn price_with(
+        viewport: &Viewport,
+        candles: &[Candle],
+        forming: Option<&Candle>,
+        overlays: &[&[f64]],
+        width: f32,
+        height: f32,
+    ) -> Self {
         let spacing = viewport.spacing;
         let left = viewport.right - f64::from(width) / spacing;
         let visible = visible_range(left, viewport.right, candles.len());
+        let forming_index = candles.len() as f64;
+        let forming = forming
+            .filter(|_| forming_index >= left - 0.5 && forming_index <= viewport.right + 0.5);
 
-        let fit = if visible.is_empty() {
+        let fit = if visible.is_empty() && forming.is_none() {
             candles.last().map(|c| (c.low, c.high, c.volume))
         } else {
-            candles[visible.clone()].iter().fold(None, |acc, c| {
-                Some(match acc {
-                    None => (c.low, c.high, c.volume),
-                    Some((lo, hi, vol)) => (c.low.min(lo), c.high.max(hi), c.volume.max(vol)),
+            candles[visible.clone()]
+                .iter()
+                .chain(forming)
+                .fold(None, |acc, c| {
+                    Some(match acc {
+                        None => (c.low, c.high, c.volume),
+                        Some((lo, hi, vol)) => (c.low.min(lo), c.high.max(hi), c.volume.max(vol)),
+                    })
                 })
-            })
         };
         let (mut lo, mut hi, max_volume) = fit.unwrap_or((0.0, 1.0, 0.0));
         if let Some((olo, ohi)) = value_range(overlays, &visible) {

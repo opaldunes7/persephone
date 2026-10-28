@@ -439,7 +439,72 @@ impl LocalMarket {
     /// Returns an error if a bar file can't be read, or the market's bars are too far apart
     /// for `timeframe`.
     pub fn candles(&self, timeframe: Timeframe, max: usize) -> anyhow::Result<Vec<Candle>> {
-        let files = match self.info.kind {
+        let files = self.bar_files(timeframe)?;
+        let mut chunks = Vec::new();
+        let mut candles = Vec::new();
+        for path in files.iter().rev() {
+            chunks.push(roll_up_file(path, timeframe)?);
+            candles = tick::resample(
+                &chunks.iter().rev().flatten().copied().collect::<Vec<_>>(),
+                timeframe,
+            );
+            // One more than wanted, as the oldest can lack its part in an earlier file.
+            if candles.len() > max {
+                break;
+            }
+        }
+        let excess = candles.len().saturating_sub(max);
+        candles.drain(..excess);
+        Ok(candles)
+    }
+
+    /// The bars of `spec` that open in `[from, to)`, oldest first. Time bars come from the
+    /// stored bars; tick and volume bars from the ticks in the range, counted from its first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a file can't be read, the market's bars are too far apart for the
+    /// timeframe, or tick or volume bars are asked of a market that has no ticks.
+    pub fn candles_between(
+        &self,
+        spec: BarSpec,
+        from: UnixNanos,
+        to: UnixNanos,
+    ) -> anyhow::Result<Vec<Candle>> {
+        let BarSpec::Time(timeframe) = spec else {
+            ensure!(
+                self.info.kind.ticks().is_some(),
+                "{} was imported as bars, so it has no ticks to make tick or volume bars from",
+                self.id()
+            );
+            return Ok(tick::bars_by(&self.read_ticks(from, to)?, spec));
+        };
+        let files = self.bar_files(timeframe)?;
+        if from >= to {
+            return Ok(Vec::new());
+        }
+        // The last bar may close past `to`, so read its whole period.
+        let until = timeframe.close_time(to - 1);
+        let mut finer = Vec::new();
+        for path in files {
+            if file_span(&path).is_some_and(|(start, end)| end > from && start < until) {
+                finer.extend(roll_up_file(&path, timeframe)?);
+            }
+        }
+        let mut candles = tick::resample(&finer, timeframe);
+        candles.retain(|c| c.ts >= from && c.ts < to);
+        Ok(candles)
+    }
+
+    /// The first and last timestamps it holds (of ticks, or of bar opens); zero while empty.
+    #[must_use]
+    pub fn span(&self) -> (UnixNanos, UnixNanos) {
+        (self.info.first, self.info.last)
+    }
+
+    /// The files of stored bars, oldest first, after checking they make `timeframe`.
+    fn bar_files(&self, timeframe: Timeframe) -> anyhow::Result<Vec<PathBuf>> {
+        Ok(match self.info.kind {
             MarketKind::Ticks(_) => self.bar_months(),
             MarketKind::Bars(spacing) => {
                 ensure!(
@@ -449,28 +514,7 @@ impl LocalMarket {
                 );
                 self.bar_years()
             }
-        };
-        // Files start at midnight UTC and timeframes up to a day divide a day, so each file
-        // rolls up on its own. Weeks and months can straddle files, so they go through days
-        // first and roll up together.
-        let per_file = match timeframe {
-            Timeframe::W1 | Timeframe::MN1 => Timeframe::D1,
-            tf => tf,
-        };
-        let mut chunks = Vec::new();
-        let mut candles = Vec::new();
-        for path in files.iter().rev() {
-            chunks.push(tick::resample(&read_bars(path)?, per_file));
-            let finer: Vec<Candle> = chunks.iter().rev().flatten().copied().collect();
-            candles = tick::resample(&finer, timeframe);
-            // One more than wanted, as the oldest can lack its part in an earlier file.
-            if candles.len() > max {
-                break;
-            }
-        }
-        let excess = candles.len().saturating_sub(max);
-        candles.drain(..excess);
-        Ok(candles)
+        })
     }
 
     /// The latest `max` bars of `spec`. Time bars come from the stored bars; tick and volume
@@ -819,6 +863,41 @@ fn combine_same_times(bars: Vec<Candle>) -> Vec<Candle> {
         }
     }
     out
+}
+
+/// One file of stored bars rolled up as far toward `timeframe` as it can go on its own. Files
+/// start at midnight UTC and timeframes up to a day divide a day, so those roll up fully;
+/// weeks and months can straddle files, so they stop at days and roll up across files after.
+fn roll_up_file(path: &Path, timeframe: Timeframe) -> anyhow::Result<Vec<Candle>> {
+    let per_file = match timeframe {
+        Timeframe::W1 | Timeframe::MN1 => Timeframe::D1,
+        tf => tf,
+    };
+    Ok(tick::resample(&read_bars(path)?, per_file))
+}
+
+/// The period a bar file covers, from its name: `2024-03.parquet` a month, `2024.parquet` a
+/// year.
+fn file_span(path: &Path) -> Option<(UnixNanos, UnixNanos)> {
+    let stem = path.file_stem()?.to_str()?;
+    let start = |year: i64, month: u32| {
+        persephone_core::time::days_from_civil(year, month, 1).max(0) as UnixNanos * NANOS_PER_DAY
+    };
+    match stem.split_once('-') {
+        Some((year, month)) => {
+            let (year, month): (i64, u32) = (year.parse().ok()?, month.parse().ok()?);
+            let next = if month == 12 {
+                (year + 1, 1)
+            } else {
+                (year, month + 1)
+            };
+            Some((start(year, month), start(next.0, next.1)))
+        }
+        None => {
+            let year: i64 = stem.parse().ok()?;
+            Some((start(year, 1), start(year + 1, 1)))
+        }
+    }
 }
 
 /// The UTC day (since 1970-01-01) a timestamp falls on.
@@ -1392,10 +1471,74 @@ mod tests {
                 .is_err()
         );
 
+        let day = |y, m, d| persephone_core::time::days_from_civil(y, m, d) as UnixNanos * DAY;
+        let january = market
+            .candles_between(Timeframe::D1.into(), day(2024, 1, 1), day(2024, 2, 1))
+            .unwrap();
+        assert_eq!(january.len(), 31);
+        let around_new_year = market
+            .candles_between(Timeframe::MN1.into(), day(2024, 12, 1), day(2025, 3, 1))
+            .unwrap();
+        assert_eq!(
+            around_new_year.len(),
+            3,
+            "December to February, across year files"
+        );
+        assert!(
+            market
+                .candles_between(Timeframe::H1.into(), 0, u64::MAX)
+                .is_err()
+        );
+        assert!(
+            market
+                .candles_between(BarSpec::Ticks(5), 0, u64::MAX)
+                .is_err()
+        );
+
         assert!(market.disk_size() > 0);
         store.remove("LOCAL", "EURUSD").unwrap();
         assert!(!market.dir().exists());
         assert!(store.markets().is_empty());
+        fs::remove_dir_all(store.root()).unwrap();
+    }
+
+    #[test]
+    fn tick_markets_load_any_range() {
+        let store = temp_store("between");
+        let market = store.create(info(TickKind::Trades)).unwrap();
+        let mut writer = MarketWriter::new(market);
+        // Two weeks of a trade a minute from Monday 2024-01-29, across two month files.
+        let monday = persephone_core::time::days_from_civil(2024, 1, 29);
+        for day in monday..monday + 14 {
+            writer.write_day(day, trades(day, 0..1_440, 1.0)).unwrap();
+        }
+        let market = writer.finish().unwrap();
+        let at = |day: i64, hour: u64| day as UnixNanos * DAY + hour * 60 * MIN;
+        let between = |spec: BarSpec, from, to| market.candles_between(spec, from, to).unwrap();
+
+        let hours = between(Timeframe::H1.into(), at(monday + 2, 12), at(monday + 4, 12));
+        assert_eq!(hours.len(), 48, "Wednesday noon to Friday noon");
+        assert_eq!(hours[0].ts, at(monday + 2, 12));
+        assert_eq!(hours[47].ts, at(monday + 4, 11));
+
+        let weeks = between(Timeframe::W1.into(), at(monday, 0), at(monday + 14, 0));
+        assert_eq!(weeks.len(), 2);
+        assert_eq!(
+            weeks[0].volume,
+            7.0 * 1_440.0,
+            "the whole week, from both months"
+        );
+        assert_eq!(
+            between(Timeframe::W1.into(), at(monday + 1, 0), at(monday + 14, 0)).len(),
+            1,
+            "a week that opened before the range is left out"
+        );
+        assert_eq!(
+            between(BarSpec::Ticks(60), at(monday, 0), at(monday, 2)).len(),
+            2
+        );
+        assert!(between(Timeframe::H1.into(), at(monday, 1), at(monday, 1)).is_empty());
+        assert_eq!(market.span(), (market.info.first, market.info.last));
         fs::remove_dir_all(store.root()).unwrap();
     }
 

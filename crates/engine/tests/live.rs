@@ -8,7 +8,7 @@ use persephone_core::{
     strategy::{BuiltInStrategy, StrategySpec},
 };
 use persephone_engine::{
-    BacktestRequest, FeeRates,
+    BacktestRequest, FeeRates, SimSettings, TradingRules,
     live::{Book, LiveEvent, LiveFeed, LiveFill, LiveMode, LiveRequest, start_live},
     spawn_backtest,
 };
@@ -60,6 +60,7 @@ fn request(history: Vec<Candle>, replay: Vec<Candle>, mode: LiveMode) -> LiveReq
         plugin: None,
         balance: 100_000.0,
         fees: FeeRates::ZERO,
+        rules: TradingRules::default(),
         owns_signals: false,
     }
 }
@@ -118,6 +119,10 @@ fn paper_trading_fills_like_a_backtest_from_where_it_starts() {
         ticks: None,
         starting_balance: 100_000.0,
         fees: FeeRates::ZERO,
+        sim: SimSettings::default(),
+        rules: TradingRules::default(),
+        trade_from: 0,
+        fill_bars: None,
     })
     .join()
     .unwrap()

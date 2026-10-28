@@ -98,6 +98,24 @@ impl Zone {
     }
 }
 
+impl Zone {
+    /// The wall-clock day (since 1970-01-01) and nanoseconds into it at `ts` in this zone.
+    #[must_use]
+    pub fn to_local(&self, ts: UnixNanos) -> (i64, u64) {
+        let local = match self {
+            Self::Utc => i128::from(ts),
+            Self::Offset(seconds) => i128::from(ts) + i128::from(*seconds) * 1_000_000_000,
+            Self::Named(_, tz) => {
+                let offset = jiff::Timestamp::from_nanosecond(i128::from(ts))
+                    .map_or(0, |at| tz.to_offset(at).seconds());
+                i128::from(ts) + i128::from(offset) * 1_000_000_000
+            }
+        };
+        let day = i128::from(NANOS_PER_DAY);
+        (local.div_euclid(day) as i64, local.rem_euclid(day) as u64)
+    }
+}
+
 impl PartialEq for Zone {
     fn eq(&self, other: &Self) -> bool {
         self.to_string() == other.to_string()
@@ -379,6 +397,33 @@ fn offset(text: &[u8]) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utc_times_read_on_local_clocks() {
+        // 2024-07-01 14:30 UTC is 10:30 in New York (daylight saving) and 15:30 at +01:00.
+        let ts = parse("2024-07-01 14:30:00", TimeFormat::YearFirst, &Zone::Utc).unwrap();
+        let day = persephone_core::time::days_from_civil(2024, 7, 1);
+        let minutes = |(d, nanos): (i64, u64)| (d - day, nanos / 60_000_000_000);
+        let new_york: Zone = "America/New_York".parse().unwrap();
+        assert_eq!(minutes(new_york.to_local(ts)), (0, 10 * 60 + 30));
+        assert_eq!(
+            minutes("+01:00".parse::<Zone>().unwrap().to_local(ts)),
+            (0, 15 * 60 + 30)
+        );
+        assert_eq!(
+            minutes("-14:30".parse::<Zone>().unwrap().to_local(ts)),
+            (0, 0),
+            "midnight"
+        );
+        assert_eq!(
+            minutes("-14:45".parse::<Zone>().unwrap().to_local(ts)),
+            (-1, 23 * 60 + 45)
+        );
+        assert_eq!(minutes(Zone::Utc.to_local(ts)), (0, 14 * 60 + 30));
+        // In January New York is on standard time.
+        let winter = parse("2024-01-15 14:30:00", TimeFormat::YearFirst, &Zone::Utc).unwrap();
+        assert_eq!(new_york.to_local(winter).1 / 60_000_000_000, 9 * 60 + 30);
+    }
 
     /// 2014-01-02 03:04:05 UTC.
     const T: UnixNanos = 1_388_631_845_000_000_000;

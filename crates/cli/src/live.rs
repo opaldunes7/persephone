@@ -10,7 +10,7 @@ use anyhow::Context;
 use persephone_core::{Side, Timeframe};
 use persephone_data::binance::BinanceClient;
 use persephone_engine::{
-    FeeRates,
+    FeeRates, TradingRules,
     live::{Book, LiveEvent, LiveFeed, LiveMode, LiveRequest, start_live},
 };
 
@@ -118,6 +118,7 @@ pub fn live(args: &LiveArgs) -> anyhow::Result<()> {
             plugin,
             balance: args.balance,
             fees: FeeRates::BINANCE_SPOT,
+            rules: TradingRules::default(),
             owns_signals: true,
         },
         move |event| {

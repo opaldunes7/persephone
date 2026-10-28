@@ -11,6 +11,9 @@ const BASE_URL: &str = "https://data-api.binance.vision";
 const VENUE: &str = "BINANCE";
 /// Binance's maximum klines per request.
 const PAGE_LIMIT: usize = 1000;
+/// The most bars one range may hold: about 300 requests, and as much as a chart handles
+/// comfortably.
+pub const MAX_RANGE_BARS: u64 = 300_000;
 const NANOS_PER_MILLI: u64 = 1_000_000;
 
 pub struct BinanceClient {
@@ -22,8 +25,10 @@ impl BinanceClient {
     ///
     /// Returns an error if the HTTP client cannot be built.
     pub fn new() -> anyhow::Result<Self> {
+        // A request that stalls fails instead of leaving a chart loading for good.
         let http = reqwest::blocking::Client::builder()
             .user_agent(concat!("persephone/", env!("CARGO_PKG_VERSION")))
+            .timeout(std::time::Duration::from_secs(30))
             .build()?;
         Ok(Self { http })
     }
@@ -48,6 +53,23 @@ impl BinanceClient {
             .next()
             .with_context(|| format!("Binance has no spot symbol `{symbol}`"))?;
         raw.into_spec()
+    }
+
+    /// When the symbol's first bar of `timeframe` opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or Binance has no bars for it.
+    pub fn first_bar_time(&self, symbol: &str, timeframe: Timeframe) -> anyhow::Result<UnixNanos> {
+        let url = format!(
+            "{BASE_URL}/api/v3/klines?symbol={symbol}&interval={}&startTime=0&limit=1",
+            timeframe.label()
+        );
+        let body = self.http.get(url).send()?.error_for_status()?.text()?;
+        parse_klines(&body)?
+            .first()
+            .map(|bar| bar.ts)
+            .with_context(|| format!("Binance has no {timeframe} bars for {symbol}"))
     }
 
     /// Fetches every bar whose open time is in `[start, end)`, oldest first.
@@ -86,6 +108,21 @@ impl BinanceClient {
 
         Ok(candles)
     }
+}
+
+/// Checks that `[start, end)` holds at most [`MAX_RANGE_BARS`] bars of `timeframe`.
+///
+/// # Errors
+///
+/// Returns a message saying how many bars it holds and what to do instead.
+pub fn check_range(timeframe: Timeframe, start: UnixNanos, end: UnixNanos) -> anyhow::Result<()> {
+    let bars = end.saturating_sub(start) / timeframe.nanos();
+    if bars > MAX_RANGE_BARS {
+        bail!(
+            "that range is {bars} {timeframe} bars, more than {MAX_RANGE_BARS}; pick a shorter range or a longer timeframe"
+        );
+    }
+    Ok(())
 }
 
 /// Parses a `/api/v3/klines` response body.
@@ -190,6 +227,18 @@ mod tests {
                 volume: 320.81872,
             }]
         );
+    }
+
+    #[test]
+    fn ranges_are_capped() {
+        let year = 365 * 86_400_000_000_000;
+        assert!(
+            check_range(Timeframe::H1, 0, 30 * year).is_ok(),
+            "about 263k hours"
+        );
+        let error = check_range(Timeframe::M1, 0, year).unwrap_err().to_string();
+        assert!(error.contains("525600 1m bars"), "{error}");
+        assert!(check_range(Timeframe::M1, year, 0).is_ok());
     }
 
     #[test]

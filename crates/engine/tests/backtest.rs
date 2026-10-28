@@ -2,7 +2,10 @@ use persephone_core::{
     Candle, InstrumentSpec, Side, Timeframe,
     strategy::{BuiltInStrategy, StrategySpec},
 };
-use persephone_engine::{BacktestReport, BacktestRequest, EngineError, FeeRates, spawn_backtest};
+use persephone_engine::{
+    BacktestReport, BacktestRequest, Direction, EngineError, FeeRates, Session, SimSettings,
+    TradingRules, spawn_backtest,
+};
 
 const START: u64 = 1_735_689_600_000_000_000; // 2025-01-01T00:00:00Z
 const BALANCE: f64 = 100_000.0;
@@ -45,6 +48,10 @@ fn request(candles: Vec<Candle>, strategy: StrategySpec) -> BacktestRequest {
         ticks: None,
         starting_balance: BALANCE,
         fees: FeeRates::ZERO,
+        sim: SimSettings::default(),
+        rules: TradingRules::default(),
+        trade_from: 0,
+        fill_bars: None,
     }
 }
 
@@ -190,4 +197,212 @@ fn ends_long_in_an_uptrend() {
     let report = run(request(candles, ema(5.0, 20.0))).unwrap();
     assert_eq!(report.fills.last().unwrap().side, Side::Buy);
     assert!(report.net_pnl() > 0.0, "the trend paid");
+}
+
+// --- Settings and rules ---------------------------------------------------------------------
+
+/// The position after each fill, in BTC, starting flat.
+fn positions(report: &BacktestReport) -> Vec<f64> {
+    let mut held = 0.0;
+    report
+        .fills
+        .iter()
+        .map(|f| {
+            held += if f.side == Side::Buy { f.qty } else { -f.qty };
+            held
+        })
+        .collect()
+}
+
+#[test]
+fn slippage_and_spread_move_every_fill_against_it() {
+    let ideal = run(request(sine_candles(600), ema(5.0, 20.0))).unwrap();
+    let mut costly = request(sine_candles(600), ema(5.0, 20.0));
+    // 2 ticks of slippage and a 3-tick spread: buys 2 + 2 ticks above, sells 2 + 1 below.
+    costly.sim = SimSettings {
+        slippage_ticks: 2,
+        spread_ticks: 3,
+        ..SimSettings::default()
+    };
+    let costly = run(costly).unwrap();
+    assert_eq!(costly.fills.len(), ideal.fills.len());
+    for (a, b) in ideal.fills.iter().zip(&costly.fills) {
+        let moved = ((b.price - a.price) * 100.0).round();
+        let expected = if a.side == Side::Buy { 4.0 } else { -3.0 };
+        assert_eq!(moved, expected, "{a:?} → {b:?}");
+    }
+    assert!(costly.net_pnl() < ideal.net_pnl());
+}
+
+#[test]
+fn a_flat_fee_is_charged_once_per_order() {
+    let mut req = request(sine_candles(600), ema(5.0, 20.0));
+    req.fees = FeeRates::BINANCE_SPOT;
+    req.sim.fee_per_order = Some(3.0);
+    let report = run(req).unwrap();
+    assert!(
+        report.fills.iter().all(|f| (f.fee - 3.0).abs() < 1e-9),
+        "{:?}",
+        report.fills
+    );
+    assert!((report.fees - 3.0 * report.total_orders as f64).abs() < 1e-6);
+}
+
+#[test]
+fn leverage_multiplies_positions() {
+    let mut req = request(sine_candles(400), ema(5.0, 20.0));
+    req.sim.leverage = 5.0;
+    let report = run(req).unwrap();
+    let first = report.fills[0].qty * report.fills[0].price;
+    assert!(
+        (first - 50_000.0).abs() < 250.0,
+        "first entry worth {first}"
+    );
+
+    let mut bad = request(sine_candles(400), ema(5.0, 20.0));
+    bad.sim.leverage = 0.5;
+    assert!(matches!(run(bad), Err(EngineError::InvalidRequest(_))));
+}
+
+#[test]
+fn long_only_and_short_only_never_cross_zero() {
+    for (direction, sign) in [(Direction::LongOnly, 1.0), (Direction::ShortOnly, -1.0)] {
+        let mut req = request(sine_candles(800), ema(5.0, 20.0));
+        req.rules.direction = direction;
+        let report = run(req).unwrap();
+        let held = positions(&report);
+        assert!(held.len() >= 4, "{direction:?} still trades");
+        assert!(
+            held.iter().all(|p| p * sign >= -1e-9),
+            "{direction:?}: {held:?}"
+        );
+    }
+}
+
+#[test]
+fn sessions_stop_entries_and_can_close_positions() {
+    let candles = sine_candles(800);
+    let cut = candles[400].ts;
+    let session = |close_after| {
+        let mut req = request(candles.clone(), ema(5.0, 20.0));
+        req.rules.session = Some(Session {
+            contains: std::sync::Arc::new(move |ts| ts < cut),
+            close_after,
+        });
+        run(req).unwrap()
+    };
+    let open = session(false);
+    let held = positions(&open);
+    for (fill, after) in open.fills.iter().zip(&held) {
+        if fill.ts >= cut {
+            assert!(
+                after.abs() < 1e-9,
+                "after the session, fills only close: {fill:?}"
+            );
+        }
+    }
+    let closing = session(true);
+    let last = closing.fills.last().unwrap();
+    assert!(last.ts >= cut && positions(&closing).last().unwrap().abs() < 1e-9);
+    assert_eq!(
+        closing.fills.iter().filter(|f| f.ts >= cut).count(),
+        1,
+        "closed once"
+    );
+}
+
+#[test]
+fn warm_up_bars_never_trade() {
+    let candles = sine_candles(800);
+    let from = candles[300].ts;
+    let mut req = request(candles, ema(5.0, 20.0));
+    req.trade_from = from;
+    let report = run(req).unwrap();
+    assert!(!report.fills.is_empty());
+    assert!(report.fills.iter().all(|f| f.ts > from));
+    assert_eq!(report.equity[299], BALANCE, "flat while warming up");
+}
+
+#[test]
+fn latency_delays_fills() {
+    let ideal = run(request(sine_candles(600), ema(5.0, 20.0))).unwrap();
+    let mut slow = request(sine_candles(600), ema(5.0, 20.0));
+    slow.sim.latency_ms = 250;
+    let slow = run(slow).unwrap();
+    assert_eq!(slow.fills.len(), ideal.fills.len());
+    for (a, b) in ideal.fills.iter().zip(&slow.fills) {
+        assert!(b.ts > a.ts, "{a:?} vs {b:?}");
+    }
+}
+
+#[test]
+fn orders_fill_on_finer_bars_when_given() {
+    let candles = sine_candles(400);
+    // Each hour's minutes drift up a little from its open, so a fill on a minute bar is never
+    // at the hour's close.
+    let minutes: Vec<Candle> = candles
+        .iter()
+        .flat_map(|hour| {
+            (0..60).map(move |m| {
+                let p = hour.open + m as f64 * 0.25;
+                Candle {
+                    ts: hour.ts + m * Timeframe::M1.nanos(),
+                    open: p,
+                    high: p + 0.5,
+                    low: p - 0.5,
+                    close: p + 0.25,
+                    volume: 1.0,
+                }
+            })
+        })
+        .collect();
+    let on_bars = run(request(candles.clone(), ema(5.0, 20.0))).unwrap();
+    let on_minutes = |latency_ms| {
+        let mut req = request(candles.clone(), ema(5.0, 20.0));
+        req.fill_bars = Some(std::sync::Arc::new(minutes.clone()));
+        req.sim.latency_ms = latency_ms;
+        run(req).unwrap()
+    };
+    // A market order fills at the last price when it's placed: the close of the minute that
+    // ends with the hour, not the hour's own close.
+    let prompt = on_minutes(0);
+    assert_eq!(prompt.fills.len(), on_bars.fills.len());
+    let minute_closing_at = |ts| {
+        minutes
+            .iter()
+            .find(|m| m.ts + Timeframe::M1.nanos() == ts)
+            .unwrap_or_else(|| panic!("no minute closes at {ts}"))
+    };
+    for (fill, on_bar) in prompt.fills.iter().zip(&on_bars.fills) {
+        assert_eq!(fill.ts, on_bar.ts);
+        assert!(
+            (fill.price - minute_closing_at(fill.ts).close).abs() < 0.006,
+            "{fill:?}"
+        );
+        assert!(
+            (fill.price - on_bar.price).abs() > 0.5,
+            "not the hour's close: {fill:?}"
+        );
+    }
+    // Late orders fill on the next minute bar that arrives after them.
+    for fill in &on_minutes(250).fills {
+        let minute = minute_closing_at(fill.ts);
+        assert!(
+            fill.ts % Timeframe::H1.nanos() != 0,
+            "a minute into the hour: {fill:?}"
+        );
+        assert!(
+            fill.price >= minute.low - 0.006 && fill.price <= minute.high + 0.006,
+            "{fill:?} vs {minute:?}"
+        );
+    }
+}
+
+#[test]
+fn tick_bars_can_fill_on_themselves() {
+    // Nautilus ranks bar types by duration, which tick bars don't have.
+    let mut req = request(sine_candles(400), ema(5.0, 20.0));
+    req.bars = persephone_core::BarSpec::Ticks(100);
+    let report = run(req).unwrap();
+    assert!(!report.fills.is_empty());
 }

@@ -75,6 +75,13 @@ pub(crate) fn bar_type(id: InstrumentId, bars: BarSpec) -> Result<BarType, Engin
     Ok(BarType::new(id, spec, AggregationSource::External))
 }
 
+/// A name for tick or volume bars that orders fill on. Nautilus ranks the bars it fills on by
+/// duration, which these don't have, so they go by the shortest one; it's only a name.
+pub(crate) fn untimed_bar_type(id: InstrumentId) -> Result<BarType, EngineError> {
+    let spec = BarSpecification::new_checked(1, BarAggregation::Millisecond, PriceType::Last)?;
+    Ok(BarType::new(id, spec, AggregationSource::External))
+}
+
 /// Converts candles to Nautilus bars, stamped with `closes`.
 ///
 /// Nautilus stamps a bar with its **close** time, while [`Candle::ts`] is the open time;

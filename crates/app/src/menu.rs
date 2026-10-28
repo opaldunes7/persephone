@@ -360,6 +360,8 @@ pub enum MenuMessage {
     RemoveStrategy,
     /// Show (`true`) or hide something in the Active list.
     Show(Active, bool),
+    /// Open the backtest panel for the tile.
+    OpenBacktest,
     /// Trade the tile's strategy on live bars, or stop.
     GoLive(LiveMode),
     StopLive,
@@ -386,7 +388,7 @@ pub struct TileInfo<'a> {
     pub quote: &'a str,
     pub base: &'a str,
     /// How the market's backtests fill orders, when worth saying.
-    pub fills: Option<&'a str>,
+    pub fills: Option<String>,
     /// Markets in the local store, for the symbol page.
     pub local_markets: &'a [MarketInfo],
     /// For a strategy plugin that asks language models: whether it may.
@@ -1548,6 +1550,10 @@ fn report<'a>(
     }
     body = body
         .push(separator())
+        .push(wide_button(
+            "Backtest: span, playback and settings",
+            MenuMessage::OpenBacktest,
+        ))
         .extend(live_section(&tile.live, quote, tile.base));
     body = match tile.ai_allowed {
         Some(false) => body
@@ -1571,8 +1577,8 @@ fn report<'a>(
         ),
         None => body,
     };
-    if let Some(fills) = tile.fills {
-        body = body.push(text(fills).size(11).color(theme::TEXT_MUTED));
+    if let Some(fills) = &tile.fills {
+        body = body.push(text(fills.clone()).size(11).color(theme::TEXT_MUTED));
     }
     container(body.push(separator()).push(remove_button(
         "Remove strategy",

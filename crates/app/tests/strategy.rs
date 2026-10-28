@@ -6,6 +6,7 @@ use std::{path::PathBuf, sync::Arc};
 use iced::{Point, Size};
 use persephone::{
     Message, Persephone, Run,
+    backtest::{Edit, Field, PanelMessage},
     menu::{MenuMessage, Page, Popup},
 };
 use persephone_chart::{ChartData, ChartMessage};
@@ -446,5 +447,104 @@ mod live {
             app.tile_live(0).is_none(),
             "the session ran the old settings"
         );
+    }
+}
+
+mod panel {
+    use std::time::{Duration, Instant};
+
+    use persephone_engine::Direction;
+
+    use super::*;
+
+    fn panel(app: &mut Persephone, message: PanelMessage) {
+        let _ = app.update(Message::Backtest(message));
+    }
+
+    fn shown(app: &Persephone) -> Option<usize> {
+        app.tile_chart(0).unwrap().playhead().map(|p| p.bars)
+    }
+
+    #[test]
+    fn the_backtest_panel_plays_a_finished_backtest_back() {
+        let mut app = app();
+        set_strategy(&mut app, BuiltInStrategy::EmaCross);
+        finish_backtest(&mut app);
+
+        // From the strategy report.
+        let _ = app.update(Message::OpenReport(0));
+        menu(&mut app, MenuMessage::OpenBacktest);
+        assert!(app.popup().is_none());
+        assert_eq!(app.panel().map(|p| p.tile), Some(0));
+        assert_eq!(shown(&app), None, "the whole result until it plays");
+
+        // At Max a whole span plays in two seconds: halfway after one.
+        panel(&mut app, PanelMessage::Speed(1.0));
+        panel(&mut app, PanelMessage::Play);
+        assert!(app.is_animating(), "frames come while it plays");
+        assert_eq!(shown(&app), Some(0), "from the first bar");
+        let now = Instant::now();
+        let _ = app.update(Message::Tick(now));
+        let _ = app.update(Message::Tick(now + Duration::from_secs(1)));
+        let half = shown(&app).unwrap();
+        assert!((740..=760).contains(&half), "{half} of 1,500 bars");
+        let _ = app.update(Message::Tick(now + Duration::from_secs(3)));
+        assert_eq!(shown(&app), Some(1_500));
+        assert!(!app.panel().unwrap().playback.playing, "stopped at the end");
+
+        panel(&mut app, PanelMessage::Restart);
+        assert_eq!(shown(&app), Some(0));
+        panel(&mut app, PanelMessage::Step);
+        panel(&mut app, PanelMessage::Step);
+        assert_eq!(shown(&app), Some(2), "a bar at a time");
+        let hundredth_close = 100 * Timeframe::H1.nanos();
+        panel(&mut app, PanelMessage::Seek(hundredth_close));
+        assert_eq!(shown(&app), Some(100));
+
+        panel(&mut app, PanelMessage::Close);
+        assert!(app.panel().is_none());
+        assert_eq!(shown(&app), None, "the whole chart again");
+    }
+
+    #[test]
+    fn settings_edits_rerun_the_backtest() {
+        let mut app = app();
+        set_strategy(&mut app, BuiltInStrategy::EmaCross);
+        finish_backtest(&mut app);
+        let _ = app.update(Message::OpenReport(0));
+        menu(&mut app, MenuMessage::OpenBacktest);
+
+        panel(&mut app, PanelMessage::Edit(Edit::Direction(true)));
+        assert!(
+            matches!(run_state(&app), Run::Done(_)),
+            "the last result shows meanwhile"
+        );
+        let (_, request) = app.backtest_request(0).unwrap();
+        assert_eq!(request.rules.direction, Direction::LongOnly);
+
+        panel(&mut app, PanelMessage::Input(Field::Slippage, "3".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Slippage));
+        assert_eq!(
+            app.backtest_request(0).unwrap().1.sim.slippage_ticks,
+            0,
+            "still off"
+        );
+        panel(&mut app, PanelMessage::Edit(Edit::Slippage(true)));
+        assert_eq!(app.backtest_request(0).unwrap().1.sim.slippage_ticks, 3);
+
+        panel(&mut app, PanelMessage::Input(Field::Capital, "nope".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Capital));
+        assert!(app.panel().unwrap().error.is_some());
+        assert_eq!(
+            app.backtest_request(0).unwrap().1.starting_balance,
+            100_000.0
+        );
+
+        panel(&mut app, PanelMessage::Edit(Edit::Stock(false)));
+        let (_, request) = app.backtest_request(0).unwrap();
+        assert_eq!(request.sim.slippage_ticks, 0, "stock settings off");
+        assert_eq!(request.rules.direction, Direction::Both);
+        finish_backtest(&mut app);
+        assert!(matches!(run_state(&app), Run::Done(_)));
     }
 }

@@ -8,8 +8,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use persephone_core::BarSpec;
+use persephone_core::{BarSpec, UnixNanos};
 use persephone_tiling::{Layout, TileId};
+
+use crate::backtest::Settings;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -58,6 +60,12 @@ pub struct SavedTile {
     /// The Active list has hidden the volume bars on this chart.
     #[serde(default, skip_serializing_if = "is_false")]
     pub volume_hidden: bool,
+    /// The span its bars are loaded for, as bar opens; the latest bars without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span: Option<(UnixNanos, UnixNanos)>,
+    /// Its backtest settings, when they aren't the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backtest: Option<Settings>,
 }
 
 /// A built-in strategy by id (e.g. "ema-cross") with its parameters. Unknown ids are skipped.
@@ -213,6 +221,8 @@ mod tests {
                     }),
                     drawings_hidden: false,
                     volume_hidden: false,
+                    span: None,
+                    backtest: None,
                 },
                 SavedTile {
                     id: 1,
@@ -223,6 +233,8 @@ mod tests {
                     strategy: None,
                     drawings_hidden: true,
                     volume_hidden: false,
+                    span: None,
+                    backtest: None,
                 },
             ],
         }

@@ -100,6 +100,15 @@ impl ChartData {
     }
 }
 
+/// How far a playback has got: the first `bars` bars show, then `forming`, the bar still being
+/// built, if there is one. Later bars, and indicator values past the last whole bar, stay
+/// hidden.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Playhead {
+    pub bars: usize,
+    pub forming: Option<Candle>,
+}
+
 #[derive(Clone, Debug)]
 pub enum ChartMessage {
     /// Drag by `dx` pixels; positive moves the bars right (into the past).
@@ -187,6 +196,8 @@ pub struct ChartState {
     tags: Vec<HeaderTag>,
     /// Volume bars along the bottom of the price pane.
     volume: bool,
+    /// Set while a backtest plays back: how much of the data shows.
+    playhead: Option<Playhead>,
 }
 
 /// A round tag in the chart's header naming an indicator, lit while it's shown. Clicking one
@@ -238,7 +249,68 @@ impl ChartState {
             tool: None,
             tags: Vec::new(),
             volume: true,
+            playhead: None,
         }
+    }
+
+    /// The whole bars on show: every one, or as far as a playback has got.
+    #[must_use]
+    pub fn candles(&self) -> &[Candle] {
+        let all = &self.data.candles;
+        match &self.playhead {
+            Some(playhead) => &all[..playhead.bars.min(all.len())],
+            None => all,
+        }
+    }
+
+    /// The bar a playback is building, after the whole ones.
+    #[must_use]
+    pub fn forming(&self) -> Option<&Candle> {
+        self.playhead.as_ref()?.forming.as_ref()
+    }
+
+    /// Bars on the axis: the whole ones and the forming one.
+    pub(crate) fn shown_len(&self) -> usize {
+        self.candles().len() + usize::from(self.forming().is_some())
+    }
+
+    /// Bar `i` on show, the forming one included.
+    pub(crate) fn shown_bar(&self, i: usize) -> Option<&Candle> {
+        let candles = self.candles();
+        match candles.get(i) {
+            Some(candle) => Some(candle),
+            None if i == candles.len() => self.forming(),
+            None => None,
+        }
+    }
+
+    /// The newest bar on show, the forming one if there is one.
+    pub(crate) fn last_shown(&self) -> Option<&Candle> {
+        self.forming().or_else(|| self.candles().last())
+    }
+
+    #[must_use]
+    pub fn playhead(&self) -> Option<&Playhead> {
+        self.playhead.as_ref()
+    }
+
+    /// Shows the data only as far as `playhead` (or all of it with `None`). Starting a
+    /// playback brings its newest bar to the right edge; after that the view moves along with
+    /// it while it shows the newest bar, and stays put once panned away.
+    pub fn set_playhead(&mut self, playhead: Option<Playhead>) {
+        if self.playhead == playhead {
+            return;
+        }
+        let old = self.shown_len() as f64;
+        let starting = self.playhead.is_none();
+        self.playhead = playhead;
+        let new = self.shown_len() as f64;
+        if starting && playhead.is_some() {
+            self.viewport.right = new - 1.0 + viewport::RIGHT_MARGIN_BARS;
+        } else if self.viewport.right >= old - 1.0 {
+            self.viewport.right += new - old;
+        }
+        self.grid_cache.clear();
     }
 
     #[must_use]
@@ -410,7 +482,7 @@ impl ChartState {
     }
 
     pub fn update(&mut self, message: ChartMessage) {
-        let len = self.data.candles.len();
+        let len = self.shown_len();
         match message {
             ChartMessage::Pan { dx, plot_width } => self.viewport.pan(dx, plot_width, len),
             ChartMessage::Zoom {
@@ -476,9 +548,10 @@ impl ChartState {
             .collect();
 
         let (price_height, pane_height) = viewport::pane_heights(plot.height, separate.len());
-        let price = Projection::price(
+        let price = Projection::price_with(
             &self.viewport,
-            &self.data.candles,
+            self.candles(),
+            self.forming(),
             &overlays,
             plot.width,
             price_height,
@@ -518,6 +591,102 @@ fn plot_size(size: Size) -> Size {
 mod tests {
     use super::*;
 
+    /// 1,000 hourly bars around 100, except the last 200, which jump to 1,000.
+    fn playback_chart() -> ChartState {
+        let candles = (0..1_000u64)
+            .map(|i| {
+                let p = if i < 800 { 100.0 } else { 1_000.0 };
+                Candle {
+                    ts: i * Timeframe::H1.nanos(),
+                    open: p,
+                    high: p + 1.0,
+                    low: p - 1.0,
+                    close: p,
+                    volume: 1.0,
+                }
+            })
+            .collect();
+        ChartState::new(ChartData::new("T", "SIM", Timeframe::H1, 2, candles))
+    }
+
+    #[test]
+    fn a_playhead_hides_later_bars_and_the_view_follows_it() {
+        let mut chart = playback_chart();
+        let plot = Size::new(800.0, 500.0);
+        let forming = Candle {
+            ts: 500 * Timeframe::H1.nanos(),
+            open: 100.0,
+            high: 140.0,
+            low: 99.0,
+            close: 130.0,
+            volume: 1.0,
+        };
+        chart.set_playhead(Some(Playhead {
+            bars: 500,
+            forming: Some(forming),
+        }));
+        assert_eq!(chart.candles().len(), 500);
+        assert_eq!(chart.shown_len(), 501);
+        assert_eq!(chart.last_shown(), Some(&forming));
+        assert_eq!(chart.shown_bar(500), Some(&forming));
+        assert_eq!(chart.shown_bar(501), None);
+        assert_eq!(
+            chart.viewport().right,
+            500.0 + viewport::RIGHT_MARGIN_BARS,
+            "the forming bar comes to the right edge"
+        );
+        let price = chart.panes(plot).price;
+        assert_eq!(price.visible.end, 500, "whole bars only");
+        assert!(
+            price.top > 140.0 && price.top < 200.0,
+            "fits the forming bar, not later ones"
+        );
+
+        // It follows the playhead...
+        chart.set_playhead(Some(Playhead {
+            bars: 520,
+            forming: None,
+        }));
+        assert_eq!(chart.viewport().right, 519.0 + viewport::RIGHT_MARGIN_BARS);
+        // ...until the view is panned away, and the bars can't be panned past.
+        chart.update(ChartMessage::Pan {
+            dx: 400.0,
+            plot_width: plot.width,
+        });
+        let panned = chart.viewport().right;
+        chart.set_playhead(Some(Playhead {
+            bars: 540,
+            forming: None,
+        }));
+        assert_eq!(chart.viewport().right, panned);
+        chart.set_playhead(None);
+        assert_eq!(chart.candles().len(), 1_000);
+        assert_eq!(
+            chart.viewport().right,
+            panned,
+            "the view stays where it was"
+        );
+
+        // Panned back to the newest bar, it follows again.
+        chart.set_playhead(Some(Playhead {
+            bars: 540,
+            forming: None,
+        }));
+        chart.update(ChartMessage::Pan {
+            dx: -100_000.0,
+            plot_width: plot.width,
+        });
+        assert!(
+            chart.viewport().right < 600.0,
+            "no further than the playhead"
+        );
+        let right = chart.viewport().right;
+        chart.set_playhead(Some(Playhead {
+            bars: 560,
+            forming: None,
+        }));
+        assert_eq!(chart.viewport().right, right + 20.0);
+    }
     #[test]
     fn times_find_the_bar_that_contains_them() {
         let hour = Timeframe::H1.nanos();

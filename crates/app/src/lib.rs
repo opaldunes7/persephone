@@ -13,6 +13,7 @@
 //! files dropped on a chart import into the local store and open there. A strategy's report
 //! can start paper trading it on live Binance bars.
 
+pub mod backtest;
 mod importing;
 pub mod keymap;
 pub mod live;
@@ -31,6 +32,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::Context as _;
 use iced::{
     Background, Border, Color, Element, Fill, Length, Padding, Point, Size, Subscription, Task,
     Theme, event,
@@ -43,10 +45,11 @@ use iced::{
     window,
 };
 use persephone_chart::{
-    ChartData, ChartMessage, ChartState, HeaderTag, PRICE_AXIS_WIDTH, TIME_AXIS_HEIGHT, theme,
+    ChartData, ChartMessage, ChartState, HeaderTag, PRICE_AXIS_WIDTH, Playhead, TIME_AXIS_HEIGHT,
+    theme,
 };
 use persephone_core::{
-    BarSpec, Candle, InstrumentSpec, Timeframe,
+    BarSpec, Candle, InstrumentSpec, Timeframe, UnixNanos,
     indicator::{IndicatorKind, IndicatorSpec},
     signal::SignalFactory,
     strategy::{StrategyKind, StrategySpec},
@@ -114,6 +117,9 @@ pub struct Market {
     symbol: String,
     /// How its bars are cut: by time on any market, by ticks or volume on local ones.
     bars: BarSpec,
+    /// The span to load, as bar opens `[from, to)`, with bars before it for strategies to warm
+    /// up on; `None` loads the latest bars.
+    span: Option<(UnixNanos, UnixNanos)>,
 }
 
 /// One market's bars plus what the engine needs to trade it.
@@ -168,6 +174,25 @@ struct Tile {
     live: Option<Live>,
     /// What its Active list has switched off.
     hidden: Hidden,
+    /// What its backtests assume, and the rules its strategy trades by.
+    backtest: backtest::Settings,
+}
+
+/// 1-minute bars for High precision: on the way, in, or why not.
+enum FineBars {
+    Loading,
+    Ready(Arc<Vec<Candle>>),
+    Failed(String),
+}
+
+/// The most 1-minute bars High precision loads for one span.
+const MAX_FINE_BARS: u64 = 1_000_000;
+
+/// What every chart of a sweep starts from: the chart it was opened on.
+struct SweepCharts {
+    market: Market,
+    indicators: Vec<IndicatorSpec>,
+    settings: backtest::Settings,
 }
 
 /// What a chart's Active list has switched off. Hidden things stay on the chart (and keep
@@ -216,6 +241,8 @@ pub struct Persephone {
     /// When the workspace last changed, for the badge naming it.
     workspace_shown: Option<Instant>,
     bars: HashMap<Market, Bars>,
+    /// 1-minute bars across a market's span, for High precision, by the market they're for.
+    fine: HashMap<Market, FineBars>,
     window: Size,
     now: Instant,
     /// The open menu, settings popover or report, if any.
@@ -255,6 +282,8 @@ pub struct Persephone {
     window_fitted: bool,
     /// When the app started, to tell start-up resizes from the user's.
     launched: Instant,
+    /// The backtest panel across the top, for one chart.
+    panel: Option<backtest::Panel>,
 }
 
 #[derive(Debug, Clone)]
@@ -294,6 +323,15 @@ pub enum Message {
     Live(TileId, u64, LiveEvent),
     /// One of a chart's corner buttons: the same as its shortcut, on that chart.
     TileButton(TileId, Action),
+    Backtest(backtest::PanelMessage),
+    /// 1-minute bars for a market's span, for High precision.
+    FineLoaded(Market, Result<Arc<Vec<Candle>>, String>),
+    /// A market's whole history, for the backtest panel's span: tile, (venue, symbol), result.
+    History(
+        TileId,
+        (Option<String>, String),
+        Result<Arc<backtest::History>, String>,
+    ),
 }
 
 impl Persephone {
@@ -337,7 +375,13 @@ impl Persephone {
                 .collect(),
             None => vec![(
                 0,
-                (market_from_args(args), Vec::new(), None, Hidden::default()),
+                (
+                    market_from_args(args),
+                    Vec::new(),
+                    None,
+                    Hidden::default(),
+                    backtest::Settings::default(),
+                ),
             )],
         };
 
@@ -351,6 +395,7 @@ impl Persephone {
             stash: BTreeMap::new(),
             workspace_shown: None,
             bars: HashMap::new(),
+            fine: HashMap::new(),
             window: DEFAULT_WINDOW,
             now: Instant::now(),
             popup: None,
@@ -376,6 +421,7 @@ impl Persephone {
             importing: None,
             window_fitted: false,
             launched: Instant::now(),
+            panel: None,
         };
         app.refresh_local_markets();
         let mut loads: Vec<_> = tiles
@@ -407,6 +453,7 @@ impl Persephone {
             local: None,
             symbol: data.symbol.clone(),
             bars: data.bars,
+            span: None,
         };
         let instrument = InstrumentSpec {
             symbol: data.symbol.clone(),
@@ -422,6 +469,7 @@ impl Persephone {
             workspace: 1,
             stash: BTreeMap::new(),
             workspace_shown: None,
+            fine: HashMap::new(),
             bars: HashMap::from([(
                 market.clone(),
                 Bars::Ready(MarketData {
@@ -454,6 +502,7 @@ impl Persephone {
             importing: None,
             window_fitted: false,
             launched: Instant::now(),
+            panel: None,
         };
         let _ = app.add_tile(0, market, Vec::new(), None);
         app.relayout(false);
@@ -471,6 +520,56 @@ impl Persephone {
         self.tiles
             .get(&id)
             .map(|tile| (tile.market.symbol.as_str(), tile.market.bars))
+    }
+
+    /// The span tile `id` loads, as bar opens; `None` for its latest bars.
+    #[must_use]
+    pub fn tile_span(&self, id: TileId) -> Option<(UnixNanos, UnixNanos)> {
+        self.tiles.get(&id)?.market.span
+    }
+
+    /// Finds the backtest panel's market history here and now instead of in a task. For
+    /// snapshots.
+    #[doc(hidden)]
+    pub fn load_history_now(&mut self) {
+        let Some(tile) = self.panel.as_ref().and_then(|p| self.tiles.get(&p.tile)) else {
+            return;
+        };
+        let key = (tile.market.local.clone(), tile.market.symbol.clone());
+        let result = history(&key, self.store.as_ref()).map_err(|e| format!("{e:#}"));
+        if let Some(panel) = &mut self.panel {
+            panel.history = Some(result);
+        }
+    }
+
+    /// Loads the 1-minute bars High precision wants for tile `id` here and now instead of in a
+    /// task. For tests and snapshots.
+    #[doc(hidden)]
+    pub fn load_fine_now(&mut self, id: TileId) {
+        let Some(tile) = self.tiles.get(&id) else {
+            return;
+        };
+        if !self.needs_fine(id) || matches!(self.fine.get(&tile.market), Some(FineBars::Ready(_))) {
+            return;
+        }
+        let Some(Bars::Ready(data)) = self.bars.get(&tile.market) else {
+            return;
+        };
+        let candles = &data.data.candles;
+        let (Some(first), Some(last)) = (candles.first(), candles.last()) else {
+            return;
+        };
+        let to = data.data.bars.closes(std::slice::from_ref(last))[0];
+        let result = fine_bars(&tile.market, self.store.as_ref(), first.ts, to)
+            .map(Arc::new)
+            .map_err(|e| format!("{e:#}"));
+        let _ = self.update(Message::FineLoaded(tile.market.clone(), result));
+    }
+
+    /// The backtest panel, while it's open.
+    #[must_use]
+    pub fn panel(&self) -> Option<&backtest::Panel> {
+        self.panel.as_ref()
     }
 
     /// What kind of ticks a local market holds (for which bars it can have); `None` for Binance
@@ -607,8 +706,10 @@ impl Persephone {
 
     #[must_use]
     pub fn is_animating(&self) -> bool {
-        self.workspace_shown
-            .is_some_and(|start| self.now.saturating_duration_since(start) < WORKSPACE_BADGE)
+        self.panel.as_ref().is_some_and(|p| p.playback.playing)
+            || self
+                .workspace_shown
+                .is_some_and(|start| self.now.saturating_duration_since(start) < WORKSPACE_BADGE)
             || self.tiles.values().any(|tile| {
                 tile.motion.is_moving(self.now)
                     || tile.flash.is_some_and(|start| self.now - start < FLASH)
@@ -633,15 +734,27 @@ impl Persephone {
                 .map(|p| Arc::clone(p) as Arc<dyn SignalFactory>),
             StrategyKind::BuiltIn(_) => None,
         };
+        let settings = &tile.backtest;
+        // Standard precision fills on the chart's bars; High on ticks or 1-minute bars.
+        let high = settings.precision == backtest::Precision::High;
         let request = BacktestRequest {
             instrument: market.instrument.clone(),
             bars: tile.market.bars,
             candles: market.data.candles.clone(),
             strategy: strategy.spec.clone(),
             plugin,
-            ticks: market.ticks.clone(),
-            starting_balance: STARTING_BALANCE,
-            fees: market.fees,
+            ticks: market.ticks.clone().filter(|_| high),
+            starting_balance: settings.capital,
+            fees: settings.fees(market.fees),
+            sim: settings.sim(),
+            rules: settings.rules().unwrap_or_default(),
+            trade_from: tile.market.span.map_or(0, |(from, _)| from),
+            fill_bars: match self.fine.get(&tile.market) {
+                Some(FineBars::Ready(bars)) if high && market.ticks.is_none() => {
+                    Some(Arc::clone(bars))
+                }
+                _ => None,
+            },
         };
         Some((strategy.generation, request))
     }
@@ -692,7 +805,9 @@ impl Persephone {
                     .filter(|(_, t)| t.market == market && t.chart.is_none())
                     .map(|(&id, _)| id)
                     .collect();
-                return Task::batch(waiting.into_iter().map(|id| self.attach(id)));
+                let mut tasks: Vec<_> = waiting.iter().map(|&id| self.attach(id)).collect();
+                tasks.extend(waiting.into_iter().map(|id| self.request_fine(id)));
+                return Task::batch(tasks);
             }
             Message::Chart(id, ChartMessage::RightClicked { at }) => {
                 self.popup = Some(Popup::Menu {
@@ -758,6 +873,9 @@ impl Persephone {
             Message::Menu(message) => return self.on_menu(message),
             Message::Escape => {
                 self.popup = None;
+                if let Some(panel) = &mut self.panel {
+                    panel.settings_open = false;
+                }
                 for chart in self.tiles.values_mut().filter_map(|t| t.chart.as_mut()) {
                     chart.cancel_drawing();
                 }
@@ -840,7 +958,39 @@ impl Persephone {
                     return fit_window();
                 }
             }
-            Message::Tick(now) => self.now = now,
+            Message::Tick(now) => {
+                self.now = now;
+                self.advance_playback(now);
+            }
+            Message::Backtest(message) => return self.on_panel(message),
+            Message::FineLoaded(market, result) => {
+                let fine = match result {
+                    Ok(bars) => FineBars::Ready(bars),
+                    Err(error) => FineBars::Failed(error),
+                };
+                self.fine.insert(market.clone(), fine);
+                let using: Vec<TileId> = self
+                    .tiles
+                    .iter()
+                    .filter(|(_, t)| {
+                        t.market == market && t.backtest.precision == backtest::Precision::High
+                    })
+                    .map(|(&id, _)| id)
+                    .collect();
+                self.sync_playhead();
+                return Task::batch(using.into_iter().map(|id| self.run_backtest_keeping(id)));
+            }
+            Message::History(id, key, result) => {
+                let wanted = self
+                    .tiles
+                    .get(&id)
+                    .map(|t| (t.market.local.clone(), t.market.symbol.clone()));
+                if let Some(panel) = self.panel.as_mut().filter(|p| p.tile == id)
+                    && wanted.as_ref() == Some(&key)
+                {
+                    panel.history = Some(result.map(|h| (*h).clone()));
+                }
+            }
             Message::PluginsChanged => {
                 if !self.reloading {
                     return self.reload_plugins(PLUGIN_SETTLE);
@@ -1009,8 +1159,9 @@ impl Persephone {
             history: backtest.candles,
             strategy: backtest.strategy,
             plugin: backtest.plugin,
-            balance: STARTING_BALANCE,
+            balance: backtest.starting_balance,
             fees: backtest.fees,
+            rules: backtest.rules,
             owns_signals: false,
         })
     }
@@ -1237,6 +1388,7 @@ impl Persephone {
                     local: None,
                     symbol: DEFAULT_SYMBOL.to_owned(),
                     bars,
+                    span: None,
                 },
             )
         }))
@@ -1320,6 +1472,7 @@ impl Persephone {
                 local: Some(info.venue.clone()),
                 symbol: info.symbol.clone(),
                 bars: t.market.bars,
+                span: None,
             };
             tasks.push(self.set_market(id, market));
         }
@@ -1358,8 +1511,12 @@ impl Persephone {
             (Err(message), _) => *error = Some(message),
             (Ok(_), None) => *error = Some("every workspace is in use; close one first".into()),
             (Ok(values), Some(number)) => {
-                let (market, indicators) = (source.market.clone(), source.indicators.clone());
-                return self.open_sweep(number, market, indicators, spec, *param, &values);
+                let charts = SweepCharts {
+                    market: source.market.clone(),
+                    indicators: source.indicators.clone(),
+                    settings: source.backtest.clone(),
+                };
+                return self.open_sweep(number, charts, spec, *param, &values);
             }
         }
         self.popup = Some(popup);
@@ -1375,8 +1532,11 @@ impl Persephone {
     fn open_sweep(
         &mut self,
         number: u8,
-        market: Market,
-        indicators: Vec<IndicatorSpec>,
+        SweepCharts {
+            market,
+            indicators,
+            settings,
+        }: SweepCharts,
         spec: StrategySpec,
         param: usize,
         values: &[f64],
@@ -1410,6 +1570,7 @@ impl Persephone {
             tasks.push(self.add_tile(tile_id, market.clone(), indicators.clone(), Some(variant)));
             if let Some(tile) = self.tiles.get_mut(&tile_id) {
                 tile.sweep = Some(id);
+                tile.backtest = settings.clone();
             }
             charts.push((tile_id, value));
         }
@@ -1951,6 +2112,7 @@ impl Persephone {
                 self.restudy(id);
                 self.save();
             }
+            MenuMessage::OpenBacktest => return self.open_panel(id),
             MenuMessage::GoLive(mode) => {
                 self.popup = Some(popup);
                 return self.go_live(id, mode);
@@ -2084,6 +2246,7 @@ impl Persephone {
                 sweep: None,
                 live: None,
                 hidden: Hidden::default(),
+                backtest: backtest::Settings::default(),
             },
         );
         let backtest = self.attach(id);
@@ -2094,11 +2257,12 @@ impl Persephone {
     fn restore(
         &mut self,
         id: TileId,
-        (market, indicators, strategy, hidden): Restored,
+        (market, indicators, strategy, hidden, settings): Restored,
     ) -> Task<Message> {
         let task = self.add_tile(id, market, indicators, strategy);
         if let Some(tile) = self.tiles.get_mut(&id) {
             tile.hidden = hidden;
+            tile.backtest = settings;
         }
         task
     }
@@ -2112,6 +2276,19 @@ impl Persephone {
         if tile.market == market {
             return Task::none();
         }
+        let other_market = tile.market.local != market.local || tile.market.symbol != market.symbol;
+        let mut history = Task::none();
+        if let Some(panel) = self.panel.as_mut().filter(|p| p.tile == id) {
+            // New bars: the playback starts over, at the same speed.
+            panel.playback.reset();
+            panel.timeline = None;
+            if other_market {
+                history = self.load_history(id);
+            }
+        }
+        let Some(tile) = self.tiles.get_mut(&id) else {
+            return history;
+        };
         tile.market = market.clone();
         tile.chart = None;
         tile.live = None;
@@ -2121,7 +2298,7 @@ impl Persephone {
         let load = self.request(&market);
         let backtest = self.attach(id);
         self.save();
-        Task::batch([load, backtest])
+        Task::batch([load, backtest, history])
     }
 
     /// Starts loading `market` unless its bars are loaded or on the way.
@@ -2177,6 +2354,323 @@ impl Persephone {
         Task::perform(backtest_on_thread(request), move |result| {
             Message::BacktestDone(id, generation, result)
         })
+    }
+
+    // --- The backtest panel -------------------------------------------------------------------
+
+    /// Opens the backtest panel for tile `id` (or keeps it, if it's open for it) and looks up
+    /// its market's whole history.
+    fn open_panel(&mut self, id: TileId) -> Task<Message> {
+        if self.panel.as_ref().is_some_and(|p| p.tile == id) {
+            return Task::none();
+        }
+        self.close_panel();
+        self.panel = Some(backtest::Panel::new(id, self.window.height));
+        self.relayout(true);
+        self.load_history(id)
+    }
+
+    fn close_panel(&mut self) {
+        if let Some(panel) = self.panel.take()
+            && let Some(chart) = self
+                .tiles
+                .get_mut(&panel.tile)
+                .and_then(|t| t.chart.as_mut())
+        {
+            chart.set_playhead(None);
+        }
+        self.relayout(true);
+    }
+
+    /// Finds the whole history of tile `id`'s market, for the panel's span slider.
+    fn load_history(&mut self, id: TileId) -> Task<Message> {
+        let Some(tile) = self.tiles.get(&id) else {
+            return Task::none();
+        };
+        if let Some(panel) = self.panel.as_mut().filter(|p| p.tile == id) {
+            panel.history = None;
+        }
+        let key = (tile.market.local.clone(), tile.market.symbol.clone());
+        let (job, store) = (key.clone(), self.store.clone());
+        Task::perform(
+            on_thread(move || {
+                history(&job, store.as_ref())
+                    .map(Arc::new)
+                    .map_err(|e| format!("{e:#}"))
+            }),
+            move |result| Message::History(id, key.clone(), result),
+        )
+    }
+
+    /// The panel's chart's playback runs from the open of its first traded bar (earlier ones
+    /// warm the strategy up) to the close of its last; also makes sure its timeline is for
+    /// the chart's current bars.
+    fn playback_span(&mut self) -> Option<(UnixNanos, UnixNanos)> {
+        let panel = self.panel.as_mut()?;
+        let tile = self.tiles.get(&panel.tile)?;
+        let data = tile.chart.as_ref()?.data();
+        if panel.timeline.as_ref().is_none_or(|t| !t.is_for(data)) {
+            panel.timeline = Some(backtest::Timeline::new(data));
+        }
+        let timeline = panel.timeline.as_ref()?;
+        let from = timeline.first_from(tile.market.span.map_or(0, |(from, _)| from));
+        let start = timeline.candles().get(from)?.ts;
+        Some((start, timeline.end()))
+    }
+
+    fn advance_playback(&mut self, now: Instant) {
+        if !self.panel.as_ref().is_some_and(|p| p.playback.playing) {
+            return;
+        }
+        if let Some((start, end)) = self.playback_span()
+            && let Some(panel) = &mut self.panel
+        {
+            panel.playback.advance(now, start, end);
+        }
+        self.sync_playhead();
+    }
+
+    /// Shows the panel's chart as far as its playback has got (or whole, if it hasn't
+    /// started), with the bar being built in High precision.
+    fn sync_playhead(&mut self) {
+        let Some(panel) = &self.panel else { return };
+        let id = panel.tile;
+        let Some(at) = panel.playback.at else {
+            if let Some(chart) = self.tiles.get_mut(&id).and_then(|t| t.chart.as_mut()) {
+                chart.set_playhead(None);
+            }
+            return;
+        };
+        let Some(bars) = panel.timeline.as_ref().map(|t| t.closed_by(at)) else {
+            return;
+        };
+        let forming = self.forming_bar(bars, at);
+        if let Some(chart) = self.tiles.get_mut(&id).and_then(|t| t.chart.as_mut()) {
+            chart.set_playhead(Some(Playhead { bars, forming }));
+        }
+    }
+
+    /// The bar after the `bars` that have closed, as it stood at `at`, when High precision
+    /// shows bars forming and the playback is slow enough to see them.
+    fn forming_bar(&mut self, bars: usize, at: UnixNanos) -> Option<Candle> {
+        let panel = self.panel.as_ref()?;
+        let tile = self.tiles.get(&panel.tile)?;
+        if tile.backtest.precision != backtest::Precision::High {
+            return None;
+        }
+        let timeline = panel.timeline.as_ref()?;
+        let bar = *timeline.candles().get(bars).filter(|bar| bar.ts <= at)?;
+        let close = *timeline.closes.get(bars)?;
+        let per_second = backtest::speed_at(panel.playback.speed).map_or(f64::INFINITY, |speed| {
+            speed * 1e9 / close.saturating_sub(bar.ts).max(1) as f64
+        });
+        if panel.playback.playing && per_second > backtest::FORMING_UP_TO {
+            return None;
+        }
+        let source = self.inside_source(tile)?;
+        let panel = self.panel.as_mut()?;
+        let inside = |ticks| match ticks {
+            Some(ticks) => backtest::Inside::Ticks(ticks),
+            None => backtest::Inside::Simulated,
+        };
+        Some(match &source {
+            backtest::Source::Ticks(feed) => {
+                let ticks =
+                    backtest::TickCache::get(&mut panel.ticks, feed.as_ref(), bar.ts, close).ok();
+                backtest::forming(&bar, close, at, inside(ticks))
+            }
+            backtest::Source::Minutes(minutes) => {
+                backtest::forming(&bar, close, at, backtest::Inside::Minutes(minutes))
+            }
+            backtest::Source::Simulated => {
+                backtest::forming(&bar, close, at, backtest::Inside::Simulated)
+            }
+        })
+    }
+
+    /// Where High precision gets the inside of `tile`'s bars from: its ticks for bars up to a
+    /// day long, else 1-minute bars once they're in, else a simulated path.
+    fn inside_source(&self, tile: &Tile) -> Option<backtest::Source> {
+        let Some(Bars::Ready(market)) = self.bars.get(&tile.market) else {
+            return None;
+        };
+        let short = tile
+            .market
+            .bars
+            .timeframe()
+            .is_none_or(|tf| tf.nanos() <= Timeframe::D1.nanos());
+        if let Some(feed) = market.ticks.as_ref().filter(|_| short) {
+            return Some(backtest::Source::Ticks(Arc::clone(feed)));
+        }
+        Some(match self.fine.get(&tile.market) {
+            Some(FineBars::Ready(minutes)) => backtest::Source::Minutes(Arc::clone(minutes)),
+            _ => backtest::Source::Simulated,
+        })
+    }
+
+    /// Whether High precision on tile `id` wants 1-minute bars: for time bars longer than a
+    /// minute, on Binance or a local market that has them, unless its ticks serve.
+    fn needs_fine(&self, id: TileId) -> bool {
+        let Some(tile) = self.tiles.get(&id) else {
+            return false;
+        };
+        let Some(Bars::Ready(market)) = self.bars.get(&tile.market) else {
+            return false;
+        };
+        let Some(tf) = tile.market.bars.timeframe() else {
+            return false;
+        };
+        let has_minutes = match &tile.market.local {
+            None => true,
+            Some(_) => self
+                .local_info(&tile.market)
+                .is_some_and(|info| info.kind.allows(Timeframe::M1)),
+        };
+        tile.backtest.precision == backtest::Precision::High
+            && tf != Timeframe::M1
+            && has_minutes
+            && !(market.ticks.is_some() && tf.nanos() <= Timeframe::D1.nanos())
+    }
+
+    /// Starts loading the 1-minute bars High precision wants for tile `id`, if it wants them
+    /// and they aren't in or on the way.
+    fn request_fine(&mut self, id: TileId) -> Task<Message> {
+        if !self.needs_fine(id) {
+            return Task::none();
+        }
+        let Some(tile) = self.tiles.get(&id) else {
+            return Task::none();
+        };
+        if self.fine.contains_key(&tile.market) {
+            return Task::none();
+        }
+        let Some(Bars::Ready(data)) = self.bars.get(&tile.market) else {
+            return Task::none();
+        };
+        let candles = &data.data.candles;
+        let (Some(first), Some(last)) = (candles.first(), candles.last()) else {
+            return Task::none();
+        };
+        let (from, to) = (
+            first.ts,
+            data.data.bars.closes(std::slice::from_ref(last))[0],
+        );
+        let market = tile.market.clone();
+        self.fine.insert(market.clone(), FineBars::Loading);
+        let (job, store) = (market.clone(), self.store.clone());
+        Task::perform(
+            on_thread(move || {
+                fine_bars(&job, store.as_ref(), from, to)
+                    .map(Arc::new)
+                    .map_err(|e| format!("{e:#}"))
+            }),
+            move |result| Message::FineLoaded(market.clone(), result),
+        )
+    }
+
+    fn on_panel(&mut self, message: backtest::PanelMessage) -> Task<Message> {
+        use backtest::PanelMessage as P;
+        let Some(id) = self.panel.as_ref().map(|p| p.tile) else {
+            return Task::none();
+        };
+        let span = self.playback_span();
+        let Some(panel) = self.panel.as_mut() else {
+            return Task::none();
+        };
+        match message {
+            P::Play => {
+                if let Some((start, end)) = span {
+                    panel.playback.play(start, end);
+                }
+            }
+            P::Pause => panel.playback.pause(),
+            P::Restart => {
+                if let Some((start, _)) = span {
+                    panel.playback.restart(start);
+                }
+            }
+            P::Step => {
+                if let (Some((start, end)), Some(timeline)) = (span, &panel.timeline) {
+                    let at = panel.playback.at.unwrap_or(start);
+                    let next = timeline
+                        .closes
+                        .get(timeline.closed_by(at))
+                        .copied()
+                        .unwrap_or(end);
+                    panel.playback.at = Some(next.clamp(start, end));
+                    panel.playback.pause();
+                }
+            }
+            P::Seek(ts) => {
+                if let Some((start, end)) = span {
+                    panel.playback.at = Some(ts.clamp(start, end));
+                }
+            }
+            P::Close => {
+                self.close_panel();
+                return Task::none();
+            }
+            P::Speed(position) => panel.playback.speed = position,
+            P::SpanDragged(from, to) => panel.dragging = Some((from, to)),
+            P::SpanReleased => {
+                if let Some(span) = panel.dragging.take() {
+                    return self.set_span(id, Some(span));
+                }
+            }
+            P::Latest => return self.set_span(id, None),
+            P::Resize(y) => {
+                panel.height = y.max(backtest::MIN_HEIGHT);
+                self.relayout(false);
+            }
+            P::ToggleSettings => panel.settings_open = !panel.settings_open,
+            P::Input(field, text) => {
+                panel.set_input(field, text);
+                panel.error = None;
+            }
+            P::Submit(field) => {
+                let Some(text) = panel.input(field).map(str::to_owned) else {
+                    return Task::none();
+                };
+                let Some(tile) = self.tiles.get_mut(&id) else {
+                    return Task::none();
+                };
+                match tile.backtest.set(field, &text) {
+                    Ok(()) => {
+                        panel.inputs.retain(|(f, _)| *f != field);
+                        self.save();
+                        return self.run_backtest_keeping(id);
+                    }
+                    Err(error) => panel.error = Some(error),
+                }
+            }
+            P::Edit(edit) => {
+                if let Some(tile) = self.tiles.get_mut(&id) {
+                    tile.backtest.apply(edit);
+                    self.save();
+                    let fine = self.request_fine(id);
+                    self.sync_playhead();
+                    return Task::batch([self.run_backtest_keeping(id), fine]);
+                }
+            }
+        }
+        self.sync_playhead();
+        Task::none()
+    }
+
+    /// Loads tile `id`'s bars for `span` (as bar opens; `None` for the latest bars), starting
+    /// its playback over.
+    fn set_span(&mut self, id: TileId, span: Option<(UnixNanos, UnixNanos)>) -> Task<Message> {
+        let Some(market) = self.tiles.get(&id).map(|t| t.market.clone()) else {
+            return Task::none();
+        };
+        let span = span.map(|(from, to)| match market.bars {
+            BarSpec::Time(tf) => {
+                let from = tf.open_time(from);
+                (from, tf.open_time(to).max(tf.close_time(from)))
+            }
+            _ => (from, to.max(from + 1)),
+        });
+        self.set_market(id, Market { span, ..market })
     }
 
     /// Reruns tile `id`'s backtest after its bars changed, showing the last result until the
@@ -2273,13 +2767,29 @@ impl Persephone {
                 local: None,
                 symbol: DEFAULT_SYMBOL.into(),
                 bars: Timeframe::M1.into(),
+                span: None,
             },
             |tile| tile.market.clone(),
         )
     }
 
+    /// Where charts go: the window, below the backtest panel if it's open.
     fn window_rect(&self) -> Rect {
-        Rect::new(0.0, 0.0, self.window.width, self.window.height)
+        let top = self.panel_height();
+        Rect::new(
+            0.0,
+            top,
+            self.window.width,
+            (self.window.height - top).max(0.0),
+        )
+    }
+
+    /// How tall the backtest panel is; 0 while it's closed (or its chart is elsewhere).
+    fn panel_height(&self) -> f32 {
+        self.panel
+            .as_ref()
+            .filter(|p| self.tiles.contains_key(&p.tile))
+            .map_or(0.0, |p| p.height_in(self.window.height))
     }
 
     /// The area tiles are arranged in when there is more than one.
@@ -2370,6 +2880,57 @@ impl Persephone {
         Subscription::batch(subscriptions)
     }
 
+    /// What the backtest panel shows for `tile`.
+    fn panel_info<'a>(
+        &'a self,
+        panel: &'a backtest::Panel,
+        tile: &'a Tile,
+    ) -> backtest::PanelInfo<'a> {
+        let ready = match self.bars.get(&tile.market) {
+            Some(Bars::Ready(market)) => Some(market),
+            _ => None,
+        };
+        let status = match tile.strategy.as_ref().map(|s| &s.run) {
+            Some(Run::Done(report)) => backtest::Status::Done(report),
+            Some(Run::Running) => backtest::Status::Running,
+            Some(Run::Failed(message)) => backtest::Status::Failed(message),
+            Some(Run::Waiting) => backtest::Status::Waiting,
+            None => backtest::Status::Failed("Add a strategy to this chart to backtest it."),
+        };
+        let data = tile.chart.as_ref().map(ChartState::data);
+        let from_index = match (data, tile.market.span) {
+            (Some(data), Some((from, _))) => data.candles.partition_point(|c| c.ts < from),
+            _ => 0,
+        };
+        let traded = data.and_then(|data| {
+            let first = data.candles.get(from_index)?.ts;
+            let last = data.candles.last()?;
+            Some((first, data.bars.closes(std::slice::from_ref(last))[0]))
+        });
+        let strategy = tile
+            .strategy
+            .as_ref()
+            .map_or("no strategy", |s| s.spec.info.name.as_str());
+        backtest::PanelInfo {
+            panel,
+            settings: &tile.backtest,
+            title: format!("{} · {} · {strategy}", tile.market.symbol, tile.market.bars),
+            status,
+            quote: ready.map_or("", |m| m.instrument.quote.as_str()),
+            span: tile.market.span,
+            traded,
+            from_index,
+            shown: tile
+                .chart
+                .as_ref()
+                .and_then(|c| c.playhead())
+                .map(|p| p.bars),
+            bar_nanos: data.map_or(Timeframe::M1.nanos(), |d| d.typical_nanos),
+            fills: ready
+                .and_then(|market| fills_note(&tile.backtest, market, self.fine.get(&tile.market))),
+        }
+    }
+
     pub fn view(&self) -> Element<'_, Message> {
         let focused = self.layout.focused();
         let fullscreen = self.layout.is_fullscreen();
@@ -2381,6 +2942,32 @@ impl Persephone {
             .filter(|(id, _)| !fullscreen || **id == focused)
             .map(|(&id, tile)| self.tile_view(id, tile, framed, id == focused))
             .collect();
+
+        if let Some(panel) = &self.panel
+            && let Some(tile) = self.tiles.get(&panel.tile)
+        {
+            let height = self.panel_height();
+            layers.push(
+                pin(container(
+                    backtest::panel(self.panel_info(panel, tile)).map(Message::Backtest),
+                )
+                .width(self.window.width)
+                .height(height))
+                .into(),
+            );
+            if panel.settings_open {
+                let x = (self.window.width - backtest::SETTINGS_WIDTH - 10.0).max(0.0);
+                layers.push(
+                    pin(container(
+                        backtest::settings_sheet(panel, &tile.backtest).map(Message::Backtest),
+                    )
+                    .max_height((self.window.height - height - 14.0).max(120.0)))
+                    .x(x)
+                    .y(height + 4.0)
+                    .into(),
+                );
+            }
+        }
 
         // The popup goes above every tile, so neighbouring charts can't cover it.
         if let Some(popup) = &self.popup
@@ -2410,7 +2997,8 @@ impl Persephone {
                 sweep: self.sweep_rows(popup.tile()),
                 quote: ready.map_or("", |m| m.instrument.quote.as_str()),
                 base: ready.map_or("", |m| m.instrument.base.as_str()),
-                fills: ready.and_then(|m| m.fills.as_deref()),
+                fills: ready
+                    .and_then(|m| fills_note(&tile.backtest, m, self.fine.get(&tile.market))),
                 local_markets: &self.local_markets,
                 bars: tile.market.bars,
                 tick_kind: self.local_kind(&tile.market),
@@ -2488,12 +3076,14 @@ impl Persephone {
             .filter(|elapsed| *elapsed < FLASH)
             .map(|elapsed| 1.0 - elapsed.as_secs_f32() / FLASH.as_secs_f32());
 
-        let border = if framed || flash.is_some() {
+        // The chart the backtest panel drives is outlined like the focused one.
+        let driven = self.panel.as_ref().is_some_and(|p| p.tile == id);
+        let border = if framed || flash.is_some() || driven {
             BORDER
         } else {
             0.0
         };
-        let idle = if focused {
+        let idle = if focused || driven {
             theme::ACCENT
         } else {
             theme::AXIS_LINE
@@ -2504,7 +3094,13 @@ impl Persephone {
             Some(chart) => chart.view().map(move |message| Message::Chart(id, message)),
             None => placeholder(&tile.market, self.bars.get(&tile.market)),
         };
-        if let Some(strategy) = tile.strategy.as_ref().filter(|_| !tile.hidden.strategy) {
+        // During a playback the summary would give the ending away; the panel has the numbers.
+        let playing_back = tile.chart.as_ref().is_some_and(|c| c.playhead().is_some());
+        if let Some(strategy) = tile
+            .strategy
+            .as_ref()
+            .filter(|_| !tile.hidden.strategy && !playing_back)
+        {
             let compact = rect.width < 640.0;
             let summary = container(strategy_summary(id, strategy, tile.live.as_ref(), compact))
                 .align_right(Fill)
@@ -2800,13 +3396,20 @@ pub fn drawing_key(market: &Market) -> String {
 
 /// A saved tile's market, indicators and strategy.
 /// A saved tile, read back: its market, indicators, strategy, and what was hidden.
-type Restored = (Market, Vec<IndicatorSpec>, Option<StrategySpec>, Hidden);
+type Restored = (
+    Market,
+    Vec<IndicatorSpec>,
+    Option<StrategySpec>,
+    Hidden,
+    backtest::Settings,
+);
 
 fn restore_tile(t: &SavedTile) -> Restored {
     let market = Market {
         local: t.local.clone(),
         symbol: t.symbol.clone(),
         bars: t.timeframe.parse().unwrap_or(BarSpec::Time(Timeframe::M1)),
+        span: t.span.filter(|(from, to)| from < to),
     };
     let mut hidden = Hidden {
         drawings: t.drawings_hidden,
@@ -2826,7 +3429,8 @@ fn restore_tile(t: &SavedTile) -> Restored {
         hidden.strategy = s.hidden;
         plugins::saved_strategy(&s.kind, &s.params)
     });
-    (market, indicators, strategy, hidden)
+    let settings = t.backtest.clone().unwrap_or_default();
+    (market, indicators, strategy, hidden, settings)
 }
 
 fn saved_tiles(tiles: &BTreeMap<TileId, Tile>) -> Vec<SavedTile> {
@@ -2854,6 +3458,9 @@ fn saved_tiles(tiles: &BTreeMap<TileId, Tile>) -> Vec<SavedTile> {
             }),
             drawings_hidden: tile.hidden.drawings,
             volume_hidden: tile.hidden.volume,
+            span: tile.market.span,
+            backtest: (tile.backtest != backtest::Settings::default())
+                .then(|| tile.backtest.clone()),
         })
         .collect()
 }
@@ -2879,6 +3486,7 @@ fn market_from_args(args: &[String]) -> Market {
         local,
         symbol,
         bars,
+        span: None,
     }
 }
 
@@ -2888,6 +3496,101 @@ fn load(market: Market, store: Option<Store>) -> Task<Message> {
         on_thread(move || Ok(fetch(&job, store.as_ref()))),
         move |result| Message::Loaded(market.clone(), result.and_then(|r| r)),
     )
+}
+
+/// How a chart's backtests fill orders, when worth saying. High precision uses the market's
+/// ticks where it has them, else 1-minute bars (`fine`, when wanted); Standard fills at the
+/// bars.
+fn fills_note(
+    settings: &backtest::Settings,
+    market: &MarketData,
+    fine: Option<&FineBars>,
+) -> Option<String> {
+    match settings.precision {
+        backtest::Precision::High if market.ticks.is_some() => market.fills.clone(),
+        backtest::Precision::High => Some(match fine {
+            Some(FineBars::Ready(_)) => {
+                "Orders fill on 1-minute bars, and playback builds each bar from them.".into()
+            }
+            Some(FineBars::Loading) => "Loading 1-minute bars for High precision…".into(),
+            Some(FineBars::Failed(error)) => format!(
+                "No 1-minute bars ({error}). Orders fill at the bars, and playback follows a simulated path."
+            ),
+            None => "Nothing finer than these bars: orders fill at the bars, and playback follows a simulated path.".into(),
+        }),
+        backtest::Precision::Standard if market.ticks.is_some() => {
+            Some("Orders fill at the bars; High precision fills them on the ticks.".into())
+        }
+        backtest::Precision::Standard => market.fills.clone(),
+    }
+}
+
+/// The 1-minute bars of `[from, to)` for High precision: from the store, or from Binance.
+fn fine_bars(
+    market: &Market,
+    store: Option<&Store>,
+    from: UnixNanos,
+    to: UnixNanos,
+) -> anyhow::Result<Vec<Candle>> {
+    let minutes = to.saturating_sub(from) / Timeframe::M1.nanos();
+    anyhow::ensure!(
+        minutes <= MAX_FINE_BARS,
+        "High precision would need {minutes} 1-minute bars here, more than {MAX_FINE_BARS}; pick a shorter span"
+    );
+    match &market.local {
+        Some(venue) => {
+            let store = store.context("there's no local store on this system")?;
+            store
+                .market(venue, &market.symbol)?
+                .candles_between(Timeframe::M1.into(), from, to)
+        }
+        None => BinanceClient::new()?.klines(&market.symbol, Timeframe::M1, from, to),
+    }
+}
+
+/// A market's whole history, for the backtest panel: its first and last times, and weekly (or
+/// monthly) closes across it.
+fn history(
+    (local, symbol): &(Option<String>, String),
+    store: Option<&Store>,
+) -> anyhow::Result<backtest::History> {
+    match local {
+        Some(venue) => {
+            let store = store.context("there's no local store on this system")?;
+            let market = store.market(venue, symbol)?;
+            let (first, last) = market.span();
+            let timeframe = if market.info.kind.allows(Timeframe::W1) {
+                Timeframe::W1
+            } else {
+                Timeframe::MN1
+            };
+            let closes = market
+                .candles(timeframe, 2_000)?
+                .iter()
+                .map(|c| (c.ts, c.close))
+                .collect();
+            Ok(backtest::History {
+                first,
+                last,
+                closes,
+            })
+        }
+        None => {
+            let binance = BinanceClient::new()?;
+            let first = binance.first_bar_time(symbol, Timeframe::D1)?;
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
+            let closes = binance
+                .klines(symbol, Timeframe::W1, first, now)?
+                .iter()
+                .map(|c| (c.ts, c.close))
+                .collect();
+            Ok(backtest::History {
+                first,
+                last: now,
+                closes,
+            })
+        }
+    }
 }
 
 /// Deletes a local market's files on a worker thread.
@@ -2926,11 +3629,11 @@ async fn backtest_on_thread(request: BacktestRequest) -> Result<Arc<BacktestRepo
 fn fetch(market: &Market, store: Option<&Store>) -> Result<MarketData, String> {
     let result = match &market.local {
         Some(venue) => match store {
-            Some(store) => local::load(store, venue, &market.symbol, market.bars),
+            Some(store) => local::load(store, venue, &market.symbol, market.bars, market.span),
             None => Err(anyhow::anyhow!("there's no local store on this system")),
         },
         None => match market.bars.timeframe() {
-            Some(timeframe) => fetch_binance(&market.symbol, timeframe),
+            Some(timeframe) => fetch_binance(&market.symbol, timeframe, market.span),
             None => Err(anyhow::anyhow!(
                 "Binance serves time bars; tick and volume bars need a local market"
             )),
@@ -2939,10 +3642,25 @@ fn fetch(market: &Market, store: Option<&Store>) -> Result<MarketData, String> {
     result.map_err(|e| format!("{e:#}"))
 }
 
-fn fetch_binance(symbol: &str, timeframe: Timeframe) -> anyhow::Result<MarketData> {
+fn fetch_binance(
+    symbol: &str,
+    timeframe: Timeframe,
+    span: Option<(UnixNanos, UnixNanos)>,
+) -> anyhow::Result<MarketData> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
-    let end = timeframe.close_time(now); // include the forming bar
-    let start = end.saturating_sub(HISTORY_BARS * timeframe.nanos());
+    let latest = timeframe.close_time(now); // include the forming bar
+    let (start, end) = match span {
+        Some((from, to)) => {
+            let start = from.saturating_sub(backtest::WARM_UP_BARS * timeframe.nanos());
+            let end = to.min(latest);
+            persephone_data::binance::check_range(timeframe, start, end)?;
+            (start, end)
+        }
+        None => (
+            latest.saturating_sub(HISTORY_BARS * timeframe.nanos()),
+            latest,
+        ),
+    };
 
     let binance = BinanceClient::new()?;
     let instrument = binance.instrument(symbol)?;

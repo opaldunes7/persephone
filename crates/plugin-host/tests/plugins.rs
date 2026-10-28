@@ -14,7 +14,9 @@ use persephone_core::{
     signal::SignalFactory,
     strategy::{BuiltInStrategy, StrategyKind, StrategySpec},
 };
-use persephone_engine::{BacktestRequest, EngineError, FeeRates, run_backtest};
+use persephone_engine::{
+    BacktestRequest, EngineError, FeeRates, SimSettings, TradingRules, run_backtest,
+};
 use persephone_plugin_host::{Host, Plugin};
 
 /// Builds the plugins workspace (once) and returns the folder with the `.wasm` files.
@@ -210,6 +212,10 @@ fn request(strategy: StrategySpec, plugin: Option<Arc<dyn SignalFactory>>) -> Ba
         ticks: None,
         starting_balance: 100_000.0,
         fees: FeeRates::BINANCE_SPOT,
+        sim: SimSettings::default(),
+        rules: TradingRules::default(),
+        trade_from: 0,
+        fill_bars: None,
     }
 }
 

@@ -14,7 +14,9 @@ use persephone_core::{
     signal::{Signal, SignalFactory},
     strategy::{StrategyKind, StrategySpec},
 };
-use persephone_engine::{BacktestReport, BacktestRequest, EngineError, FeeRates, run_backtest};
+use persephone_engine::{
+    BacktestReport, BacktestRequest, EngineError, FeeRates, SimSettings, TradingRules, run_backtest,
+};
 use persephone_plugin_host::{Host, Plugins};
 use serde_json::{Value, json};
 
@@ -146,6 +148,10 @@ fn backtest(
         ticks: None,
         starting_balance: 100_000.0,
         fees: FeeRates::ZERO,
+        sim: SimSettings::default(),
+        rules: TradingRules::default(),
+        trade_from: 0,
+        fill_bars: None,
     })
 }
 

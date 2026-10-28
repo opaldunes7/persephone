@@ -51,7 +51,7 @@ use persephone_core::{
 use rust_decimal::Decimal;
 
 use crate::{
-    EngineError, FeeRates, convert,
+    EngineError, FeeRates, TradingRules, convert,
     report::RawFill,
     strategies::{SignalStrategy, Watcher, builtins},
 };
@@ -123,6 +123,8 @@ pub struct LiveRequest {
     pub balance: f64,
     /// The paper account's fees; real venues charge their own.
     pub fees: FeeRates,
+    /// Which way it may trade and when it may open positions, as in its backtests.
+    pub rules: TradingRules,
     /// Whether the node handles Ctrl-C itself (in a terminal). Apps stop it with
     /// [`LiveSession::stop`].
     pub owns_signals: bool,
@@ -371,6 +373,7 @@ async fn run(
         Rc::default(),
         Rc::default(),
     )
+    .ruled(request.rules.clone(), 0)
     .watched(
         Box::new(Reporter {
             events: Rc::clone(events),
