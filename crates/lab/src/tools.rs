@@ -671,7 +671,7 @@ pub fn tools() -> Vec<Tool> {
                 CURSOR,
                 LIMIT,
             ],
-            &["columns", "rows", "next_cursor"],
+            &["rows", "next_cursor"],
         ),
         tool(
             "compare_runs",

@@ -2625,6 +2625,254 @@ fn every_position_asked_for_is_taken_however_sizes_round() {
         })
         .collect();
     assert_eq!(sides, expected);
+    assert_eq!(run["summary"]["warnings"], json!([]), "{run}");
+}
+
+#[test]
+fn a_run_following_its_strategy_says_nothing_however_it_is_set_up() {
+    let (lab, _source) = binance_lab();
+    let at = |hour: u64| START + hour * HOUR;
+    let cycle = [1, -1, 0, -1, 0, 1, 0, -1, 1, 0];
+    let list: Vec<Value> = (0..120)
+        .map(|i| json!([at(30 + i * 11), cycle[i as usize % cycle.len()]]))
+        .collect();
+    let stop = json!({"logic": {
+        "name": "Trailing",
+        "long": {"crosses_above": [{"ema": {"length": 5}}, {"ema": {"length": 15}}]},
+        "short": {"crosses_below": [{"ema": {"length": 5}}, {"ema": {"length": 15}}]},
+        "flat": {"lt": ["close", {"mul": ["high_since_entry", 0.99]}]},
+    }});
+    let costs = json!({
+        "commission": {"on": true, "value": {"percent": 0.1}},
+        "slippage_percent": {"on": true, "value": 0.05},
+    });
+    let settings = [
+        json!({}),
+        costs.clone(),
+        json!({"latency": {"on": true, "value": 100}}),
+        json!({"compound": true, "commission": costs["commission"], "slippage_percent": costs["slippage_percent"]}),
+        json!({"direction": {"on": true, "value": "long-only"}}),
+        json!({"direction": {"on": true, "value": "short-only"}}),
+        json!({"invert": true}),
+        json!({"leverage": {"on": true, "value": 2}}),
+        json!({"session": {"on": true, "value": {
+            "days": [true, true, true, true, true, false, false],
+            "from": 570, "to": 960, "zone": "UTC", "close_after": true,
+        }}}),
+        json!({"session": {"on": true, "value": {
+            "days": [true, true, true, true, true, true, true],
+            "from": 60, "to": 600, "zone": "UTC", "close_after": false,
+        }}}),
+    ];
+    for strategy in [
+        json!({"positions": list}),
+        stop,
+        json!({"builtin": "ema-cross"}),
+        json!({"builtin": "rsi-reversion"}),
+    ] {
+        for settings in &settings {
+            let run = lab
+                .dispatch(
+                    "run_backtest",
+                    &json!({
+                        "symbol": "BTCUSDT", "bars": "1h", "from": at(0), "wait_seconds": 120,
+                        "strategy": strategy, "settings": settings,
+                    }),
+                )
+                .unwrap();
+            let warnings = run["summary"]["warnings"].as_array().unwrap();
+            assert!(
+                !warnings.iter().any(|w| {
+                    let text = w.as_str().unwrap();
+                    text.contains("wasn't what") || text.contains("rounds to nothing")
+                }),
+                "{settings}: {warnings:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_position_too_small_to_order_says_so() {
+    // Whole units here, so 1,000 is 10 at 100, the size checked at the start from the last close, but
+    // rounds to nothing at 100,000 partway through.
+    let closes: Vec<f64> = (0..120)
+        .map(|hour| {
+            if (50..70).contains(&hour) {
+                100_000.0
+            } else {
+                100.0
+            }
+        })
+        .collect();
+    let (lab, times) = market_of(&closes);
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({
+                "strategy": {
+                    "positions": [[times[10], 1], [times[20], 0], [times[60], 1], [times[65], 0]],
+                    "params": {"Size %": 1},
+                },
+            })),
+        )
+        .unwrap();
+    assert_eq!(run["summary"]["fills"], 2, "{run}");
+    let warnings = run["summary"]["warnings"].to_string();
+    assert!(warnings.contains("On 5 bars"), "{warnings}");
+    assert!(warnings.contains("rounds to nothing"), "{warnings}");
+    assert!(!warnings.contains("wasn't what"), "{warnings}");
+}
+
+#[test]
+fn with_latency_every_change_goes_out_a_bar_late_and_the_position_stays_right() {
+    let closes: Vec<f64> = (0..120).map(|hour| 100.0 + f64::from(hour % 7)).collect();
+    let (lab, times) = market_of(&closes);
+    let run_with = |list: &[(usize, i64)], settings: Value| {
+        let list: Vec<Value> = list
+            .iter()
+            .map(|(hour, want)| json!([times[*hour], want]))
+            .collect();
+        lab.dispatch(
+            "run_backtest",
+            &on_hand_market(json!({"strategy": {"positions": list}, "settings": settings})),
+        )
+        .unwrap()
+    };
+    let latency = json!({"latency": {"on": true, "value": 100}});
+    let cycle = [1, -1, 0, -1, 0, 1, 0, -1, 1, 0];
+    // A change on every bar, with flips, entries and exits.
+    let list: Vec<(usize, i64)> = (0..40).map(|i| (10 + i, cycle[i % cycle.len()])).collect();
+
+    let fills_of = |run: &Value| {
+        let fills = lab
+            .dispatch(
+                "get_fills",
+                &json!({"run_id": run["run_id"], "limit": 1000}),
+            )
+            .unwrap();
+        fills["rows"].as_array().unwrap().clone()
+    };
+    let prompt = run_with(&list, json!({}));
+    let late = run_with(&list, latency.clone());
+    assert_eq!(late["summary"]["warnings"], json!([]), "{late}");
+    let (prompt, late) = (fills_of(&prompt), fills_of(&late));
+    assert_eq!(prompt.len(), 40);
+    assert_eq!(late.len(), 40, "{late:?}");
+    let mut position = 0.0;
+    for ((early, late), (_, want)) in prompt.iter().zip(&late).zip(&list) {
+        assert_eq!(late[0].as_u64().unwrap(), early[0].as_u64().unwrap() + HOUR);
+        assert_eq!(late[2], early[2], "same side");
+        assert_eq!(late[4], early[4], "same size");
+        // Never doubled: after each it's what was asked for.
+        let size = late[4].as_f64().unwrap();
+        position += if late[2] == "buy" { size } else { -size };
+        assert_eq!(position.signum() as i64 * i64::from(position != 0.0), *want);
+    }
+
+    // With nothing to spare: each fill is paid for by the one before it, not filled yet.
+    let all_in = {
+        let list: Vec<Value> = list
+            .iter()
+            .map(|(hour, want)| json!([times[*hour], want]))
+            .collect();
+        lab.dispatch(
+            "run_backtest",
+            &on_hand_market(json!({
+                "strategy": {"positions": list, "params": {"Size %": 100}},
+                "settings": latency,
+            })),
+        )
+        .unwrap()
+    };
+    assert_eq!(all_in["summary"]["fills"], 40, "{all_in}");
+    assert_eq!(all_in["summary"]["warnings"], json!([]), "{all_in}");
+}
+
+#[test]
+fn a_list_can_run_past_the_span_and_returns_leave_out_warm_up() {
+    let (lab, _source) = binance_lab();
+    let at = |hour: u64| START + hour * HOUR;
+    let from = at(1_000);
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &json!({
+                "symbol": "BTCUSDT", "bars": "1h", "from": from, "to": at(1_200), "wait_seconds": 120,
+                // Before all the bars loaded, inside the span, and after it.
+                "strategy": {"positions": [[at(0), 1], [at(1_100), 0], [at(2_000), 1]]},
+            }),
+        )
+        .unwrap();
+    // Taken up at the first bar, closed once, and nothing from what's after.
+    assert_eq!(run["summary"]["fills"], 2, "{run}");
+    let returns = lab
+        .dispatch(
+            "get_returns",
+            &json!({"run_id": run["run_id"], "limit": 1000}),
+        )
+        .unwrap();
+    let rows = returns["rows"].as_array().unwrap();
+    assert!(!rows.is_empty(), "{returns}");
+    assert!(
+        rows.iter().all(|row| row[0].as_u64().unwrap() >= from),
+        "{returns}"
+    );
+}
+
+#[test]
+fn a_look_back_longer_than_the_warm_up_says_so_even_when_it_trades() {
+    let (lab, _source) = binance_lab();
+    let at = |hour: u64| START + hour * HOUR;
+    let run_with = |long: Value| {
+        lab.dispatch(
+            "run_backtest",
+            &json!({
+                "symbol": "BTCUSDT", "bars": "1h", "from": at(0), "to": at(1_000), "wait_seconds": 120,
+                "strategy": {"logic": {"name": "Either", "long": long, "flat": {"ge": ["bars_held", 3]}}},
+            }),
+        )
+        .unwrap()
+    };
+    let short = json!({"crosses_above": [{"ema": {"length": 5}}, {"ema": {"length": 15}}]});
+    let run = run_with(json!({"or": [
+        short.clone(),
+        {"gt": ["close", {"sma": {"length": 800}}]},
+    ]}));
+    assert!(run["summary"]["fills"].as_u64().unwrap() > 0, "{run}");
+    let warnings = run["summary"]["warnings"].to_string();
+    assert!(warnings.contains("about 800 bars"), "{warnings}");
+
+    // One the warm-up covers says nothing.
+    let run = run_with(short);
+    assert_eq!(run["summary"]["warnings"], json!([]), "{run}");
+}
+
+#[test]
+fn the_batch_table_has_each_runs_years() {
+    let (lab, _source) = binance_lab();
+    let at = |hour: u64| START + hour * HOUR;
+    let batch = lab
+        .dispatch(
+            "run_backtests",
+            &json!({
+                "defaults": {"symbol": "BTCUSDT", "bars": "1h", "from": at(0)},
+                "wait_seconds": 120,
+                "runs": [{"strategy": {"builtin": "ema-cross"}}],
+            }),
+        )
+        .unwrap();
+    let columns = batch["columns"].as_array().unwrap();
+    let column = columns.iter().position(|c| c == "by_year").unwrap();
+    let row = &batch["rows"][0];
+    let run = lab
+        .dispatch("get_report", &json!({"run_id": row[1]}))
+        .unwrap();
+    assert_eq!(row[column], run["summary"]["by_year"], "{batch}");
+    assert!(
+        row[column].as_object().is_some_and(|y| !y.is_empty()),
+        "{batch}"
+    );
 }
 
 #[test]

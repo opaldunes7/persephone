@@ -42,6 +42,7 @@ How a backtest works, which decides what its numbers mean.
   a list of `positions`, which holds whatever you put in it.
 - **Fills:** a market order, at that bar's close, plus any slippage and spread. With `latency`, it arrives after
   that close, so on bars it fills at the next bar's close, which is a whole bar's delay however small the latency.
+  Every change still goes out, each from where the order before it will leave things.
   With `precision: "high"`, it fills on what's next inside the bars instead: ticks, or 1-minute bars. So `high` only
   changes results alongside `latency`, or on ticks, and otherwise just takes longer.
 - **A strategy says what position it wants:** long, short or flat. One position at a time, in one
@@ -65,6 +66,8 @@ How a backtest works, which decides what its numbers mean.
 - No margin calls or financing costs, and any size fills in full, while the account can pay. If it can't, as with
   `Size %` near 100 or high leverage, the order's refused, the position stays as it was, and the summary's `warnings`
   says so. Such a result doesn't follow the strategy: don't trust it.
+- Every bar, the position is checked against what the strategy asked for. A mismatch adds to `warnings`: one with no
+  order refused is a fault in the backtest, and one where the position rounds to nothing means raising the capital or size.
 - Unless `compound` is set, a strategy trading in and out falls behind `buy_and_hold_return` as profits build. To
   compare fairly, use `Size %` 100 and `compound`.
 - One market at a time: there are no portfolios or limit orders.
@@ -126,9 +129,23 @@ UTC, at the bar's close. So exits work like this:
 }}
 ```
 
-An exit beats an entry to what's already held, so a stop always works. Once out, an entry that's still true goes back
-in on the next bar, so write one that fires once, like a cross, or also require `{"lt": ["position", 1]}` and your own
-condition for being ready again. `highest`, `lowest`, `zscore` (population deviation) and `high_since_entry` include
+A trailing stop follows the furthest it's gone since entry:
+
+```json
+{"tool": "run_backtest", "args": {
+  "symbol": "BTCUSDT", "bars": "1h", "from": "2024-01-01", "to": "2024-03-01",
+  "strategy": {"logic": {
+    "name": "Cross, with a 5% trailing stop",
+    "params": {"trail": 0.95},
+    "long": {"crosses_above": [{"ema": {"length": 10}}, {"ema": {"length": 30}}]},
+    "flat": {"lt": ["close", {"mul": ["high_since_entry", "$trail"]}]}
+  }}
+}}
+```
+
+An exit beats an entry to what's already held, so a stop always works, with no need to guard the entry. A guard only
+matters for going back in: once out, an entry that's still true goes back in on the next bar, so write one that fires
+once, like a cross, or also require `{"lt": ["position", 1]}` and your own condition for being ready again. `highest`, `lowest`, `zscore` (population deviation) and `high_since_entry` include
 the current bar; `high_since_entry` starts from the entry price, then each later bar's high.
 
 ## settings
@@ -211,6 +228,18 @@ value, and `ends_with_open_trade` says if there is one. `Max Loser` is the large
 `closed_positions_pnl`, `returns` and `general` come from Nautilus under its own names, and `closed_positions_pnl`
 leaves out an open trade, so a run holding to the end shows only its entry fee there.
 
+**What a time means, by tool.** Getting this wrong by one bar invalidates a model's test:
+
+| Where | It's when |
+|---|---|
+| `ts` in `get_bars`, `export_data`, `positions` and `get_equity` | The bar opens. `get_equity`'s value is at that bar's close |
+| `ts` in `get_fills`, and `opened` and `closed` in `get_trades` | The bar it filled at closes, so a list's entry fills one bar's length after its `ts` |
+| `ts` sent to a program over a socket, and `hour` and `weekday` | The bar closes |
+| `bar`, `entry_bar` and `exit_bar` | Not a time: numbers counting warm-up bars |
+
+A random block's `to` is its last bar, which is included. To replay one with `run_backtest`, whose `to` isn't
+included, give a `to` one bar later.
+
 ## data
 
 Which bars a call uses, their limits, and what's cached.
@@ -229,7 +258,8 @@ Which bars a call uses, their limits, and what's cached.
   `export_data` has no such limit.
 - **Caching:** Binance bars are kept on disk, so a span costs a download once. A first call on a long span
   can take a while; later ones take milliseconds. Don't avoid repeating a span to save time.
-- **For training models elsewhere,** `export_data` writes CSV or Parquet.
+- **For training models elsewhere,** `export_data` writes CSV or Parquet. Then test the predictions as a list of
+  positions: see "Using a model you trained" in the `extending` topic.
 
 ## tests
 
@@ -350,14 +380,19 @@ A sensible order for testing an idea, cheapest first. Nothing here is required.
    too (set `commission` to 0), stop: cheaper fills won't save it.
 2. **Compare fairly:** `Size %` 100 and `compound` against `buy_and_hold_return`, and look at `by_year`, as one good year
    often explains everything.
+   To test a model trained elsewhere, see "Using a model you trained" in the `extending` topic.
 3. **Vary it:** `run_backtests` across parameters, symbols and costs, with a `label`. A real effect survives nearby values.
 4. **Against chance:** `run_random_entries` on the best, remembering how many you tried.
 5. **On unseen data:** `run_walk_forward`, or `run_optimize` with `hold_out`, each with the market's return beside it.
 6. **Throughout the market:** `run_random_blocks`, and `run_monte_carlo` for the range of luck in its trades.
 7. **Show someone:** `save_result`.
 
-The built-in strategies differ more than their names say: `rsi-reversion` holds whichever side it last faded, so it's
-nearly always in the market. `describe_strategy` gives their parameters, and `exposure` shows what they really do.
+The built-in strategies differ more than their names say. None ever goes flat by itself: once in, each holds a side until
+the opposite signal, so `exposure` is near 1.
+
+- `ema-cross`: long when the fast EMA crosses above the slow one, short when it crosses below.
+- `rsi-reversion`: long when RSI climbs back above oversold, short when it drops back below overbought.
+- `donchian-breakout`: long on a close above the previous `Length` bars' highest high, short below their lowest low.
 
 ## paging
 
@@ -397,8 +432,9 @@ is taken up on the first bar that can trade.
 1. **A list of positions,** written out or as a JSON file's path, as `"positions": "/path/list.json"`, which spares you
    writing long lists into calls. Export bars with `export_data`, make predictions, and backtest them as
    `{"positions": [[ts, 1], [ts, -1], [ts, 0]]}`. Each `ts` is a bar's, from `get_bars` or the export: when it opens.
-   It fills at that bar's close and holds until the next entry, so a span or random block starting later takes up
-   what's wanted by then. It runs in parallel, but nothing checks the list only used what was known by then:
+   It fills at that bar's close and holds until the next entry. A list can run past the span at either end: a span or
+   random block starting later takes up what's wanted by then, and later entries are left out. Inside the span, a time
+   that isn't a bar's is an error. It runs in parallel, but nothing checks the list only used what was known by then:
    train and predict on separate stretches. It can't go in `save_result`, as it only fits the bars it was made for.
 2. **A program over a socket,** for a full Python stack. It's told one bar at a time, so it can't see ahead, but
    backtests run one at a time. Listen on a local socket, with a thread per connection, answering one JSON line per

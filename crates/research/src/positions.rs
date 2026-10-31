@@ -85,10 +85,19 @@ impl Positions {
     ///
     /// Returns a message naming a time that isn't a bar's.
     pub fn at_closes(&self, opens: &[UnixNanos], closes: &[UnixNanos]) -> Result<Self, String> {
+        let (Some(&first), Some(&last)) = (opens.first(), opens.last()) else {
+            return Err("positions: there are no bars to place them on".into());
+        };
+        // A list can be made for more than this span: what's after it doesn't matter, and what's
+        // before it is taken up by its first bar.
         let list = self
             .list
             .iter()
+            .filter(|(ts, _)| *ts <= last)
             .map(|&(ts, position)| {
+                if ts < first {
+                    return Ok((closes[0], position));
+                }
                 let found = opens.binary_search(&ts).map_err(|_| {
                     format!(
                         "positions: no bar opens at {ts}; use the `ts` of a bar from get_bars, here from {} to {}",
@@ -248,6 +257,12 @@ mod tests {
         assert_eq!(*moved.list, vec![(199, 1), (299, 0)]);
         let error = list.at_closes(&[100, 300], &[299, 499]).unwrap_err();
         assert!(error.contains("no bar opens at 200"), "{error}");
+
+        // Past either end of the bars, it's kept to what these bars need.
+        let long =
+            Positions::parse(&json!([[10, 1], [50, -1], [100, 0], [200, 1], [900, -1]])).unwrap();
+        let moved = long.at_closes(&[100, 200], &[199, 299]).unwrap();
+        assert_eq!(*moved.list, vec![(199, 1), (199, -1), (199, 0), (299, 1)]);
     }
 
     #[test]

@@ -7,8 +7,9 @@ use nautilus_model::{
     data::{Bar, BarType},
     enums::OrderSide,
     events::{OrderDenied, OrderFilled, OrderRejected},
-    identifiers::StrategyId,
+    identifiers::{ClientOrderId, StrategyId},
     instruments::Instrument,
+    orders::Order as _,
     types::Quantity,
 };
 use nautilus_trading::{
@@ -43,11 +44,10 @@ pub(crate) struct SignalStrategy {
     position: f64,
     /// What the position now held was entered at.
     entry_price: f64,
-    /// How much of the order sent is still to fill. With latency an order can still be on its way
-    /// at the next bar, and asking again then would double the position.
-    unfilled: f64,
-    /// What was asked for while an order was on its way, to do once it's filled.
-    deferred: Option<i8>,
+    /// Orders sent and not filled yet, with how much of each is to come, signed. With latency one
+    /// can still be on its way at the next bar, so the next is worked out from where it will leave
+    /// things: from what's held alone, it would double the position.
+    in_flight: Vec<(ClientOrderId, f64)>,
     /// What the account started with, when positions are sized from what it holds now.
     compound_from: Option<f64>,
     /// Cash, kept from fills, starting from nothing: the account is this plus what it started with
@@ -55,6 +55,13 @@ pub(crate) struct SignalStrategy {
     cash: f64,
     /// Orders refused, and why the first was, for the report.
     refused: Rc<RefCell<(usize, Option<String>)>>,
+    /// The position last asked for, after the trading rules, and how big its order was.
+    asked: i8,
+    asked_size: f64,
+    /// The last order was refused, which is reported already and explains not holding what's asked.
+    last_refused: bool,
+    /// Where what's held didn't match what was asked for, for the report.
+    missed: Rc<RefCell<Missed>>,
     /// Shared with the engine thread that runs this strategy; collected after the run.
     fills: Rc<RefCell<Vec<RawFill>>>,
     /// Set when the signal fails; the strategy stops trading and the run reports it.
@@ -84,11 +91,14 @@ impl SignalStrategy {
             size_precision,
             position: 0.0,
             entry_price: f64::NAN,
-            unfilled: 0.0,
-            deferred: None,
+            in_flight: Vec::new(),
             compound_from: None,
             cash: 0.0,
             refused: Rc::default(),
+            asked: 0,
+            asked_size: 0.0,
+            last_refused: false,
+            missed: Rc::default(),
             fills,
             failure,
             long_only: false,
@@ -112,6 +122,12 @@ impl SignalStrategy {
     /// Sizes positions from the account as it is now, it having started with `balance`.
     pub(crate) const fn compounding(mut self, balance: Option<f64>) -> Self {
         self.compound_from = balance;
+        self
+    }
+
+    /// Keeps count of bars that didn't get what the strategy asked for in `missed`.
+    pub(crate) fn counting_misses(mut self, missed: Rc<RefCell<Missed>>) -> Self {
+        self.missed = missed;
         self
     }
 
@@ -143,8 +159,9 @@ impl SignalStrategy {
     }
 
     /// An order won't fill: says so, and lets the next go.
-    fn refuse(&mut self, message: String) {
-        self.unfilled = 0.0;
+    fn refuse(&mut self, order: ClientOrderId, message: String) {
+        self.in_flight.retain(|(id, _)| *id != order);
+        self.last_refused = true;
         let mut refused = self.refused.borrow_mut();
         refused.0 += 1;
         refused.1.get_or_insert_with(|| message.clone());
@@ -160,21 +177,68 @@ impl SignalStrategy {
 
     /// Which way the position is: `1`, `-1` or `0`.
     fn held(&self) -> i8 {
-        if self.position > 0.0 {
-            1
-        } else if self.position < 0.0 {
-            -1
-        } else {
-            0
-        }
+        sign_of(self.position)
     }
 
-    fn holds(&self, target: i8) -> bool {
-        match target {
-            1 => self.position > 0.0,
-            -1 => self.position < 0.0,
-            _ => self.position == 0.0,
+    /// `value` in the market's own steps: floating-point sums of sizes don't always come back to
+    /// exactly zero, and a dust of a short would read as being short.
+    fn in_steps(&self, value: f64) -> f64 {
+        let steps = 10_f64.powi(i32::from(self.size_precision));
+        (value * steps).round() / steps
+    }
+
+    /// The position once everything on its way has filled.
+    fn expected(&self) -> f64 {
+        let coming: f64 = self.in_flight.iter().map(|(_, left)| left).sum();
+        self.in_steps(self.position + coming)
+    }
+}
+
+/// Where a run didn't do what its strategy asked, with nothing else having said so.
+#[derive(Debug, Default)]
+pub(crate) struct Missed {
+    /// Bars where what's held wasn't what was asked for, and the first of them.
+    pub(crate) unmet: usize,
+    pub(crate) first_unmet: UnixNanos,
+    /// Bars where the position asked for rounded to nothing, and the first of them.
+    pub(crate) too_small: usize,
+    pub(crate) first_too_small: UnixNanos,
+}
+
+impl Missed {
+    fn unmet(&mut self, ts: UnixNanos) {
+        if self.unmet == 0 {
+            self.first_unmet = ts;
         }
+        self.unmet += 1;
+    }
+
+    fn too_small(&mut self, ts: UnixNanos) {
+        if self.too_small == 0 {
+            self.first_too_small = ts;
+        }
+        self.too_small += 1;
+    }
+}
+
+fn sign_of(position: f64) -> i8 {
+    if position > 0.0 {
+        1
+    } else if position < 0.0 {
+        -1
+    } else {
+        0
+    }
+}
+
+/// Whether `position` is what was asked for: flat to within the market's steps, or on that side and
+/// at least half the size of the order sent. Rounding leaves it close, so anything further off isn't
+/// rounding.
+fn meets(asked: i8, asked_size: f64, position: f64, size_precision: u8) -> bool {
+    if asked == 0 {
+        position.abs() < 0.5 / 10_f64.powi(i32::from(size_precision))
+    } else {
+        position * f64::from(asked) >= asked_size / 2.0
     }
 }
 
@@ -196,12 +260,18 @@ nautilus_strategy!(SignalStrategy, {
             _ => Side::Buy,
         };
         let before = self.position;
-        // To the market's own steps: floating-point sums of sizes don't always come back to exactly
-        // zero, and a dust of a short would read as being short, so the next short wouldn't go out.
-        let steps = 10_f64.powi(i32::from(self.size_precision));
-        let moved = self.position + if side == Side::Buy { qty } else { -qty };
-        self.position = (moved * steps).round() / steps;
-        self.unfilled = (self.unfilled - qty).max(0.0);
+        let signed = if side == Side::Buy { qty } else { -qty };
+        self.position = self.in_steps(self.position + signed);
+        if let Some(at) = self
+            .in_flight
+            .iter()
+            .position(|(id, _)| *id == event.client_order_id)
+        {
+            self.in_flight[at].1 -= signed;
+            if self.in_steps(self.in_flight[at].1) == 0.0 {
+                self.in_flight.remove(at);
+            }
+        }
         let value = qty * event.last_px.as_f64();
         self.cash += if side == Side::Buy { -value } else { value };
         self.cash -= event.commission.map_or(0.0, |fee| fee.as_f64());
@@ -224,11 +294,17 @@ nautilus_strategy!(SignalStrategy, {
     }
 
     fn on_order_rejected(&mut self, event: OrderRejected) {
-        self.refuse(format!("order rejected: {}", event.reason));
+        self.refuse(
+            event.client_order_id,
+            format!("order rejected: {}", event.reason),
+        );
     }
 
     fn on_order_denied(&mut self, event: OrderDenied) {
-        self.refuse(format!("order denied: {}", event.reason));
+        self.refuse(
+            event.client_order_id,
+            format!("order denied: {}", event.reason),
+        );
     }
 });
 
@@ -292,21 +368,34 @@ impl DataActor for SignalStrategy {
         if candle.ts <= self.trade_from {
             return Ok(());
         }
-        let target = self.rules.target(wanted, self.held(), candle.ts);
-        let Some(target) = target.or(self.deferred.take()) else {
+        // A check on everything below, so it mustn't lean on any of it: what's asked for by now
+        // should be held, unless an order is still on its way or was refused.
+        if self.in_flight.is_empty()
+            && !self.last_refused
+            && !meets(
+                self.asked,
+                self.asked_size,
+                self.position,
+                self.size_precision,
+            )
+        {
+            self.missed.borrow_mut().unmet(candle.ts);
+        }
+        let expected = self.expected();
+        let Some(target) = self.rules.target(wanted, sign_of(expected), candle.ts) else {
             return Ok(());
         };
-        if self.unfilled > 0.0 {
-            self.deferred = Some(target);
-            return Ok(());
-        }
         let target = if self.long_only {
             target.max(0)
         } else {
             target
         };
         // Stopping a live session closes the position; nothing new meanwhile.
-        if self.holds(target) || candle.close <= 0.0 || self.is_exiting() {
+        if candle.close <= 0.0 || self.is_exiting() {
+            return Ok(());
+        }
+        if sign_of(expected) == target {
+            self.asked = target;
             return Ok(());
         }
 
@@ -315,12 +404,17 @@ impl DataActor for SignalStrategy {
             self.size_precision,
         )
         .as_f64();
-        let delta = f64::from(target) * size - self.position;
+        let delta = f64::from(target) * size - expected;
         let qty = Quantity::new(delta.abs(), self.size_precision);
         if qty.is_zero() {
+            if size == 0.0 {
+                self.missed.borrow_mut().too_small(candle.ts);
+            }
             return Ok(());
         }
-        self.unfilled = qty.as_f64();
+        self.asked = target;
+        self.asked_size = size;
+        self.last_refused = false;
         let side = if delta > 0.0 {
             OrderSide::Buy
         } else {
@@ -339,6 +433,30 @@ impl DataActor for SignalStrategy {
             None, // tags
             None, // client_order_id
         );
+        // Before it goes, as a refusal can come back straight away.
+        self.in_flight
+            .push((order.client_order_id(), delta.signum() * qty.as_f64()));
         self.submit_order(order, None, None, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn holding_what_was_asked_for_means_the_size_and_not_just_the_sign() {
+        assert!(meets(0, 1.0, 0.0, 5));
+        assert!(meets(1, 1.0, 1.0, 5));
+        assert!(meets(-1, 1.0, -1.0, 5));
+        // Compounding and rounding leave it near, which is fine.
+        assert!(meets(1, 1.0, 0.99, 5));
+        // A dust of a short is on the right side, but isn't a short: this once lost 30% of orders.
+        assert!(!meets(-1, 1.0, -4.44e-16, 5));
+        assert!(!meets(1, 1.0, -1.0, 5));
+        assert!(!meets(1, 1.0, 0.0, 5));
+        assert!(!meets(0, 1.0, 1.0, 5));
+        assert!(!meets(0, 1.0, 0.01, 2));
+        assert!(meets(0, 1.0, 0.001, 2), "under half a step counts as flat");
     }
 }

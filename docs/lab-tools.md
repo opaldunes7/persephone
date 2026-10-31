@@ -359,7 +359,7 @@ Saved runs, newest first unless sorted. Searching reads every summary, so it tak
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `columns`, `rows`, `next_cursor`
+Returns: `rows`, `next_cursor`
 
 ## `compare_runs`
 

@@ -41,7 +41,7 @@ use persephone_core::{
     signal::{Note, Signal, SignalFactory},
     strategy::{StrategyKind, StrategySpec},
     tick::{TickFeed, Ticks},
-    time::NANOS_PER_DAY,
+    time::{DateTime, NANOS_PER_DAY},
 };
 use rust_decimal::Decimal;
 
@@ -50,7 +50,7 @@ pub use settings::{Direction, Session, SimSettings, TradingRules};
 
 use crate::{
     models::CostFillModel,
-    strategies::{SignalStrategy, builtins},
+    strategies::{SignalStrategy, builtins, signal::Missed},
 };
 
 /// Everything needed to run one backtest.
@@ -180,6 +180,7 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
     let fills = Rc::new(RefCell::new(Vec::new()));
     let failure = Rc::new(RefCell::new(None));
     let refused = Rc::new(RefCell::new((0, None)));
+    let missed = Rc::new(RefCell::new(Missed::default()));
     let signal = Rc::new(RefCell::new(signal));
     engine.add_strategy(
         SignalStrategy::new(
@@ -192,6 +193,7 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
         )
         .ruled(request.rules.clone(), request.trade_from)
         .counting_refusals(Rc::clone(&refused))
+        .counting_misses(Rc::clone(&missed))
         .compounding(request.sim.compound.then_some(request.starting_balance)),
     )?;
 
@@ -237,6 +239,32 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
             warning: true,
         });
     }
+    let missed = missed.borrow();
+    let at = |ts| {
+        let at = DateTime::from_nanos(ts);
+        format!("{} {}", at.date(), at.time())
+    };
+    if missed.unmet > 0 {
+        report.notes.push(Note {
+            text: format!(
+                "On {} bars the position held wasn't what the strategy had asked for, first at {}, with no order refused. This is a fault in the backtest: don't trust these results, and please report it.",
+                missed.unmet,
+                at(missed.first_unmet),
+            ),
+            warning: true,
+        });
+    }
+    if missed.too_small > 0 {
+        report.notes.push(Note {
+            text: format!(
+                "On {} bars no order went out because the position rounds to nothing at this market's size steps, first at {}. The account may have run out; if it hasn't, raise the capital or size.",
+                missed.too_small,
+                at(missed.first_too_small),
+            ),
+            warning: true,
+        });
+    }
+    drop(missed);
     Ok(report)
 }
 

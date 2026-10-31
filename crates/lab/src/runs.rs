@@ -50,7 +50,7 @@ const LISTED_RUNS: usize = 20;
 const LISTED_VALUES: usize = 50;
 /// The most backtests `run_backtests` takes in one call.
 const MAX_BACKTESTS: usize = 5_000;
-const BATCH_COLUMNS: [&str; 17] = [
+const BATCH_COLUMNS: [&str; 18] = [
     "index",
     "run_id",
     "label",
@@ -66,6 +66,7 @@ const BATCH_COLUMNS: [&str; 17] = [
     "profit_factor",
     "exposure",
     "average_trade",
+    "by_year",
     "warnings",
     "error",
 ];
@@ -245,6 +246,36 @@ fn warnings_of(report: &BacktestReport) -> Vec<String> {
         ));
     }
     warnings
+}
+
+/// A page whose rows are objects, so has no columns to name.
+fn named_rows(mut page: Value) -> Value {
+    if let Some(page) = page.as_object_mut() {
+        page.remove("columns");
+    }
+    page
+}
+
+/// How many bars a logic tree needs before all its rules are ready. Nothing else says.
+fn look_back_of(args: &Value, params: &[f64]) -> usize {
+    args["strategy"]
+        .get("logic")
+        .map_or(0, |_| match StrategyRef::parse(&args["strategy"]) {
+            Ok(StrategyRef::Logic(logic)) => logic.look_back(params),
+            _ => 0,
+        })
+}
+
+/// Said when a tree's rules can't be true for at least 5% of the span, which trades or not is easy
+/// to miss, as a rule that isn't ready is just false. Less is usual and not worth saying every run.
+fn look_back_warning(look_back: usize, before: usize, bars: usize) -> Option<String> {
+    let unready = look_back.saturating_sub(before);
+    let span = bars.saturating_sub(before);
+    (unready > 0 && unready * 20 >= span).then(|| {
+        format!(
+            "A look-back here needs about {look_back} bars, with {before} before the span, so rules on it can't be true for about its first {unready} bars of {span}."
+        )
+    })
 }
 
 /// What each UTC year added, as a fraction of the starting capital, so they add up to `net_return`.
@@ -582,8 +613,14 @@ impl Lab {
         let (request, from_index, name) = self.prepare(args)?;
         let times: Vec<u64> = request.candles.iter().map(|c| c.ts).collect();
         let bars: Vec<(u64, f64)> = request.candles.iter().map(|c| (c.ts, c.close)).collect();
+        let look_back = look_back_of(args, request.strategy.own_params());
         let report = backtest(request)?;
         let mut summary = summary_of(&report, from_index, &name, &bars);
+        if let Some(warning) = look_back_warning(look_back, from_index, times.len())
+            && let Some(warnings) = summary["warnings"].as_array_mut()
+        {
+            warnings.push(json!(warning));
+        }
         if let Some(label) = args.get("label") {
             summary["label"] = label.clone();
         }
@@ -714,6 +751,7 @@ impl Lab {
             "actual_fell": fell,
             "share_matching_return": returns.iter().filter(|r| **r >= actual).count() as f64 / count,
             "share_matching_fall": falls.iter().filter(|f| **f <= fell).count() as f64 / count,
+            "warning": (holds.len() < 2).then_some("With one trade there's little to place at random, so this says almost nothing."),
             "median": percentile(&returns, 0.5),
             "low": percentile(&returns, 0.05),
             "high": percentile(&returns, 0.95),
@@ -819,6 +857,7 @@ impl Lab {
                     summary["profit_factor"],
                     summary["exposure"],
                     summary["average_trade"],
+                    summary["by_year"],
                     summary["warnings"].as_array().map_or(0, Vec::len),
                     null,
                 ])
@@ -975,7 +1014,17 @@ impl Lab {
     pub(crate) fn get_returns(&self, args: &Value) -> Result<Value, String> {
         let run = self.load_run(text(args, "run_id")?)?;
         let empty = Vec::new();
-        let rows = run["returns_series"].as_array().unwrap_or(&empty);
+        // Warm-up days aren't part of the run, and would only be zeros.
+        let first = run["times"]
+            .get(run["from_index"].as_u64().unwrap_or(0) as usize)
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let rows: Vec<&Value> = run["returns_series"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter(|row| row[0].as_u64().is_none_or(|ts| ts >= first))
+            .collect();
         Ok(page_of(
             &["ts", "return"],
             rows.len(),
@@ -1097,16 +1146,16 @@ impl Lab {
                     (None, None) => std::cmp::Ordering::Equal,
                 });
             }
-            return Ok(page_of(
-                &["run_id", "created", "summary"],
+            return Ok(named_rows(page_of(
+                &[],
                 briefs.len(),
                 args,
                 LISTED_RUNS,
                 |i| without_request(briefs[i].clone()),
-            ));
+            )));
         }
-        Ok(page_of(
-            &["run_id", "created", "summary"],
+        Ok(named_rows(page_of(
+            &[],
             ids.len(),
             args,
             LISTED_RUNS,
@@ -1114,7 +1163,7 @@ impl Lab {
                 let id = &ids[i].2;
                 without_request(read_summary(&dir, id).unwrap_or_else(|| json!({"run_id": id})))
             },
-        ))
+        )))
     }
 
     pub(crate) fn compare_runs(&self, args: &Value) -> Result<Value, String> {
@@ -1162,7 +1211,13 @@ impl Lab {
             number(args, "seed", 0),
         )?;
         job.done.store(draws as usize, Ordering::Relaxed);
-        monte_carlo_json(&found, &report, args)
+        let mut answer = monte_carlo_json(&found, &report, args)?;
+        if run["request"]["settings"]["compound"] == true {
+            answer["warning"] = json!(
+                "This run compounds, but its trades are redrawn at the amounts they made, not as fractions of the account. Falls can pass 100% that the run itself couldn't have: read these as rough at best."
+            );
+        }
+        Ok(answer)
     }
 
     pub(crate) fn run_random_blocks(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {

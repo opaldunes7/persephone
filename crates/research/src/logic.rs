@@ -536,6 +536,23 @@ impl Logic {
         )
     }
 
+    /// About how many bars it takes for every rule to be ready, with these parameters.
+    #[must_use]
+    pub fn look_back(&self, params: &[f64]) -> usize {
+        let values: BTreeMap<&str, f64> = self
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, (name, &default))| (name.as_str(), params.get(i).copied().unwrap_or(default)))
+            .collect();
+        [&self.long, &self.short, &self.flat]
+            .into_iter()
+            .flatten()
+            .map(|rule| rule.look_back(&values))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The strategy to put in a backtest request, with this as its plugin.
     #[must_use]
     pub fn spec(&self) -> StrategySpec {
@@ -566,6 +583,38 @@ impl SignalFactory for Logic {
             high_since_entry: f64::NAN,
             low_since_entry: f64::NAN,
         }))
+    }
+}
+
+impl Rule {
+    fn look_back(&self, values: &BTreeMap<&str, f64>) -> usize {
+        match self {
+            Self::Compare(comparison, a, b) => {
+                let crossing = matches!(
+                    comparison,
+                    Comparison::CrossesAbove | Comparison::CrossesBelow
+                );
+                a.look_back(values).max(b.look_back(values)) + usize::from(crossing)
+            }
+            Self::And(rules) | Self::Or(rules) => rules
+                .iter()
+                .map(|rule| rule.look_back(values))
+                .max()
+                .unwrap_or(0),
+            Self::Not(rule) => rule.look_back(values),
+        }
+    }
+}
+
+impl Expr {
+    fn look_back(&self, values: &BTreeMap<&str, f64>) -> usize {
+        let bars = |given: &Amount| amount(given, values).max(0.0) as usize;
+        match self {
+            Self::Number(_) | Self::Field(_) => 0,
+            Self::Indicator { of, length, .. } => of.look_back(values) + bars(length),
+            Self::Ago { of, bars: back } => of.look_back(values) + bars(back),
+            Self::Arithmetic(_, a, b) => a.look_back(values).max(b.look_back(values)),
+        }
     }
 }
 
