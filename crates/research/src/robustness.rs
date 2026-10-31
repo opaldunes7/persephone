@@ -7,7 +7,7 @@
 use std::{
     ops::Range,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -784,12 +784,67 @@ pub fn pool<T: Sync, R: Send>(
     results.into_inner().unwrap_or_default()
 }
 
+/// Lets only so many through at once, with the rest waiting their turn.
+struct Gate {
+    /// How many, worked out when first needed; 0 means a core less than the machine has.
+    most: usize,
+    inside: Mutex<usize>,
+    freed: Condvar,
+}
+
+/// A place taken in a [`Gate`], given up when dropped.
+struct Turn<'a>(&'a Gate);
+
+impl Gate {
+    const fn new(most: usize) -> Self {
+        Self {
+            most,
+            inside: Mutex::new(0),
+            freed: Condvar::new(),
+        }
+    }
+
+    fn limit(&self) -> usize {
+        if self.most > 0 {
+            return self.most;
+        }
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .saturating_sub(1)
+            .max(1)
+    }
+
+    /// Waits for a place.
+    fn enter(&self) -> Turn<'_> {
+        let limit = self.limit();
+        let mut inside = self.inside.lock().unwrap_or_else(|e| e.into_inner());
+        while *inside >= limit {
+            inside = self.freed.wait(inside).unwrap_or_else(|e| e.into_inner());
+        }
+        *inside += 1;
+        Turn(self)
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut inside = self.0.inside.lock().unwrap_or_else(|e| e.into_inner());
+        *inside -= 1;
+        self.0.freed.notify_one();
+    }
+}
+
+/// All backtests in this process, however many calls they're from: parallel calls each start as many
+/// workers as there are cores, and queueing beats them all fighting for the machine.
+static BACKTESTS: Gate = Gate::new(0);
+
 /// Runs a backtest on a new thread, as a chart's are: the engine keeps state per thread.
 ///
 /// # Errors
 ///
 /// Returns a message if it fails or stops unexpectedly.
 pub fn backtest(request: BacktestRequest) -> Result<BacktestReport, String> {
+    let _turn = BACKTESTS.enter();
     std::thread::spawn(move || persephone_engine::run_backtest(&request))
         .join()
         .map_err(|_| "A backtest stopped unexpectedly.".to_string())?
@@ -885,6 +940,27 @@ impl BlockJob {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_gate_never_lets_more_through_than_it_should() {
+        use std::{sync::atomic::AtomicUsize, time::Duration};
+
+        let gate = Gate::new(3);
+        let (now, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..20 {
+                scope.spawn(|| {
+                    let _turn = gate.enter();
+                    let inside = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(inside, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(5));
+                    now.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+        assert_eq!(now.load(Ordering::SeqCst), 0);
+    }
+
     use std::collections::BTreeMap;
 
     use persephone_engine::Fill;

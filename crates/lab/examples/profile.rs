@@ -1,19 +1,23 @@
 //! Times what long research runs do most, to see what's worth speeding up:
 //!
 //! ```text
-//! cargo run --release -p persephone-lab --example profile [--binance]
+//! cargo run --release -p persephone-lab --example profile [--binance] [--agent]
 //! ```
 //!
-//! `--binance` also times repeated backtests of a real market, which needs the network.
+//! `--binance` also times repeated backtests of a real market, which needs the network. `--agent`
+//! also times what grows with an agent's use: thousands of runs, a long call log, millions of ticks.
 
 use std::{
-    fs,
+    fs::{self, File},
+    io::{BufWriter, Write as _},
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use flate2::{Compression, write::GzEncoder};
 use persephone_core::time::civil_from_days;
-use persephone_lab::{Lab, Paths};
+use persephone_lab::{Lab, Paths, tools::tools};
 use persephone_plugin_host::Host;
 use persephone_research::RunColumn;
 use persephone_research::robustness::{RunRow, monte_carlo, sort_rows, summarize_run};
@@ -61,6 +65,225 @@ fn csv(bars: u64) -> String {
 fn call(lab: &Arc<Lab>, tool: &str, args: &Value) -> Value {
     lab.dispatch(tool, args)
         .unwrap_or_else(|e| panic!("{tool}: {e}"))
+}
+
+/// What an agent's work costs once there's a lot of it.
+fn agent(lab: &Arc<Lab>, dir: &Path) {
+    println!("\nWhat an agent's own use makes slower");
+    let args = json!({
+        "symbol": "BTCUSDT", "venue": "TEST", "bars": "1h", "from": "2000-01-01",
+        "strategy": {"builtin": "ema-cross", "params": {"Fast": 5, "Slow": 20}},
+        "wait_seconds": 600,
+    });
+    let run = call(lab, "run_backtest", &args);
+    let id = run["run_id"].as_str().unwrap().to_owned();
+    timed("First read after a 100,000-bar backtest", || {
+        call(lab, "get_report", &json!({"run_id": id}))
+    });
+
+    average("A page of that run's trades", 5, || {
+        call(lab, "get_trades", &json!({"run_id": id, "limit": 20}));
+    });
+
+    println!("\nWhat one call costs in text, with no limit given");
+    for (tool, args) in [
+        (
+            "get_bars",
+            json!({"symbol": "BTCUSDT", "venue": "TEST", "bars": "1h", "from": "2005-01-01"}),
+        ),
+        ("get_trades", json!({"run_id": id})),
+        ("get_fills", json!({"run_id": id})),
+        ("get_equity", json!({"run_id": id})),
+        ("get_returns", json!({"run_id": id})),
+    ] {
+        let bytes = call(lab, tool, &args).to_string().len();
+        println!(
+            "  {tool:<50} {:>7} KB, about {:>6} tokens",
+            bytes / 1024,
+            bytes / 4
+        );
+    }
+    let grid = call(
+        lab,
+        "run_optimize",
+        &json!({
+            "symbol": "BTCUSDT", "venue": "TEST", "bars": "1h", "from": "2010-01-01",
+            "strategy": {"builtin": "ema-cross"}, "wait_seconds": 600,
+            "variables": [
+                {"name": "Fast", "min": 2, "max": 11, "step": 1},
+                {"name": "Slow", "min": 20, "max": 29, "step": 1},
+            ],
+        }),
+    );
+    let bytes = grid.to_string().len();
+    println!(
+        "  {:<50} {:>7} KB, about {:>6} tokens",
+        "run_optimize, 100 values",
+        bytes / 1024,
+        bytes / 4
+    );
+
+    let list: Vec<Value> = tools()
+        .iter()
+        .map(|tool| json!({"name": tool.name, "description": tool.what, "inputSchema": tool.input_schema()}))
+        .collect();
+    let bytes = Value::Array(list).to_string().len();
+    println!(
+        "  {:<50} {:>7} KB, about {:>6} tokens",
+        "The tool list, once a session",
+        bytes / 1024,
+        bytes / 4
+    );
+
+    let short = json!({
+        "symbol": "BTCUSDT", "venue": "TEST", "bars": "1h", "from": "2000-03-01", "to": "2000-03-05",
+        "strategy": {"builtin": "ema-cross", "params": {"Fast": 5, "Slow": 20}},
+    });
+    average("A very short backtest, saved", 20, || {
+        call(lab, "run_backtest", &short);
+    });
+    let mut list = json!({
+        "symbol": "BTCUSDT", "venue": "TEST", "bars": "1h", "from": "2000-03-01", "to": "2000-06-01",
+        "strategy": {"builtin": "ema-cross", "params": {"Fast": 5, "Slow": 20}},
+    });
+    timed("200 backtests of about 2,700 bars, one call each", || {
+        for fast in 0..200 {
+            list["strategy"]["params"]["Fast"] = json!(2 + fast % 15);
+            call(lab, "run_backtest", &list);
+        }
+    });
+    let batch: Vec<Value> = (0..200)
+        .map(|fast| json!({"strategy": {"builtin": "ema-cross", "params": {"Fast": 2 + fast % 15, "Slow": 20}}}))
+        .collect();
+    let answer = timed("The same 200 in one run_backtests call", || {
+        call(
+            lab,
+            "run_backtests",
+            &json!({
+                "runs": batch, "wait_seconds": 600, "limit": 10,
+                "defaults": {"symbol": "BTCUSDT", "venue": "TEST", "bars": "1h", "from": "2000-03-01", "to": "2000-06-01"},
+            }),
+        )
+    });
+    println!(
+        "  ({} succeeded, {} bytes)",
+        answer["succeeded"],
+        answer.to_string().len()
+    );
+    let optimize = json!({
+        "symbol": "BTCUSDT", "venue": "TEST", "bars": "1h", "from": "2000-01-01",
+        "strategy": {"builtin": "ema-cross", "params": {"Fast": 5, "Slow": 40}}, "wait_seconds": 600,
+        "variables": [{"name": "Fast", "min": 2, "max": 21, "step": 1}],
+    });
+    timed("Optimize 20 values on local bars, alone", || {
+        call(lab, "run_optimize", &optimize)
+    });
+    timed("Optimize 20 values, three at once", || {
+        std::thread::scope(|scope| {
+            for _ in 0..3 {
+                scope.spawn(|| call(lab, "run_optimize", &optimize));
+            }
+        });
+    });
+
+    // Saving, as run_backtest does: a tree, its text, then packed.
+    let times: Vec<u64> = (0..100_000).map(|i| START + i * HOUR).collect();
+    let equity: Vec<f64> = (0..100_000)
+        .map(|i| 100_000.0 + (f64::from(i) / 40.0).sin() * 1234.567)
+        .collect();
+    timed("Build, write and pack 100,000 bars of a run", || {
+        let run = json!({"times": times, "equity": equity});
+        let mut packed = GzEncoder::new(Vec::new(), Compression::fast());
+        packed.write_all(run.to_string().as_bytes()).unwrap();
+        packed.finish().unwrap()
+    });
+
+    // Thousands of runs, made by copying a small one under new ids.
+    let runs = lab.paths.lab().join("runs");
+    let small = call(lab, "run_backtest", &short);
+    let small = small["run_id"].as_str().unwrap().to_owned();
+    let packed = fs::read(runs.join(format!("{small}.json.gz"))).unwrap();
+    let brief = fs::read(runs.join(format!("{small}.summary"))).unwrap();
+    let ids: Vec<String> = (0..10_000)
+        .map(|i| format!("run-{}-1-{i}", 1_700_000_000_000_u64 + i))
+        .collect();
+    for id in &ids {
+        fs::write(runs.join(format!("{id}.json.gz")), &packed).unwrap();
+        fs::write(runs.join(format!("{id}.summary")), &brief).unwrap();
+    }
+    average("list_runs with 10,000 runs saved", 3, || {
+        call(lab, "list_runs", &json!({"limit": 20}));
+    });
+    average("compare_runs of 20 runs", 3, || {
+        call(lab, "compare_runs", &json!({"run_ids": ids[100..120]}));
+    });
+
+    // A long call log.
+    let line = json!({"at": 1, "tool": "run_backtest", "args": short, "ok": true, "error": null})
+        .to_string();
+    {
+        let mut log = BufWriter::new(
+            File::options()
+                .create(true)
+                .append(true)
+                .open(lab.paths.lab().join("calls.jsonl"))
+                .unwrap(),
+        );
+        for _ in 0..1_000_000 {
+            writeln!(log, "{line}").unwrap();
+        }
+    }
+    timed("get_call_log with 1,000,000 calls logged", || {
+        call(lab, "get_call_log", &json!({"limit": 50}))
+    });
+
+    // Millions of ticks, over about a year.
+    const TICKS: u64 = 10_000_000;
+    let file = dir.join("ticks.csv");
+    {
+        let mut out = BufWriter::new(File::create(&file).unwrap());
+        writeln!(out, "time,price,size").unwrap();
+        for i in 0..TICKS {
+            let at = START + i * 3_000_000_000;
+            let (year, month, day) = civil_from_days((at / (24 * HOUR)) as i64);
+            let seconds = (at % (24 * HOUR)) / 1_000_000_000;
+            writeln!(
+                out,
+                "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02},{:.2},0.5",
+                seconds / 3600,
+                seconds / 60 % 60,
+                seconds % 60,
+                50_000.0 + 1_500.0 * (i as f64 / 3_000.0).sin(),
+            )
+            .unwrap();
+        }
+    }
+    timed("Import 10,000,000 ticks", || {
+        call(
+            lab,
+            "import_data",
+            &json!({
+                "files": [file], "symbol": "ETHUSDT", "venue": "TEST", "wait_seconds": 3600,
+            }),
+        )
+    });
+    let mut ticks =
+        json!({"symbol": "ETHUSDT", "venue": "TEST", "from": "2000-01-01", "limit": 100});
+    timed("A page of 100 ticks from the start, no `to`", || {
+        call(lab, "get_ticks", &ticks)
+    });
+    ticks["from"] = json!("2000-12-30");
+    timed("A page of 100 ticks near the end, no `to`", || {
+        call(lab, "get_ticks", &ticks)
+    });
+    let every = json!({
+        "symbol": "ETHUSDT", "venue": "TEST", "bars": "1000t", "from": "2000-03-01", "to": "2000-04-01",
+        "strategy": {"builtin": "ema-cross", "params": {"Fast": 5, "Slow": 20}}, "wait_seconds": 600,
+    });
+    timed("Backtest a month of tick bars", || {
+        call(lab, "run_backtest", &every)
+    });
+    let _ = lab;
 }
 
 fn main() {
@@ -177,6 +400,9 @@ fn main() {
         },
     );
 
+    if std::env::args().any(|arg| arg == "--agent") {
+        agent(&lab, &dir);
+    }
     if std::env::args().any(|arg| arg == "--binance") {
         let args = json!({
             "symbol": "BTCUSDT", "bars": "1h", "from": "2023-01-01",

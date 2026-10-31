@@ -95,7 +95,7 @@ persephone-lab call run_backtest '{"symbol": "BTCUSDT", "bars": "1h", "from": "2
 - **The call log** in `lab/calls.jsonl` records every call, with its tool and arguments. Lab enforces
   nothing with it, but it's there for an agent's rules, such as counting attempts.
 
-**Binance bars are cached** in `lab/cache`, so a span costs a download once and repeats exactly. Lab only
+**Binance bars are cached** in `lab/cache`, so a span costs a download once and repeats exactly. Downloads make up to 6 requests at once, and wait when Binance says to slow down. Lab only
 uses closed bars. Saved runs are compressed, but still grow without limit if an agent runs for long; this
 removes old ones, and nothing but this does:
 

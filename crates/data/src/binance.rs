@@ -3,6 +3,8 @@
 //! Uses `data-api.binance.vision`, Binance's market-data-only host, which is reachable from
 //! more regions than `api.binance.com`.
 
+use std::time::Duration;
+
 use anyhow::{Context, bail};
 use persephone_core::{Candle, InstrumentSpec, Timeframe, UnixNanos};
 use serde::Deserialize;
@@ -10,14 +12,29 @@ use serde::Deserialize;
 const BASE_URL: &str = "https://data-api.binance.vision";
 const VENUE: &str = "BINANCE";
 /// Binance's maximum klines per request.
-const PAGE_LIMIT: usize = 1000;
+pub const PAGE_LIMIT: usize = 1000;
 /// The most bars one range may hold: about 300 requests, and as much as a chart handles
 /// comfortably.
 pub const MAX_RANGE_BARS: u64 = 300_000;
 const NANOS_PER_MILLI: u64 = 1_000_000;
+/// How many times to ask after being told to slow down.
+const MOST_RETRIES: u32 = 5;
+/// The longest to wait when told to slow down; a longer wait is a failure to report.
+const MOST_RETRY_WAIT_SECS: u64 = 60;
 
 pub struct BinanceClient {
     http: reqwest::blocking::Client,
+    base: String,
+}
+
+/// How long to wait before asking again after a response of `status`, if it's worth asking again:
+/// 429 and 418 are Binance saying to slow down, with `Retry-After` saying for how long.
+fn retry_wait(status: u16, retry_after: Option<u64>, retries: u32) -> Option<Duration> {
+    if !matches!(status, 429 | 418) || retries >= MOST_RETRIES {
+        return None;
+    }
+    let seconds = retry_after.unwrap_or(1 << retries);
+    (seconds <= MOST_RETRY_WAIT_SECS).then(|| Duration::from_secs(seconds))
 }
 
 impl BinanceClient {
@@ -28,9 +45,30 @@ impl BinanceClient {
         // A request that stalls fails instead of leaving a chart loading for good.
         let http = reqwest::blocking::Client::builder()
             .user_agent(concat!("persephone/", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(Duration::from_secs(30))
             .build()?;
-        Ok(Self { http })
+        Ok(Self {
+            http,
+            base: BASE_URL.to_owned(),
+        })
+    }
+
+    /// A successful response to `url`, waiting and asking again if told to slow down.
+    fn get(&self, url: String) -> anyhow::Result<reqwest::blocking::Response> {
+        let mut retries = 0;
+        loop {
+            let response = self.http.get(&url).send()?;
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok());
+            match retry_wait(response.status().as_u16(), retry_after, retries) {
+                Some(wait) => std::thread::sleep(wait),
+                None => return Ok(response.error_for_status()?),
+            }
+            retries += 1;
+        }
     }
 
     /// Looks up a spot symbol's assets and tick/lot precision.
@@ -39,12 +77,9 @@ impl BinanceClient {
     ///
     /// Returns an error if the request fails or the symbol is unknown.
     pub fn instrument(&self, symbol: &str) -> anyhow::Result<InstrumentSpec> {
-        let url = format!("{BASE_URL}/api/v3/exchangeInfo?symbol={symbol}");
+        let url = format!("{}/api/v3/exchangeInfo?symbol={symbol}", self.base);
         let info: ExchangeInfo = self
-            .http
             .get(url)
-            .send()?
-            .error_for_status()
             .with_context(|| format!("Binance has no spot symbol `{symbol}`"))?
             .json()?;
         let raw = info
@@ -62,10 +97,11 @@ impl BinanceClient {
     /// Returns an error if the request fails or Binance has no bars for it.
     pub fn first_bar_time(&self, symbol: &str, timeframe: Timeframe) -> anyhow::Result<UnixNanos> {
         let url = format!(
-            "{BASE_URL}/api/v3/klines?symbol={symbol}&interval={}&startTime=0&limit=1",
+            "{}/api/v3/klines?symbol={symbol}&interval={}&startTime=0&limit=1",
+            self.base,
             timeframe.label()
         );
-        let body = self.http.get(url).send()?.error_for_status()?.text()?;
+        let body = self.get(url)?.text()?;
         parse_klines(&body)?
             .first()
             .map(|bar| bar.ts)
@@ -90,11 +126,12 @@ impl BinanceClient {
 
         while cursor_ms < end_ms {
             let url = format!(
-                "{BASE_URL}/api/v3/klines?symbol={symbol}&interval={}&startTime={cursor_ms}&endTime={}&limit={PAGE_LIMIT}",
+                "{}/api/v3/klines?symbol={symbol}&interval={}&startTime={cursor_ms}&endTime={}&limit={PAGE_LIMIT}",
+                self.base,
                 timeframe.label(),
                 end_ms - 1,
             );
-            let body = self.http.get(url).send()?.error_for_status()?.text()?;
+            let body = self.get(url)?.text()?;
             let page = parse_klines(&body)?;
             let Some(last) = page.last() else { break };
 
@@ -210,6 +247,53 @@ impl RawSymbol {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn being_told_to_slow_down_waits_and_asks_again() {
+        use std::{
+            io::{Read as _, Write as _},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let answers = [
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\n[]",
+            ];
+            for answer in answers {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.read(&mut [0; 4096]).unwrap();
+                stream.write_all(answer.as_bytes()).unwrap();
+            }
+        });
+        let mut client = super::BinanceClient::new().unwrap();
+        client.base = format!("http://127.0.0.1:{port}");
+        let bars = client
+            .klines(
+                "BTCUSDT",
+                persephone_core::Timeframe::H1,
+                0,
+                3_600_000_000_000,
+            )
+            .unwrap();
+        assert!(bars.is_empty());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn only_slow_down_answers_are_tried_again_and_not_for_ever() {
+        use std::time::Duration;
+
+        use super::retry_wait;
+        assert_eq!(retry_wait(429, Some(7), 0), Some(Duration::from_secs(7)));
+        assert_eq!(retry_wait(418, None, 2), Some(Duration::from_secs(4)));
+        assert_eq!(retry_wait(429, Some(3_600), 0), None, "too long to wait");
+        assert_eq!(retry_wait(429, Some(1), 5), None, "tried enough");
+        assert_eq!(retry_wait(500, Some(1), 0), None);
+        assert_eq!(retry_wait(200, None, 0), None);
+    }
+
     use super::*;
 
     #[test]

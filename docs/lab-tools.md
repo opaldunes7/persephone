@@ -53,7 +53,7 @@ A market's bars, in pages, oldest first. Without `from`, its latest bars.
 - `from` (time): Start, in UTC: 2024-01-31 or 2024-01-31 09:30.
 - `to` (time): End (not included), in UTC.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
-- `limit` (integer): The most to return in this page.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
 Returns: `columns`, `rows`, `next_cursor`
 
@@ -66,7 +66,7 @@ A local market's trades or quotes, in pages.
 - `from` (time, required): Start, in UTC.
 - `to` (time): End (not included), in UTC.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
-- `limit` (integer): The most to return in this page.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
 Returns: `kind`, `columns`, `rows`, `next_cursor`
 
@@ -127,7 +127,7 @@ An indicator's values over a market's bars.
 - `indicator` (string, required): An id from list_indicators.
 - `params` (object): {"name": value}; the rest keep their defaults.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
-- `limit` (integer): The most to return in this page.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
 Returns: `columns`, `rows`, `next_cursor`
 
@@ -187,9 +187,19 @@ Backtests any strategy on any span with any settings. The run is saved, so its d
 - `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
 - `from` (time): Start, in UTC: 2024-01-31 or 2024-01-31 09:30.
 - `to` (time): End (not included), in UTC.
-- `settings` (object): Costs and rules; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
+- `settings` (object): Costs and rules, as in run_backtest; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
 
 Returns: `run_id`, `summary`
+
+## `run_backtests` *job*
+
+Many backtests in one call, in parallel: much quicker for an agent than one call each. Every run is saved, so all the tools that take a run_id work on them. One that fails doesn't stop the rest.
+
+- `runs` (array, required): A list of arguments as run_backtest takes, up to 5,000.
+- `defaults` (object): Arguments every run shares, such as bars, from, to and settings. A run's own win.
+- `limit` (integer): How many runs to list, best return first. Default 100.
+
+Returns: `columns`, `rows`, `total`, `succeeded`, `failed`, `not_run`
 
 ## `run_monte_carlo` *job*
 
@@ -214,7 +224,7 @@ Backtests random stretches of a span, to see whether a strategy works throughout
 - `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
 - `from` (time): Start, in UTC: 2024-01-31 or 2024-01-31 09:30.
 - `to` (time): End (not included), in UTC.
-- `settings` (object): Costs and rules; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
+- `settings` (object): Costs and rules, as in run_backtest; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
 - `blocks` (integer): How many stretches. Default 50.
 - `length` (string): week, month (30 days, the default) or quarter (91 days).
 - `seed` (integer): The same seed gives the same stretches. Default 0.
@@ -232,7 +242,7 @@ Backtests a range of one or two parameters, scored by return, Monte Carlo or ran
 - `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
 - `from` (time): Start, in UTC: 2024-01-31 or 2024-01-31 09:30.
 - `to` (time): End (not included), in UTC.
-- `settings` (object): Costs and rules; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
+- `settings` (object): Costs and rules, as in run_backtest; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
 - `variables` (array, required): One or two of {"name", "min", "max", "step"}.
 - `score` (string): backtest (the default), monte-carlo or random-blocks.
 - `hold_out` (boolean): Score on the first 70% of the span and check the best on the rest. Default false.
@@ -241,8 +251,9 @@ Backtests a range of one or two parameters, scored by return, Monte Carlo or ran
 - `runs` (integer): For monte-carlo: how many draws. Default 1,000.
 - `ruin_percent` (number): For monte-carlo. Default 50.
 - `seed` (integer): Default 0.
+- `limit` (integer): How many values to list, best first. Default 50.
 
-Returns: `values`, `top`, `on_edge`, `held_out`, `backtests`
+Returns: `values`, `total`, `top`, `on_edge`, `held_out`, `backtests`
 
 ## `get_report`
 
@@ -258,7 +269,7 @@ A run's trades, from flat to flat, in pages: profit in the quote currency, retur
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
-- `limit` (integer): The most to return in this page.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
 Returns: `columns`, `rows`, `next_cursor`
 
@@ -268,7 +279,7 @@ A run's fills, in pages.
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
-- `limit` (integer): The most to return in this page.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
 Returns: `columns`, `rows`, `next_cursor`
 
@@ -278,7 +289,7 @@ A run's equity at each bar's close, in pages.
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
-- `limit` (integer): The most to return in this page.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
 Returns: `columns`, `rows`, `next_cursor`
 
@@ -288,7 +299,7 @@ A run's per-period returns, as Nautilus works them out, in pages.
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
-- `limit` (integer): The most to return in this page.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
 Returns: `columns`, `rows`, `next_cursor`
 
@@ -308,7 +319,7 @@ Returns: `level`, `rows`
 Saved runs, newest first.
 
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
-- `limit` (integer): The most to return in this page.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
 Returns: `columns`, `rows`, `next_cursor`
 
@@ -322,9 +333,10 @@ Returns: `runs`
 
 ## `get_job`
 
-How a job is doing, and its result once it's done.
+How a job is doing, and its result once it's done. Give wait_seconds rather than asking again and again.
 
 - `job_id` (string, required): A job id.
+- `wait_seconds` (number): How long to wait for it to finish, answering the moment it does. Default 0.
 
 Returns: `job_id`, `status`
 
@@ -360,7 +372,7 @@ Saves a strategy for the app, where it joins the backtest panel's strategy list.
 
 - `name` (string, required): What to call it.
 - `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"} or {"logic": {...tree...}}, each with optional "params": {"name": value}.
-- `settings` (object): Costs and rules; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
+- `settings` (object): Costs and rules, as in run_backtest; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
 - `run_id` (string): A run, whose summary to keep with it.
 - `note` (string): Anything worth saying about it.
 
@@ -378,6 +390,6 @@ Every call made to Lab: tool, arguments and how it went, newest first. Lab enfor
 
 - `tool` (string): Only this tool's calls.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
-- `limit` (integer): The most to return in this page.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `rows`, `next_cursor`, `total`
+Returns: `columns`, `rows`, `next_cursor`

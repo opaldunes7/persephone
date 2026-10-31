@@ -1,7 +1,12 @@
 //! Tools for what's installed and saved: indicators, models, strategies, plugins, the app's own state,
 //! saved results and the call log.
 
-use std::{fs, path::Path, sync::Arc};
+use std::{
+    fs::{self, File},
+    io::{Read as _, Seek as _, SeekFrom},
+    path::Path,
+    sync::Arc,
+};
 
 use persephone_core::{
     indicator::{BuiltIn, IndicatorInfo, IndicatorKind, IndicatorSpec, Param},
@@ -21,7 +26,7 @@ use crate::{
     Lab,
     data::MarketArgs,
     new_id, now_ms, time_text,
-    tools::{page, text},
+    tools::{DEFAULT_ROWS, limit_of, page, text},
 };
 
 fn params_json(params: &[Param]) -> Vec<Value> {
@@ -350,7 +355,7 @@ impl Lab {
         let mut columns: Vec<String> = vec!["ts".into(), "time".into()];
         columns.extend(info.outputs.iter().map(|o| o.name.to_string()));
         let names: Vec<&str> = columns.iter().map(String::as_str).collect();
-        Ok(page(&names, rows, args, 1_000))
+        Ok(page(&names, rows, args, DEFAULT_ROWS))
     }
 
     pub(crate) fn list_models(&self) -> Result<Value, String> {
@@ -524,20 +529,82 @@ impl Lab {
     }
 
     pub(crate) fn get_call_log(&self, args: &Value) -> Result<Value, String> {
-        let path = self.paths.lab().join("calls.jsonl");
-        let text = fs::read_to_string(path).unwrap_or_default();
         let only = args.get("tool").and_then(Value::as_str);
-        let rows: Vec<Value> = text
-            .lines()
-            .rev()
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .filter(|row| only.is_none_or(|tool| row["tool"] == tool))
-            .collect();
-        Ok(page(
-            &["at", "tool", "args", "ok", "error"],
-            rows,
-            args,
-            200,
-        ))
+        let before = args
+            .get("cursor")
+            .and_then(Value::as_str)
+            .and_then(|cursor| cursor.parse().ok());
+        let (rows, next) = read_log_back(
+            &self.paths.lab().join("calls.jsonl"),
+            before,
+            limit_of(args, LOGGED_CALLS),
+            |row| only.is_none_or(|tool| row["tool"] == tool),
+        );
+        Ok(json!({
+            "columns": ["at", "tool", "args", "ok", "error"],
+            "rows": rows,
+            "next_cursor": next.map(|at: u64| at.to_string()),
+        }))
     }
+}
+
+/// How many calls `get_call_log` gives unless asked for more.
+const LOGGED_CALLS: usize = 50;
+/// How much of the log to read at a time, going back from its end.
+const LOG_CHUNK: u64 = 256 * 1024;
+
+/// The newest lines before byte `before` (the end if there's none) that `keep` accepts, up to `most`,
+/// with where to carry on. It reads only as far back as it needs to, as the log only ever grows.
+fn read_log_back(
+    path: &Path,
+    before: Option<u64>,
+    most: usize,
+    keep: impl Fn(&Value) -> bool,
+) -> (Vec<Value>, Option<u64>) {
+    let mut rows = Vec::new();
+    let Ok(mut file) = File::open(path) else {
+        return (rows, None);
+    };
+    let size = file.metadata().map_or(0, |meta| meta.len());
+    let mut at = before.unwrap_or(size).min(size);
+    // The start of a line whose beginning is in a chunk not read yet.
+    let mut rest = Vec::new();
+    while at > 0 {
+        let length = LOG_CHUNK.min(at);
+        at -= length;
+        let mut chunk = vec![0; length as usize];
+        if file.seek(SeekFrom::Start(at)).is_err() || file.read_exact(&mut chunk).is_err() {
+            break;
+        }
+        chunk.append(&mut rest);
+        let mut end = chunk.len();
+        loop {
+            let start = chunk[..end]
+                .iter()
+                .rposition(|&byte| byte == b'\n')
+                .map(|newline| newline + 1);
+            // The first line in a chunk may go back further, unless this is the file's start.
+            let Some(line_start) = start.or((at == 0).then_some(0)) else {
+                break;
+            };
+            let line = &chunk[line_start..end];
+            if let Ok(row) = serde_json::from_slice::<Value>(line)
+                && keep(&row)
+            {
+                rows.push(row);
+                if rows.len() == most {
+                    let next = at + line_start as u64;
+                    return (rows, (next > 0).then_some(next));
+                }
+            }
+            if line_start == 0 {
+                end = 0;
+                break;
+            }
+            end = line_start - 1;
+        }
+        chunk.truncate(end);
+        rest = chunk;
+    }
+    (rows, None)
 }

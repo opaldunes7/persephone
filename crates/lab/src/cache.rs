@@ -14,12 +14,16 @@ use std::{
     collections::HashMap,
     fs::{self, File},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use persephone_core::{Candle, InstrumentSpec, Timeframe, UnixNanos};
-use persephone_data::binance::BinanceClient;
+use persephone_data::binance::{BinanceClient, PAGE_LIMIT};
+use persephone_research::robustness::pool;
 use serde_json::{Value, json};
 
 /// Where bars come from: Binance, or a stand-in in tests.
@@ -50,13 +54,25 @@ pub trait BarSource: Send + Sync {
     }
 }
 
-/// Binance itself.
-pub struct Binance;
+/// Binance itself, over one client, whose connections are reused between requests.
+#[derive(Default)]
+pub struct Binance {
+    client: OnceLock<Result<BinanceClient, String>>,
+}
+
+impl Binance {
+    fn client(&self) -> Result<&BinanceClient, String> {
+        self.client
+            .get_or_init(|| BinanceClient::new().map_err(|e| format!("{e:#}")))
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+}
 
 impl BarSource for Binance {
     fn instrument(&self, symbol: &str) -> Result<InstrumentSpec, String> {
-        BinanceClient::new()
-            .and_then(|client| client.instrument(symbol))
+        self.client()?
+            .instrument(symbol)
             .map_err(|e| format!("{e:#}"))
     }
 
@@ -67,14 +83,17 @@ impl BarSource for Binance {
         start: UnixNanos,
         end: UnixNanos,
     ) -> Result<Vec<Candle>, String> {
-        BinanceClient::new()
-            .and_then(|client| client.klines(symbol, timeframe, start, end))
+        self.client()?
+            .klines(symbol, timeframe, start, end)
             .map_err(|e| format!("{e:#}"))
     }
 }
 
 /// How many bars to fetch before saving, so a long download's progress survives a failure.
 const SAVE_EVERY_BARS: u64 = 50_000;
+/// How many requests to have out at once: well inside Binance's limits, at about 1,600 of its
+/// 6,000 weight a minute, and a long download takes a sixth of the time.
+const FETCHERS: usize = 6;
 /// How many markets to hold in memory.
 const IN_MEMORY: usize = 8;
 /// How often to ask again about a market's details, which hardly ever change.
@@ -92,6 +111,14 @@ struct Market {
     /// The file these came from, to notice another process has changed it.
     stamp: Option<SystemTime>,
     last_used: u64,
+}
+
+/// A market's entry: its bars, and who's downloading. They have separate locks so that a long
+/// download doesn't hold up reading the bars that are already here.
+#[derive(Default)]
+struct Entry {
+    market: Mutex<Market>,
+    downloading: Mutex<()>,
 }
 
 /// Which parts of `from..to` aren't in `covered`.
@@ -138,9 +165,9 @@ fn cover(covered: &mut Vec<(UnixNanos, UnixNanos)>, from: UnixNanos, to: UnixNan
 pub struct BarCache {
     dir: PathBuf,
     source: Arc<dyn BarSource>,
-    /// Each market's own lock is what makes one download at a time: workers wanting the same market
-    /// wait here, and find it's been fetched.
-    markets: Mutex<HashMap<String, Arc<Mutex<Market>>>>,
+    /// Each entry's `downloading` lock is what makes one download at a time: workers wanting bars
+    /// that aren't here wait on it, and find they've been fetched.
+    markets: Mutex<HashMap<String, Arc<Entry>>>,
     uses: Mutex<u64>,
 }
 
@@ -239,23 +266,28 @@ impl BarCache {
         if start >= end {
             return Ok(Vec::new());
         }
-        let market = self.market(symbol, timeframe);
-        let mut market = market
-            .lock()
-            .map_err(|_| "the bar cache failed".to_owned())?;
+        let entry = self.market(symbol, timeframe);
         let path = self.path(symbol, timeframe);
-        self.refresh(&mut market, &path)?;
-        if !missing(&market.covered, start, end).is_empty() {
-            self.fetch(&mut market, &path, symbol, timeframe, (start, end))?;
+        let cut = |market: &Market| {
+            let bars = &market.bars;
+            let first = bars.partition_point(|bar| bar.ts < from.max(start));
+            let last = bars.partition_point(|bar| bar.ts < end.min(to));
+            bars[first..last.max(first)].to_vec()
+        };
+        {
+            let mut market = locked(&entry.market)?;
+            self.refresh(&mut market, &path)?;
+            if missing(&market.covered, start, end).is_empty() {
+                return Ok(cut(&market));
+            }
         }
-        let bars = &market.bars;
-        let first = bars.partition_point(|bar| bar.ts < from.max(start));
-        let last = bars.partition_point(|bar| bar.ts < end.min(to));
-        Ok(bars[first..last.max(first)].to_vec())
+        let _downloading = locked(&entry.downloading)?;
+        self.fetch(&entry, &path, symbol, timeframe, (start, end))?;
+        Ok(cut(&*locked(&entry.market)?))
     }
 
     /// The entry for a market, leaving out those least recently used if there are too many.
-    fn market(&self, symbol: &str, timeframe: Timeframe) -> Arc<Mutex<Market>> {
+    fn market(&self, symbol: &str, timeframe: Timeframe) -> Arc<Entry> {
         let key = format!("{symbol}-{}", timeframe.label());
         let mut uses = self.uses.lock().unwrap_or_else(|e| e.into_inner());
         *uses += 1;
@@ -264,8 +296,9 @@ impl BarCache {
             // One nobody's using: a busy market's lock can't be taken, so it stays.
             let oldest = markets
                 .iter()
-                .filter_map(|(key, market)| {
-                    let market = market.try_lock().ok()?;
+                .filter_map(|(key, entry)| {
+                    let _idle = entry.downloading.try_lock().ok()?;
+                    let market = entry.market.try_lock().ok()?;
                     Some((market.last_used, key.clone()))
                 })
                 .min();
@@ -273,11 +306,11 @@ impl BarCache {
                 markets.remove(&oldest);
             }
         }
-        let market = markets.entry(key).or_default();
-        if let Ok(mut held) = market.try_lock() {
+        let entry = markets.entry(key).or_default();
+        if let Ok(mut held) = entry.market.try_lock() {
             held.last_used = *uses;
         }
-        Arc::clone(market)
+        Arc::clone(entry)
     }
 
     /// Reads the file if it's new to us: first use, or another process has added to it.
@@ -292,9 +325,11 @@ impl BarCache {
         Ok(())
     }
 
+    /// Fetches what's missing of `start..end`. The caller holds the entry's `downloading` lock, and
+    /// the bars stay readable meanwhile, except while saving what's arrived.
     fn fetch(
         &self,
-        market: &mut Market,
+        entry: &Entry,
         path: &PathBuf,
         symbol: &str,
         timeframe: Timeframe,
@@ -304,23 +339,70 @@ impl BarCache {
         // Other processes wait here too; what they fetched is then read, not fetched again.
         let lock = File::create(path.with_extension("lock")).map_err(|e| e.to_string())?;
         lock.lock().map_err(|e| e.to_string())?;
-        self.refresh(market, path)?;
+        let gaps = {
+            let mut market = locked(&entry.market)?;
+            self.refresh(&mut market, path)?;
+            missing(&market.covered, start, end)
+        };
         let step = SAVE_EVERY_BARS.saturating_mul(timeframe.nanos());
-        for (gap_start, gap_end) in missing(&market.covered, start, end) {
+        for (gap_start, gap_end) in gaps {
             let mut at = gap_start;
             while at < gap_end {
                 let until = gap_end.min(at.saturating_add(step));
-                let fetched = self.source.klines(symbol, timeframe, at, until)?;
-                merge(market, fetched);
-                // Even with no bars: that's a real hole in the market, not one to ask about again.
-                cover(&mut market.covered, at, until);
+                let pages = pages_of(at, until, timeframe);
+                let stop = AtomicBool::new(false);
+                let results = pool(&pages, FETCHERS, &stop, &|| {}, &|&(from, to)| {
+                    let fetched = self.source.klines(symbol, timeframe, from, to);
+                    if fetched.is_err() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    fetched
+                });
+                // In order, up to the first that failed: what arrived before it is kept.
+                let mut market = locked(&entry.market)?;
+                let mut failed = None;
+                for (&(from, to), result) in pages.iter().zip(results) {
+                    match result {
+                        Some(Ok(fetched)) => {
+                            merge(&mut market, fetched);
+                            // Even with no bars: that's a real hole in the market, not one to ask
+                            // about again.
+                            cover(&mut market.covered, from, to);
+                        }
+                        Some(Err(error)) => {
+                            failed = Some(error);
+                            break;
+                        }
+                        None => break,
+                    }
+                }
                 write_file(path, &market.bars, &market.covered)?;
                 market.stamp = fs::metadata(path).and_then(|meta| meta.modified()).ok();
+                if let Some(error) = failed {
+                    return Err(error);
+                }
                 at = until;
             }
         }
         Ok(())
     }
+}
+
+fn locked<T>(lock: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
+    lock.lock().map_err(|_| "the bar cache failed".to_owned())
+}
+
+/// `from..to` in stretches of one request each.
+fn pages_of(from: UnixNanos, to: UnixNanos, timeframe: Timeframe) -> Vec<(UnixNanos, UnixNanos)> {
+    let size = (PAGE_LIMIT as u64).saturating_mul(timeframe.nanos());
+    let mut pages = Vec::new();
+    let mut at = from;
+    while at < to {
+        let until = to.min(at.saturating_add(size));
+        pages.push((at, until));
+        at = until;
+    }
+    pages
 }
 
 /// Adds bars, in order; a bar fetched again replaces the one there.
@@ -425,7 +507,10 @@ fn read_file(path: &PathBuf) -> Result<(Vec<Candle>, Vec<Range>), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::{
+        sync::atomic::{AtomicU64, AtomicUsize},
+        thread,
+    };
 
     use super::*;
 
@@ -593,14 +678,15 @@ mod tests {
         let fake = Fake::new(200_000);
         let dir = dir();
         let cache = BarCache::new(dir.clone(), fake.clone());
-        // Three saves' worth, failing on the second.
-        fake.fail_after.store(1, Ordering::Relaxed);
+        // Three saves' worth, of 50 requests each, failing during the second.
+        fake.fail_after.store(60, Ordering::Relaxed);
         assert!(
             cache
                 .bars("BTCUSDT", Timeframe::H1, 0, 120_000 * HOUR)
                 .is_err()
         );
-        assert_eq!(fake.asked(), vec![(0, 50_000)]);
+        let asked = fake.asked().len();
+        assert!((60..120).contains(&asked), "{asked}");
 
         // Even after a restart, it carries on from there rather than leaving a hole.
         fake.fail_after.store(usize::MAX, Ordering::Relaxed);
@@ -609,7 +695,77 @@ mod tests {
             .bars("BTCUSDT", Timeframe::H1, 0, 120_000 * HOUR)
             .unwrap();
         assert_eq!(all.len(), 120_000);
-        assert_eq!(fake.asked()[1], (50_000, 100_000), "not from the start");
+        assert!(
+            fake.asked()[asked..].iter().all(|page| page.0 >= 50_000),
+            "not from the start"
+        );
+    }
+
+    /// A market whose requests past `free` wait until told to carry on.
+    struct Held {
+        free: u64,
+        carry_on: Mutex<std::sync::mpsc::Receiver<()>>,
+        waiting: AtomicUsize,
+    }
+
+    impl BarSource for Held {
+        fn instrument(&self, _symbol: &str) -> Result<InstrumentSpec, String> {
+            Err("not asked".into())
+        }
+
+        fn klines(
+            &self,
+            _symbol: &str,
+            _timeframe: Timeframe,
+            start: UnixNanos,
+            end: UnixNanos,
+        ) -> Result<Vec<Candle>, String> {
+            if start >= self.free * HOUR {
+                self.waiting.fetch_add(1, Ordering::SeqCst);
+                let _ = self.carry_on.lock().unwrap().recv();
+            }
+            Ok((start / HOUR..end / HOUR)
+                .map(|hour| Candle {
+                    ts: hour * HOUR,
+                    open: 1.0,
+                    high: 1.0,
+                    low: 1.0,
+                    close: 1.0,
+                    volume: 1.0,
+                })
+                .collect())
+        }
+
+        fn now(&self) -> UnixNanos {
+            1_000_000 * HOUR
+        }
+    }
+
+    #[test]
+    fn a_long_download_doesnt_hold_up_bars_already_here_and_arrives_in_order() {
+        let (release, carry_on) = std::sync::mpsc::channel();
+        let held = Arc::new(Held {
+            free: 1_000,
+            carry_on: Mutex::new(carry_on),
+            waiting: AtomicUsize::new(0),
+        });
+        let cache = Arc::new(BarCache::new(dir(), held.clone()));
+        assert_eq!(bars(&cache, 0, 1_000).len(), 1_000);
+
+        let downloading = {
+            let cache = Arc::clone(&cache);
+            thread::spawn(move || bars(&cache, 0, 20_000))
+        };
+        while held.waiting.load(Ordering::SeqCst) == 0 {
+            thread::yield_now();
+        }
+        // The download's stuck, and what's here can still be read.
+        assert_eq!(bars(&cache, 100, 200).len(), 100);
+
+        drop(release);
+        let all = downloading.join().unwrap();
+        let expected: Vec<u64> = (0..20_000).map(|hour| hour * HOUR).collect();
+        assert_eq!(all.iter().map(|bar| bar.ts).collect::<Vec<_>>(), expected);
     }
 
     #[test]

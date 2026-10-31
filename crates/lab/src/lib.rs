@@ -103,7 +103,7 @@ impl Lab {
     ///
     /// Returns a message if its folders can't be made or the plugin runtime can't start.
     pub fn new(paths: Paths) -> Result<Arc<Self>, String> {
-        Self::with_source(paths, Arc::new(cache::Binance))
+        Self::with_source(paths, Arc::new(cache::Binance::default()))
     }
 
     /// One whose non-local bars come from `source`, for tests.

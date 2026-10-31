@@ -193,6 +193,14 @@ fn calls(lab: &Arc<Lab>, dir: &std::path::Path) -> Vec<(&'static str, Value)> {
             with(json!({"strategy": ema(), "blocks": 4, "length": "week", "wait_seconds": 120})),
         ),
         (
+            "run_backtests",
+            json!({
+                "runs": [{"strategy": ema()}],
+                "defaults": market(),
+                "wait_seconds": 120,
+            }),
+        ),
+        (
             "run_optimize",
             with(json!({
                 "strategy": ema(),
@@ -919,7 +927,11 @@ fn backtests_of_binance_markets_repeat_exactly_without_asking_again() {
         )
         .unwrap();
     assert_eq!(batch["blocks"].as_array().unwrap().len(), 8);
-    assert_eq!(source.requests.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        source.requests.load(Ordering::Relaxed),
+        5,
+        "one download, of 5,000 bars at 1,000 a request"
+    );
 }
 
 #[test]
@@ -1345,6 +1357,338 @@ fn the_guide_comes_a_topic_at_a_time() {
     let defaults = lab.dispatch("get_settings", &json!({})).unwrap();
     let settings: Settings = serde_json::from_value(defaults["settings"].clone()).unwrap();
     assert_eq!(settings, Settings::default());
+}
+
+#[test]
+fn answers_with_no_limit_stay_small_and_paging_reaches_every_row() {
+    let (lab, _dir) = lab();
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({"strategy": ema(), "wait_seconds": 120})),
+        )
+        .unwrap();
+    let id = run["run_id"].clone();
+    for (tool, args) in [
+        ("get_bars", with(json!({"from": "2024-01-01"}))),
+        ("get_equity", json!({"run_id": id})),
+        ("get_returns", json!({"run_id": id})),
+        ("get_fills", json!({"run_id": id})),
+        ("get_trades", json!({"run_id": id})),
+        (
+            "compute_indicator",
+            with(json!({
+                "indicator": "sma", "from": "2024-01-01", "wait_seconds": 60,
+            })),
+        ),
+    ] {
+        let answer = lab.dispatch(tool, &args).unwrap();
+        let rows = answer["rows"].as_array().unwrap().len();
+        assert!(rows <= 100, "{tool}: {rows}");
+        let bytes = answer.to_string().len();
+        assert!(bytes < 40_000, "{tool}: {bytes} bytes");
+        // Every page together is what one huge page gives.
+        let mut all = lab_rows(&lab, tool, &args);
+        let mut whole = args.clone();
+        whole["limit"] = json!(50_000);
+        assert_eq!(
+            std::mem::take(&mut all),
+            lab.dispatch(tool, &whole).unwrap()["rows"]
+                .as_array()
+                .unwrap()
+                .clone(),
+            "{tool}"
+        );
+    }
+}
+
+/// All of a paged tool's rows, walking its pages.
+fn lab_rows(lab: &Arc<Lab>, tool: &str, args: &Value) -> Vec<Value> {
+    let mut args = args.clone();
+    let mut rows = Vec::new();
+    loop {
+        let answer = lab.dispatch(tool, &args).unwrap();
+        rows.extend(answer["rows"].as_array().unwrap().iter().cloned());
+        match answer["next_cursor"].as_str() {
+            Some(cursor) => args["cursor"] = json!(cursor),
+            None => return rows,
+        }
+    }
+}
+
+#[test]
+fn optimizing_lists_the_best_values_and_says_how_many_there_were() {
+    let (lab, _dir) = lab();
+    let answer = lab
+        .dispatch(
+            "run_optimize",
+            &with(json!({
+                "strategy": ema(), "limit": 3, "wait_seconds": 120,
+                "variables": [{"name": "Fast", "min": 2, "max": 9, "step": 1}],
+            })),
+        )
+        .unwrap();
+    let values = answer["values"].as_array().unwrap();
+    assert_eq!(values.len(), 3);
+    assert_eq!(answer["total"], 8);
+    let scores: Vec<f64> = values
+        .iter()
+        .map(|v| v["score"].as_f64().unwrap())
+        .collect();
+    assert!(
+        scores.windows(2).all(|pair| pair[0] >= pair[1]),
+        "{scores:?}"
+    );
+}
+
+#[test]
+fn many_backtests_in_one_call_match_the_same_ones_alone() {
+    let (lab, _dir) = lab();
+    let strategy =
+        |fast: u32| json!({"builtin": "ema-cross", "params": {"Fast": fast, "Slow": 40}});
+    let answer = lab
+        .dispatch(
+            "run_backtests",
+            &json!({
+                "defaults": market(),
+                "runs": [
+                    {"strategy": strategy(5)},
+                    {"strategy": {"builtin": "no-such-thing"}},
+                    {"strategy": strategy(9)},
+                    {"strategy": strategy(9), "not_an_argument": 1},
+                ],
+                "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    assert_eq!(answer["total"], 4);
+    assert_eq!(answer["succeeded"], 2, "{answer}");
+    assert_eq!(answer["failed"], 2, "{answer}");
+    let columns: Vec<&str> = answer["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+    let at = |name: &str| columns.iter().position(|c| *c == name).unwrap();
+    let rows = answer["rows"].as_array().unwrap();
+    for row in &rows[..2] {
+        let fast = if row[at("index")] == 0 { 5 } else { 9 };
+        let alone = lab
+            .dispatch(
+                "run_backtest",
+                &with(json!({"strategy": strategy(fast), "wait_seconds": 120})),
+            )
+            .unwrap();
+        assert_eq!(row[at("net_return")], alone["summary"]["net_return"]);
+        assert_eq!(row[at("trades")], alone["summary"]["trades"]);
+        // It's saved, so everything about a run works on it.
+        lab.dispatch("get_report", &json!({"run_id": row[at("run_id")]}))
+            .unwrap();
+    }
+    assert!(
+        rows[0][at("net_return")].as_f64() >= rows[1][at("net_return")].as_f64(),
+        "best first"
+    );
+    assert!(
+        rows[2][at("error")].is_string() && rows[3][at("error")].is_string(),
+        "{rows:?}"
+    );
+
+    // The log shows each as what it was.
+    let log = lab
+        .dispatch(
+            "get_call_log",
+            &json!({"tool": "run_backtest", "limit": 50}),
+        )
+        .unwrap();
+    assert!(log["rows"].as_array().unwrap().len() >= 4, "{log}");
+}
+
+#[test]
+fn a_batch_reports_progress_can_be_waited_on_and_can_be_cancelled() {
+    let (lab, _dir) = lab();
+    let run = json!({"strategy": ema()});
+    let start = |count: usize| {
+        lab.dispatch(
+            "run_backtests",
+            &json!({"defaults": market(), "runs": vec![run.clone(); count], "wait_seconds": 0}),
+        )
+        .unwrap()
+    };
+    let job = start(16);
+    assert_eq!(job["status"], "running", "{job}");
+    let id = job["job_id"].clone();
+    // A long wait comes back as soon as it's done, not at the deadline.
+    let began = Instant::now();
+    let done = lab
+        .dispatch("get_job", &json!({"job_id": id, "wait_seconds": 600}))
+        .unwrap();
+    assert_eq!(done["status"], "done", "{done}");
+    assert_eq!(done["result"]["succeeded"], 16);
+    assert!(began.elapsed() < Duration::from_secs(300));
+
+    let job = start(2_000);
+    let id = job["job_id"].clone();
+    // A short wait comes back at its deadline.
+    let began = Instant::now();
+    let running = lab
+        .dispatch("get_job", &json!({"job_id": id, "wait_seconds": 0.05}))
+        .unwrap();
+    assert_eq!(running["status"], "running", "{running}");
+    assert!(began.elapsed() >= Duration::from_millis(50));
+    assert_eq!(running["total"], 2_000);
+
+    lab.dispatch("cancel_job", &json!({"job_id": id})).unwrap();
+    let ended = lab
+        .dispatch("get_job", &json!({"job_id": id, "wait_seconds": 600}))
+        .unwrap();
+    assert_eq!(ended["status"], "done", "{ended}");
+    let result = &ended["result"];
+    assert!(result["not_run"].as_u64().unwrap() > 0, "{result}");
+    assert_eq!(result["total"], 2_000);
+}
+
+#[test]
+fn pages_of_ticks_miss_none_even_when_they_share_a_time() {
+    let (lab, dir) = lab();
+    // Three ticks each second, over three days, so pages end between ticks of one time.
+    let file = dir.join("ticks.csv");
+    let mut text = String::from("time,price,size\n");
+    for second in 0..3_000 {
+        for tick in 0..3 {
+            let at = second * 86;
+            text += &format!(
+                "2024-03-{:02} {:02}:{:02}:{:02},{}.5,1\n",
+                1 + at / 86_400,
+                at / 3_600 % 24,
+                at / 60 % 60,
+                at % 60,
+                second * 3 + tick,
+            );
+        }
+    }
+    fs::write(&file, text).unwrap();
+    lab.dispatch(
+        "import_data",
+        &json!({"files": [file], "symbol": "ETHUSDT", "venue": "TEST", "wait_seconds": 60}),
+    )
+    .unwrap();
+    let args = json!({"symbol": "ETHUSDT", "venue": "TEST", "from": "2024-01-01", "limit": 100});
+    let rows = lab_rows(&lab, "get_ticks", &args);
+    let prices: Vec<f64> = rows.iter().map(|row| row[1].as_f64().unwrap()).collect();
+    let expected: Vec<f64> = (0..9_000).map(|i| f64::from(i) + 0.5).collect();
+    assert_eq!(prices, expected);
+
+    // Past the market's end is just the end, and no default answer is huge.
+    let first = lab
+        .dispatch(
+            "get_ticks",
+            &json!({"symbol": "ETHUSDT", "venue": "TEST", "from": "2024-01-01"}),
+        )
+        .unwrap();
+    assert_eq!(first["rows"].as_array().unwrap().len(), 100);
+    let none = lab
+        .dispatch(
+            "get_ticks",
+            &json!({"symbol": "ETHUSDT", "venue": "TEST", "from": "2030-01-01"}),
+        )
+        .unwrap();
+    assert!(none["rows"].as_array().unwrap().is_empty());
+    assert!(none["next_cursor"].is_null());
+}
+
+#[test]
+fn the_call_log_reads_back_from_its_end_a_page_at_a_time() {
+    let (lab, _dir) = lab();
+    let path = lab.paths.lab().join("calls.jsonl");
+    // Far more than one read's worth, with lines of different lengths.
+    let mut text = String::new();
+    for at in 0..20_000 {
+        let tool = if at % 2 == 0 { "even" } else { "odd" };
+        let padding = "x".repeat(at % 300);
+        text += &json!({"at": at, "tool": tool, "args": {"p": padding}, "ok": true, "error": null})
+            .to_string();
+        text.push('\n');
+    }
+    fs::write(&path, text).unwrap();
+
+    let walk = |tool: &str| -> Vec<u64> {
+        let mut args = json!({"tool": tool, "limit": 700});
+        let mut seen = Vec::new();
+        loop {
+            let answer = lab.dispatch("get_call_log", &args).unwrap();
+            seen.extend(
+                answer["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["at"].as_u64().unwrap()),
+            );
+            match answer["next_cursor"].as_str() {
+                Some(cursor) => args["cursor"] = json!(cursor),
+                None => return seen,
+            }
+        }
+    };
+    let even: Vec<u64> = (0..20_000).rev().filter(|at| at % 2 == 0).collect();
+    assert_eq!(walk("even"), even, "newest first, none missed or repeated");
+
+    let newest = lab.dispatch("get_call_log", &json!({})).unwrap();
+    assert_eq!(newest["rows"].as_array().unwrap().len(), 50, "the default");
+}
+
+#[test]
+fn runs_list_newest_first_and_compare_without_unpacking_them() {
+    let (lab, _dir) = lab();
+    let ids: Vec<Value> = (0..3)
+        .map(|_| {
+            lab.dispatch(
+                "run_backtest",
+                &with(json!({"strategy": ema(), "wait_seconds": 120})),
+            )
+            .unwrap()["run_id"]
+                .clone()
+        })
+        .collect();
+    let list = lab.dispatch("list_runs", &json!({"limit": 2})).unwrap();
+    let rows = list["rows"].as_array().unwrap();
+    assert_eq!(list["total"], 3);
+    assert_eq!(rows[0]["run_id"], ids[2]);
+    assert_eq!(rows[1]["run_id"], ids[1]);
+    assert!(rows[0].get("request").is_none(), "kept short");
+    assert!(rows[0]["summary"]["trades"].is_number());
+    let more = lab
+        .dispatch("list_runs", &json!({"cursor": list["next_cursor"]}))
+        .unwrap();
+    assert_eq!(more["rows"][0]["run_id"], ids[0]);
+
+    // The full run isn't needed, and is gone here, to show it.
+    let runs = lab.paths.lab().join("runs");
+    let id = ids[0].as_str().unwrap();
+    fs::remove_file(runs.join(format!("{id}.json.gz"))).unwrap();
+    let compared = lab
+        .dispatch("compare_runs", &json!({"run_ids": [id]}))
+        .unwrap();
+    assert!(
+        compared["runs"][0]["request"]["strategy"].is_object(),
+        "{compared}"
+    );
+
+    // One saved before summaries held the request reads the full run.
+    let id = ids[1].as_str().unwrap();
+    fs::write(
+        runs.join(format!("{id}.summary")),
+        json!({"run_id": id, "created": 1, "summary": {}}).to_string(),
+    )
+    .unwrap();
+    let compared = lab
+        .dispatch("compare_runs", &json!({"run_ids": [id]}))
+        .unwrap();
+    assert!(
+        compared["runs"][0]["request"]["strategy"].is_object(),
+        "{compared}"
+    );
 }
 
 #[test]

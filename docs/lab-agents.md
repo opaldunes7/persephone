@@ -169,8 +169,26 @@ Which bars a call uses, their limits, and what's cached.
 
 ## tests
 
-Monte Carlo, random blocks and Optimize. All three run many backtests or draws, and take a `seed`: the same inputs and seed
-give the same answer.
+Monte Carlo, random blocks, Optimize and batches of backtests. The first three take a `seed`: the same inputs
+and seed give the same answer.
+
+**Trying many things? Use one `run_backtests` call rather than many `run_backtest` calls.** It runs them in
+parallel and answers in one table, best return first, which saves a model turn for each one.
+
+```json
+{"tool": "run_backtests", "args": {
+  "defaults": {"bars": "1h", "from": "2024-01-01", "to": "2024-03-01"},
+  "runs": [
+    {"symbol": "BTCUSDT", "strategy": {"builtin": "ema-cross", "params": {"Fast": 5}}},
+    {"symbol": "BTCUSDT", "strategy": {"builtin": "ema-cross", "params": {"Fast": 10}}},
+    {"symbol": "BTCUSDT", "strategy": {"builtin": "rsi-reversion"}}
+  ]
+}}
+```
+
+Each run's own arguments override `defaults`. `index` in a row is the run's place in your list. One that fails
+doesn't stop the others: `error` says why, and `failed` and `first_error` report it. It lists 100 unless
+`limit` says otherwise, and all are saved, so `get_report`, `get_trades` and the rest work on any `run_id`.
 
 Monte Carlo draws a finished run's trades at random. It needs at least 10 trades.
 
@@ -203,6 +221,7 @@ Optimize tries a range of one or two parameters, by the names `describe_strategy
 ```
 
 - **`score`:** `backtest` (return), `monte-carlo` (5th percentile return) or `random-blocks` (median block).
+- **`values`** lists the best 50 unless `limit` says otherwise, and `total` says how many there were.
 - **`top`** ranks by `with_neighbours`, a value's score averaged with those beside it, so a lone spike
   doesn't win.
 - **`hold_out`** scores on the span's first 70% and gives the top 5's `unseen_return` on the last 30%. It's
@@ -215,18 +234,23 @@ Backtests and tests may take a while. Each waits `wait_seconds` (30 by default),
 answers with `status: "running"` and a `job_id` rather than holding the call open.
 
 ```json
-{"tool": "get_job", "args": {"job_id": "$JOB"}}
+{"tool": "get_job", "args": {"job_id": "$JOB", "wait_seconds": 60}}
 ```
 
 `get_job` gives `done` and `total` while running, and `status: "done"` with `result` when finished, or the
-error if it failed. `cancel_job` stops it, and it shows `status: "cancelling"` until it has. Answers are
-kept, so a job can be read after a restart.
+error if it failed. Give it `wait_seconds` rather than asking repeatedly: it answers the moment the job
+finishes. `cancel_job` stops it, and it shows `status: "cancelling"` until it has. Answers are kept, so a
+job can be read after a restart.
+
+Backtests run in parallel up to one less than the machine's cores, however many calls they come from. The
+rest wait their turn, so calling in parallel is safe.
 
 ## paging
 
 Long answers come in pages: `columns`, `rows` and `next_cursor`. Pass `next_cursor` back as `cursor` until
-it's null. `limit` sets a page's size, up to 50,000. To keep your context small, ask for small pages or use
-the `summary` from a run, and use `export_data` for anything large.
+it's null. Pages are 100 rows unless `limit` says otherwise (`list_runs` gives 20, and `get_call_log` 50),
+up to 50,000. A page of 100 trades costs about 5,000 tokens, so ask for what you need: a run's `summary` is
+usually enough, and `export_data` suits anything large.
 
 ## results
 

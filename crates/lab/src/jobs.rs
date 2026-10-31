@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     fs,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -31,12 +31,40 @@ pub struct Job {
     /// Set to ask it to stop.
     pub stop: Arc<AtomicBool>,
     result: Mutex<Option<Result<Value, String>>>,
+    /// Told when `result` is set, so nothing has to keep checking.
+    ended: Condvar,
 }
 
 impl Job {
     fn finished(&self) -> Option<Result<Value, String>> {
         self.result.lock().ok()?.clone()
     }
+
+    /// Waits until it's finished or `wait` has passed, whichever comes first.
+    fn wait(&self, wait: Duration) -> Option<Result<Value, String>> {
+        let deadline = Instant::now() + wait;
+        let mut result = self.result.lock().ok()?;
+        loop {
+            if result.is_some() {
+                return result.clone();
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            result = self.ended.wait_timeout(result, left).ok()?.0;
+        }
+    }
+}
+
+/// How long a call says to wait.
+fn wait_of(args: &Value, default: f64) -> Duration {
+    let seconds = args
+        .get("wait_seconds")
+        .and_then(Value::as_f64)
+        .unwrap_or(default)
+        .clamp(0.0, 86_400.0);
+    Duration::from_secs_f64(seconds)
 }
 
 /// What a job's status looks like, finished or not.
@@ -82,6 +110,7 @@ impl Lab {
             total: AtomicUsize::new(0),
             stop: Arc::new(AtomicBool::new(false)),
             result: Mutex::new(None),
+            ended: Condvar::new(),
         });
         if let Ok(mut jobs) = self.jobs.lock() {
             jobs.insert(id.clone(), Arc::clone(&job));
@@ -109,31 +138,21 @@ impl Lab {
             if let Ok(mut slot) = worker.result.lock() {
                 *slot = Some(result);
             }
+            worker.ended.notify_all();
             // Its answer's on disk now, so a long-lived server needn't keep it too.
             if let Ok(mut jobs) = lab.jobs.lock() {
                 jobs.remove(&job_id);
             }
         });
 
-        let wait = args
-            .get("wait_seconds")
-            .and_then(Value::as_f64)
-            .unwrap_or(DEFAULT_WAIT_SECONDS)
-            .max(0.0);
-        let deadline = Instant::now() + Duration::from_secs_f64(wait.min(86_400.0));
-        loop {
-            if let Some(result) = job.finished() {
-                return result.map(|mut value| {
-                    if let Some(object) = value.as_object_mut() {
-                        object.insert("job_id".into(), json!(id));
-                    }
-                    value
-                });
-            }
-            if Instant::now() >= deadline {
-                return status(&id, &job);
-            }
-            thread::sleep(Duration::from_millis(5));
+        match job.wait(wait_of(args, DEFAULT_WAIT_SECONDS)) {
+            Some(result) => result.map(|mut value| {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("job_id".into(), json!(id));
+                }
+                value
+            }),
+            None => status(&id, &job),
         }
     }
 
@@ -141,6 +160,7 @@ impl Lab {
         let id = crate::tools::text(args, "job_id")?;
         let job = self.jobs.lock().ok().and_then(|jobs| jobs.get(id).cloned());
         if let Some(job) = job {
+            job.wait(wait_of(args, 0.0));
             return status(id, &job);
         }
         check_id(id)?;

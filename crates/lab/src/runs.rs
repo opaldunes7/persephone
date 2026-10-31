@@ -5,6 +5,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     io::{Read as _, Write as _},
+    path::Path,
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
@@ -24,7 +25,7 @@ use persephone_research::{
     optimize::{Grid, OptimizeJob, Outcome, split_at},
     results::{StrategyRef, with_params},
     robustness::{
-        BlockJob, MonteCarlo, RoundTrip, backtest, closed_trades, monte_carlo, pick_blocks,
+        BlockJob, MonteCarlo, RoundTrip, backtest, closed_trades, monte_carlo, pick_blocks, pool,
         round_trips,
     },
     settings::{BlockLength, OptimizeSettings, Precision, ScoreBy, Settings, Variable},
@@ -36,11 +37,17 @@ use crate::{
     data::MarketArgs,
     jobs::{Job, check_id},
     new_id, now_ms, time_text,
-    tools::{page, page_of, text},
+    tools::{DEFAULT_ROWS, check_args, limit_of, page_of, text, tools},
 };
 
 /// How many runs to keep read.
 const RECENT_RUNS: usize = 4;
+/// How many runs `list_runs` gives unless asked for more.
+const LISTED_RUNS: usize = 20;
+/// How many values `run_optimize` lists unless asked for more.
+const LISTED_VALUES: usize = 50;
+/// The most backtests `run_backtests` takes in one call.
+const MAX_BACKTESTS: usize = 5_000;
 const TRADE_COLUMNS: [&str; 14] = [
     "trade",
     "side",
@@ -235,6 +242,11 @@ fn report_from(run: &Value) -> BacktestReport {
     }
 }
 
+/// A run's summary file, if it has one.
+fn read_summary(dir: &Path, id: &str) -> Option<Value> {
+    serde_json::from_str(&fs::read_to_string(dir.join(format!("{id}.summary"))).ok()?).ok()
+}
+
 impl Lab {
     /// The strategy a call names, and what makes its signal if it isn't built in.
     pub(crate) fn resolve(
@@ -369,11 +381,126 @@ impl Lab {
             .and_then(|()| packed.finish())
             .and_then(|bytes| fs::write(dir.join(format!("{run_id}.json.gz")), bytes))
             .and_then(|()| {
-                let brief = json!({"run_id": run_id, "created": now_ms(), "summary": summary});
+                let brief = json!({
+                    "run_id": run_id, "created": now_ms(), "summary": summary, "request": args,
+                });
                 fs::write(dir.join(format!("{run_id}.summary")), brief.to_string())
             })
             .map_err(|e| format!("couldn't save the run: {e}"))?;
+        // Whatever's asked next is most likely about this run.
+        self.remember_run(&run_id, Arc::new(run));
         Ok(json!({"run_id": run_id, "summary": summary}))
+    }
+
+    /// Many backtests from one call, in parallel, answered as a table.
+    pub(crate) fn run_backtests(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {
+        let items = args
+            .get("runs")
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty())
+            .ok_or("`runs` should be a list of run_backtest's arguments")?;
+        if items.len() > MAX_BACKTESTS {
+            return Err(format!(
+                "`runs`: that's {} backtests, more than the {MAX_BACKTESTS} allowed in a call",
+                items.len()
+            ));
+        }
+        let shared = args.get("defaults").and_then(Value::as_object);
+        let calls: Vec<Value> = items
+            .iter()
+            .map(|item| {
+                let own = item
+                    .as_object()
+                    .ok_or_else(|| format!("`runs`: {item} isn't an object"))?;
+                let mut call = shared.cloned().unwrap_or_default();
+                call.extend(own.clone());
+                Ok(Value::Object(call))
+            })
+            .collect::<Result<_, String>>()?;
+        // One at a time if any of them is a strategy in a process of its own.
+        let workers = calls
+            .iter()
+            .filter_map(|call| self.resolve(call.get("strategy")?).ok())
+            .map(|(spec, _)| self.workers_for(&spec))
+            .min()
+            .unwrap_or(1);
+        job.total.store(calls.len(), Ordering::Relaxed);
+        let all = tools();
+        let tool = all
+            .iter()
+            .find(|tool| tool.name == "run_backtest")
+            .ok_or("run_backtest is missing")?;
+        let results = pool(
+            &calls,
+            workers,
+            &job.stop,
+            &|| {
+                job.done.fetch_add(1, Ordering::Relaxed);
+            },
+            &|call| {
+                let result = check_args(tool, call).and_then(|()| self.run_backtest(call));
+                // Each is logged as a backtest of its own, so the log shows what was really tried.
+                self.log_call("run_backtest", call, &result);
+                result
+            },
+        );
+        let (mut succeeded, mut failed, mut not_run) = (Vec::new(), Vec::new(), 0);
+        for (index, result) in results.into_iter().enumerate() {
+            match result {
+                Some(Ok(run)) => succeeded.push((index, run)),
+                Some(Err(error)) => failed.push((index, error)),
+                None => not_run += 1,
+            }
+        }
+        let net = |run: &Value| run["summary"]["net_return"].as_f64().unwrap_or(f64::MIN);
+        succeeded.sort_by(|(_, a), (_, b)| net(b).total_cmp(&net(a)));
+        let total = calls.len();
+        let (done, errors) = (succeeded.len(), failed.len());
+        let first_error = failed
+            .first()
+            .map(|(index, error)| json!({"index": index, "error": error}));
+        let mut rows: Vec<Value> = succeeded
+            .iter()
+            .map(|(index, run)| {
+                let summary = &run["summary"];
+                json!([
+                    index,
+                    run["run_id"],
+                    summary["net_return"],
+                    summary["max_drawdown"],
+                    summary["trades"],
+                    summary["win_rate"],
+                    summary["fees"],
+                    summary["final_equity"],
+                    null,
+                ])
+            })
+            .collect();
+        rows.extend(
+            failed.iter().map(|(index, error)| {
+                json!([index, null, null, null, null, null, null, null, error])
+            }),
+        );
+        rows.truncate(limit_of(args, DEFAULT_ROWS));
+        Ok(json!({
+            "columns": [
+                "index", "run_id", "net_return", "max_drawdown", "trades", "win_rate", "fees",
+                "final_equity", "error",
+            ],
+            "rows": rows,
+            "total": total,
+            "succeeded": done,
+            "failed": errors,
+            "not_run": not_run,
+            "first_error": first_error,
+        }))
+    }
+
+    fn remember_run(&self, id: &str, run: Arc<Value>) {
+        if let Ok(mut recent) = self.recent_runs.lock() {
+            recent.push_front((id.to_owned(), run));
+            recent.truncate(RECENT_RUNS);
+        }
     }
 
     pub(crate) fn load_run(&self, id: &str) -> Result<Arc<Value>, String> {
@@ -397,10 +524,7 @@ impl Lab {
             Err(_) => fs::read_to_string(dir.join(format!("{id}.json"))).map_err(|_| missing())?,
         };
         let run: Arc<Value> = Arc::new(serde_json::from_str(&text).map_err(|e| e.to_string())?);
-        if let Ok(mut recent) = self.recent_runs.lock() {
-            recent.push_front((id.to_owned(), Arc::clone(&run)));
-            recent.truncate(RECENT_RUNS);
-        }
+        self.remember_run(id, Arc::clone(&run));
         Ok(run)
     }
 
@@ -457,22 +581,26 @@ impl Lab {
     pub(crate) fn get_trades(&self, args: &Value) -> Result<Value, String> {
         let run = self.load_run(text(args, "run_id")?)?;
         let report = report_from(&run);
-        let rows = round_trips(&report)
-            .iter()
-            .enumerate()
-            .map(|(i, trade)| trade_row(i + 1, trade, report.starting_balance))
-            .collect();
-        Ok(page(&TRADE_COLUMNS, rows, args, 1_000))
+        let trades = round_trips(&report);
+        Ok(page_of(
+            &TRADE_COLUMNS,
+            trades.len(),
+            args,
+            DEFAULT_ROWS,
+            |i| trade_row(i + 1, &trades[i], report.starting_balance),
+        ))
     }
 
     pub(crate) fn get_fills(&self, args: &Value) -> Result<Value, String> {
         let run = self.load_run(text(args, "run_id")?)?;
-        let rows = run["fills"].as_array().cloned().unwrap_or_default();
-        Ok(page(
+        let empty = Vec::new();
+        let fills = run["fills"].as_array().unwrap_or(&empty);
+        Ok(page_of(
             &["ts", "bar", "side", "price", "size", "fee"],
-            rows,
+            fills.len(),
             args,
-            1_000,
+            DEFAULT_ROWS,
+            |i| fills[i].clone(),
         ))
     }
 
@@ -487,7 +615,7 @@ impl Lab {
             &["ts", "time", "equity"],
             total,
             args,
-            1_000,
+            DEFAULT_ROWS,
             |i| {
                 let at = times[from + i].as_u64().unwrap_or(0);
                 json!([at, time_text(at), equity[from + i]])
@@ -499,9 +627,13 @@ impl Lab {
         let run = self.load_run(text(args, "run_id")?)?;
         let empty = Vec::new();
         let rows = run["returns_series"].as_array().unwrap_or(&empty);
-        Ok(page_of(&["ts", "return"], rows.len(), args, 1_000, |i| {
-            rows[i].clone()
-        }))
+        Ok(page_of(
+            &["ts", "return"],
+            rows.len(),
+            args,
+            DEFAULT_ROWS,
+            |i| rows[i].clone(),
+        ))
     }
 
     pub(crate) fn get_calendar(&self, args: &Value) -> Result<Value, String> {
@@ -578,14 +710,34 @@ impl Lab {
 
     pub(crate) fn list_runs(&self, args: &Value) -> Result<Value, String> {
         let dir = self.paths.lab().join("runs");
-        let mut runs: Vec<Value> = fs::read_dir(dir)
+        // A run's id says when it was made, so only the page's files need reading.
+        let mut ids: Vec<(u64, u64, String)> = fs::read_dir(&dir)
             .map_err(|e| e.to_string())?
             .flatten()
-            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "summary"))
-            .filter_map(|entry| serde_json::from_str(&fs::read_to_string(entry.path()).ok()?).ok())
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let id = name.to_str()?.strip_suffix(".summary")?;
+                let mut parts = id.split('-').skip(1);
+                let made = parts.next()?.parse().ok()?;
+                let number = parts.nth(1)?.parse().ok()?;
+                Some((made, number, id.to_owned()))
+            })
             .collect();
-        runs.sort_by_key(|run: &Value| std::cmp::Reverse(run["created"].as_u64().unwrap_or(0)));
-        Ok(page(&["run_id", "created", "summary"], runs, args, 100))
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        Ok(page_of(
+            &["run_id", "created", "summary"],
+            ids.len(),
+            args,
+            LISTED_RUNS,
+            |i| {
+                let id = &ids[i].2;
+                let mut brief = read_summary(&dir, id).unwrap_or_else(|| json!({"run_id": id}));
+                if let Some(brief) = brief.as_object_mut() {
+                    brief.remove("request");
+                }
+                brief
+            },
+        ))
     }
 
     pub(crate) fn compare_runs(&self, args: &Value) -> Result<Value, String> {
@@ -599,8 +751,18 @@ impl Lab {
                 let id = id
                     .as_str()
                     .ok_or_else(|| format!("`run_ids`: {id} isn't an id"))?;
-                let run = self.load_run(id)?;
-                Ok(json!({"run_id": id, "summary": run["summary"], "request": run["request"]}))
+                check_id(id)?;
+                let brief = read_summary(&self.paths.lab().join("runs"), id)
+                    .filter(|brief| brief.get("request").is_some());
+                // Saved before summaries held the request.
+                let (summary, request) = match brief {
+                    Some(brief) => (brief["summary"].clone(), brief["request"].clone()),
+                    None => {
+                        let run = self.load_run(id)?;
+                        (run["summary"].clone(), run["request"].clone())
+                    }
+                };
+                Ok(json!({"run_id": id, "summary": summary, "request": request}))
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(json!({"runs": runs}))
@@ -791,7 +953,7 @@ impl Lab {
             }
             Value::Object(names)
         };
-        let rows: Vec<Value> = found
+        let mut rows: Vec<Value> = found
             .outcomes
             .iter()
             .enumerate()
@@ -806,6 +968,11 @@ impl Lab {
                 json!({"values": names_of(cell), "score": score, "status": status, "what": what})
             })
             .collect();
+        // Best first, and the list cut short: a grid can have thousands.
+        let score_of = |row: &Value| row["score"].as_f64().unwrap_or(f64::MIN);
+        rows.sort_by(|a, b| score_of(b).total_cmp(&score_of(a)));
+        let values = rows.len();
+        rows.truncate(limit_of(args, LISTED_VALUES));
         let top: Vec<Value> = found
             .top
             .iter()
@@ -820,6 +987,7 @@ impl Lab {
             .collect();
         Ok(json!({
             "values": rows,
+            "total": values,
             "top": top,
             "on_edge": found.on_edge,
             "held_out": found.held_out,

@@ -1,5 +1,6 @@
 //! Tools for markets, bars and ticks.
 
+use std::ops::Range;
 use std::{
     fs::{self, File},
     io::{BufWriter, Write as _},
@@ -28,11 +29,10 @@ use crate::{
     Lab,
     jobs::Job,
     new_id, parse_time, time_text,
-    tools::{limit_of, text},
+    tools::{DEFAULT_ROWS, limit_of, text},
 };
 
 const BAR_COLUMNS: [&str; 7] = ["ts", "time", "open", "high", "low", "close", "volume"];
-const DEFAULT_PAGE: usize = 1_000;
 
 /// A market as a call names it.
 #[derive(Clone, Debug)]
@@ -259,7 +259,7 @@ impl Lab {
                     .map_err(|_| format!("`{cursor}` isn't a cursor"))?,
             );
         }
-        let limit = limit_of(args, DEFAULT_PAGE);
+        let limit = limit_of(args, DEFAULT_ROWS);
         let mut bars = self.bars_between(&market, limit)?;
         let more = bars.len() > limit;
         bars.truncate(limit);
@@ -292,8 +292,15 @@ impl Lab {
         let market = self.store.market(&venue, &symbol).map_err(error_text)?;
         let mut from = parse_time(args.get("from").unwrap_or(&Value::Null))
             .map_err(|e| format!("`from`: {e}"))?;
+        // Where the next tick is: a time, and how many at exactly that time have been given, as
+        // several ticks can share one.
+        let mut given = 0;
         if let Some(cursor) = args.get("cursor").and_then(Value::as_str) {
-            from = cursor
+            let (at, skip) = cursor.split_once(':').unwrap_or((cursor, "0"));
+            from = at
+                .parse()
+                .map_err(|_| format!("`{cursor}` isn't a cursor"))?;
+            given = skip
                 .parse()
                 .map_err(|_| format!("`{cursor}` isn't a cursor"))?;
         }
@@ -302,12 +309,18 @@ impl Lab {
             .map(|value| parse_time(value).map_err(|e| format!("`to`: {e}")))
             .transpose()?
             .unwrap_or(UnixNanos::MAX);
-        let limit = limit_of(args, DEFAULT_PAGE);
-        let ticks = market.read_ticks(from, to).map_err(error_text)?;
-        let (columns, mut rows, times) = tick_rows(&ticks);
-        let more = rows.len() > limit;
-        rows.truncate(limit);
-        let next = more.then(|| (times[limit - 1] + 1).to_string());
+        let limit = limit_of(args, DEFAULT_ROWS);
+        let ticks = market
+            .read_some_ticks(from, to, given + limit + 1)
+            .map_err(error_text)?;
+        let end = ticks.len().min(given + limit);
+        let more = ticks.len() > end;
+        let (columns, rows) = tick_rows(&ticks, given.min(end)..end);
+        let next = more.then(|| {
+            let at = ticks.ts(end - 1);
+            let same = (0..end).filter(|&i| ticks.ts(i) == at).count();
+            format!("{at}:{same}")
+        });
         Ok(json!({
             "kind": match ticks { Ticks::Trades(_) => "trades", Ticks::Quotes(_) => "quotes" },
             "columns": columns,
@@ -502,23 +515,21 @@ impl Lab {
 }
 
 /// Ticks as rows, with their times for finding where a page ends.
-fn tick_rows(ticks: &Ticks) -> (Vec<&'static str>, Vec<Value>, Vec<UnixNanos>) {
+fn tick_rows(ticks: &Ticks, range: Range<usize>) -> (Vec<&'static str>, Vec<Value>) {
     match ticks {
         Ticks::Trades(trades) => (
             vec!["ts", "price", "size", "aggressor"],
-            trades
+            trades[range]
                 .iter()
                 .map(|t| json!([t.ts, t.price, t.size, format!("{:?}", t.aggressor)]))
                 .collect(),
-            trades.iter().map(|t| t.ts).collect(),
         ),
         Ticks::Quotes(quotes) => (
             vec!["ts", "bid", "ask", "bid_size", "ask_size"],
-            quotes
+            quotes[range]
                 .iter()
                 .map(|q| json!([q.ts, q.bid, q.ask, q.bid_size, q.ask_size]))
                 .collect(),
-            quotes.iter().map(|q| q.ts).collect(),
         ),
     }
 }

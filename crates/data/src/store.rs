@@ -558,12 +558,32 @@ impl LocalMarket {
     ///
     /// Returns an error if a tick file can't be read, or the market holds bars.
     pub fn read_ticks(&self, start: UnixNanos, end: UnixNanos) -> anyhow::Result<Ticks> {
+        self.read_some_ticks(start, end, usize::MAX)
+    }
+
+    /// The ticks in `[start, end)`, stopping at the end of the day that brings them to `most`, so
+    /// a page of a long span only costs a page's worth of reading.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the market doesn't hold ticks or a file can't be read.
+    pub fn read_some_ticks(
+        &self,
+        start: UnixNanos,
+        end: UnixNanos,
+        most: usize,
+    ) -> anyhow::Result<Ticks> {
         let kind = self.tick_kind()?;
         let mut out = Ticks::empty(kind);
+        // There's nothing past its last tick, however far ahead the span goes.
+        let end = end.min(self.info.last.saturating_add(1));
         if start >= end {
             return Ok(out);
         }
         for day in day_of(start)..=day_of(end - 1) {
+            if out.len() >= most {
+                break;
+            }
             let path = self.day_path(day);
             if path.exists() {
                 append_between(&mut out, read_ticks(&path, kind)?, start, end);

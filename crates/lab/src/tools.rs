@@ -59,7 +59,8 @@ impl Tool {
                 json!(arg.kind)
             };
             let mut schema = json!({"type": kind, "description": arg.what});
-            if arg.name == "settings" {
+            // Once is enough for an agent to learn its shape, and the tool list is read every session.
+            if arg.name == "settings" && self.name == "run_backtest" {
                 schema["properties"] = settings_schema();
             }
             properties.insert(arg.name.to_owned(), schema);
@@ -148,7 +149,11 @@ const CURSOR: Arg = opt(
     "string",
     "Where to carry on, from the last page's next_cursor.",
 );
-const LIMIT: Arg = opt("limit", "integer", "The most to return in this page.");
+const LIMIT: Arg = opt(
+    "limit",
+    "integer",
+    "The most to return in this page, up to 50,000. Default 100, to keep answers small.",
+);
 const STRATEGY: Arg = arg(
     "strategy",
     "object",
@@ -157,7 +162,7 @@ const STRATEGY: Arg = arg(
 const SETTINGS: Arg = opt(
     "settings",
     "object",
-    "Costs and rules; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.",
+    "Costs and rules, as in run_backtest; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.",
 );
 const RUN_ID: Arg = arg("run_id", "string", "A run, from run_backtest or list_runs.");
 
@@ -392,6 +397,28 @@ pub fn tools() -> Vec<Tool> {
             &["run_id", "summary"],
         ),
         job(
+            "run_backtests",
+            "Many backtests in one call, in parallel: much quicker for an agent than one call each. Every run is saved, so all the tools that take a run_id work on them. One that fails doesn't stop the rest.",
+            vec![
+                arg(
+                    "runs",
+                    "array",
+                    "A list of arguments as run_backtest takes, up to 5,000.",
+                ),
+                opt(
+                    "defaults",
+                    "object",
+                    "Arguments every run shares, such as bars, from, to and settings. A run's own win.",
+                ),
+                opt(
+                    "limit",
+                    "integer",
+                    "How many runs to list, best return first. Default 100.",
+                ),
+            ],
+            &["columns", "rows", "total", "succeeded", "failed", "not_run"],
+        ),
+        job(
             "run_monte_carlo",
             "Draws a run's trades at random many times, to see the range of results they could have given. Returns, falls and ruin are fractions.",
             vec![
@@ -490,9 +517,14 @@ pub fn tools() -> Vec<Tool> {
                     ),
                     opt("ruin_percent", "number", "For monte-carlo. Default 50."),
                     opt("seed", "integer", "Default 0."),
+                    opt(
+                        "limit",
+                        "integer",
+                        "How many values to list, best first. Default 50.",
+                    ),
                 ],
             ),
-            &["values", "top", "on_edge", "held_out", "backtests"],
+            &["values", "total", "top", "on_edge", "held_out", "backtests"],
         ),
         tool(
             "get_report",
@@ -551,8 +583,15 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "get_job",
-            "How a job is doing, and its result once it's done.",
-            vec![arg("job_id", "string", "A job id.")],
+            "How a job is doing, and its result once it's done. Give wait_seconds rather than asking again and again.",
+            vec![
+                arg("job_id", "string", "A job id."),
+                opt(
+                    "wait_seconds",
+                    "number",
+                    "How long to wait for it to finish, answering the moment it does. Default 0.",
+                ),
+            ],
             &["job_id", "status"],
         ),
         tool(
@@ -605,7 +644,7 @@ pub fn tools() -> Vec<Tool> {
                 CURSOR,
                 LIMIT,
             ],
-            &["rows", "next_cursor", "total"],
+            &["columns", "rows", "next_cursor"],
         ),
     ]
 }
@@ -643,7 +682,7 @@ pub(crate) fn text<'a>(args: &'a Value, name: &str) -> Result<&'a str, String> {
 }
 
 /// Checks a call's arguments against its tool, so an agent hears what's wrong before anything runs.
-fn check_args(tool: &Tool, args: &Value) -> Result<(), String> {
+pub(crate) fn check_args(tool: &Tool, args: &Value) -> Result<(), String> {
     let object = args
         .as_object()
         .ok_or_else(|| format!("{}: arguments must be an object, not {args}", tool.name))?;
@@ -744,6 +783,7 @@ impl Lab {
                     "fetch_archive" => lab.fetch_archive(&owned, job),
                     "compute_indicator" => lab.compute_indicator(&owned),
                     "run_backtest" => lab.run_backtest(&owned),
+                    "run_backtests" => lab.run_backtests(&owned, job),
                     "run_monte_carlo" => lab.run_monte_carlo(&owned, job),
                     "run_random_blocks" => lab.run_random_blocks(&owned, job),
                     "run_optimize" => lab.run_optimize(&owned, job),
@@ -754,7 +794,7 @@ impl Lab {
     }
 
     /// Notes a call. Enormous arguments are cut short: the log is for seeing what happened.
-    fn log_call(&self, name: &str, args: &Value, result: &Result<Value, String>) {
+    pub(crate) fn log_call(&self, name: &str, args: &Value, result: &Result<Value, String>) {
         const MOST: usize = 4_000;
         let arguments = if args.to_string().len() > MOST {
             json!({"cut_short": true})
@@ -776,6 +816,10 @@ impl Lab {
         }
     }
 }
+
+/// How many rows an answer has unless asked for more: enough to look at, small enough for an agent's
+/// context, as a thousand rows runs to tens of thousands of tokens.
+pub(crate) const DEFAULT_ROWS: usize = 100;
 
 /// One page of `rows`, from `cursor`, with where to carry on.
 pub(crate) fn page(columns: &[&str], rows: Vec<Value>, args: &Value, default: usize) -> Value {
