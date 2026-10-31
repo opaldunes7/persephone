@@ -2,6 +2,7 @@
 //! side on a workspace of their own.
 
 use persephone_core::indicator::Param;
+pub use persephone_research::optimize::{default_range, label};
 use persephone_tiling::TileId;
 
 /// The most charts a sweep opens.
@@ -45,26 +46,6 @@ pub fn values(param: &Param, from: f64, to: f64, charts: usize) -> Result<Vec<f6
         return Err("those give fewer than two different values".into());
     }
     Ok(out)
-}
-
-/// A starting range around `value`: half to double, within the parameter's limits.
-#[must_use]
-pub fn default_range(param: &Param, value: f64) -> (f64, f64) {
-    let round = |v: f64| if param.integer { v.round() } else { v };
-    (
-        round((value / 2.0).max(param.min)),
-        round((value * 2.0).min(param.max)),
-    )
-}
-
-/// How a number reads in a sweep: whole numbers without decimals.
-#[must_use]
-pub fn label(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{value:.0}")
-    } else {
-        format!("{value}")
-    }
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ use persephone_core::{
     time::{DateTime, days_from_civil},
 };
 
-use super::robustness::RoundTrip;
+use crate::robustness::RoundTrip;
 
 /// Which part of the calendar is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

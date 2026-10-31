@@ -65,6 +65,10 @@ use persephone_engine::{
     live::{LiveEvent, LiveFeed, LiveMode, LiveRequest, start_live},
 };
 use persephone_plugin_host::{Host, Plugins, StrategyPlugin};
+use persephone_research::{
+    logic::Logic,
+    results::{SavedResult, StrategyRef, load_results, with_params},
+};
 use persephone_tiling::{Layout, Rect, TileId};
 
 use crate::{
@@ -78,8 +82,8 @@ use crate::{
     persist::{Saved, SavedIndicator, SavedStrategy, SavedTile, SavedWorkspace},
 };
 
-/// How many bars each market loads.
-const HISTORY_BARS: u64 = 5_000;
+/// What a strategy saved by Lab is called among plugins, so it saves with a layout like them.
+const LAB_PREFIX: &str = "lab:";
 /// Every backtest starts with this much of the quote currency.
 pub const STARTING_BALANCE: f64 = 100_000.0;
 /// Space around and between tiles when there is more than one.
@@ -134,6 +138,24 @@ pub struct MarketData {
     pub fills: Option<String>,
 }
 
+impl From<persephone_research::market::MarketBars> for MarketData {
+    fn from(market: persephone_research::market::MarketBars) -> Self {
+        Self {
+            data: ChartData::new(
+                market.symbol,
+                market.venue,
+                market.bars,
+                market.price_precision,
+                market.candles,
+            ),
+            instrument: market.instrument,
+            fees: market.fees,
+            ticks: market.ticks,
+            fills: market.fills,
+        }
+    }
+}
+
 enum Bars {
     Loading,
     Ready(MarketData),
@@ -184,9 +206,6 @@ enum FineBars {
     Ready(Arc<Vec<Candle>>),
     Failed(String),
 }
-
-/// The most 1-minute bars High precision loads for one span.
-const MAX_FINE_BARS: u64 = 1_000_000;
 
 /// What every chart of a sweep starts from: the chart it was opened on.
 struct SweepCharts {
@@ -253,6 +272,10 @@ pub struct Persephone {
     host: Option<Arc<Host>>,
     /// Where plugin files live, watched for changes.
     plugin_dir: Option<PathBuf>,
+    /// Where Lab saves strategies for the app, what's there, and the logic trees among them.
+    results_dir: Option<PathBuf>,
+    lab_results: Vec<SavedResult>,
+    lab_logic: HashMap<String, Arc<Logic>>,
     /// What's loaded from `plugin_dir`.
     plugins: Arc<Plugins>,
     /// A reload is already on its way.
@@ -304,6 +327,8 @@ pub enum Message {
     OpenReport(TileId),
     /// A plugin file was added, changed or removed.
     PluginsChanged,
+    /// Something's been saved to, or removed from, Lab's results.
+    LabResultsChanged,
     PluginsLoaded(Arc<Plugins>),
     /// Files started (`true`) or stopped being dragged over the window.
     FilesHovered(bool),
@@ -366,7 +391,9 @@ impl Persephone {
             Err(error) => eprintln!("persephone: plugins are off: {error}"),
         }
         let plugins = app.reload_plugins(Duration::ZERO);
-        (app, Task::batch([loads, plugins]))
+        app.results_dir = plugins::lab_results_dir();
+        let results = app.load_lab_results();
+        (app, Task::batch([loads, plugins, results]))
     }
 
     /// Starts from the layout saved at `save_path` (if any, and valid), else from one chart
@@ -410,6 +437,9 @@ impl Persephone {
             save_path,
             host: None,
             plugin_dir: None,
+            results_dir: None,
+            lab_results: Vec::new(),
+            lab_logic: HashMap::new(),
             plugins: Arc::default(),
             reloading: false,
             store: Store::default_root().map(Store::new),
@@ -494,6 +524,9 @@ impl Persephone {
             save_path: None,
             host: None,
             plugin_dir: None,
+            results_dir: None,
+            lab_results: Vec::new(),
+            lab_logic: HashMap::new(),
             plugins: Arc::default(),
             reloading: false,
             store: None,
@@ -778,7 +811,12 @@ impl Persephone {
                 .plugins
                 .strategies
                 .get(id)
-                .map(|p| Arc::clone(p) as Arc<dyn SignalFactory>),
+                .map(|p| Arc::clone(p) as Arc<dyn SignalFactory>)
+                .or_else(|| {
+                    self.lab_logic
+                        .get(id)
+                        .map(|logic| Arc::clone(logic) as Arc<dyn SignalFactory>)
+                }),
             StrategyKind::BuiltIn(_) => None,
         };
         let settings = &tile.backtest;
@@ -1096,6 +1134,7 @@ impl Persephone {
                     panel.history = Some(result.map(|h| (*h).clone()));
                 }
             }
+            Message::LabResultsChanged => return self.load_lab_results(),
             Message::PluginsChanged => {
                 if !self.reloading {
                     return self.reload_plugins(PLUGIN_SETTLE);
@@ -2313,6 +2352,113 @@ impl Persephone {
         Task::batch(reruns)
     }
 
+    /// Reads what Lab has saved. A chart already on one of its logic trees gets its description, as a
+    /// restored chart only has a placeholder until now, and runs its backtest.
+    fn load_lab_results(&mut self) -> Task<Message> {
+        let Some(dir) = &self.results_dir else {
+            return Task::none();
+        };
+        self.lab_results = load_results(dir);
+        self.lab_logic.clear();
+        for result in &self.lab_results {
+            if let Ok(StrategyRef::Logic(logic)) = StrategyRef::parse(&result.strategy) {
+                self.lab_logic
+                    .insert(format!("{LAB_PREFIX}{}", result.id), Arc::new(*logic));
+            }
+        }
+        let waiting: Vec<(TileId, StrategySpec)> = self
+            .tiles
+            .iter()
+            .filter_map(|(&id, tile)| {
+                let strategy = tile.strategy.as_ref()?;
+                let StrategyKind::Plugin(plugin) = &strategy.spec.kind else {
+                    return None;
+                };
+                let logic = self.lab_logic.get(plugin)?;
+                let info = Arc::new(logic.info());
+                (strategy.spec.info != info).then(|| {
+                    (
+                        id,
+                        StrategySpec::from_info(
+                            strategy.spec.kind.clone(),
+                            info,
+                            &strategy.spec.params,
+                        ),
+                    )
+                })
+            })
+            .collect();
+        Task::batch(
+            waiting
+                .into_iter()
+                .map(|(id, spec)| self.set_strategy(id, spec)),
+        )
+    }
+
+    /// Reads Lab's results from `dir`. For tests.
+    #[doc(hidden)]
+    pub fn use_results_dir(&mut self, dir: PathBuf) -> Task<Message> {
+        self.results_dir = Some(dir);
+        self.load_lab_results()
+    }
+
+    /// What Lab has saved, newest first.
+    #[must_use]
+    pub fn lab_results(&self) -> &[SavedResult] {
+        &self.lab_results
+    }
+
+    /// Puts a saved strategy on tile `id`, with the costs and rules it was saved with, if any.
+    fn use_lab_result(&mut self, id: TileId, result: &str) -> Task<Message> {
+        let Some(saved) = self.lab_results.iter().find(|r| r.id == result).cloned() else {
+            return Task::none();
+        };
+        let kind = StrategyKind::Plugin(format!("{LAB_PREFIX}{}", saved.id));
+        let spec = match StrategyRef::parse(&saved.strategy) {
+            Ok(StrategyRef::BuiltIn(builtin)) => with_params(
+                StrategyKind::BuiltIn(builtin),
+                Arc::new(builtin.info()),
+                &saved.strategy,
+            ),
+            Ok(StrategyRef::Plugin(plugin)) => match self.plugins.strategies.get(&plugin) {
+                Some(loaded) => with_params(
+                    StrategyKind::Plugin(plugin),
+                    Arc::clone(&loaded.info),
+                    &saved.strategy,
+                ),
+                None => Err(format!("the plugin `{plugin}` isn't loaded")),
+            },
+            Ok(StrategyRef::Logic(logic)) => {
+                with_params(kind, Arc::new(logic.info()), &saved.strategy)
+            }
+            Err(error) => Err(error),
+        };
+        let spec = match spec {
+            Ok(spec) => spec,
+            Err(error) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.error = Some(format!("{}: {error}", saved.name));
+                }
+                return Task::none();
+            }
+        };
+        if let (Some(settings), Some(tile)) = (saved.settings, self.tiles.get_mut(&id)) {
+            // Its costs and rules; which test is showing is the panel's own.
+            let current = tile.backtest.clone();
+            tile.backtest = backtest::Settings {
+                test: current.test,
+                stock_open: current.stock_open,
+                runs: current.runs,
+                ruin: current.ruin,
+                blocks: current.blocks,
+                block_length: current.block_length,
+                optimize: current.optimize,
+                ..settings
+            };
+        }
+        self.set_strategy(id, spec)
+    }
+
     /// Replaces the loaded plugins, as a reload would. For tests.
     #[doc(hidden)]
     pub fn set_plugins(&mut self, plugins: Plugins) -> Task<Message> {
@@ -3445,6 +3591,15 @@ impl Persephone {
                 return Task::none();
             }
             P::Strategy(choice) => {
+                if let StrategyKind::Plugin(plugin) = &choice.kind
+                    && let Some(result) = plugin.strip_prefix(LAB_PREFIX)
+                {
+                    panel.playback.reset();
+                    panel.inputs.clear();
+                    let result = result.to_owned();
+                    self.sync_playhead();
+                    return self.use_lab_result(id, &result);
+                }
                 let spec = match choice.kind {
                     StrategyKind::BuiltIn(kind) => Some(StrategySpec::new(kind)),
                     StrategyKind::Plugin(plugin) => {
@@ -3748,6 +3903,11 @@ impl Persephone {
                 plugins::watch(dir)
             }));
         }
+        if let Some(dir) = &self.results_dir {
+            subscriptions.push(Subscription::run_with(dir.clone(), |dir: &PathBuf| {
+                plugins::watch_results(dir)
+            }));
+        }
         if self.is_animating() {
             subscriptions.push(window::frames().map(Message::Tick));
         }
@@ -3804,7 +3964,17 @@ impl Persephone {
                     p.info.name.clone()
                 },
             });
-        let strategies: Vec<_> = built_in.chain(from_plugins).collect();
+        // What Lab saved, with how it did if that's known.
+        let from_lab = self.lab_results.iter().map(|result| {
+            let made = result.summary["net_return"]
+                .as_f64()
+                .map_or(String::new(), |made| format!(" {:+.2}%", made * 100.0));
+            backtest::StrategyChoice {
+                kind: StrategyKind::Plugin(format!("{LAB_PREFIX}{}", result.id)),
+                name: format!("{} (Lab{made})", result.name),
+            }
+        });
+        let strategies: Vec<_> = built_in.chain(from_plugins).chain(from_lab).collect();
         let current = tile
             .strategy
             .as_ref()
@@ -4449,20 +4619,14 @@ fn fine_bars(
     from: UnixNanos,
     to: UnixNanos,
 ) -> anyhow::Result<Vec<Candle>> {
-    let minutes = to.saturating_sub(from) / Timeframe::M1.nanos();
-    anyhow::ensure!(
-        minutes <= MAX_FINE_BARS,
-        "High precision would need {minutes} 1-minute bars here, more than {MAX_FINE_BARS}; pick a shorter span"
-    );
-    match &market.local {
-        Some(venue) => {
-            let store = store.context("there's no local store on this system")?;
-            store
-                .market(venue, &market.symbol)?
-                .candles_between(Timeframe::M1.into(), from, to)
-        }
-        None => BinanceClient::new()?.klines(&market.symbol, Timeframe::M1, from, to),
-    }
+    let local = match &market.local {
+        Some(venue) => Some((
+            store.context("there's no local store on this system")?,
+            venue.as_str(),
+        )),
+        None => None,
+    };
+    persephone_research::market::fine_bars(local, &market.symbol, from, to)
 }
 
 /// A market's whole history, for the backtest panel: its first and last times, and weekly (or
@@ -4625,37 +4789,5 @@ fn fetch_binance(
     timeframe: Timeframe,
     span: Option<(UnixNanos, UnixNanos)>,
 ) -> anyhow::Result<MarketData> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
-    let latest = timeframe.close_time(now); // include the forming bar
-    let (start, end) = match span {
-        Some((from, to)) => {
-            let start = from.saturating_sub(backtest::WARM_UP_BARS * timeframe.nanos());
-            let end = to.min(latest);
-            persephone_data::binance::check_range(timeframe, start, end)?;
-            (start, end)
-        }
-        None => (
-            latest.saturating_sub(HISTORY_BARS * timeframe.nanos()),
-            latest,
-        ),
-    };
-
-    let binance = BinanceClient::new()?;
-    let instrument = binance.instrument(symbol)?;
-    let candles = binance.klines(symbol, timeframe, start, end)?;
-    anyhow::ensure!(!candles.is_empty(), "Binance returned no bars for {symbol}");
-    let data = ChartData::new(
-        instrument.symbol.clone(),
-        instrument.venue.clone(),
-        timeframe,
-        instrument.price_precision,
-        candles,
-    );
-    Ok(MarketData {
-        data,
-        instrument,
-        fees: FeeRates::BINANCE_SPOT,
-        ticks: None,
-        fills: None,
-    })
+    persephone_research::market::load_binance(symbol, timeframe, span).map(MarketData::from)
 }

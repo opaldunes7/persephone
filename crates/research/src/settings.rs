@@ -11,7 +11,7 @@ use persephone_data::import::Zone;
 use persephone_engine::{Direction, FeeRates, Session, SimSettings, TradingRules};
 use serde::{Deserialize, Serialize};
 
-use super::Field;
+use crate::Field;
 
 /// What a chart's backtests assume beyond its strategy and bars. Each stock section has its
 /// own switch, and `stock` switches them all at once; a section that's off leaves things as

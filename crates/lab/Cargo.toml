@@ -1,0 +1,36 @@
+[package]
+name = "persephone-lab"
+description = "Persephone Lab: everything in Persephone, as tools for agents and scripts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "persephone-lab"
+path = "src/main.rs"
+
+[dependencies]
+persephone-core.workspace = true
+persephone-data.workspace = true
+# Without its `live` feature: Lab has no way to place an order.
+persephone-engine.workspace = true
+persephone-ml.workspace = true
+persephone-plugin-host.workspace = true
+persephone-research.workspace = true
+anyhow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+dirs.workspace = true
+getrandom = "0.3"
+parquet.workspace = true
+reqwest.workspace = true
+rmcp = { version = "1", default-features = false, features = ["server", "transport-io"] }
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+tiny_http = "0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dev-dependencies]
+iced.workspace = true
+persephone-chart.workspace = true
+persephone.workspace = true

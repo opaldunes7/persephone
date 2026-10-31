@@ -17,7 +17,7 @@ use persephone_data::binance::MAX_RANGE_BARS;
 use persephone_engine::{BacktestReport, BacktestRequest};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
-use super::{BlockLength, RunColumn, WARM_UP_BARS};
+use crate::{RunColumn, WARM_UP_BARS, settings::BlockLength};
 
 /// Fewer trades than this say too little to draw from.
 pub const MIN_TRADES: usize = 10;

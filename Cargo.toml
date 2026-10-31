@@ -27,12 +27,15 @@ nautilus-model = "=0.66.0"
 nautilus-sandbox = { version = "=0.66.0", default-features = false }
 nautilus-trading = "=0.66.0"
 
+persephone = { path = "crates/app" }
 persephone-chart = { path = "crates/chart" }
 persephone-core = { path = "crates/core" }
 persephone-data = { path = "crates/data" }
 persephone-engine = { path = "crates/engine" }
 persephone-ml = { path = "crates/ml" }
 persephone-plugin-host = { path = "crates/plugin-host" }
+persephone-lab = { path = "crates/lab" }
+persephone-research = { path = "crates/research" }
 persephone-tiling = { path = "crates/tiling" }
 
 anyhow = "1"

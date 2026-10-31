@@ -17,12 +17,30 @@ use std::{
 use persephone_core::{Candle, indicator::Param};
 use persephone_engine::{BacktestReport, BacktestRequest};
 
-use super::{
-    ScoreBy,
+use crate::{
     robustness::{backtest, closed_trades, monte_carlo, percentile, pool},
-    settings::{OptimizeSettings, Variable},
+    settings::{OptimizeSettings, ScoreBy, Variable},
 };
-use crate::sweep::label;
+
+/// A starting range around `value`: half to double, within the parameter's limits.
+#[must_use]
+pub fn default_range(param: &Param, value: f64) -> (f64, f64) {
+    let round = |v: f64| if param.integer { v.round() } else { v };
+    (
+        round((value / 2.0).max(param.min)),
+        round((value * 2.0).min(param.max)),
+    )
+}
+
+/// How a number reads in a sweep: whole numbers without decimals.
+#[must_use]
+pub fn label(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}")
+    } else {
+        format!("{value}")
+    }
+}
 
 /// The most backtests one optimization may run.
 pub const MAX_BACKTESTS: usize = 5_000;

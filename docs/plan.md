@@ -239,6 +239,13 @@ world strategy {
 - **Hover text** explains nearly every control and figure in the panel; sliders have theirs on their labels, so it doesn't cover them while dragging.
 - Along the way: tick and volume bars filling on bars no longer crash Nautilus (they go by a time name), and Binance requests time out after 30 s.
 
+### Persephone Lab *(built after M7)*
+- **An open sandbox for agents** (`crates/lab`, binary `persephone-lab`): every data point and test as named tools, reached by MCP over stdio (`rmcp`), local HTTP or the command line, all through one `dispatch`. It deliberately has no research rules. An agent's rules belong in its own setup, which can decide from a call's structured arguments before it runs; Lab only logs calls.
+- **Three boundaries:** no API keys (and no language models, so nothing can spend money), no orders (built without the engine's `live` feature), and no deleting or overwriting data. HTTP is local only, with a token and Host and Origin checks.
+- **Shared code** moved to `crates/research` so the app and Lab can't drift: settings, market loading, Monte Carlo, random blocks, optimize, the calendar and saved results.
+- **Logic trees** (`research/logic.rs`): strategies as JSON that implement `SignalFactory`, so they run through the existing `BacktestRequest`. They only get one closed bar at a time, and `sma`, `ema`, `rsi` and `atr` use Nautilus's own through `indicators::Streaming`.
+- **Results:** `save_result` writes a file the app watches with `notify`; they join the panel's strategy list under the kind `Plugin("lab:<id>")`, so they save with a layout like plugins.
+
 ## Milestones (each ends with something you can run)
 
 | # | Milestone | Done when |

@@ -13,12 +13,12 @@ persephone-data.workspace = true
 persephone-engine = { workspace = true, features = ["live"] }
 persephone-ml.workspace = true
 persephone-plugin-host.workspace = true
+persephone-research.workspace = true
 persephone-tiling.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
 iced.workspace = true
 notify.workspace = true
-rand.workspace = true
 rfd.workspace = true
 ron.workspace = true
 serde.workspace = true

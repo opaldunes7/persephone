@@ -102,6 +102,42 @@ pub fn watch(dir: &Path) -> impl Stream<Item = Message> + use<> {
     })
 }
 
+/// Where Lab saves strategies for the app.
+#[must_use]
+pub fn lab_results_dir() -> Option<PathBuf> {
+    let dir = persephone_research::results::results_dir(&dirs::data_dir()?.join("persephone"));
+    fs::create_dir_all(&dir).is_ok().then_some(dir)
+}
+
+/// Says when a result's been saved to or removed from `dir`. Lab writes them aside and moves them
+/// in, so a file is whole by the time this notices it.
+pub fn watch_results(dir: &Path) -> impl Stream<Item = Message> + use<> {
+    let dir = dir.to_path_buf();
+    iced::stream::channel(8, async move |mut output: mpsc::Sender<Message>| {
+        let (tx, mut rx) = mpsc::unbounded();
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            if let Ok(event) = event
+                && event
+                    .paths
+                    .iter()
+                    .any(|p| p.extension().is_some_and(|ext| ext == "json"))
+            {
+                let _ = tx.unbounded_send(());
+            }
+        });
+        let Ok(mut watcher) = watcher else { return };
+        if notify::Watcher::watch(&mut watcher, &dir, notify::RecursiveMode::NonRecursive).is_err()
+        {
+            return;
+        }
+        while rx.next().await.is_some() {
+            if output.send(Message::LabResultsChanged).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
 fn is_plugin(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext == "wasm" || ext == "external")

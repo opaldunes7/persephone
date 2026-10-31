@@ -26,6 +26,8 @@ strategies can paper trade on live Binance bars.
   a month apart), in almost any layout, imported from the symbol search or by dropping them on
   a chart, and Binance's bulk archives. Tick data backtests fill on ticks.
 - **Paper and live trading** of the same strategies through Nautilus's live node.
+- **Lab, for agents and scripts:** every data point and test as tools over MCP, local HTTP or the
+  command line, including strategies written as JSON with nothing to compile.
 
 ## Run it
 
@@ -81,6 +83,7 @@ and the time axis to stretch time; double-click either to reset it.
 
 - [User guide](docs/guide.md): charts, strategies and reports, sweeps, drawings, your own
   data, paper and live trading, where files live.
+- [Persephone Lab](docs/lab.md): connecting agents and scripts, with [every tool](docs/lab-tools.md).
 - [Writing plugins](docs/plugins.md): indicators and strategies in Rust, models and AI,
   external strategies in Python or anything else.
 - [Design plan](docs/plan.md): architecture and the decisions behind it.

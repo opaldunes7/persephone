@@ -8,10 +8,6 @@
 //!
 //! Two more tests sit beside it, in [`robustness`]: they say how much of a result was luck.
 
-pub mod calendar;
-pub mod optimize;
-pub mod robustness;
-mod settings;
 mod view;
 mod widgets;
 
@@ -34,16 +30,16 @@ use persephone_core::{
 use persephone_engine::BacktestReport;
 use persephone_tiling::TileId;
 
-pub use self::{
+pub use persephone_research::{
+    Field, RunColumn, WARM_UP_BARS, calendar, optimize, robustness,
     settings::{
-        BlockLength, Commission, Edit, OneWay, OptimizeSettings, Precision, ScoreBy, Section,
+        self, BlockLength, Commission, Edit, OneWay, OptimizeSettings, Precision, ScoreBy, Section,
         SessionRule, Settings, TestKind, Variable, parse_time, time_text,
     },
-    view::{PLUGIN_SLOTS, PanelInfo, Status, panel},
 };
 
-/// Bars loaded before a span's start for the strategy to warm up on, without trading.
-pub const WARM_UP_BARS: u64 = 500;
+pub use self::view::{PLUGIN_SLOTS, PanelInfo, Status, panel};
+
 /// The panel's share of the window when it opens, and the least it's ever given.
 pub const DEFAULT_SHARE: f32 = 0.3;
 pub const MIN_HEIGHT: f32 = 190.0;
@@ -113,15 +109,6 @@ pub struct Tests {
     pub run: Option<usize>,
     pub runs_sort: (RunColumn, bool),
     pub runs_scroll: usize,
-}
-
-/// What the table of runs can be sorted by.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum RunColumn {
-    #[default]
-    Return,
-    Fell,
-    Run,
 }
 
 impl Default for Tests {
@@ -392,49 +379,6 @@ pub struct StrategyChoice {
 impl fmt::Display for StrategyChoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.name)
-    }
-}
-
-/// A box in the settings section.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Field {
-    Capital,
-    Commission,
-    Slippage,
-    Spread,
-    Latency,
-    Leverage,
-    SessionFrom,
-    SessionTo,
-    SessionZone,
-    Runs,
-    Ruin,
-    Blocks,
-    /// An Optimize variable's range: the first variable or the second.
-    Min(usize),
-    Max(usize),
-    Step(usize),
-}
-
-impl Field {
-    /// Whether it's one of `test`'s own settings, which that test applies when it's run.
-    #[must_use]
-    pub const fn belongs_to(self, test: TestKind) -> bool {
-        match test {
-            TestKind::Backtest => false,
-            TestKind::MonteCarlo => matches!(self, Self::Runs | Self::Ruin),
-            TestKind::RandomBlocks => matches!(self, Self::Blocks),
-            TestKind::Optimize => self.belongs_to_tests(),
-        }
-    }
-
-    /// Whether it's one of the tests' own settings, which don't change the backtest itself.
-    #[must_use]
-    pub const fn belongs_to_tests(self) -> bool {
-        matches!(
-            self,
-            Self::Runs | Self::Ruin | Self::Blocks | Self::Min(_) | Self::Max(_) | Self::Step(_)
-        )
     }
 }
 

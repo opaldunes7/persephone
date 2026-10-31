@@ -16,6 +16,7 @@ chart, in the strategy report, and in `persephone-cli`. This guide walks through
 - [Your own data](#your-own-data)
 - [Paper and live trading](#paper-and-live-trading)
 - [Plugins, models and AI](#plugins-models-and-ai)
+- [Persephone Lab](#persephone-lab)
 - [Where files live](#where-files-live)
 
 ## Starting
@@ -491,6 +492,12 @@ When a strategy plugin wants to ask language models, the app asks you first. The
 explains what's at stake (prompts leave your machine, and new calls can cost money) and has
 **Allow it to ask AI models**. Replies are recorded, so rerunning a backtest asks nothing
 new.
+
+## Persephone Lab
+
+Agents and scripts can read every data point and run every test through
+[Persephone Lab](lab.md), without the app open. Strategies they save appear in the backtest panel's
+strategy list, marked **Lab**, ready to backtest and replay.
 
 ## Where files live
 

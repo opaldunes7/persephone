@@ -113,6 +113,69 @@ pub fn compute(spec: &IndicatorSpec, candles: &[Candle]) -> Result<Vec<Vec<f64>>
     Ok(out)
 }
 
+/// A built-in indicator fed one value at a time, for rules built while the app runs. Being
+/// Nautilus's own, it gives the same values as [`compute`], and can run over any series.
+pub enum Streaming {
+    Sma(SimpleMovingAverage),
+    Ema(ExponentialMovingAverage),
+    Rsi(RelativeStrengthIndex),
+    Atr(AverageTrueRange),
+}
+
+impl Streaming {
+    #[must_use]
+    pub fn sma(period: usize) -> Self {
+        Self::Sma(SimpleMovingAverage::new(period, Some(PriceType::Last)))
+    }
+
+    #[must_use]
+    pub fn ema(period: usize) -> Self {
+        Self::Ema(ExponentialMovingAverage::new(period, Some(PriceType::Last)))
+    }
+
+    /// With Wilder smoothing, like [`BuiltIn::Rsi`].
+    #[must_use]
+    pub fn rsi(period: usize) -> Self {
+        Self::Rsi(RelativeStrengthIndex::new(
+            period,
+            Some(MovingAverageType::Wilder),
+        ))
+    }
+
+    /// With Wilder smoothing, like [`BuiltIn::Atr`].
+    #[must_use]
+    pub fn atr(period: usize) -> Self {
+        Self::Atr(AverageTrueRange::new(
+            period,
+            Some(MovingAverageType::Wilder),
+            Some(true),
+            Some(0.0),
+        ))
+    }
+
+    /// Takes the next value (ATR's is the bar's), returning the indicator's once warmed up.
+    pub fn update(&mut self, value: f64, bar: &Candle) -> Option<f64> {
+        match self {
+            Self::Sma(sma) => {
+                sma.update_raw(value);
+                sma.initialized().then(|| sma.value())
+            }
+            Self::Ema(ema) => {
+                ema.update_raw(value);
+                ema.initialized().then(|| ema.value())
+            }
+            Self::Rsi(rsi) => {
+                rsi.update_raw(value);
+                rsi.initialized().then_some(rsi.value)
+            }
+            Self::Atr(atr) => {
+                atr.update_raw(bar.high, bar.low, bar.close);
+                atr.initialized().then_some(atr.value)
+            }
+        }
+    }
+}
+
 /// Feeds every candle to `step` and stores the values it returns once warmed up.
 fn fill(
     out: &mut [Vec<f64>],

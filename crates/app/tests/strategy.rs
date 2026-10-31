@@ -1583,4 +1583,189 @@ mod panel {
         assert_eq!(app.panel().unwrap().tests.line, Some(run));
         measure(&mut app);
     }
+
+    fn results_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "persephone-results-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn save_result(
+        dir: &std::path::Path,
+        id: &str,
+        strategy: serde_json::Value,
+        settings: serde_json::Value,
+    ) {
+        let text = serde_json::json!({
+            "id": id,
+            "name": format!("Saved {id}"),
+            "strategy": strategy,
+            "settings": settings,
+            "summary": {"net_return": 0.125},
+            "saved_at": 1,
+        });
+        std::fs::write(dir.join(format!("{id}.json")), text.to_string()).unwrap();
+    }
+
+    fn choice(id: &str) -> PanelMessage {
+        PanelMessage::Strategy(StrategyChoice {
+            kind: StrategyKind::Plugin(format!("lab:{id}")),
+            name: id.into(),
+        })
+    }
+
+    #[test]
+    fn strategies_lab_saved_can_be_backtested_and_replayed_in_the_app() {
+        let mut app = ready_panel(TestKind::Backtest);
+        let dir = results_dir();
+        save_result(
+            &dir,
+            "tree",
+            serde_json::json!({"logic": {
+                "name": "Fast over slow",
+                "params": {"fast": 5, "slow": 20},
+                "long": {"crosses_above": [{"ema": {"length": "$fast"}}, {"ema": {"length": "$slow"}}]},
+                "short": {"crosses_below": [{"ema": {"length": "$fast"}}, {"ema": {"length": "$slow"}}]},
+            }, "params": {"fast": 6}}),
+            serde_json::json!({"invert": true, "test": "monte-carlo"}),
+        );
+        let _ = app.use_results_dir(dir.clone());
+        assert_eq!(app.lab_results().len(), 1);
+        measure(&mut app);
+
+        // Picking it puts it on the chart with the settings it was saved with.
+        panel(&mut app, choice("tree"));
+        let (spec, _) = app.tile_strategy(0).unwrap();
+        assert_eq!(spec.info.name, "Fast over slow");
+        assert_eq!(spec.params[0], 6.0, "its saved value");
+        assert_eq!(spec.kind, StrategyKind::Plugin("lab:tree".into()));
+        assert!(app.tile_backtest(0).unwrap().invert);
+        assert_eq!(
+            app.tile_backtest(0).unwrap().test,
+            TestKind::Backtest,
+            "which test shows stays the panel's"
+        );
+
+        // It runs like any strategy, and can be replayed.
+        finish_backtest(&mut app);
+        let made = trades(&app);
+        assert!(!made.is_empty(), "it trades");
+        panel(&mut app, PanelMessage::ReplayTrade(made.len() / 2));
+        assert!(shown(&app).is_some());
+    }
+
+    #[test]
+    fn a_saved_built_in_goes_on_as_itself_and_a_new_result_shows_up() {
+        let mut app = ready_panel(TestKind::Backtest);
+        let dir = results_dir();
+        let _ = app.use_results_dir(dir.clone());
+        assert!(app.lab_results().is_empty());
+
+        save_result(
+            &dir,
+            "plain",
+            serde_json::json!({"builtin": "rsi-reversion", "params": {"Length": 9}}),
+            serde_json::Value::Null,
+        );
+        let _ = app.update(Message::LabResultsChanged);
+        assert_eq!(app.lab_results()[0].name, "Saved plain");
+        panel(&mut app, choice("plain"));
+        let (spec, _) = app.tile_strategy(0).unwrap();
+        assert_eq!(
+            spec.kind,
+            StrategyKind::BuiltIn(BuiltInStrategy::RsiReversion)
+        );
+        assert_eq!(spec.params[0], 9.0);
+
+        // One that can't be used says why, and changes nothing.
+        save_result(
+            &dir,
+            "gone",
+            serde_json::json!({"plugin": "not-here"}),
+            serde_json::Value::Null,
+        );
+        let _ = app.update(Message::LabResultsChanged);
+        panel(&mut app, choice("gone"));
+        assert!(
+            app.panel()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("not-here")
+        );
+        assert_eq!(
+            app.tile_strategy(0).unwrap().0.kind,
+            StrategyKind::BuiltIn(BuiltInStrategy::RsiReversion)
+        );
+    }
+
+    #[test]
+    fn a_chart_saved_on_a_lab_strategy_picks_it_up_again() {
+        use persephone::persist::{self, Saved, SavedStrategy, SavedTile};
+        use persephone_tiling::Layout;
+
+        let dir = results_dir();
+        save_result(
+            &dir,
+            "tree",
+            serde_json::json!({"logic": {
+                "name": "Over its average",
+                "params": {"n": 5},
+                "long": {"gt": ["close", {"sma": {"length": "$n"}}]},
+                "short": {"lt": ["close", {"sma": {"length": "$n"}}]},
+            }}),
+            serde_json::Value::Null,
+        );
+        let path = dir.join("layout.ron");
+        persist::save(
+            &path,
+            &Saved {
+                workspace: 1,
+                others: Vec::new(),
+                layout: Layout::new(),
+                tiles: vec![SavedTile {
+                    id: 0,
+                    local: None,
+                    symbol: "BTCUSDT".into(),
+                    timeframe: "1h".into(),
+                    indicators: Vec::new(),
+                    strategy: Some(SavedStrategy {
+                        kind: "plugin:lab:tree".into(),
+                        params: vec![9.0, 25.0],
+                        hidden: false,
+                    }),
+                    drawings_hidden: false,
+                    volume_hidden: false,
+                    span: None,
+                    backtest: None,
+                }],
+            },
+        )
+        .unwrap();
+
+        let (mut app, _loads) = Persephone::start(&[], Some(path));
+        let (waiting, _) = app.tile_strategy(0).unwrap();
+        assert!(
+            waiting.info.params.is_empty(),
+            "a placeholder until it's read"
+        );
+        assert_eq!(waiting.params, vec![9.0, 25.0], "values kept meanwhile");
+
+        let _ = app.use_results_dir(dir.clone());
+        let (spec, _) = app.tile_strategy(0).unwrap();
+        assert_eq!(spec.info.name, "Over its average");
+        assert_eq!(
+            spec.params,
+            vec![9.0, 25.0],
+            "with the values it was saved at"
+        );
+    }
 }

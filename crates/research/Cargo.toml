@@ -1,0 +1,20 @@
+[package]
+name = "persephone-research"
+description = "What the Persephone app and Lab share: settings, loading markets, and the tests beyond a backtest."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+persephone-core.workspace = true
+persephone-data.workspace = true
+persephone-engine.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+ron.workspace = true
