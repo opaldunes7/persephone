@@ -990,6 +990,7 @@ impl Persephone {
                     && panel.tests.monte_carlo_run == Some(run)
                 {
                     panel.tests.monte_carlo_run = None;
+                    panel.tests.reset_fan();
                     panel.tests.monte_carlo = Some(result);
                 }
             }
@@ -1010,6 +1011,7 @@ impl Persephone {
                         backtest::BlockRun::Running { run: running, .. } if running == run
                     )
                 {
+                    panel.tests.reset_fan();
                     panel.tests.blocks = match result {
                         Ok(summary) => backtest::BlockRun::Done(summary),
                         Err(error) => backtest::BlockRun::Failed(error),
@@ -3098,6 +3100,30 @@ impl Persephone {
             return Task::none();
         };
         match message {
+            P::SelectLine(line) => {
+                panel.tests.line = line;
+                // A block happened at a real time, so the chart can go there.
+                if let (backtest::BlockRun::Done(summary), Some(line)) = (&panel.tests.blocks, line)
+                    && self.tiles.get(&id).map(|t| t.backtest.test)
+                        == Some(backtest::TestKind::RandomBlocks)
+                    && let Some(block) = summary.blocks.get(line)
+                    && let Some(chart) = self.tiles.get_mut(&id).and_then(|t| t.chart.as_mut())
+                {
+                    chart.show_bar(block.last_bar);
+                }
+                return Task::none();
+            }
+            P::ZoomFan(zoom) => {
+                panel.tests.zoom = zoom;
+                return Task::none();
+            }
+            P::StockOpen(open) => {
+                if let Some(tile) = self.tiles.get_mut(&id) {
+                    tile.backtest.stock_open = open;
+                }
+                self.save();
+                return Task::none();
+            }
             P::ShowCalendar(shown) => panel.calendar.shown = shown,
             P::CalendarLevel(level) => panel.calendar.level = level,
             P::ReplayTrade(index) => {
@@ -3131,6 +3157,7 @@ impl Persephone {
                     tile.backtest.test = test;
                 }
                 panel.playback.reset();
+                panel.tests.reset_fan();
                 self.sync_playhead();
                 self.refresh_variables(id);
                 self.save();

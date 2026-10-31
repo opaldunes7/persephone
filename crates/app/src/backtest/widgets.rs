@@ -17,7 +17,9 @@ use persephone_core::{BarSpec, Candle, UnixNanos, time::DateTime};
 use super::{
     History, PanelMessage, SPEED_LABELS,
     optimize::{OptimizeResult, Outcome},
-    position_of, speed_at,
+    position_of,
+    robustness::LineStats,
+    speed_at,
 };
 
 const HANDLE: Color = Color::from_rgb8(0xd1, 0xd4, 0xdc);
@@ -193,6 +195,19 @@ fn axis_tag(frame: &mut Frame, pane: &Projection, value: f64, background: Color)
 impl canvas::Program<PanelMessage> for Equity<'_> {
     type State = EquityGrid;
 
+    fn update(
+        &self,
+        _state: &mut EquityGrid,
+        event: &Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<canvas::Action<PanelMessage>> {
+        matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }))
+            .then(|| cursor.position_in(bounds))
+            .flatten()
+            .map(|_| canvas::Action::request_redraw())
+    }
+
     fn draw(
         &self,
         state: &EquityGrid,
@@ -303,37 +318,112 @@ impl canvas::Program<PanelMessage> for Equity<'_> {
 
 // --- The tests' fan of equity lines ----------------------------------------------------------
 
-/// Many equity lines from the same capital, drawn faintly over each other with their median
-/// bright on top: how Monte Carlo's runs and Random blocks' blocks spread out.
+/// A picked line, in a color nothing else on the fan uses.
+const PICKED: Color = Color::from_rgb8(0xff, 0xd5, 0x4f);
+/// How close the mouse must be to a line to hover or pick it, in pixels.
+const LINE_REACH: f32 = 8.0;
+/// A drag shorter than this is a click.
+const DRAG_FROM: f32 = 3.0;
+
+/// Many equity lines from the same capital, faint over each other with their median bright on
+/// top: how Monte Carlo's runs and Random blocks' blocks spread out. Any line can be hovered and
+/// picked; the wheel zooms and dragging moves along, as on a chart.
 pub struct Fan<'a> {
     pub paths: &'a [Vec<f64>],
     pub median: &'a [f64],
+    /// The backtest's own line, counted as the line after `paths`.
+    pub actual: Option<&'a [f64]>,
+    /// How each line went, the backtest's last.
+    pub stats: Vec<LineStats>,
+    /// Lines to pick out without being asked, with their colors.
+    pub marks: Vec<(usize, Color)>,
+    pub picked: Option<usize>,
+    /// How much of it shows, from 0 to 1.
+    pub zoom: (f32, f32),
     pub start: f64,
-    /// What's between a line's points, and how many of them.
+    /// What's between a line's points, how many of them, and what a line is.
     pub unit: &'static str,
     pub stride: usize,
+    pub line_name: &'static str,
 }
 
 /// The lines stay drawn between frames, as there can be many.
 #[derive(Default)]
 pub struct FanLines {
+    /// Apart, as a clipped drawing would land under the grid's background in the same frame.
+    grid: canvas::Cache,
     cache: canvas::Cache,
-    drawn_for: Cell<(u32, u32, usize)>,
+    drawn_for: Cell<(u32, u32, usize, u32, u32, usize)>,
+    /// Where a press began and what was showing, until it's let go.
+    press: Option<(Point, (f32, f32))>,
+    dragged: bool,
 }
 
 impl Fan<'_> {
-    fn projection(&self, size: Size) -> Projection {
-        let count = self.paths.iter().map(Vec::len).max().unwrap_or(0);
-        let values = self.paths.iter().flatten().copied();
-        pane_for(values, self.start, count, size)
+    fn line(&self, line: usize) -> Option<&[f64]> {
+        match self.paths.get(line) {
+            Some(path) => Some(path),
+            None if line == self.paths.len() => self.actual,
+            None => None,
+        }
     }
 
-    fn draw_lines(&self, frame: &mut Frame, pane: &Projection) {
+    fn lines(&self) -> impl Iterator<Item = (usize, &[f64])> {
+        let count = self.paths.len() + usize::from(self.actual.is_some());
+        (0..count).filter_map(|line| Some((line, self.line(line)?)))
+    }
+
+    /// The most points any line has.
+    fn points(&self) -> usize {
+        self.lines().map(|(_, line)| line.len()).max().unwrap_or(0)
+    }
+
+    /// The points showing, as a range of whole indices.
+    fn showing(&self) -> (usize, usize) {
+        let last = self.points().saturating_sub(1) as f32;
+        let from = (self.zoom.0 * last).floor() as usize;
+        let to = (self.zoom.1 * last).ceil() as usize;
+        (from, to.max(from + 1))
+    }
+
+    /// The pane: its scale fits what's showing, and its bars run from `showing`'s start.
+    fn projection(&self, size: Size) -> Projection {
+        let (from, to) = self.showing();
+        let values = self
+            .lines()
+            .flat_map(|(_, line)| line.get(from..=to.min(line.len().saturating_sub(1))))
+            .flatten()
+            .copied();
+        let mut pane = pane_for(values, self.start, to - from + 1, size);
+        pane.left = from as f64;
+        pane
+    }
+
+    fn stroke_line(frame: &mut Frame, pane: &Projection, values: &[f64], stroke: Stroke<'_>) {
+        let from = (pane.left as usize).saturating_sub(1);
+        let to = (pane.left as usize + pane.visible.end + 1).min(values.len());
+        if from >= to {
+            return;
+        }
+        let path = Path::new(|b| {
+            for (i, &value) in values[from..to].iter().enumerate() {
+                let point = Point::new(pane.x((from + i) as f64), pane.y(value));
+                if i == 0 {
+                    b.move_to(point);
+                } else {
+                    b.line_to(point);
+                }
+            }
+        });
+        frame.stroke(&path, stroke);
+    }
+
+    fn draw_grid(&self, frame: &mut Frame, pane: &Projection) {
         price_grid(frame, pane);
-        let count = pane.visible.end;
-        let every = nice_step((count * self.stride / 6).max(1));
-        let mut at = every;
-        while at < count * self.stride {
+        let (from, to) = self.showing();
+        let every = nice_step(((to - from) * self.stride / 6).max(1));
+        let mut at = (from * self.stride).div_ceil(every) * every;
+        while at <= to * self.stride {
             let x = pane.x((at / self.stride) as f64).round();
             frame.fill_rectangle(Point::new(x, 0.0), Size::new(1.0, pane.height), theme::GRID);
             let y = pane.height + TIME_STRIP / 2.0;
@@ -341,31 +431,95 @@ impl Fan<'_> {
             at += every;
         }
         axes_and_start(frame, pane, self.start);
-
-        let line = |values: &[f64]| {
-            Path::new(|b| {
-                for (i, &value) in values.iter().enumerate() {
-                    let point = Point::new(pane.x(i as f64), pane.y(value));
-                    if i == 0 {
-                        b.move_to(point);
-                    } else {
-                        b.line_to(point);
-                    }
-                }
-            })
-        };
-        let faint = Color { a: 0.14, ..EQUITY };
-        for path in self.paths {
-            frame.stroke(
-                &line(path),
-                Stroke::default().with_color(faint).with_width(1.0),
-            );
-        }
-        frame.stroke(
-            &line(self.median),
-            Stroke::default().with_color(HANDLE).with_width(1.5),
-        );
     }
+
+    fn draw_lines(&self, frame: &mut Frame, pane: &Projection) {
+        let clip = Rectangle::new(Point::ORIGIN, Size::new(pane.width, pane.height));
+        frame.with_clip(clip, |frame| {
+            // Fewer lines are each stronger, so that a few still show.
+            let alpha = (8.0 / self.paths.len().max(1) as f32).clamp(0.14, 0.6);
+            let faint = Stroke::default()
+                .with_color(Color { a: alpha, ..EQUITY })
+                .with_width(1.0);
+            for path in self.paths {
+                Self::stroke_line(frame, pane, path, faint);
+            }
+            Self::stroke_line(
+                frame,
+                pane,
+                self.median,
+                Stroke::default().with_color(HANDLE).with_width(1.5),
+            );
+            if let Some(actual) = self.actual {
+                Self::stroke_line(
+                    frame,
+                    pane,
+                    actual,
+                    Stroke::default().with_color(EQUITY).with_width(1.5),
+                );
+            }
+            for &(line, color) in &self.marks {
+                if let Some(values) = self.line(line) {
+                    Self::stroke_line(
+                        frame,
+                        pane,
+                        values,
+                        Stroke::default().with_color(color).with_width(1.5),
+                    );
+                }
+            }
+        });
+    }
+
+    /// The line nearest the mouse, if one is close enough.
+    fn line_at(&self, point: Point, pane: &Projection) -> Option<usize> {
+        if point.x >= pane.width || point.y >= pane.height {
+            return None;
+        }
+        let index = pane.index_at(point.x).round().max(0.0) as usize;
+        self.lines()
+            .filter_map(|(line, values)| {
+                let value = values.get(index)?;
+                Some((line, (pane.y(*value) - point.y).abs()))
+            })
+            .filter(|(_, away)| *away <= LINE_REACH)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(line, _)| line)
+    }
+
+    /// Zooms by `factor` around the fraction `around` of the way across what's showing.
+    fn zoomed(&self, factor: f32, around: f32) -> Option<(f32, f32)> {
+        let (from, to) = self.zoom;
+        let least = (4.0 / self.points().max(2) as f32).min(1.0);
+        let width = ((to - from) * factor).clamp(least, 1.0);
+        if width >= 1.0 {
+            return None;
+        }
+        let start = (from + (to - from) * around - width * around).clamp(0.0, 1.0 - width);
+        Some((start, start + width))
+    }
+}
+
+/// What's under the mouse, in a box just above it: among the lines, as text on an axis would
+/// show through a box drawn over it.
+fn hover_label(frame: &mut Frame, content: String, x: f32, y: f32, plot_width: f32) {
+    let half = content.chars().count() as f32 * 3.6 + 7.0;
+    let center = x.clamp(half, (plot_width - half).max(half));
+    let top = (y - 28.0).max(LEGEND_ROOM + 2.0);
+    frame.fill_rectangle(
+        Point::new(center - half, top),
+        Size::new(half * 2.0, TIME_STRIP - 2.0),
+        theme::LABEL_BACKGROUND,
+    );
+    frame.fill_text(Text {
+        content,
+        position: Point::new(center, top + (TIME_STRIP - 2.0) / 2.0),
+        color: theme::LABEL_TEXT,
+        size: theme::TEXT_SIZE.into(),
+        align_x: text::Alignment::Center,
+        align_y: alignment::Vertical::Center,
+        ..Text::default()
+    });
 }
 
 /// A round number near `rough`: 1, 2 or 5 times a power of ten.
@@ -384,6 +538,87 @@ fn nice_step(rough: usize) -> usize {
 impl canvas::Program<PanelMessage> for Fan<'_> {
     type State = FanLines;
 
+    fn update(
+        &self,
+        state: &mut FanLines,
+        event: &Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<canvas::Action<PanelMessage>> {
+        let Event::Mouse(event) = event else {
+            return None;
+        };
+        let pane = self.projection(bounds.size());
+        match event {
+            mouse::Event::WheelScrolled { delta } => {
+                let point = cursor.position_in(bounds)?;
+                let lines = match delta {
+                    ScrollDelta::Lines { y, .. } => *y,
+                    ScrollDelta::Pixels { y, .. } => *y / 40.0,
+                };
+                let around = (point.x / pane.width.max(1.0)).clamp(0.0, 1.0);
+                let zoom = self.zoomed(0.85_f32.powf(lines), around);
+                Some(canvas::Action::publish(PanelMessage::ZoomFan(zoom)).and_capture())
+            }
+            mouse::Event::ButtonPressed(mouse::Button::Left) => {
+                let point = cursor.position_in(bounds)?;
+                state.press = Some((point, self.zoom));
+                state.dragged = false;
+                Some(canvas::Action::request_redraw().and_capture())
+            }
+            mouse::Event::CursorMoved { .. } => {
+                let Some((began, from)) = state.press else {
+                    return cursor
+                        .position_in(bounds)
+                        .map(|_| canvas::Action::request_redraw());
+                };
+                let point = cursor.position_from(bounds.position())?;
+                let moved = point.x - began.x;
+                if moved.abs() < DRAG_FROM && !state.dragged {
+                    return None;
+                }
+                state.dragged = true;
+                let width = from.1 - from.0;
+                if width >= 1.0 {
+                    return None;
+                }
+                let start = (from.0 - moved / pane.width.max(1.0) * width).clamp(0.0, 1.0 - width);
+                Some(canvas::Action::publish(PanelMessage::ZoomFan(Some((
+                    start,
+                    start + width,
+                )))))
+            }
+            mouse::Event::ButtonReleased(mouse::Button::Left) => {
+                let (began, _) = state.press.take()?;
+                if state.dragged {
+                    return Some(canvas::Action::request_redraw());
+                }
+                let line = self.line_at(began, &pane);
+                Some(canvas::Action::publish(PanelMessage::SelectLine(line)))
+            }
+            _ => None,
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        state: &FanLines,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        if state.dragged && state.press.is_some() {
+            return mouse::Interaction::Grabbing;
+        }
+        let over = cursor
+            .position_in(bounds)
+            .and_then(|point| self.line_at(point, &self.projection(bounds.size())));
+        if over.is_some() {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::default()
+        }
+    }
+
     fn draw(
         &self,
         state: &FanLines,
@@ -398,48 +633,85 @@ impl canvas::Program<PanelMessage> for Fan<'_> {
             size.width.to_bits(),
             size.height.to_bits(),
             self.paths.as_ptr() as usize,
+            self.zoom.0.to_bits(),
+            self.zoom.1.to_bits(),
+            self.marks.len(),
         );
         if state.drawn_for.replace(key) != key {
+            state.grid.clear();
             state.cache.clear();
         }
+        let grid = state
+            .grid
+            .draw(renderer, size, |frame| self.draw_grid(frame, &pane));
         let lines = state
             .cache
             .draw(renderer, size, |frame| self.draw_lines(frame, &pane));
 
         let mut frame = Frame::new(renderer, size);
-        if let Some(&last) = self.median.last() {
-            axis_tag(&mut frame, &pane, last, EQUITY);
+        let clip = Rectangle::new(Point::ORIGIN, Size::new(pane.width, pane.height));
+        let point = cursor.position_in(bounds);
+        let hovered = point.and_then(|point| self.line_at(point, &pane));
+        for (line, color, width) in [(hovered, HANDLE, 1.5), (self.picked, PICKED, 2.5)] {
+            if let Some(values) = line.and_then(|line| self.line(line)) {
+                frame.with_clip(clip, |frame| {
+                    Self::stroke_line(
+                        frame,
+                        &pane,
+                        values,
+                        Stroke::default().with_color(color).with_width(width),
+                    );
+                });
+            }
         }
-        let hovered = cursor
-            .position_in(bounds)
+        let tagged = self
+            .picked
+            .and_then(|line| self.line(line))
+            .unwrap_or(self.median);
+        if let Some(&last) = tagged.last() {
+            let color = if self.picked.is_some() {
+                PICKED
+            } else {
+                EQUITY
+            };
+            axis_tag(&mut frame, &pane, last, color);
+        }
+        let index = point
             .filter(|p| p.x < pane.width && p.y < pane.height)
-            .and_then(|p| pane.bar_at(p.x, self.median.len()));
-        if let Some(i) = hovered {
+            .map(|p| pane.index_at(p.x).round().max(0.0) as usize)
+            .filter(|&i| i < self.points());
+        if let Some(i) = index {
             let x = pane.x(i as f64).round();
             frame.stroke(
                 &Path::line(Point::new(x, 0.0), Point::new(x, pane.height)),
                 dashed(theme::CROSSHAIR),
             );
-            axis_tag(&mut frame, &pane, self.median[i], theme::LABEL_BACKGROUND);
-            let label = format!("{} {}", self.unit, i * self.stride);
-            let half = label.chars().count() as f32 * 3.4 + 7.0;
-            let center = x.clamp(half, (pane.width - half).max(half));
-            frame.fill_rectangle(
-                Point::new(center - half, pane.height + 1.0),
-                Size::new(half * 2.0, TIME_STRIP - 2.0),
-                theme::LABEL_BACKGROUND,
-            );
-            frame.fill_text(Text {
-                content: label,
-                position: Point::new(center, pane.height + TIME_STRIP / 2.0),
-                color: theme::LABEL_TEXT,
-                size: theme::TEXT_SIZE.into(),
-                align_x: text::Alignment::Center,
-                align_y: alignment::Vertical::Center,
-                ..Text::default()
-            });
+            let mut label = format!("{} {}", self.unit, i * self.stride);
+            let shown = hovered.or(self.picked);
+            if let Some((line, stats)) = shown.and_then(|line| Some((line, self.stats.get(line)?)))
+            {
+                let name = if line == self.paths.len() {
+                    "The backtest"
+                } else {
+                    self.line_name
+                };
+                label = format!(
+                    "{label}  ·  {name}: {:+.2}%, fell {:.2}% at worst",
+                    stats.return_ * 100.0,
+                    stats.drawdown * 100.0
+                );
+            }
+            if let Some(value) = hovered
+                .or(self.picked)
+                .and_then(|line| self.line(line)?.get(i))
+                .or_else(|| self.median.get(i))
+            {
+                axis_tag(&mut frame, &pane, *value, theme::LABEL_BACKGROUND);
+            }
+            let y = point.map_or(0.0, |p| p.y);
+            hover_label(&mut frame, label, x, y, pane.width);
         }
-        vec![lines, frame.into_geometry()]
+        vec![grid, lines, frame.into_geometry()]
     }
 }
 
@@ -720,6 +992,11 @@ impl canvas::Program<PanelMessage> for Landscape<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<PanelMessage>> {
+        if matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. })) {
+            return cursor
+                .position_in(bounds)
+                .map(|_| canvas::Action::request_redraw());
+        }
         let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event else {
             return None;
         };
@@ -764,28 +1041,9 @@ impl canvas::Program<PanelMessage> for Landscape<'_> {
             self.draw_bars(&mut frame, hovered);
         }
         if let Some(cell) = hovered {
-            let label = self.describe(cell);
-            let half = label.chars().count() as f32 * 3.4 + 7.0;
             let plot = (size.width - PRICE_AXIS_WIDTH).max(1.0);
-            let center = cursor
-                .position_in(bounds)
-                .map_or(0.0, |p| p.x)
-                .clamp(half, (plot - half).max(half));
-            let y = size.height - TIME_STRIP;
-            frame.fill_rectangle(
-                Point::new(center - half, y + 1.0),
-                Size::new(half * 2.0, TIME_STRIP - 2.0),
-                theme::LABEL_BACKGROUND,
-            );
-            frame.fill_text(Text {
-                content: label,
-                position: Point::new(center, y + TIME_STRIP / 2.0),
-                color: theme::LABEL_TEXT,
-                size: theme::TEXT_SIZE.into(),
-                align_x: text::Alignment::Center,
-                align_y: alignment::Vertical::Center,
-                ..Text::default()
-            });
+            let point = cursor.position_in(bounds).unwrap_or(Point::ORIGIN);
+            hover_label(&mut frame, self.describe(cell), point.x, point.y, plot);
         }
         vec![frame.into_geometry()]
     }

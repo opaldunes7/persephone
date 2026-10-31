@@ -169,11 +169,40 @@ pub struct MonteCarlo {
     pub drawdown: f64,
     /// The share of runs that fell at least the ruin level from a peak.
     pub ruin: f64,
-    /// Some of the runs' equity, from the capital on.
+    /// Some of the runs' equity, from the capital on, always with the best, worst and middle.
     pub paths: Vec<Vec<f64>>,
+    /// How each of those runs went.
+    pub stats: Vec<LineStats>,
+    /// Which of them ended highest, lowest and nearest the median.
+    pub best: usize,
+    pub worst: usize,
+    pub middle: usize,
     pub median_path: Vec<f64>,
+    /// The trades as they really came, and how that went.
+    pub actual: Vec<f64>,
+    pub actual_stats: LineStats,
     /// Trades between a line's points.
     pub stride: usize,
+}
+
+/// How one line on a fan went.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LineStats {
+    /// As a fraction of the capital.
+    pub return_: f64,
+    /// The deepest fall from a peak, as a fraction of that peak.
+    pub drawdown: f64,
+}
+
+/// The deepest fall from a peak along `equity`, from `capital`.
+fn deepest_fall(equity: impl Iterator<Item = f64>, capital: f64) -> f64 {
+    let mut peak = capital;
+    let mut fall = 0.0_f64;
+    for value in equity {
+        peak = peak.max(value);
+        fall = fall.max(1.0 - value / peak);
+    }
+    fall.min(1.0)
 }
 
 /// Runs `runs` draws of as many trades as `trades` has, with replacement, so that both where a
@@ -201,7 +230,7 @@ pub fn monte_carlo(
     let stride = stride_for(trades.len() + 1);
     let mut returns = Vec::with_capacity(runs as usize);
     let mut drawdowns = Vec::with_capacity(runs as usize);
-    let mut paths = Vec::new();
+    let mut paths: Vec<Vec<f64>> = Vec::new();
     let mut ruined = 0_u32;
     for _ in 0..runs {
         let mut path = vec![capital];
@@ -219,21 +248,78 @@ pub fn monte_carlo(
         ruined += u32::from(fall >= ruin_at);
         paths.push(path);
     }
+    let in_order: Vec<LineStats> = returns
+        .iter()
+        .zip(&drawdowns)
+        .map(|(&return_, &drawdown)| LineStats { return_, drawdown })
+        .collect();
     returns.sort_by(f64::total_cmp);
     drawdowns.sort_by(f64::total_cmp);
     // The median line is every run's, so it ends where the median figure says.
     let median_line = median_path(&paths);
-    paths.truncate(MAX_PATHS);
+    let median = percentile(&returns, 0.5);
+    let closest = |better: &dyn Fn(f64, f64) -> bool| {
+        (0..in_order.len()).fold(0, |found, run| {
+            if better(in_order[run].return_, in_order[found].return_) {
+                run
+            } else {
+                found
+            }
+        })
+    };
+    let extremes = [
+        closest(&|a, b| a > b),
+        closest(&|a, b| a < b),
+        closest(&|a, b| (a - median).abs() < (b - median).abs()),
+    ];
+    // Draw the first few runs, swapping in those three if they aren't among them.
+    let mut kept: Vec<usize> = (0..in_order.len().min(MAX_PATHS)).collect();
+    let mut spare = kept.len();
+    for extreme in extremes {
+        if !kept.contains(&extreme) {
+            spare -= 1;
+            while extremes.contains(&kept[spare]) {
+                spare -= 1;
+            }
+            kept[spare] = extreme;
+        }
+    }
+    let place = |run: usize| kept.iter().position(|&k| k == run).unwrap_or(0);
+    let (best, worst, middle) = (place(extremes[0]), place(extremes[1]), place(extremes[2]));
+    let stats = kept.iter().map(|&run| in_order[run]).collect();
+    let paths = kept
+        .iter()
+        .map(|&run| std::mem::take(&mut paths[run]))
+        .collect();
+    // The trades as they came, for comparing the draws with what really happened.
+    let mut running = capital;
+    let real: Vec<f64> = std::iter::once(capital)
+        .chain(trades.iter().map(|trade| {
+            running += trade;
+            running
+        }))
+        .collect();
+    let actual_stats = LineStats {
+        return_: running / capital - 1.0,
+        drawdown: deepest_fall(real.iter().copied(), capital),
+    };
+    let actual = real.into_iter().step_by(stride).collect();
     Ok(MonteCarlo {
         trades: trades.len(),
         runs,
-        median: percentile(&returns, 0.5),
+        median,
         low: percentile(&returns, 0.05),
         high: percentile(&returns, 0.95),
         drawdown: percentile(&drawdowns, 0.95),
         ruin: f64::from(ruined) / f64::from(runs.max(1)),
         median_path: median_line,
         paths,
+        stats,
+        best,
+        worst,
+        middle,
+        actual,
+        actual_stats,
         stride,
     })
 }
@@ -389,8 +475,24 @@ pub struct BlockResult {
     pub from: UnixNanos,
     pub to: UnixNanos,
     pub return_: f64,
+    /// The deepest fall from a peak, as a fraction of that peak.
+    pub drawdown: f64,
+    /// How many orders filled.
+    pub fills: usize,
+    /// Its last bar on the chart, for showing it there.
+    pub last_bar: usize,
     /// Equity at the block's bars' closes.
     pub path: Vec<f64>,
+}
+
+/// How one block went, without its line.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BlockStats {
+    pub from: UnixNanos,
+    pub to: UnixNanos,
+    pub stats: LineStats,
+    pub fills: usize,
+    pub last_bar: usize,
 }
 
 /// How all the blocks went.
@@ -404,6 +506,11 @@ pub struct BlockSummary {
     pub worst: f64,
     /// When the worst block was.
     pub worst_dates: (UnixNanos, UnixNanos),
+    /// Each block, in the same order as its line.
+    pub blocks: Vec<BlockStats>,
+    /// Which lines ended highest and lowest.
+    pub best_line: usize,
+    pub worst_line: usize,
     pub paths: Vec<Vec<f64>>,
     pub median_path: Vec<f64>,
     /// Bars between a line's points.
@@ -419,6 +526,29 @@ pub fn summarize(results: Vec<BlockResult>, stride: usize) -> BlockSummary {
         .iter()
         .min_by(|a, b| a.return_.total_cmp(&b.return_));
     let worst_dates = worst.map_or((0, 0), |r| (r.from, r.to));
+    let line = |better: &dyn Fn(f64, f64) -> bool| {
+        (0..results.len()).fold(0, |found, i| {
+            if better(results[i].return_, results[found].return_) {
+                i
+            } else {
+                found
+            }
+        })
+    };
+    let (best_line, worst_line) = (line(&|a, b| a > b), line(&|a, b| a < b));
+    let blocks = results
+        .iter()
+        .map(|r| BlockStats {
+            from: r.from,
+            to: r.to,
+            stats: LineStats {
+                return_: r.return_,
+                drawdown: r.drawdown,
+            },
+            fills: r.fills,
+            last_bar: r.last_bar,
+        })
+        .collect();
     let paths: Vec<Vec<f64>> = results.into_iter().map(|r| r.path).collect();
     BlockSummary {
         profitable: returns.iter().filter(|r| **r > 0.0).count() as f64
@@ -427,6 +557,9 @@ pub fn summarize(results: Vec<BlockResult>, stride: usize) -> BlockSummary {
         best: returns.last().copied().unwrap_or(0.0),
         worst: returns.first().copied().unwrap_or(0.0),
         worst_dates,
+        blocks,
+        best_line,
+        worst_line,
         median_path: median_path(&paths),
         paths,
         stride,
@@ -548,6 +681,9 @@ impl BlockJob {
             from: first,
             to,
             return_: end / capital - 1.0,
+            drawdown: deepest_fall(equity.iter().copied(), capital),
+            fills: report.fills.len(),
+            last_bar: block.end - 1,
             path: equity.iter().copied().step_by(stride).collect(),
         })
     }
@@ -719,6 +855,33 @@ mod tests {
     }
 
     #[test]
+    fn the_best_worst_and_middle_runs_are_always_kept_to_pick_out() {
+        let trades: Vec<f64> = (0..40).map(|i| f64::from(i - 15) * 3.0).collect();
+        let result = monte_carlo(&trades, 1_000.0, 5_000, 0.5, 7).unwrap();
+        assert_eq!(result.paths.len(), MAX_PATHS);
+        assert_eq!(result.stats.len(), MAX_PATHS);
+        let ends = |line: usize| result.paths[line].last().unwrap() / 1_000.0 - 1.0;
+        for line in 0..MAX_PATHS {
+            assert!((ends(line) - result.stats[line].return_).abs() < 1e-9);
+            assert!(result.stats[line].return_ <= result.stats[result.best].return_);
+            assert!(result.stats[line].return_ >= result.stats[result.worst].return_);
+        }
+        // The extremes of all 5,000 runs, not just of those drawn.
+        assert!(result.stats[result.best].return_ >= result.high);
+        assert!(result.stats[result.worst].return_ <= result.low);
+        assert!((result.stats[result.middle].return_ - result.median).abs() < 0.01);
+    }
+
+    #[test]
+    fn the_real_order_of_trades_is_kept_to_compare_with() {
+        let trades: Vec<f64> = [50.0, -100.0, 20.0].repeat(5);
+        let result = monte_carlo(&trades, 1_000.0, 20, 0.5, 7).unwrap();
+        assert_eq!(result.actual[..3], [1_000.0, 1_050.0, 950.0]);
+        assert!((result.actual_stats.return_ - (-0.15)).abs() < 1e-9);
+        assert!(result.actual_stats.drawdown > 0.0);
+    }
+
+    #[test]
     fn only_winners_never_ruin_and_big_losers_always_do() {
         let winners = vec![5.0; 20];
         let result = monte_carlo(&winners, 1_000.0, 200, 0.1, 3).unwrap();
@@ -837,6 +1000,9 @@ mod tests {
             from,
             to: from + 1,
             return_,
+            drawdown: 0.0,
+            fills: 1,
+            last_bar: 0,
             path: vec![100.0, 100.0 * (1.0 + return_)],
         };
         let summary = summarize(
@@ -854,6 +1020,8 @@ mod tests {
         assert!(close(summary.best, 0.3));
         assert!(close(summary.worst, -0.2));
         assert_eq!(summary.worst_dates, (2, 3));
+        assert_eq!((summary.best_line, summary.worst_line), (2, 1));
+        assert_eq!(summary.blocks[1].from, 2);
         assert_eq!(summary.paths.len(), 5);
         assert!(close(summary.median_path[1], 100.0));
     }

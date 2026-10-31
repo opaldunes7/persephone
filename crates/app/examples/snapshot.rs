@@ -137,6 +137,29 @@ fn main() -> anyhow::Result<()> {
                     BlockLength::Quarter,
                 )));
             }
+            '@' => {
+                // Picks out the backtest's own line on Monte Carlo, or the first block.
+                let lines = app.panel().and_then(|panel| {
+                    panel
+                        .tests
+                        .monte_carlo
+                        .as_ref()?
+                        .as_ref()
+                        .ok()
+                        .map(|r| r.paths.len())
+                });
+                let _ = app.update(Message::Backtest(PanelMessage::SelectLine(Some(
+                    lines.unwrap_or(0),
+                ))));
+            }
+            '%' => {
+                // Zoomed into the fan's first half.
+                let _ = app.update(Message::Backtest(PanelMessage::ZoomFan(Some((0.0, 0.5)))));
+            }
+            '~' => {
+                // The stock settings folded away.
+                let _ = app.update(Message::Backtest(PanelMessage::StockOpen(false)));
+            }
             'g' | '#' => {
                 // The backtest's calendar: its years, or the busiest day and its first trade.
                 let _ = app.update(Message::Backtest(PanelMessage::ShowCalendar(true)));

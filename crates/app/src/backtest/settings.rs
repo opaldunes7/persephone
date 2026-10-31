@@ -20,6 +20,8 @@ use super::Field;
 #[serde(default)]
 pub struct Settings {
     pub stock: bool,
+    /// Whether the panel shows the stock settings or keeps them folded away.
+    pub stock_open: bool,
     /// Starting cash, in the market's quote currency. Paper trading starts with it too.
     pub capital: f64,
     pub commission: Section<Commission>,
@@ -52,6 +54,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             stock: true,
+            stock_open: true,
             capital: 100_000.0,
             commission: Section::off(Commission::Percent(0.1)),
             slippage: Section::off(1),
@@ -431,6 +434,18 @@ impl Settings {
             }
         }
         Ok(())
+    }
+
+    /// How many stock sections are switched on.
+    #[must_use]
+    pub const fn stock_sections_on(&self) -> usize {
+        self.commission.on as usize
+            + self.slippage.on as usize
+            + self.spread.on as usize
+            + self.latency.on as usize
+            + self.leverage.on as usize
+            + self.direction.on as usize
+            + self.session.on as usize
     }
 
     fn on<'a, T>(&self, section: &'a Section<T>) -> Option<&'a T> {

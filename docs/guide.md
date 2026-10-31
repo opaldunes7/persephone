@@ -163,6 +163,9 @@ until it's over.
 
 ### Backtest settings
 
+**Stock settings** folds away with the arrow beside its name, for more room; they still apply, and
+the fold shows how many are on.
+
 Each setting has its own switch, and **Stock** turns them all off at once, for an
 ideal run to compare against. They're saved with each chart.
 
@@ -200,7 +203,9 @@ understanding the days behind a result. It's part of **Backtest** in **Test**.
 A trade counts on the day it **closed**, even if it opened days earlier; replaying goes to where it
 opened. A trade still open at the end counts on the last bar's day, at that bar's close, so the
 calendar adds up to the backtest's whole profit. Days are in UTC, like the chart's own time axis.
-Changing the backtest takes the calendar back to its months.
+Hover over any square or total for its percentage of the capital. With a day open, **Day before**
+and **Day after** step through the days that have trades. Changing the backtest takes the calendar
+back to its months.
 
 ## Skill or luck: Monte Carlo and random blocks
 
@@ -212,7 +217,9 @@ or figure in the panel to see what it does. Playback is only for **Backtest**.
 replacement, over and over (**Runs**, 1,000 at first). It needs at least 10 trades. A position
 still open at the end counts as a trade at the last close. It runs on its own whenever the
 backtest finishes. The faint lines are up to 200 of the runs, by trade number; the bright one is
-the median of all of them.
+the median of all of them. **Each line is one possible history**: not a real one, but what these
+trades could have added up to in a different mix. Best is green, worst red, and the backtest itself
+bright blue, so you can see where the real order sits among the draws.
 
 - **Median** and **5–95%**: where runs ended. If the low end is well below zero, these trades can
   lose money overall, whatever the backtest happened to show.
@@ -237,6 +244,11 @@ this is the usual reason. A number typed without pressing Enter counts once you 
   in this market.
 - **Median**, **Best**, **Worst**: block returns, and the worst block's dates. A best far above the
   median means the result leans on a few good stretches.
+
+On both tests, the list beside the lines says what the result means and how each one went. **Click a
+line or a row** to pick it out; hover over a line to see its return and worst fall. On Random blocks
+this also moves the chart to that block, as it happened at a real time. **Scroll to zoom and drag to
+move along**, as on a chart, and **Show it all** goes back.
 
 Blocks use the chart's strategy and settings, but orders always fill on the chart's bars, even at
 High precision, to keep a batch quick. Changing the strategy, a setting or the span stops a batch

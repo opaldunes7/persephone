@@ -1210,4 +1210,97 @@ mod panel {
         panel(&mut app, PanelMessage::ReplayTrade(0));
         assert_eq!(shown(&app), None);
     }
+
+    /// Runs what a panel message hands back, delivering what it sends, as the app would.
+    fn run_task(app: &mut Persephone, message: PanelMessage) {
+        use iced::futures::{StreamExt, executor::block_on};
+        use iced_runtime::{Action as Run_, task::into_stream};
+        let task = app.update(Message::Backtest(message));
+        let mut events = into_stream(task).expect("a task");
+        while let Some(action) = block_on(events.next()) {
+            if let Run_::Output(message) = action {
+                let _ = app.update(message);
+            }
+        }
+    }
+
+    #[test]
+    fn pressing_run_delivers_random_blocks_through_its_task() {
+        let mut app = ready_panel(TestKind::RandomBlocks);
+        panel(&mut app, PanelMessage::BlockLength(BlockLength::Week));
+        panel(&mut app, PanelMessage::Input(Field::Blocks, "5".into()));
+        run_task(&mut app, PanelMessage::RunBlocks);
+        let BlockRun::Done(summary) = &app.panel().unwrap().tests.blocks else {
+            panic!("{:?}", app.panel().unwrap().tests.blocks);
+        };
+        assert_eq!(summary.paths.len(), 5);
+    }
+
+    #[test]
+    fn a_blocks_line_can_be_picked_and_the_chart_goes_to_it() {
+        let mut app = ready_panel(TestKind::RandomBlocks);
+        panel(&mut app, PanelMessage::BlockLength(BlockLength::Week));
+        panel(&mut app, PanelMessage::Input(Field::Blocks, "4".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Blocks));
+        app.blocks_now();
+        let BlockRun::Done(summary) = &app.panel().unwrap().tests.blocks else {
+            panic!("no results");
+        };
+        let last_bar = summary.blocks[2].last_bar;
+        assert!(summary.blocks.iter().all(|b| b.last_bar < 1_500));
+        assert_eq!(summary.blocks.len(), summary.paths.len());
+        panel(&mut app, PanelMessage::SelectLine(Some(2)));
+        assert_eq!(app.panel().unwrap().tests.line, Some(2));
+        let right = app.tile_chart(0).unwrap().viewport().right;
+        assert!(
+            (right - last_bar as f64).abs() < 20.0,
+            "{right} for {last_bar}"
+        );
+        measure(&mut app);
+
+        // Zooming stays until asked back, and a changed backtest starts over.
+        panel(&mut app, PanelMessage::ZoomFan(Some((0.25, 0.5))));
+        measure(&mut app);
+        panel(&mut app, PanelMessage::Edit(Edit::Slippage(true)));
+        assert_eq!(app.panel().unwrap().tests.line, None);
+        assert_eq!(app.panel().unwrap().tests.zoom, None);
+    }
+
+    #[test]
+    fn monte_carlos_lines_can_be_picked_including_the_backtests_own() {
+        let mut app = ready_panel(TestKind::MonteCarlo);
+        app.monte_carlo_now();
+        let result = app
+            .panel()
+            .unwrap()
+            .tests
+            .monte_carlo
+            .clone()
+            .unwrap()
+            .unwrap();
+        panel(&mut app, PanelMessage::SelectLine(Some(result.best)));
+        measure(&mut app);
+        panel(&mut app, PanelMessage::SelectLine(Some(result.paths.len())));
+        measure(&mut app);
+        assert_eq!(app.panel().unwrap().tests.line, Some(result.paths.len()));
+        // What really happened is one of the things it compares against.
+        let Run::Done(report) = run_state(&app) else {
+            panic!("no backtest");
+        };
+        let made = report.equity.last().unwrap() / report.starting_balance - 1.0;
+        assert!((result.actual_stats.return_ - made).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stock_settings_fold_away_and_the_panel_needs_less_room() {
+        let mut app = ready_panel(TestKind::Backtest);
+        panel(&mut app, PanelMessage::Resize(0.0));
+        let open = measure(&mut app);
+        panel(&mut app, PanelMessage::StockOpen(false));
+        let folded = measure(&mut app);
+        assert!(folded < open, "{folded} against {open}");
+        assert!(!app.tile_backtest(0).unwrap().stock_open);
+        // Folding away changes nothing about the backtest.
+        assert!(matches!(run_state(&app), Run::Done(_)));
+    }
 }

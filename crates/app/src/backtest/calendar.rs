@@ -94,6 +94,20 @@ impl Calendar {
             .map_or_else(Total::default, |trades| self.total_of(trades))
     }
 
+    /// The nearest earlier day with trades.
+    #[must_use]
+    pub fn day_before(&self, year: i64, month: u32, day: u32) -> Option<Level> {
+        let (&(y, m, d), _) = self.days.range(..(year, month, day)).next_back()?;
+        Some(Level::Day(y, m, d))
+    }
+
+    /// The nearest later day with trades.
+    #[must_use]
+    pub fn day_after(&self, year: i64, month: u32, day: u32) -> Option<Level> {
+        let (&(y, m, d), _) = self.days.range((year, month, day + 1)..).next()?;
+        Some(Level::Day(y, m, d))
+    }
+
     /// Which trades closed on a day, by their place in the backtest's trades.
     #[must_use]
     pub fn trades_on(&self, year: i64, month: u32, day: u32) -> &[usize] {
@@ -228,6 +242,32 @@ mod tests {
             .map(|y| calendar.year(*y).profit)
             .sum();
         assert_eq!(years, total);
+    }
+
+    #[test]
+    fn stepping_a_day_skips_days_without_trades_across_months() {
+        let calendar = Calendar::new(
+            vec![
+                trade(at(2026, 10, 30), at(2026, 10, 30), 1.0, false),
+                trade(at(2026, 11, 2), at(2026, 11, 2), 1.0, false),
+                trade(at(2026, 11, 9), at(2026, 11, 9), 1.0, false),
+            ],
+            at(2026, 12, 1),
+        );
+        assert_eq!(
+            calendar.day_before(2026, 11, 2),
+            Some(Level::Day(2026, 10, 30))
+        );
+        assert_eq!(
+            calendar.day_after(2026, 10, 30),
+            Some(Level::Day(2026, 11, 2))
+        );
+        assert_eq!(
+            calendar.day_after(2026, 11, 2),
+            Some(Level::Day(2026, 11, 9))
+        );
+        assert_eq!(calendar.day_before(2026, 10, 30), None);
+        assert_eq!(calendar.day_after(2026, 11, 9), None);
     }
 
     #[test]

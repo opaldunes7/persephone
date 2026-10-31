@@ -319,6 +319,12 @@ impl ChartState {
         self.grid_cache.clear();
     }
 
+    /// Scrolls so that bar `index` is near the right edge.
+    pub fn show_bar(&mut self, index: usize) {
+        self.viewport.right = index as f64 + viewport::RIGHT_MARGIN_BARS;
+        self.grid_cache.clear();
+    }
+
     #[must_use]
     pub fn drawings(&self) -> &[Drawing] {
         &self.drawings

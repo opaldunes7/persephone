@@ -18,7 +18,7 @@ use super::{
     optimize::{OptimizeResult, Outcome},
     progress,
     robustness::Problem,
-    robustness::{RoundTrip, round_trips},
+    robustness::{BlockSummary, LineStats, MonteCarlo, RoundTrip, round_trips},
     speed_text,
     widgets::heat,
     widgets::{Edge, Equity, Fan, Glyph, HeatScale, Icon, Landscape, Span, Speed},
@@ -279,18 +279,29 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                         "The share of runs that fell as far as the Ruin at setting from a peak.",
                     ));
                 note = Some(muted(format!(
-                    "{} runs of {} trades, each drawn at random from the backtest's",
-                    result.runs, result.trades
+                    "Each line is one possible history: {} of the backtest's trades drawn at random. Click one, or pick from the list. Scroll to zoom.",
+                    result.trades
                 )));
-                canvas(Fan {
-                    paths: &result.paths,
-                    median: &result.median_path,
-                    start: report.starting_balance,
-                    unit: "Trade",
-                    stride: result.stride,
-                })
-                .width(Fill)
-                .height(Fill)
+                let mut stats = result.stats.clone();
+                stats.push(result.actual_stats);
+                row![
+                    canvas(Fan {
+                        paths: &result.paths,
+                        median: &result.median_path,
+                        actual: Some(&result.actual),
+                        stats,
+                        marks: vec![(result.best, theme::UP), (result.worst, theme::DOWN)],
+                        picked: panel.tests.line,
+                        zoom: panel.tests.zoom.unwrap_or((0.0, 1.0)),
+                        start: report.starting_balance,
+                        unit: "Trade",
+                        stride: result.stride,
+                        line_name: "This run",
+                    })
+                    .width(Fill)
+                    .height(Fill),
+                    monte_carlo_list(result, panel.tests.line, panel.tests.zoom.is_some()),
+                ]
                 .into()
             }
             // Said under the test's settings.
@@ -402,22 +413,31 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                             up_or_down(summary.worst),
                             "The worst block's return: what a bad stretch of this market did.",
                         ));
-                    let (from, to) = summary.worst_dates;
                     note = Some(muted(format!(
-                        "{} blocks. The worst ran {} → {}",
+                        "Each line is a real stretch of the market, backtested alone: {} of them. Click one to see it on the chart; scroll to zoom.",
                         summary.paths.len(),
-                        DateTime::from_nanos(from).date(),
-                        DateTime::from_nanos(to).date(),
                     )));
-                    canvas(Fan {
-                        paths: &summary.paths,
-                        median: &summary.median_path,
-                        start: info.settings.capital,
-                        unit: "Bar",
-                        stride: summary.stride,
-                    })
-                    .width(Fill)
-                    .height(Fill)
+                    row![
+                        canvas(Fan {
+                            paths: &summary.paths,
+                            median: &summary.median_path,
+                            actual: None,
+                            stats: summary.blocks.iter().map(|b| b.stats).collect(),
+                            marks: vec![
+                                (summary.best_line, theme::UP),
+                                (summary.worst_line, theme::DOWN),
+                            ],
+                            picked: panel.tests.line,
+                            zoom: panel.tests.zoom.unwrap_or((0.0, 1.0)),
+                            start: info.settings.capital,
+                            unit: "Bar",
+                            stride: summary.stride,
+                            line_name: "This block",
+                        })
+                        .width(Fill)
+                        .height(Fill),
+                        blocks_list(summary, panel.tests.line, panel.tests.zoom.is_some()),
+                    ]
                     .into()
                 }
                 BlockRun::Running { done, total, .. } => {
@@ -764,29 +784,56 @@ fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMessage> {
     .width(Fill)
     .style(|_, status| list_style(status))
     .menu_style(|_| list_menu_style());
-    let top = row![
-        tip_at(
-            strategy,
-            "The strategy this chart trades and tests. Its settings are in the chart's right-click menu.",
-            None,
-            tooltip::Position::Right,
-        ),
-        tip(
+    let top = tip_at(
+        strategy,
+        "The strategy this chart trades and tests. Its settings are in the chart's right-click menu.",
+        None,
+        tooltip::Position::Right,
+    );
+    let open = settings.stock_open;
+    let mut stock_title = row![tip(
+        button(
             row![
-                text("Stock").size(HINT).color(theme::TEXT_MUTED),
-                toggler(stock)
-                    .size(15)
-                    .on_toggle(|on| PanelMessage::Edit(Edit::Stock(on)))
-                    .style(switch_style),
+                text(if open { "▾" } else { "▸" }).size(SMALL + 4.0),
+                text("Stock settings").size(SMALL),
             ]
-            .spacing(8)
+            .spacing(5)
             .align_y(Alignment::Center),
-            "Stock settings: off turns all of them off at once, for an ideal run to compare against.",
-            None,
-        ),
-    ]
+        )
+        .padding(0)
+        .on_press(PanelMessage::StockOpen(!open))
+        .style(|_, status| plain(status)),
+        if open {
+            "Fold the stock settings away, for more room. They still apply."
+        } else {
+            "Show the stock settings."
+        },
+        None,
+    )]
     .spacing(8)
     .align_y(Alignment::Center);
+    if !open {
+        stock_title = stock_title.push(
+            text(format!(
+                "{} of 7 on, capital {}",
+                settings.stock_sections_on(),
+                settings.text(Field::Capital)
+            ))
+            .size(HINT)
+            .color(theme::TEXT_MUTED),
+        );
+    }
+    let stock_title = stock_title.push(
+        container(tip(
+            toggler(stock)
+                .size(15)
+                .on_toggle(|on| PanelMessage::Edit(Edit::Stock(on)))
+                .style(switch_style),
+            "Off turns all the stock settings off at once, for an ideal run to compare against.",
+            None,
+        ))
+        .align_right(Fill),
+    );
 
     // Which test, and its own settings.
     let tests = row![
@@ -1325,10 +1372,11 @@ fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMessage> {
     if let Some(error) = &panel.error {
         body = body.push(text(error.as_str()).size(SMALL).color(theme::DOWN));
     }
-    body = body
-        .push(grid(simulation, columns))
-        .push(session_row)
-        .push(plugin_row);
+    body = body.push(stock_title);
+    if open {
+        body = body.push(grid(simulation, columns)).push(session_row);
+    }
+    body = body.push(plugin_row);
 
     // The panel is kept tall enough for what the sensor measures, so there's nothing to scroll.
     // The scrollable is what lets it measure the full height, and covers a window too short to
@@ -1497,6 +1545,217 @@ fn result_style(current: bool, status: button::Status) -> button::Style {
     }
 }
 
+/// The list beside a fan, under the legend's first line, with its way back from zooming.
+fn fan_list<'a>(
+    verdict: String,
+    rows: Element<'a, PanelMessage>,
+    zoomed: bool,
+) -> Element<'a, PanelMessage> {
+    let mut list = column![
+        text(verdict).size(HINT).color(theme::TEXT_BRIGHT),
+        container(rows).height(Fill)
+    ]
+    .spacing(6)
+    .padding(Padding {
+        top: 8.0,
+        right: 8.0,
+        bottom: 6.0,
+        left: 8.0,
+    })
+    .width(RESULTS_WIDTH + 30.0)
+    .height(Fill);
+    if zoomed {
+        list = list.push(
+            button(text("Show it all").size(SMALL).center())
+                .width(Fill)
+                .padding([3, 6])
+                .on_press(PanelMessage::ZoomFan(None))
+                .style(|_, status| chip(false, status)),
+        );
+    }
+    let divider = container(Space::new())
+        .width(1)
+        .height(Fill)
+        .style(|_| container::background(theme::AXIS_LINE));
+    row![divider, list].into()
+}
+
+/// One line's row in a fan's list: clicking it picks the line, or unpicks it.
+fn line_row<'a>(
+    label: String,
+    color: Color,
+    stats: LineStats,
+    line: usize,
+    picked: Option<usize>,
+    what: String,
+) -> Element<'a, PanelMessage> {
+    let up_or_down = if stats.return_ >= 0.0 {
+        theme::UP
+    } else {
+        theme::DOWN
+    };
+    let number = |content: String, color: Color| {
+        text(content)
+            .size(HINT)
+            .font(iced::Font::MONOSPACE)
+            .color(color)
+            .width(RESULT_FIGURE)
+    };
+    let selected = picked == Some(line);
+    tip_at(
+        button(
+            row![
+                text(label).size(HINT).color(color).width(Fill),
+                number(format!("{:+.2}%", stats.return_ * 100.0), up_or_down),
+                number(format!("{:.2}%", stats.drawdown * 100.0), theme::TEXT),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        )
+        .padding([2, 6])
+        .width(Fill)
+        .on_press(PanelMessage::SelectLine((!selected).then_some(line)))
+        .style(move |_, status| result_style(selected, status)),
+        what,
+        None,
+        tooltip::Position::Left,
+    )
+}
+
+/// The heading of a fan's list.
+fn list_titles<'a>(first: &'static str) -> Element<'a, PanelMessage> {
+    let title = |content: &'static str, width: iced::Length| {
+        text(content)
+            .size(HINT)
+            .color(theme::TEXT_MUTED)
+            .width(width)
+    };
+    row![
+        title(first, Fill),
+        title("Return", RESULT_FIGURE.into()),
+        title("Fell", RESULT_FIGURE.into()),
+    ]
+    .spacing(4)
+    .padding([0, 6])
+    .into()
+}
+
+/// Monte Carlo's notable runs, and what they come to.
+fn monte_carlo_list<'a>(
+    result: &MonteCarlo,
+    picked: Option<usize>,
+    zoomed: bool,
+) -> Element<'a, PanelMessage> {
+    let verdict = if result.low > 0.0 {
+        "Even unlucky draws made money, so these trades look solid."
+    } else if result.median > 0.0 {
+        "Most draws made money, but an unlucky mix of these trades could lose."
+    } else {
+        "Most draws lost money, so these trades show no edge here."
+    };
+    let verdict = if result.ruin > 0.0 {
+        format!(
+            "{verdict} {:.1}% of draws were ruined.",
+            result.ruin * 100.0
+        )
+    } else {
+        verdict.to_owned()
+    };
+    let rows = column![
+        list_titles("Run"),
+        line_row(
+            "Best".to_owned(),
+            theme::UP,
+            result.stats[result.best],
+            result.best,
+            picked,
+            "The luckiest draw of all the runs: a ceiling, not something to expect.".to_owned(),
+        ),
+        line_row(
+            "Middle".to_owned(),
+            theme::TEXT_BRIGHT,
+            result.stats[result.middle],
+            result.middle,
+            picked,
+            "The draw closest to the median: half did better, half worse. The white line is the median at every step.".to_owned(),
+        ),
+        line_row(
+            "Worst".to_owned(),
+            theme::DOWN,
+            result.stats[result.worst],
+            result.worst,
+            picked,
+            "The unluckiest draw of all the runs: what these same trades could do.".to_owned(),
+        ),
+        line_row(
+            "The backtest".to_owned(),
+            Color::from_rgb8(0x42, 0xa5, 0xf5),
+            result.actual_stats,
+            result.paths.len(),
+            picked,
+            "The trades as they really came, the bright blue line. Compare where it sits among the draws: near the top means the real order was lucky.".to_owned(),
+        ),
+    ]
+    .spacing(2);
+    fan_list(verdict, rows.into(), zoomed)
+}
+
+/// Every block, best first.
+fn blocks_list<'a>(
+    summary: &BlockSummary,
+    picked: Option<usize>,
+    zoomed: bool,
+) -> Element<'a, PanelMessage> {
+    let verdict = if summary.median > 0.0 && summary.profitable >= 0.6 {
+        "It made money in most stretches of the market."
+    } else if summary.profitable <= 0.4 {
+        "It lost or stood still in most stretches, so a good backtest may rest on one period."
+    } else {
+        "It's mixed: it worked in some stretches and not others."
+    };
+    let mut order: Vec<usize> = (0..summary.blocks.len()).collect();
+    order.sort_by(|&a, &b| {
+        summary.blocks[b]
+            .stats
+            .return_
+            .total_cmp(&summary.blocks[a].stats.return_)
+    });
+    let mut rows = column![].spacing(2);
+    for line in order {
+        let block = &summary.blocks[line];
+        let from = DateTime::from_nanos(block.from);
+        let to = DateTime::from_nanos(block.to);
+        rows = rows.push(line_row(
+            format!(
+                "{} {:02} – {} {:02} {}",
+                from.month_name(),
+                from.day,
+                to.month_name(),
+                to.day,
+                to.year
+            ),
+            theme::TEXT,
+            block.stats,
+            line,
+            picked,
+            format!(
+                "{} fills. Click to pick out its line and move the chart to it.",
+                block.fills
+            ),
+        ));
+    }
+    let rows = column![
+        list_titles("Block"),
+        scrollable(rows)
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::hidden()
+            ))
+            .height(Fill)
+    ]
+    .spacing(2);
+    fan_list(verdict.to_owned(), rows.into(), zoomed)
+}
+
 /// Room over the calendar for the legend and the way back up.
 const CALENDAR_TOP: f32 = 60.0;
 const LEDGER_WIDTH: f32 = 500.0;
@@ -1587,6 +1846,7 @@ fn calendar_cell<'a>(
     reach: f64,
     selected: bool,
     narrow: bool,
+    capital: f64,
     open: Option<Level>,
 ) -> Element<'a, PanelMessage> {
     let mut content = row![].spacing(4).align_y(Alignment::Center);
@@ -1615,7 +1875,9 @@ fn calendar_cell<'a>(
     }
     let fill = (total.trades > 0).then(|| heat(total.profit, reach));
     let what = format!(
-        "{} {}",
+        "{} ({:+.2}% of the capital), from {} {}",
+        money(total.profit),
+        total.profit / capital * 100.0,
         total.trades,
         if total.trades == 1 { "trade" } else { "trades" }
     );
@@ -1706,9 +1968,11 @@ fn calendar_pane<'a>(
                 for month in 1..=12 {
                     let total = calendar.month(year, month);
                     let open = (total.trades > 0).then_some(Level::Month(year, month));
-                    line = line.push(calendar_cell(None, total, reach, false, false, open));
+                    line = line.push(calendar_cell(
+                        None, total, reach, false, false, capital, open,
+                    ));
                 }
-                line = line.push(total_text(calendar.year(year)));
+                line = line.push(total_text(calendar.year(year), capital));
                 rows = rows.push(line);
             }
             column![
@@ -1752,13 +2016,14 @@ fn calendar_pane<'a>(
                                 reach,
                                 selected == Some(day),
                                 selected.is_some(),
+                                capital,
                                 open,
                             )
                         }
                         None => Element::from(Space::new().width(Fill).height(Fill)),
                     });
                 }
-                rows = rows.push(line.push(total_text(sum)));
+                rows = rows.push(line.push(total_text(sum, capital)));
             }
             rows.into()
         }
@@ -1775,12 +2040,7 @@ fn calendar_pane<'a>(
     if let Level::Day(year, month, day) = level {
         row![
             grid,
-            ledger(
-                calendar,
-                calendar.trades_on(year, month, day),
-                replaying,
-                capital
-            )
+            ledger(calendar, (year, month, day), replaying, capital)
         ]
         .into()
     } else {
@@ -1789,7 +2049,7 @@ fn calendar_pane<'a>(
 }
 
 /// A row or week's total, beside its squares.
-fn total_text<'a>(total: Total) -> Element<'a, PanelMessage> {
+fn total_text<'a>(total: Total, capital: f64) -> Element<'a, PanelMessage> {
     let color = if total.profit >= 0.0 {
         theme::UP
     } else {
@@ -1800,15 +2060,23 @@ fn total_text<'a>(total: Total) -> Element<'a, PanelMessage> {
     } else {
         String::new()
     };
-    container(
+    let shown = container(
         text(content)
             .size(HINT)
             .font(iced::Font::MONOSPACE)
             .color(color),
     )
     .center_y(Fill)
-    .align_right(CALENDAR_TOTAL)
-    .into()
+    .align_right(CALENDAR_TOTAL);
+    if total.trades > 0 {
+        tip(
+            shown,
+            format!("{:+.2}% of the capital", total.profit / capital * 100.0),
+            None,
+        )
+    } else {
+        shown.into()
+    }
 }
 
 /// How long a trade was open: `45m`, `3h 20m`, `2d 4h`.
@@ -1833,7 +2101,7 @@ fn price_text(price: f64) -> String {
 /// A day's trades, each a click from being replayed on the chart.
 fn ledger<'a>(
     calendar: &Calendar,
-    trades: &[usize],
+    (year, month, day): (i64, u32, u32),
     replaying: Option<usize>,
     capital: f64,
 ) -> Element<'a, PanelMessage> {
@@ -1845,6 +2113,54 @@ fn ledger<'a>(
             .width(width)
     };
     let muted = |content: &str, width: f32| cell(content.to_owned(), theme::TEXT_MUTED, width);
+    let trades = calendar.trades_on(year, month, day);
+    let step = |label: &'static str, to: Option<Level>, what: &'static str| {
+        tip(
+            button(text(label).size(HINT).center())
+                .padding([2, 7])
+                .on_press_maybe(to.map(PanelMessage::CalendarLevel))
+                .style(|_, status| chip(false, status)),
+            what,
+            None,
+        )
+    };
+    let total = calendar.day(year, month, day);
+    let color = if total.profit >= 0.0 {
+        theme::UP
+    } else {
+        theme::DOWN
+    };
+    let stepping = row![
+        step(
+            "‹ Day before",
+            calendar.day_before(year, month, day),
+            "The nearest earlier day with trades.",
+        ),
+        container(
+            row![
+                text(format!("{day} {} {year}", MONTH_NAMES[month as usize - 1]))
+                    .size(SMALL)
+                    .color(theme::TEXT_BRIGHT),
+                text(format!(
+                    "{} ({:+.2}%)",
+                    money(total.profit),
+                    total.profit / capital * 100.0
+                ))
+                .size(HINT)
+                .font(iced::Font::MONOSPACE)
+                .color(color),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .center_x(Fill),
+        step(
+            "Day after ›",
+            calendar.day_after(year, month, day),
+            "The nearest later day with trades.",
+        ),
+    ]
+    .align_y(Alignment::Center);
     let titles = row![
         muted("Opened", COLUMN_OPENED),
         muted("Side", COLUMN_SIDE),
@@ -1918,6 +2234,7 @@ fn ledger<'a>(
         ));
     }
     let list = column![
+        stepping,
         titles,
         scrollable(rows)
             .direction(scrollable::Direction::Vertical(

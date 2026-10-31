@@ -99,6 +99,10 @@ pub struct Tests {
     pub optimize: OptimizeRun,
     /// The strategy's parameters before a result was applied, to go back to.
     pub original: Option<Vec<f64>>,
+    /// The line picked on a Monte Carlo or Random blocks fan; one past the last for the backtest.
+    pub line: Option<usize>,
+    /// How much of that fan shows, from 0 to 1; `None` is all of it.
+    pub zoom: Option<(f32, f32)>,
 }
 
 /// Where an optimization has got.
@@ -134,10 +138,17 @@ pub enum BlockRun {
 impl Tests {
     /// Forgets the results and stops what's running, as what they were about has changed.
     pub fn clear(&mut self) {
+        self.reset_fan();
         self.clear_monte_carlo();
         self.blocks = BlockRun::Idle;
         self.optimize = OptimizeRun::Idle;
         self.original = None;
+    }
+
+    /// Back to seeing a fan whole, with no line picked.
+    pub fn reset_fan(&mut self) {
+        self.line = None;
+        self.zoom = None;
     }
 
     pub fn clear_monte_carlo(&mut self) {
@@ -279,6 +290,12 @@ pub enum PanelMessage {
     Apply(usize),
     /// Back to the strategy's parameters from before any result was applied.
     Revert,
+    /// Pick a line on a fan, or none.
+    SelectLine(Option<usize>),
+    /// Show this much of a fan, from 0 to 1, or all of it.
+    ZoomFan(Option<(f32, f32)>),
+    /// Show the stock settings, or fold them away.
+    StockOpen(bool),
     /// Show the backtest's calendar, or its equity curve.
     ShowCalendar(bool),
     CalendarLevel(calendar::Level),
