@@ -32,6 +32,10 @@ use crate::{
     tools::{DEFAULT_ROWS, limit_of, text},
 };
 
+/// The least to look through at a time for a page of Binance's bars, so a span starting long before
+/// a market existed doesn't take a request for every small page's worth of nothing.
+const MIN_STRETCH_BARS: usize = 5_000;
+
 const BAR_COLUMNS: [&str; 7] = ["ts", "time", "open", "high", "low", "close", "volume"];
 
 /// A market as a call names it.
@@ -242,9 +246,21 @@ impl Lab {
                 .and_then(|m| m.candles_between(market.bars, from, to))
                 .map_err(error_text),
             None => {
+                // A stretch can hold fewer bars than its length, or none, where the market had an
+                // outage, so it goes on until it has enough or there's nothing more.
                 let timeframe = market.timeframe()?;
-                let end = to.min(from.saturating_add(limit as u64 * timeframe.nanos()));
-                self.cache.bars(&market.symbol, timeframe, from, end)
+                let end = to.min(self.cache.forming(timeframe));
+                let stretch =
+                    (limit.max(MIN_STRETCH_BARS) as u64).saturating_mul(timeframe.nanos());
+                let mut bars = Vec::new();
+                let mut at = from;
+                while bars.len() < limit && at < end {
+                    let until = end.min(at.saturating_add(stretch));
+                    bars.extend(self.cache.bars(&market.symbol, timeframe, at, until)?);
+                    at = until;
+                }
+                bars.truncate(limit);
+                Ok(bars)
             }
         }
     }

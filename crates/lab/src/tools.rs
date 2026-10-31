@@ -55,6 +55,8 @@ impl Tool {
         for arg in args {
             let kind = if arg.kind == "time" {
                 json!(["string", "integer"])
+            } else if arg.kind == "list_or_path" {
+                json!(["array", "string"])
             } else {
                 json!(arg.kind)
             };
@@ -99,6 +101,8 @@ fn settings_schema() -> Value {
             "Fees instead of the market's own.",
         ),
         "slippage": section(whole.clone(), "Ticks every market order fills worse."),
+        "slippage_percent": section(number.clone(), "Percent of the price every market order fills worse, as 0.01 for 1 basis point."),
+        "compound": {"type": "boolean", "description": "Size positions from the account as it is now, rather than as it started."},
         "spread": section(whole.clone(), "Ticks of spread assumed for bars and trades."),
         "latency": section(whole, "Milliseconds before orders reach the venue."),
         "leverage": section(number, "A multiple of position size, 1 or more."),
@@ -162,7 +166,7 @@ const LIMIT: Arg = opt(
 const STRATEGY: Arg = arg(
     "strategy",
     "object",
-    "{\"builtin\": \"ema-cross\"}, {\"plugin\": \"id\"}, {\"logic\": {...tree...}} or {\"positions\": [[ts, 1], [ts, 0]]}, each with optional \"params\": {\"name\": value}.",
+    "{\"builtin\": \"ema-cross\"}, {\"plugin\": \"id\"}, {\"logic\": {...tree...}} or {\"positions\": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional \"params\": {\"name\": value}.",
 );
 const SETTINGS: Arg = opt(
     "settings",
@@ -419,8 +423,8 @@ pub fn tools() -> Vec<Tool> {
             vec![
                 arg(
                     "runs",
-                    "array",
-                    "A list of arguments as run_backtest takes, up to 5,000.",
+                    "list_or_path",
+                    "A list of arguments as run_backtest takes, up to 5,000, or a JSON file holding one.",
                 ),
                 opt(
                     "defaults",
@@ -492,9 +496,33 @@ pub fn tools() -> Vec<Tool> {
                         "The same seed gives the same stretches. Default 0.",
                     ),
                     opt("include_trades", "boolean", "Include each block's trades."),
+                    opt("limit", "integer", "How many blocks to list. Default 50."),
                 ],
             ),
-            &["profitable", "median", "best", "worst", "blocks"],
+            &["profitable", "median", "best", "worst", "blocks", "total"],
+        ),
+        job(
+            "run_random_entries",
+            "Whether a run beat chance: the same holds and directions at random times, on the same bars and settings, many times over. Returns and falls are fractions.",
+            vec![
+                RUN_ID,
+                opt("runs", "integer", "How many random placings. Default 200."),
+                opt(
+                    "seed",
+                    "integer",
+                    "The same seed gives the same placings. Default 0.",
+                ),
+            ],
+            &[
+                "runs",
+                "trades",
+                "actual_return",
+                "share_matching_return",
+                "share_matching_fall",
+                "median",
+                "low",
+                "high",
+            ],
         ),
         job(
             "run_walk_forward",
@@ -588,7 +616,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "get_report",
-            "A run's full report: every statistic and note. Its own figures are fractions; pnl, returns and general are Nautilus's own.",
+            "A run's full report: every statistic and note. Its own figures are fractions, and pnl counts a trade still open at its last value; closed_positions_pnl, returns and general are Nautilus's own.",
             vec![RUN_ID],
             &[
                 "run_id", "request", "summary", "pnl", "returns", "general", "notes",
@@ -666,7 +694,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "cancel_job",
-            "Asks a job to stop. What's under way finishes and is dropped.",
+            "Asks a job to stop. What's under way finishes and is dropped. get_job then says status cancelled, or done with what it got, if it can answer in part.",
             vec![arg("job_id", "string", "A job id.")],
             &["job_id", "status"],
         ),
@@ -783,6 +811,7 @@ pub(crate) fn check_args(tool: &Tool, args: &Value) -> Result<(), String> {
             "boolean" => value.is_boolean(),
             "object" => value.is_object(),
             "array" => value.is_array(),
+            "list_or_path" => value.is_array() || value.is_string(),
             _ => value.is_string() || value.is_u64(),
         };
         if !fits {
@@ -810,7 +839,9 @@ impl Lab {
     fn call(self: &Arc<Self>, name: &str, args: &Value) -> Result<Value, String> {
         let all = tools();
         let tool = all.iter().find(|tool| tool.name == name).ok_or_else(|| {
-            format!("there's no tool `{name}`; `persephone-lab tools` lists them")
+            format!(
+                "there's no tool `{name}`; the tool list has them, and `get_guide` where to start"
+            )
         })?;
         check_args(tool, args)?;
         match name {
@@ -858,6 +889,7 @@ impl Lab {
                     "run_random_blocks" => lab.run_random_blocks(&owned, job),
                     "run_optimize" => lab.run_optimize(&owned, job),
                     "run_walk_forward" => lab.run_walk_forward(&owned, job),
+                    "run_random_entries" => lab.run_random_entries(&owned, job),
                     other => Err(format!("there's no tool `{other}`")),
                 })
             }

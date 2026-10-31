@@ -191,7 +191,8 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
             Rc::clone(&failure),
         )
         .ruled(request.rules.clone(), request.trade_from)
-        .counting_refusals(Rc::clone(&refused)),
+        .counting_refusals(Rc::clone(&refused))
+        .compounding(request.sim.compound.then_some(request.starting_balance)),
     )?;
 
     match &request.ticks {
@@ -367,6 +368,7 @@ fn venue_config(
         .fill_model(FillModelHandle::new(CostFillModel::new(
             sim.slippage_ticks,
             sim.spread_ticks,
+            sim.slippage_percent,
         )))
         .maybe_latency_model((sim.latency_ms > 0).then(|| {
             let latency = DurationNanos::new(u64::from(sim.latency_ms) * 1_000_000);

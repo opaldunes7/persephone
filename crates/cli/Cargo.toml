@@ -15,6 +15,7 @@ persephone-data.workspace = true
 persephone-engine = { workspace = true, features = ["live"] }
 persephone-ml.workspace = true
 persephone-plugin-host.workspace = true
+persephone-research.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true

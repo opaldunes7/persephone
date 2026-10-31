@@ -48,6 +48,11 @@ pub(crate) struct SignalStrategy {
     unfilled: f64,
     /// What was asked for while an order was on its way, to do once it's filled.
     deferred: Option<i8>,
+    /// What the account started with, when positions are sized from what it holds now.
+    compound_from: Option<f64>,
+    /// Cash, kept from fills, starting from nothing: the account is this plus what it started with
+    /// and the position at its price.
+    cash: f64,
     /// Orders refused, and why the first was, for the report.
     refused: Rc<RefCell<(usize, Option<String>)>>,
     /// Shared with the engine thread that runs this strategy; collected after the run.
@@ -81,6 +86,8 @@ impl SignalStrategy {
             entry_price: f64::NAN,
             unfilled: 0.0,
             deferred: None,
+            compound_from: None,
+            cash: 0.0,
             refused: Rc::default(),
             fills,
             failure,
@@ -100,6 +107,23 @@ impl SignalStrategy {
     ) -> Self {
         self.refused = refused;
         self
+    }
+
+    /// Sizes positions from the account as it is now, it having started with `balance`.
+    pub(crate) const fn compounding(mut self, balance: Option<f64>) -> Self {
+        self.compound_from = balance;
+        self
+    }
+
+    /// What a position is worth now: as set, or grown or shrunk with the account.
+    fn notional_at(&self, close: f64) -> f64 {
+        match self.compound_from {
+            Some(balance) if balance > 0.0 => {
+                let account = balance + self.cash + self.position * close;
+                self.notional * (account / balance).max(0.0)
+            }
+            _ => self.notional,
+        }
     }
 
     pub(crate) fn ruled(mut self, rules: TradingRules, trade_from: UnixNanos) -> Self {
@@ -172,8 +196,15 @@ nautilus_strategy!(SignalStrategy, {
             _ => Side::Buy,
         };
         let before = self.position;
-        self.position += if side == Side::Buy { qty } else { -qty };
+        // To the market's own steps: floating-point sums of sizes don't always come back to exactly
+        // zero, and a dust of a short would read as being short, so the next short wouldn't go out.
+        let steps = 10_f64.powi(i32::from(self.size_precision));
+        let moved = self.position + if side == Side::Buy { qty } else { -qty };
+        self.position = (moved * steps).round() / steps;
         self.unfilled = (self.unfilled - qty).max(0.0);
+        let value = qty * event.last_px.as_f64();
+        self.cash += if side == Side::Buy { -value } else { value };
+        self.cash -= event.commission.map_or(0.0, |fee| fee.as_f64());
         if self.position == 0.0 {
             self.entry_price = f64::NAN;
         } else if before == 0.0 || before.is_sign_positive() != self.position.is_sign_positive() {
@@ -279,7 +310,11 @@ impl DataActor for SignalStrategy {
             return Ok(());
         }
 
-        let size = Quantity::new(self.notional / candle.close, self.size_precision).as_f64();
+        let size = Quantity::new(
+            self.notional_at(candle.close) / candle.close,
+            self.size_precision,
+        )
+        .as_f64();
         let delta = f64::from(target) * size - self.position;
         let qty = Quantity::new(delta.abs(), self.size_precision);
         if qty.is_zero() {

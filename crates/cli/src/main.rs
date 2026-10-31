@@ -27,6 +27,7 @@ use persephone_engine::{
     BacktestReport, BacktestRequest, FeeRates, SimSettings, TradingRules, spawn_backtest,
 };
 use persephone_plugin_host::{Host, external};
+use persephone_research::robustness::{pnl_by_trade, win_rate};
 
 #[derive(Parser)]
 #[command(name = "persephone-cli", version, about)]
@@ -267,7 +268,6 @@ fn local_market(id: &str, tf: BarSpec, days: u64, bar_fills: bool) -> anyhow::Re
 }
 
 fn print_summary(report: &BacktestReport, quote: &str) {
-    let stat = |key: &str| report.stat(key).unwrap_or(f64::NAN);
     println!(
         "  {:<14}{} fills · {} positions",
         "Trades",
@@ -285,11 +285,15 @@ fn print_summary(report: &BacktestReport, quote: &str) {
         "Max drawdown",
         report.max_drawdown * 100.0
     );
-    println!("  {:<14}{}", "Win rate", percent(stat("Win Rate")));
+    println!(
+        "  {:<14}{}",
+        "Win rate",
+        percent(win_rate(report).unwrap_or(f64::NAN))
+    );
     println!("  {:<14}{:.2} {quote}", "Fees", report.fees);
     println!();
 
-    print_section("PnL", &report.pnl);
+    print_section("PnL", &pnl_by_trade(report));
     print_section("Returns", &report.returns);
     print_section("General", &report.general);
     if !report.notes.is_empty() {

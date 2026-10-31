@@ -4779,6 +4779,7 @@ dependencies = [
  "persephone-engine",
  "persephone-ml",
  "persephone-plugin-host",
+ "persephone-research",
  "reqwest",
  "serde_json",
 ]

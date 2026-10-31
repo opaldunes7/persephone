@@ -76,6 +76,15 @@ fn status(id: &str, job: &Job) -> Result<Value, String> {
             "status": "done",
             "result": result,
         })),
+        // Stopping when asked to isn't a failure.
+        Some(Err(error)) if job.stop.load(Ordering::Relaxed) => Ok(json!({
+            "job_id": id,
+            "tool": job.tool,
+            "status": "cancelled",
+            "message": error,
+            "done": job.done.load(Ordering::Relaxed),
+            "total": job.total.load(Ordering::Relaxed),
+        })),
         Some(Err(error)) => Err(error),
         None if job.stop.load(Ordering::Relaxed) => Ok(json!({
             "job_id": id,
@@ -132,6 +141,13 @@ impl Lab {
             // Kept so the answer outlasts this process.
             let saved = match &result {
                 Ok(value) => json!({"tool": tool_name, "status": "done", "result": value}),
+                Err(error) if worker.stop.load(Ordering::Relaxed) => json!({
+                    "tool": tool_name,
+                    "status": "cancelled",
+                    "message": error,
+                    "done": worker.done.load(Ordering::Relaxed),
+                    "total": worker.total.load(Ordering::Relaxed),
+                }),
                 Err(error) => json!({"tool": tool_name, "status": "failed", "error": error}),
             };
             let _ = fs::write(file, saved.to_string());
@@ -146,13 +162,13 @@ impl Lab {
         });
 
         match job.wait(wait_of(args, DEFAULT_WAIT_SECONDS)) {
-            Some(result) => result.map(|mut value| {
+            Some(Ok(mut value)) => {
                 if let Some(object) = value.as_object_mut() {
                     object.insert("job_id".into(), json!(id));
                 }
-                value
-            }),
-            None => status(&id, &job),
+                Ok(value)
+            }
+            Some(Err(_)) | None => status(&id, &job),
         }
     }
 

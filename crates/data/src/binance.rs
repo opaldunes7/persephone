@@ -17,7 +17,7 @@ pub const PAGE_LIMIT: usize = 1000;
 /// comfortably.
 pub const MAX_RANGE_BARS: u64 = 300_000;
 const NANOS_PER_MILLI: u64 = 1_000_000;
-/// How many times to ask after being told to slow down.
+/// How many times to ask again after a request fails in a way that may pass.
 const MOST_RETRIES: u32 = 5;
 /// The longest to wait when told to slow down; a longer wait is a failure to report.
 const MOST_RETRY_WAIT_SECS: u64 = 60;
@@ -28,9 +28,10 @@ pub struct BinanceClient {
 }
 
 /// How long to wait before asking again after a response of `status`, if it's worth asking again:
-/// 429 and 418 are Binance saying to slow down, with `Retry-After` saying for how long.
+/// 429 and 418 are Binance saying to slow down, with `Retry-After` saying for how long, and a 5xx
+/// is its own trouble, which usually passes.
 fn retry_wait(status: u16, retry_after: Option<u64>, retries: u32) -> Option<Duration> {
-    if !matches!(status, 429 | 418) || retries >= MOST_RETRIES {
+    if !matches!(status, 429 | 418 | 500..=599) || retries >= MOST_RETRIES {
         return None;
     }
     let seconds = retry_after.unwrap_or(1 << retries);
@@ -57,7 +58,18 @@ impl BinanceClient {
     fn get(&self, url: String) -> anyhow::Result<reqwest::blocking::Response> {
         let mut retries = 0;
         loop {
-            let response = self.http.get(&url).send()?;
+            let response = match self.http.get(&url).send() {
+                Ok(response) => response,
+                // One stalled or dropped connection shouldn't lose a long download.
+                Err(error)
+                    if (error.is_timeout() || error.is_connect()) && retries < MOST_RETRIES =>
+                {
+                    std::thread::sleep(Duration::from_secs(1 << retries));
+                    retries += 1;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let retry_after = response
                 .headers()
                 .get(reqwest::header::RETRY_AFTER)
@@ -290,7 +302,8 @@ mod tests {
         assert_eq!(retry_wait(418, None, 2), Some(Duration::from_secs(4)));
         assert_eq!(retry_wait(429, Some(3_600), 0), None, "too long to wait");
         assert_eq!(retry_wait(429, Some(1), 5), None, "tried enough");
-        assert_eq!(retry_wait(500, Some(1), 0), None);
+        assert_eq!(retry_wait(503, Some(1), 0), Some(Duration::from_secs(1)));
+        assert_eq!(retry_wait(404, Some(1), 0), None);
         assert_eq!(retry_wait(200, None, 0), None);
     }
 

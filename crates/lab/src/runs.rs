@@ -12,6 +12,7 @@ use std::{
 
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 
+use persephone_core::time::civil_from_days;
 use persephone_core::{
     Candle, Side, Timeframe,
     signal::{Note, SignalFactory},
@@ -23,11 +24,11 @@ use persephone_research::{
     calendar::{Calendar, days_in_month, weeks},
     market::{MAX_FINE_BARS, MarketBars, fine_bars},
     optimize::{Grid, OptimizeJob, Outcome, rank, split_at},
-    positions::Positions,
+    positions::{Positions, random_entries},
     results::{StrategyRef, with_params},
     robustness::{
-        BlockJob, MonteCarlo, RoundTrip, backtest, closed_trades, monte_carlo, pick_blocks, pool,
-        round_trips,
+        BlockJob, MonteCarlo, RoundTrip, backtest, closed_trades, monte_carlo, percentile,
+        pick_blocks, pnl_by_trade, pool, round_trips,
     },
     settings::{BlockLength, OptimizeSettings, Precision, ScoreBy, Settings, Variable},
 };
@@ -49,9 +50,11 @@ const LISTED_RUNS: usize = 20;
 const LISTED_VALUES: usize = 50;
 /// The most backtests `run_backtests` takes in one call.
 const MAX_BACKTESTS: usize = 5_000;
-const BATCH_COLUMNS: [&str; 15] = [
+const BATCH_COLUMNS: [&str; 17] = [
     "index",
     "run_id",
+    "label",
+    "fills",
     "net_return",
     "max_drawdown",
     "trades",
@@ -223,11 +226,40 @@ fn summary_of(
         "profit_factor": (losses > 0.0).then(|| gains / losses),
         "exposure": exposure(report, from_index),
         "average_trade": (!trades.is_empty()).then(|| profit / trades.len() as f64),
-        "warnings": report.notes.iter()
-            .filter(|note| note.warning)
-            .map(|note| note.text.as_str())
-            .collect::<Vec<_>>(),
+        "by_year": by_year(report, from_index, bars),
+        "warnings": warnings_of(report),
     })
+}
+
+/// What needs saying about a run: its own warnings, and if it made no trades, why that may be.
+fn warnings_of(report: &BacktestReport) -> Vec<String> {
+    let mut warnings: Vec<String> = report
+        .notes
+        .iter()
+        .filter(|note| note.warning)
+        .map(|note| note.text.clone())
+        .collect();
+    if report.fills.is_empty() {
+        warnings.push(format!(
+            "It made no trades. A look-back longer than the {WARM_UP_BARS} bars warmed up on before the span isn't ready until that far in, and a rule on it is false until then."
+        ));
+    }
+    warnings
+}
+
+/// What each UTC year added, as a fraction of the starting capital, so they add up to `net_return`.
+fn by_year(report: &BacktestReport, from_index: usize, bars: &[(u64, f64)]) -> Value {
+    const NANOS_PER_DAY: u64 = 86_400_000_000_000;
+    let capital = report.starting_balance;
+    let mut years = Map::new();
+    let mut before = capital;
+    for (&(ts, _), &equity) in bars.iter().zip(&report.equity).skip(from_index) {
+        let (year, _, _) = civil_from_days((ts / NANOS_PER_DAY) as i64);
+        let added = years.entry(year.to_string()).or_insert(json!(0.0));
+        *added = json!(added.as_f64().unwrap_or(0.0) + (equity - before) / capital);
+        before = equity;
+    }
+    Value::Object(years)
 }
 
 /// What holding the market made: from the close of the first bar it could trade at, as a strategy's
@@ -602,12 +634,111 @@ impl Lab {
     }
 
     /// Many backtests from one call, in parallel, answered as a table.
+    /// A run's holds at random times, many times over: what the same trading comes to with entries
+    /// owing nothing to the strategy.
+    pub(crate) fn run_random_entries(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {
+        let run = self.load_run(text(args, "run_id")?)?;
+        let report = report_from(&run);
+        let holds: Vec<(i8, usize)> = round_trips(&report)
+            .iter()
+            .map(|trade| {
+                let bars = if trade.open {
+                    report.equity.len().saturating_sub(trade.entry_bar)
+                } else {
+                    trade.exit_bar.saturating_sub(trade.entry_bar)
+                };
+                (if trade.long { 1 } else { -1 }, bars.max(1))
+            })
+            .collect();
+        if holds.is_empty() {
+            return Err("that run made no trades, so there's nothing to place at random".into());
+        }
+        let (mut request, from_index, _) = self.prepare(&run["request"])?;
+        request.ticks = None;
+        request.fill_bars = None;
+        let opens: Vec<u64> = request.candles.iter().map(|c| c.ts).collect();
+        let closes = request.bars.closes(&request.candles);
+        // Sized as the run was, with positions in place of its strategy.
+        let shell = Positions::from_list(Vec::new());
+        request.strategy = with_params(
+            shell.spec().kind,
+            Arc::new(shell.info()),
+            &json!({"params": {"Size %": request.strategy.size_fraction() * 100.0}}),
+        )?;
+        let draws = number(args, "runs", 200).clamp(1, MAX_BACKTESTS as u64) as usize;
+        let seed = number(args, "seed", 0);
+        let seeds: Vec<u64> = (0..draws as u64).collect();
+        job.total.store(draws, Ordering::Relaxed);
+        let results = pool(
+            &seeds,
+            self.workers_for(&request.strategy),
+            &job.stop,
+            &|| {
+                job.done.fetch_add(1, Ordering::Relaxed);
+            },
+            &|&draw| {
+                let changes = random_entries(&holds, from_index, opens.len(), seed ^ (draw << 16))
+                    .ok_or("its trades don't fit the span")?;
+                let list = changes
+                    .iter()
+                    .map(|&(bar, position)| (closes[bar], position))
+                    .collect();
+                let mut trying = request.clone();
+                trying.plugin = Some(Arc::new(Positions::from_list(list)));
+                backtest(trying).map(|report| {
+                    let capital = report.starting_balance;
+                    let last = report.equity.last().copied().unwrap_or(capital);
+                    (last / capital - 1.0, report.max_drawdown.abs())
+                })
+            },
+        );
+        let mut returns = Vec::with_capacity(draws);
+        let mut falls = Vec::with_capacity(draws);
+        for result in results.into_iter().flatten() {
+            let (returned, fell) = result?;
+            returns.push(returned);
+            falls.push(fell);
+        }
+        if returns.is_empty() {
+            return Err("Stopped.".into());
+        }
+        returns.sort_by(f64::total_cmp);
+        falls.sort_by(f64::total_cmp);
+        let actual = run["summary"]["net_return"].as_f64().unwrap_or(f64::NAN);
+        let fell = run["summary"]["max_drawdown"].as_f64().unwrap_or(f64::NAN);
+        let count = returns.len() as f64;
+        Ok(json!({
+            "runs": returns.len(),
+            "trades": holds.len(),
+            "actual_return": actual,
+            "actual_fell": fell,
+            "share_matching_return": returns.iter().filter(|r| **r >= actual).count() as f64 / count,
+            "share_matching_fall": falls.iter().filter(|f| **f <= fell).count() as f64 / count,
+            "median": percentile(&returns, 0.5),
+            "low": percentile(&returns, 0.05),
+            "high": percentile(&returns, 0.95),
+        }))
+    }
+
     pub(crate) fn run_backtests(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {
-        let items = args
-            .get("runs")
+        // A path, as a long list costs an agent a lot to write out in a call.
+        let from_file = match args.get("runs").and_then(Value::as_str) {
+            Some(path) => {
+                let text = fs::read_to_string(path)
+                    .map_err(|e| format!("`runs`: couldn't read {path}: {e}"))?;
+                Some(
+                    serde_json::from_str::<Value>(&text)
+                        .map_err(|e| format!("`runs`: {path} isn't JSON: {e}"))?,
+                )
+            }
+            None => None,
+        };
+        let items = from_file
+            .as_ref()
+            .or_else(|| args.get("runs"))
             .and_then(Value::as_array)
             .filter(|items| !items.is_empty())
-            .ok_or("`runs` should be a list of run_backtest's arguments")?;
+            .ok_or("`runs` should be a list of run_backtest's arguments, or a JSON file's path")?;
         if items.len() > MAX_BACKTESTS {
             return Err(format!(
                 "`runs`: that's {} backtests, more than the {MAX_BACKTESTS} allowed in a call",
@@ -675,6 +806,8 @@ impl Lab {
                 json!([
                     index,
                     run["run_id"],
+                    summary["label"],
+                    summary["fills"],
                     summary["net_return"],
                     summary["max_drawdown"],
                     summary["trades"],
@@ -750,7 +883,7 @@ impl Lab {
     /// Returns a message if a folder can't be read.
     pub fn prune(&self, age: Duration) -> Result<(usize, u64), String> {
         let (mut files, mut bytes) = (0, 0);
-        for folder in ["runs", "jobs"] {
+        for folder in ["runs", "jobs", "answers"] {
             for entry in fs::read_dir(self.paths.lab().join(folder))
                 .map_err(|e| e.to_string())?
                 .flatten()
@@ -775,6 +908,7 @@ impl Lab {
 
     pub(crate) fn get_report(&self, args: &Value) -> Result<Value, String> {
         let run = self.load_run(text(args, "run_id")?)?;
+        let report = report_from(&run);
         Ok(json!({
             "run_id": run["run_id"],
             "request": run["request"],
@@ -784,7 +918,9 @@ impl Lab {
             "fees": run["fees"],
             "total_orders": run["total_orders"],
             "total_positions": run["total_positions"],
-            "pnl": run["pnl"],
+            "pnl": map_of(&pnl_by_trade(&report)),
+            "ends_with_open_trade": round_trips(&report).last().is_some_and(|t| t.open),
+            "closed_positions_pnl": run["pnl"],
             "returns": run["returns"],
             "general": run["general"],
             "notes": run["notes"],
@@ -1076,7 +1212,7 @@ impl Lab {
             .iter()
             .map(|block| held_over(block.from, block.to))
             .collect();
-        let rows: Vec<Value> = summary
+        let mut rows: Vec<Value> = summary
             .blocks
             .iter()
             .zip(&summary.trades)
@@ -1104,6 +1240,13 @@ impl Lab {
             .collect();
         held.sort_by(f64::total_cmp);
         let median_held = held.get(held.len() / 2).copied();
+        let total = rows.len();
+        let warning = summary.blocks.iter().all(|block| block.fills == 0).then(|| {
+            format!(
+                "No block made a trade. A look-back longer than the {WARM_UP_BARS} bars warmed up on before each block is never ready in time."
+            )
+        });
+        rows.truncate(limit_of(args, LISTED_VALUES));
         Ok(json!({
             "profitable": summary.profitable,
             "median": summary.median,
@@ -1112,6 +1255,8 @@ impl Lab {
             "worst": summary.worst,
             "worst_dates": [time_text(summary.worst_dates.0), time_text(summary.worst_dates.1)],
             "blocks": rows,
+            "total": total,
+            "warning": warning,
         }))
     }
 
@@ -1244,6 +1389,11 @@ impl Lab {
         let candles = std::mem::take(&mut request.candles);
         let from = candles.partition_point(|c| c.ts < request.trade_from);
         let split = hold_out.then(|| split_at(from, candles.len()));
+        let held_out_market = split.and_then(|split| {
+            let first = candles.get(split)?.close;
+            let last = candles.last()?.close;
+            Some(last / first - 1.0)
+        });
         let seed = number(args, "seed", 0);
         let blocks = if score == ScoreBy::RandomBlocks {
             pick_blocks(
@@ -1318,6 +1468,7 @@ impl Lab {
             "top": top,
             "on_edge": found.on_edge,
             "held_out": found.held_out,
+            "held_out_buy_and_hold": held_out_market,
             "backtests": total,
         }))
     }

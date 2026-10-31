@@ -201,6 +201,10 @@ fn calls(lab: &Arc<Lab>, dir: &std::path::Path) -> Vec<(&'static str, Value)> {
             }),
         ),
         (
+            "run_random_entries",
+            json!({"run_id": run_id, "runs": 5, "wait_seconds": 120}),
+        ),
+        (
             "run_walk_forward",
             with(json!({
                 "strategy": ema(),
@@ -660,15 +664,30 @@ fn slow_work_can_be_checked_on_and_cancelled() {
 
     // It stops short of all 400, saying so.
     let deadline = Instant::now() + Duration::from_secs(60);
-    let error = loop {
-        match lab.dispatch("get_job", &json!({"job_id": id})) {
-            Err(error) => break error,
-            Ok(status) => assert_ne!(status["status"], "done", "it should've stopped: {status}"),
+    let stopped = loop {
+        let status = lab.dispatch("get_job", &json!({"job_id": id})).unwrap();
+        assert_ne!(status["status"], "done", "it should've stopped: {status}");
+        if status["status"] == "cancelled" {
+            break status;
         }
         assert!(Instant::now() < deadline, "it never stopped");
         thread::sleep(Duration::from_millis(20));
     };
-    assert!(error.contains("Stopped"), "{error}");
+    assert_eq!(stopped["job_id"], id, "{stopped}");
+    assert_eq!(stopped["total"], 400, "{stopped}");
+    // It reads the same once only its file is left, as after a restart.
+    let file = lab
+        .paths
+        .lab()
+        .join("jobs")
+        .join(format!("{}.json", id.as_str().unwrap()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !file.exists() {
+        assert!(Instant::now() < deadline, "it was never saved");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+    assert_eq!(saved["status"], "cancelled", "{saved}");
 
     // One left alone finishes, reports how far it got and keeps its answer.
     let run = lab
@@ -845,6 +864,8 @@ fn a_run_saved_before_they_were_packed_still_reads() {
 /// A market from "Binance" with no network: `HOURS` of hourly bars from `START`, counting requests.
 struct FakeBinance {
     requests: AtomicUsize,
+    /// Hours from `START` with no bars, as an exchange outage leaves.
+    hole: Option<(u64, u64)>,
 }
 
 const HOURS: u64 = 3_000;
@@ -871,6 +892,11 @@ impl BarSource for FakeBinance {
         self.requests.fetch_add(1, Ordering::Relaxed);
         Ok((start / HOUR..end / HOUR)
             .filter(|hour| (START / HOUR..=START / HOUR + HOURS).contains(hour))
+            .filter(|hour| {
+                self.hole.is_none_or(|(from, to)| {
+                    !(START / HOUR + from..START / HOUR + to).contains(hour)
+                })
+            })
             .map(|hour| {
                 let mid = 50_000.0 + 1_500.0 * (hour as f64 / 30.0).sin();
                 Candle {
@@ -893,6 +919,7 @@ impl BarSource for FakeBinance {
 fn binance_lab() -> (Arc<Lab>, Arc<FakeBinance>) {
     let source = Arc::new(FakeBinance {
         requests: AtomicUsize::new(0),
+        hole: None,
     });
     let lab = Lab::with_source(Paths::under(temp_dir()), source.clone()).unwrap();
     (lab, source)
@@ -1071,6 +1098,60 @@ fn http_only_answers_with_the_token_at_its_own_address() {
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_persephone-lab")
+}
+
+#[test]
+fn a_run_holding_to_the_end_reports_its_open_trade_as_the_summary_does() {
+    // Up 10% from hour 50 with a long held from hour 10 to the end, never closed.
+    let closes: Vec<f64> = (0..120)
+        .map(|h| if h < 50 { 100.0 } else { 110.0 })
+        .collect();
+    let (lab, times) = market_of(&closes);
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({"strategy": {"positions": [[times[10], 1]]}})),
+        )
+        .unwrap();
+    let report = lab
+        .dispatch("get_report", &json!({"run_id": run["run_id"]}))
+        .unwrap();
+    let summary = &report["summary"];
+    let pnl = &report["pnl"];
+    assert_eq!(report["ends_with_open_trade"], true, "{report}");
+    let profit =
+        summary["final_equity"].as_f64().unwrap() - report["starting_balance"].as_f64().unwrap();
+    assert!(profit > 0.0, "{summary}");
+    assert!(
+        (pnl["PnL (total)"].as_f64().unwrap() - profit).abs() < 1e-6,
+        "{pnl}"
+    );
+    assert_eq!(pnl["Win Rate"], summary["win_rate"], "{pnl}");
+    assert_eq!(pnl["Max Winner"], pnl["PnL (total)"], "{pnl}");
+    assert!(pnl["Avg Loser"].is_null(), "{pnl}");
+    // The engine's own leaves it out, and is kept under a name saying so.
+    assert!(
+        report["closed_positions_pnl"]["PnL (total)"]
+            .as_f64()
+            .unwrap()
+            <= 0.0,
+        "{report}"
+    );
+}
+
+#[test]
+fn a_line_that_is_not_json_gets_an_error_with_a_null_id_and_the_server_carries_on() {
+    let dir = temp_dir();
+    let mut client = McpClient::start(&dir);
+    let stdin = client.child.stdin.as_mut().unwrap();
+    writeln!(stdin, "{{not json").unwrap();
+    stdin.flush().unwrap();
+    let mut line = String::new();
+    client.output.read_line(&mut line).unwrap();
+    let answer: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(answer["error"]["code"], -32700, "{answer}");
+    assert!(answer.get("id").is_some_and(Value::is_null), "{answer}");
+    assert!(client.request("tools/list", json!({}))["tools"].is_array());
 }
 
 fn call_cli(dir: &std::path::Path, tool: &str, args: &Value) -> Value {
@@ -2092,6 +2173,7 @@ fn a_program_over_a_socket_can_be_added_and_backtested() {
 fn two_labs_sharing_a_folder_download_a_cold_market_once() {
     let source = Arc::new(FakeBinance {
         requests: AtomicUsize::new(0),
+        hole: None,
     });
     let dir = std::env::temp_dir().join(format!("persephone-lab-shared-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -2422,6 +2504,296 @@ fn a_trailing_stop_follows_the_high_since_entry() {
     assert_eq!(fills["rows"][0][3], 101.0, "{fills}");
     assert_eq!(fills["rows"][1][3], 116.0, "{fills}");
     assert_eq!(fills["rows"].as_array().unwrap().len(), 2, "{fills}");
+}
+
+#[test]
+fn slippage_as_a_percentage_and_compounding_work_out_by_hand() {
+    let closes: Vec<f64> = (0..60)
+        .map(|hour| if hour < 20 { 100.0 } else { 200.0 })
+        .collect();
+    let (lab, times) = market_of(&closes);
+    let fills_of = |run: &Value| {
+        let fills = lab
+            .dispatch("get_fills", &json!({"run_id": run["run_id"]}))
+            .unwrap();
+        fills["rows"].as_array().unwrap().clone()
+    };
+    let list = json!({"positions": [
+        [times[5], 1], [times[25], 0], [times[30], 1], [times[40], 0],
+    ]});
+    let no_fees = json!({"commission": {"on": true, "value": {"percent": 0}}});
+
+    // 1% of the price against each fill, on any market.
+    let mut settings = no_fees.clone();
+    settings["slippage_percent"] = json!({"on": true, "value": 1.0});
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({"strategy": list, "settings": settings})),
+        )
+        .unwrap();
+    let fills = fills_of(&run);
+    assert_eq!(fills[0][3], 101.0, "a buy pays more");
+    assert_eq!(fills[1][3], 198.0, "a sell gets less");
+
+    // Without compounding, the second position is worth the same as the first.
+    let flat = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({"strategy": list, "settings": no_fees})),
+        )
+        .unwrap();
+    let fills = fills_of(&flat);
+    let worth = |fill: &Value| fill[3].as_f64().unwrap() * fill[4].as_f64().unwrap();
+    assert!((worth(&fills[0]) - 10_000.0).abs() < 1.0);
+    assert!((worth(&fills[2]) - 10_000.0).abs() < 1.0);
+
+    // With it, the first doubled 10% of the account, so the second is 10% of 110,000.
+    let mut settings = no_fees.clone();
+    settings["compound"] = json!(true);
+    let grown = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({"strategy": list, "settings": settings})),
+        )
+        .unwrap();
+    let fills = fills_of(&grown);
+    assert!((worth(&fills[0]) - 10_000.0).abs() < 1.0, "{fills:?}");
+    assert!((worth(&fills[2]) - 11_000.0).abs() < 1.0, "{fills:?}");
+}
+
+#[test]
+fn optimizing_with_bars_kept_back_says_what_the_market_did_on_them() {
+    let closes: Vec<f64> = (0..600).map(|hour| 100.0 + f64::from(hour) * 0.1).collect();
+    let (lab, _times) = market_of(&closes);
+    let answer = lab
+        .dispatch(
+            "run_optimize",
+            &on_hand_market(json!({
+                "strategy": {"builtin": "ema-cross"}, "hold_out": true,
+                "variables": [{"name": "Fast", "min": 3, "max": 6, "step": 3}],
+            })),
+        )
+        .unwrap();
+    // The last 30% of 600 bars: from bar 420 at 142, to bar 599 at 159.9.
+    let held = answer["held_out_buy_and_hold"].as_f64().unwrap();
+    assert!((held - (159.9 / 142.0 - 1.0)).abs() < 1e-9, "{held}");
+}
+
+#[test]
+fn every_position_asked_for_is_taken_however_sizes_round() {
+    // Flips leave sizes that don't add back to exactly zero in floating point, which once read as
+    // still being short, so the next short never went out.
+    let (lab, _source) = binance_lab();
+    let at = |hour: u64| START + hour * HOUR;
+    let cycle = [1, -1, 0, -1, 0, 1, 0, -1, 1, 0];
+    let list: Vec<Value> = (0..250)
+        .map(|i| json!([at(30 + i * 11), cycle[i as usize % cycle.len()]]))
+        .collect();
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &json!({
+                "symbol": "BTCUSDT", "bars": "1h", "from": at(0), "wait_seconds": 120,
+                "strategy": {"positions": list},
+            }),
+        )
+        .unwrap();
+    assert_eq!(run["summary"]["fills"], 250, "{run}");
+    // Sizes come back as what was held, each flat really being flat.
+    let fills = lab
+        .dispatch(
+            "get_fills",
+            &json!({"run_id": run["run_id"], "limit": 1000}),
+        )
+        .unwrap();
+    let sides: Vec<&str> = fills["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row[2].as_str().unwrap())
+        .collect();
+    let expected: Vec<&str> = (0..250)
+        .map(|i| {
+            let now = cycle[i % cycle.len()];
+            let before = if i == 0 {
+                0
+            } else {
+                cycle[(i - 1) % cycle.len()]
+            };
+            if now > before { "buy" } else { "sell" }
+        })
+        .collect();
+    assert_eq!(sides, expected);
+}
+
+#[test]
+fn pages_and_exports_carry_on_past_a_hole_in_the_market() {
+    let source = Arc::new(FakeBinance {
+        requests: AtomicUsize::new(0),
+        hole: Some((400, 700)),
+    });
+    let dir = std::env::temp_dir().join(format!("persephone-lab-hole-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let lab = Lab::with_source(Paths::under(&dir), source).unwrap();
+    // A page ending in the hole, and pages smaller than it.
+    let mut args = json!({"symbol": "BTCUSDT", "bars": "1h", "from": START, "limit": 150});
+    let mut got = Vec::new();
+    loop {
+        let page = lab.dispatch("get_bars", &args).unwrap();
+        got.extend(
+            page["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row[0].as_u64().unwrap()),
+        );
+        match page["next_cursor"].as_str() {
+            Some(cursor) => args["cursor"] = json!(cursor),
+            None => break,
+        }
+    }
+    let expected: Vec<u64> = (0..HOURS)
+        .filter(|hour| !(400..700).contains(hour))
+        .map(|hour| START + hour * HOUR)
+        .collect();
+    assert_eq!(got, expected);
+
+    let path = dir.join("all.csv");
+    let export = lab
+        .dispatch(
+            "export_data",
+            &json!({
+                "symbol": "BTCUSDT", "bars": "1h", "from": START, "format": "csv",
+                "path": path, "wait_seconds": 60,
+            }),
+        )
+        .unwrap();
+    assert_eq!(export["rows"], expected.len(), "{export}");
+    assert_eq!(export["columns"][0], "ts");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_strategy_trading_like_chance_looks_like_chance() {
+    // A smooth market, so entries owe nothing to the strategy: a list of its own holds at set times.
+    let (lab, _dir) = lab();
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({"strategy": ema(), "wait_seconds": 120})),
+        )
+        .unwrap();
+    let args = json!({"run_id": run["run_id"], "runs": 30, "seed": 3, "wait_seconds": 120});
+    let answer = lab.dispatch("run_random_entries", &args).unwrap();
+    assert_eq!(answer["runs"], 30);
+    assert_eq!(answer["trades"], run["summary"]["trades"]);
+    assert_eq!(answer["actual_return"], run["summary"]["net_return"]);
+    let share = answer["share_matching_return"].as_f64().unwrap();
+    assert!((0.0..=1.0).contains(&share), "{answer}");
+    assert!(answer["low"].as_f64() <= answer["median"].as_f64());
+    assert!(answer["median"].as_f64() <= answer["high"].as_f64());
+    assert!(answer["low"].as_f64() < answer["high"].as_f64(), "{answer}");
+    // The same seed repeats exactly.
+    let again = lab.dispatch("run_random_entries", &args).unwrap();
+    assert_eq!(again["median"], answer["median"]);
+    assert_eq!(again["share_matching_fall"], answer["share_matching_fall"]);
+
+    // No trades, nothing to place, and a word on why there may be none.
+    let idle = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({
+                "wait_seconds": 120,
+                "strategy": {"logic": {"long": {"gt": ["close", {"sma": {"length": 10000}}]}}},
+            })),
+        )
+        .unwrap();
+    assert!(
+        idle["summary"]["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("look-back"),
+        "{idle}"
+    );
+    let error = lab
+        .dispatch(
+            "run_random_entries",
+            &json!({"run_id": idle["run_id"], "wait_seconds": 60}),
+        )
+        .unwrap_err();
+    assert!(error.contains("no trades"), "{error}");
+}
+
+#[test]
+fn years_add_up_and_long_lists_can_come_from_files() {
+    let (lab, dir) = lab();
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({"strategy": ema(), "label": "one", "wait_seconds": 120})),
+        )
+        .unwrap();
+    let summary = &run["summary"];
+    let years = summary["by_year"].as_object().unwrap();
+    assert!(!years.is_empty(), "{summary}");
+    let sum: f64 = years.values().map(|year| year.as_f64().unwrap()).sum();
+    assert!(
+        (sum - summary["net_return"].as_f64().unwrap()).abs() < 1e-9,
+        "{summary}"
+    );
+
+    let runs = dir.join("runs.json");
+    fs::write(
+        &runs,
+        json!([{"strategy": ema(), "label": "filed"}]).to_string(),
+    )
+    .unwrap();
+    let batch = lab
+        .dispatch(
+            "run_backtests",
+            &json!({"runs": runs, "defaults": market(), "wait_seconds": 120}),
+        )
+        .unwrap();
+    assert_eq!(batch["succeeded"], 1, "{batch}");
+    let label = batch["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|c| c == "label")
+        .unwrap();
+    assert_eq!(batch["rows"][0][label], "filed");
+
+    let bars = lab
+        .dispatch("get_bars", &with(json!({"from": "2024-01-02", "limit": 2})))
+        .unwrap();
+    let list = dir.join("list.json");
+    fs::write(
+        &list,
+        json!([[bars["rows"][0][0], 1], [bars["rows"][1][0], 0]]).to_string(),
+    )
+    .unwrap();
+    let listed = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({"strategy": {"positions": list}, "wait_seconds": 120})),
+        )
+        .unwrap();
+    assert_eq!(listed["summary"]["fills"], 2, "{listed}");
+}
+
+#[test]
+fn an_answer_too_big_for_an_agent_goes_to_a_file() {
+    let (lab, _dir) = lab();
+    let small = json!({"rows": [1, 2, 3]});
+    assert_eq!(lab.fit_for_agent(&small), small.to_string());
+
+    let big = json!({"rows": vec!["x".repeat(1_000); 200]});
+    let answer: Value = serde_json::from_str(&lab.fit_for_agent(&big)).unwrap();
+    assert_eq!(answer["too_large"], true, "{answer}");
+    let saved = fs::read_to_string(answer["path"].as_str().unwrap()).unwrap();
+    assert_eq!(saved, big.to_string());
+    assert!(answer["hint"].as_str().unwrap().contains("limit"));
 }
 
 #[test]

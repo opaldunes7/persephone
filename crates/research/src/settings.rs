@@ -27,6 +27,8 @@ pub struct Settings {
     pub commission: Section<Commission>,
     /// Ticks every market order fills worse.
     pub slippage: Section<u32>,
+    /// Slippage as a percentage of the price, on top of any in ticks.
+    pub slippage_percent: Section<f64>,
     /// A spread assumed for bar data, in ticks.
     pub spread: Section<u32>,
     /// Milliseconds orders take to reach the venue.
@@ -35,6 +37,8 @@ pub struct Settings {
     pub direction: Section<OneWay>,
     /// Trade the opposite of what the strategy says.
     pub invert: bool,
+    /// Size positions from the account as it is now, rather than as it started.
+    pub compound: bool,
     pub session: Section<SessionRule>,
     pub precision: Precision,
     /// Plugins added to the backtest, by name. They're only listed for now: no kind of
@@ -60,11 +64,13 @@ impl Default for Settings {
             capital: 100_000.0,
             commission: Section::off(Commission::Percent(0.1)),
             slippage: Section::off(1),
+            slippage_percent: Section::off(0.01),
             spread: Section::off(2),
             latency: Section::off(100),
             leverage: Section::off(2.0),
             direction: Section::off(OneWay::LongOnly),
             invert: false,
+            compound: false,
             session: Section::off(SessionRule::default()),
             precision: Precision::Standard,
             plugins: Vec::new(),
@@ -310,11 +316,13 @@ pub enum Edit {
     /// A flat fee per order instead of a percentage.
     PerOrder(bool),
     Slippage(bool),
+    SlippagePercent(bool),
     Spread(bool),
     Latency(bool),
     Leverage(bool),
     Direction(bool),
     Invert(bool),
+    Compound(bool),
     OneWay(OneWay),
     Session(bool),
     /// Monday is 0.
@@ -336,12 +344,14 @@ impl Settings {
                 };
             }
             Edit::Slippage(on) => self.slippage.on = on,
+            Edit::SlippagePercent(on) => self.slippage_percent.on = on,
             Edit::Spread(on) => self.spread.on = on,
             Edit::Latency(on) => self.latency.on = on,
             Edit::Leverage(on) => self.leverage.on = on,
             Edit::Direction(on) => self.direction.on = on,
             Edit::OneWay(way) => self.direction.value = way,
             Edit::Invert(on) => self.invert = on,
+            Edit::Compound(on) => self.compound = on,
             Edit::Session(on) => self.session.on = on,
             Edit::Day(day) => {
                 if let Some(on) = self.session.value.days.get_mut(day) {
@@ -362,6 +372,7 @@ impl Settings {
                 Commission::Percent(v) | Commission::PerOrder(v) => trim(v),
             },
             Field::Slippage => self.slippage.value.to_string(),
+            Field::SlippagePercent => trim(self.slippage_percent.value),
             Field::Spread => self.spread.value.to_string(),
             Field::Latency => self.latency.value.to_string(),
             Field::Leverage => trim(self.leverage.value),
@@ -415,6 +426,9 @@ impl Settings {
                 };
             }
             Field::Slippage => self.slippage.value = whole(10_000, "Slippage")?,
+            Field::SlippagePercent => {
+                self.slippage_percent.value = number(0.0, 10.0, "A percentage")?;
+            }
             Field::Spread => self.spread.value = whole(10_000, "The spread")?,
             Field::Latency => self.latency.value = whole(60_000, "Latency")?,
             Field::Leverage => self.leverage.value = number(1.0, 1_000.0, "Leverage")?,
@@ -446,11 +460,13 @@ impl Settings {
     pub const fn stock_sections_on(&self) -> usize {
         self.commission.on as usize
             + self.slippage.on as usize
+            + self.slippage_percent.on as usize
             + self.spread.on as usize
             + self.latency.on as usize
             + self.leverage.on as usize
             + self.direction.on as usize
             + self.invert as usize
+            + self.compound as usize
             + self.session.on as usize
     }
 
@@ -478,9 +494,11 @@ impl Settings {
                 _ => None,
             },
             slippage_ticks: self.on(&self.slippage).copied().unwrap_or(0),
+            slippage_percent: self.on(&self.slippage_percent).copied().unwrap_or(0.0),
             spread_ticks: self.on(&self.spread).copied().unwrap_or(0),
             latency_ms: self.on(&self.latency).copied().unwrap_or(0),
             leverage: self.on(&self.leverage).copied().unwrap_or(1.0),
+            compound: self.stock && self.compound,
         }
     }
 

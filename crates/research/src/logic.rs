@@ -16,8 +16,8 @@
 //! values (`gt`, `lt`, `ge`, `le`, `crosses_above`, `crosses_below`) or combines rules (`and`, `or`,
 //! `not`).
 //!
-//! `long` and `short` ask for that position; on a bar with both or neither, `flat` asks to close,
-//! and otherwise the position stays as it is. Everything runs one closed bar at a time, so a
+//! `long` and `short` ask for that position; `flat` asks to close on a bar with both or neither, or
+//! when the one that's true is what's already held, and otherwise the position stays as it is. Everything runs one closed bar at a time, so a
 //! strategy can't look ahead. A value not ready yet makes any comparison on it false.
 
 use std::{
@@ -866,9 +866,11 @@ impl Signal for Running {
             holds(&mut self.short),
             holds(&mut self.flat),
         );
+        // An exit beats an entry to what's already held, so a stop can't be held off by an entry
+        // that's still true or has fired again.
         Ok(match (long, short) {
-            (true, false) => Some(1),
-            (false, true) => Some(-1),
+            (true, false) if !(flat && self.position == 1) => Some(1),
+            (false, true) if !(flat && self.position == -1) => Some(-1),
             _ if flat => Some(0),
             _ => None,
         })
@@ -963,11 +965,23 @@ mod tests {
         assert_eq!(running.on_bar(&bar).unwrap(), Some(1));
         running.holding(0, f64::NAN);
         assert_eq!(running.on_bar(&bar).unwrap(), Some(1));
-        // Told it's long, it counts bars from there, and asks to leave at two.
+        // Told it's long, it counts bars from there, and asks to leave at two, as an exit beats an
+        // entry to what's already held.
         running.holding(1, 100.0);
         assert_eq!(running.on_bar(&bar).unwrap(), None);
         running.holding(1, 100.0);
         assert_eq!(running.on_bar(&bar).unwrap(), Some(0));
+
+        let both = Logic::parse(&json!({
+            "long": {"gt": ["close", 0]},
+            "flat": {"gt": ["bars_held", 0]},
+        }))
+        .unwrap();
+        let mut running = both.create(&[]).unwrap();
+        running.holding(0, f64::NAN);
+        assert_eq!(running.on_bar(&bar).unwrap(), Some(1), "enters from flat");
+        running.holding(1, 100.0);
+        assert_eq!(running.on_bar(&bar).unwrap(), Some(0), "the exit wins");
     }
 
     fn same(a: &[f64], b: &[f64]) {

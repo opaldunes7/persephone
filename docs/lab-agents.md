@@ -17,7 +17,7 @@ A backtest, then its details, then a strategy written without code.
 }}
 ```
 
-It answers with a `run_id` and a `summary`. Read the rest by that id:
+It answers with a `run_id` and a `summary`, including `warnings`: read them first. Read the rest by that id:
 
 ```json
 {"tool": "get_trades", "args": {"run_id": "$RUN", "limit": 20}}
@@ -47,7 +47,8 @@ How a backtest works, which decides what its numbers mean.
 - **A strategy says what position it wants:** long, short or flat. One position at a time, in one
   direction; reversing is one order, twice the size. There are no stops or limit orders.
 - **Size:** each position is worth capital × `Size %` × leverage, worked out from the **starting**
-  capital, at the price when it opens. Profits aren't compounded. `Size %` is a parameter of every
+  capital, at the price when it opens. Profits aren't compounded unless `compound` is set, which sizes from the
+  account as it is at the time. `Size %` is a parameter of every
   strategy, 10 unless set, from 1 to 100.
 - **Fees:** Binance markets pay 0.1% of each fill unless `settings` say otherwise; imported markets pay
   what they were imported with.
@@ -57,16 +58,15 @@ How a backtest works, which decides what its numbers mean.
 
 **What backtests leave out,** so they flatter a strategy:
 
-- A decision and its fill share one close. Real orders go after it, so set `slippage` or `latency`. Slippage is in
-  ticks, so the same number means different things on different markets: a tick is `10^-price_precision`, from
-  `get_instrument`.
+- A decision and its fill share one close. Real orders go after it, so set `slippage_percent` or `latency`. Prefer
+  `slippage_percent` to `slippage`, which is in ticks and so means different things on different markets.
 - Stops are checked at closes too, so one fills at the close that broke it, which may be well past its level.
 - Shorts are allowed on spot markets, with no borrowing or funding costs. Paper and live spot accounts can't short.
 - No margin calls or financing costs, and any size fills in full, while the account can pay. If it can't, as with
   `Size %` near 100 or high leverage, the order's refused, the position stays as it was, and the summary's `warnings`
   says so. Such a result doesn't follow the strategy: don't trust it.
-- Sizes don't compound, so a strategy trading in and out falls behind `buy_and_hold_return` as profits build. Compare
-  at `Size %` 100, or work out compounded returns from `get_trades`.
+- Unless `compound` is set, a strategy trading in and out falls behind `buy_and_hold_return` as profits build. To
+  compare fairly, use `Size %` 100 and `compound`.
 - One market at a time: there are no portfolios or limit orders.
 
 A strategy is `{"builtin": id}`, `{"plugin": id}`, `{"logic": tree}` or `{"positions": list}`, each with optional
@@ -126,8 +126,10 @@ UTC, at the bar's close. So exits work like this:
 }}
 ```
 
-`flat` only counts on a bar where `long` and `short` are both true or both false, so write an entry that fires once,
-like a cross. An entry that stays true would keep the position open past its stop.
+An exit beats an entry to what's already held, so a stop always works. Once out, an entry that's still true goes back
+in on the next bar, so write one that fires once, like a cross, or also require `{"lt": ["position", 1]}` and your own
+condition for being ready again. `highest`, `lowest`, `zscore` (population deviation) and `high_since_entry` include
+the current bar; `high_since_entry` starts from the entry price, then each later bar's high.
 
 ## settings
 
@@ -147,6 +149,8 @@ differs from the defaults, which `get_settings` returns as exact JSON.
     "leverage": {"on": true, "value": 3},
     "direction": {"on": true, "value": "long-only"},
     "invert": true,
+    "compound": false,
+    "slippage_percent": {"on": true, "value": 0.01},
     "session": {"on": true, "value": {
       "days": [true, true, true, true, true, false, false],
       "from": 570, "to": 960, "zone": "America/New_York", "close_after": false
@@ -164,7 +168,9 @@ an error.
 | `stock` | `false` turns all of the below off at once, except `capital` and `precision` |
 | `capital` | Starting cash, in the quote currency |
 | `commission` | `{"percent": 0.1}` of each fill, or `{"per-order": 1.5}` flat, instead of the market's fee |
-| `slippage` | Ticks every market order fills worse. See `backtests` on what a tick is |
+| `slippage` | Ticks every market order fills worse. A tick is `10^-price_precision`, from `get_instrument` |
+| `slippage_percent` | Percent of the price every market order fills worse, on top of any in ticks: `0.01` is 1 basis point |
+| `compound` | `true` sizes positions from the account as it is now. Monte Carlo redraws such trades' amounts as they were |
 | `spread` | Ticks of spread assumed for bars and trades |
 | `latency` | Milliseconds before orders reach the venue |
 | `leverage` | A multiple of position size, 1 or more. Margin calls aren't simulated |
@@ -190,6 +196,9 @@ What every number means, the same everywhere.
 - **`profit_factor`** is winning trades' profit over losing trades' loss, null if there were no losses.
 - **`exposure`** is the fraction of bars that began with a position open.
 - **`average_trade`** is net profit per trade, in the quote currency, after fees.
+- **`by_year`** is what each UTC year added, as a fraction of the starting capital, so the years add up to `net_return`.
+- **`return_percent`** on a trade is a percentage of the starting capital, even with `compound`, so add them up rather
+  than compounding them.
 - **Times:** `ts` is nanoseconds since 1970, and `time` is `YYYY-MM-DD HH:MM`. All are UTC.
 - **A bar's `ts` is when it opens.** Its order fills at its close.
 - **`from` and `to`** take `2024-01-31`, `2024-01-31 09:30` or nanoseconds. `to` isn't included.
@@ -197,7 +206,10 @@ What every number means, the same everywhere.
 - **`fills` and `trades` differ:** a trade is flat to flat, and a reversal is one fill in two trades.
 - **Null** in a number means it wasn't a number: often an indicator not ready yet.
 
-Statistics in `get_report`'s `pnl`, `returns` and `general` come from Nautilus under its own names.
+`get_report`'s `pnl` agrees with `summary`: it covers every trade, counting one still open at the end at its last
+value, and `ends_with_open_trade` says if there is one. `Max Loser` is the largest loss and `Min Loser` the smallest.
+`closed_positions_pnl`, `returns` and `general` come from Nautilus under its own names, and `closed_positions_pnl`
+leaves out an open trade, so a run holding to the end shows only its entry fee there.
 
 ## data
 
@@ -280,8 +292,8 @@ Optimize tries a range of one or two parameters, by the names `describe_strategy
 - **`values`** lists the best 50 unless `limit` says otherwise, and `total` says how many there were.
 - **`top`** ranks by `with_neighbours`, a value's score averaged with those beside it, so a lone spike
   doesn't win.
-- **`hold_out`** scores on the span's first 70% and gives the top 5's `unseen_return` on the last 30%. It's
-  off unless asked for.
+- **`hold_out`** scores on the span's first 70% and gives the top 5's `unseen_return` on the last 30%, with
+  `held_out_buy_and_hold` for what the market did there. It's off unless asked for.
 - **Values with no score:** `status` says `too-few-trades` or `failed`, and the rest carry on.
 
 Walk-forward picks the best values on a stretch, tests them on the next, unseen, and slides along.
@@ -298,23 +310,19 @@ Walk-forward picks the best values on a stretch, tests them on the next, unseen,
 Each of `windows` says what it picked, its `unseen_return`, and the market's `buy_and_hold_return` over it. The
 top-level figures add them up, as each stretch starts from the same capital. It fills on the chart's bars whatever the `precision`.
 
-**Against chance:** backtest random positions at about your strategy's trade count, many times, and see how often
-they match it. Make the lists yourself from bars' `ts`, as Lab has no such tool, a different random one per run:
+**Against chance:** `run_random_entries` places a run's own holds and directions at random times, on the same bars and
+settings, and says how many placings did as well.
 
 ```json
-{"tool": "run_backtests", "args": {
-  "defaults": {"symbol": "BTCUSDT", "bars": "1h", "label": "random-entries"},
-  "runs": [
-    {"from": "2024-01-01", "to": "2024-02-01",
-     "strategy": {"positions": [[1704153600000000000, 1], [1704240000000000000, 0]]}},
-    {"from": "2024-01-01", "to": "2024-02-01",
-     "strategy": {"positions": [[1704326400000000000, -1], [1704412800000000000, 0]]}}
-  ]
-}}
+{"tool": "run_random_entries", "args": {"run_id": "$RUN", "runs": 200, "seed": 1}}
 ```
 
-`list_runs` then finds and sorts them, with `{"label": "random-entries", "sort": "net_return"}`. Give any backtest a
-`label` to keep experiments apart, and sort by any summary figure.
+`share_matching_return` is the share that did as well, so a low one is good, and `share_matching_fall` likewise for the
+deepest fall. It doesn't allow for how many strategies you tried before picking this one: picking the best of 100 will
+often give 1 in 100 by luck.
+
+Give any backtest a `label` to keep experiments apart. `list_runs` finds and sorts them, with
+`{"label": "my-idea", "sort": "sharpe"}`, by any summary figure.
 
 ## jobs
 
@@ -327,11 +335,29 @@ answers with `status: "running"` and a `job_id` rather than holding the call ope
 
 `get_job` gives `done` and `total` while running, and `status: "done"` with `result` when finished, or the
 error if it failed. Give it `wait_seconds` rather than asking repeatedly: it answers the moment the job
-finishes. `cancel_job` stops it, and it shows `status: "cancelling"` until it has. Answers are kept, so a
-job can be read after a restart.
+finishes. `cancel_job` stops it, and it shows `status: "cancelling"` until it has. Then it's `status: "cancelled"`
+with `done` and `total`, or `status: "done"` with what it got if the tool can answer in part. Answers are kept, so
+a job can be read after a restart.
 
 Backtests run in parallel up to one less than the machine's cores, however many calls they come from. The
 rest wait their turn, so calling in parallel is safe.
+
+## recipe
+
+A sensible order for testing an idea, cheapest first. Nothing here is required.
+
+1. **Try it once, with costs:** `run_backtest` with `slippage_percent` set, and read `warnings`. If it loses before costs
+   too (set `commission` to 0), stop: cheaper fills won't save it.
+2. **Compare fairly:** `Size %` 100 and `compound` against `buy_and_hold_return`, and look at `by_year`, as one good year
+   often explains everything.
+3. **Vary it:** `run_backtests` across parameters, symbols and costs, with a `label`. A real effect survives nearby values.
+4. **Against chance:** `run_random_entries` on the best, remembering how many you tried.
+5. **On unseen data:** `run_walk_forward`, or `run_optimize` with `hold_out`, each with the market's return beside it.
+6. **Throughout the market:** `run_random_blocks`, and `run_monte_carlo` for the range of luck in its trades.
+7. **Show someone:** `save_result`.
+
+The built-in strategies differ more than their names say: `rsi-reversion` holds whichever side it last faded, so it's
+nearly always in the market. `describe_strategy` gives their parameters, and `exposure` shows what they really do.
 
 ## paging
 
@@ -339,6 +365,8 @@ Long answers come in pages: `columns`, `rows` and `next_cursor`. Pass `next_curs
 it's null. Pages are 100 rows unless `limit` says otherwise (`list_runs` gives 20, and `get_call_log` 50),
 up to 50,000. A page of 100 trades costs about 5,000 tokens, so ask for what you need: a run's `summary` is
 usually enough, and `export_data` suits anything large.
+
+Over MCP, an answer over about 100 KB is saved to a file rather than sent: you get `too_large` and its `path`.
 
 ## results
 
@@ -360,9 +388,14 @@ Adding markets, strategies and models.
 `import_data` and `fetch_archive` add markets. `list_indicators` lists built-in and plugin indicators, and `run_model`
 runs an ONNX model from `list_models`.
 
+**Warm-up and bar numbers:** bar numbers in `bar`, `entry_bar` and `exit_bar` count warm-up bars, so the first that can
+trade is usually number 500. A program over a socket is sent warm-up bars too, and what it last asked for during them
+is taken up on the first bar that can trade.
+
 **Using a model you trained, three ways, simplest first:**
 
-1. **A list of positions.** Export bars with `export_data`, make predictions, and backtest them as
+1. **A list of positions,** written out or as a JSON file's path, as `"positions": "/path/list.json"`, which spares you
+   writing long lists into calls. Export bars with `export_data`, make predictions, and backtest them as
    `{"positions": [[ts, 1], [ts, -1], [ts, 0]]}`. Each `ts` is a bar's, from `get_bars` or the export: when it opens.
    It fills at that bar's close and holds until the next entry, so a span or random block starting later takes up
    what's wanted by then. It runs in parallel, but nothing checks the list only used what was known by then:

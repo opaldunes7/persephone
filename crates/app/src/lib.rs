@@ -175,6 +175,8 @@ pub enum Run {
 struct Strategy {
     spec: StrategySpec,
     run: Run,
+    /// The finished run's, kept as the chart's corner shows it on every redraw.
+    win_rate: Option<f64>,
     /// Bumped on every new run so results from older runs are dropped.
     generation: u64,
 }
@@ -1009,6 +1011,10 @@ impl Persephone {
                     .and_then(|t| t.strategy.as_mut())
                     .filter(|s| s.generation == generation)
                 {
+                    strategy.win_rate = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|report| backtest::robustness::win_rate(report));
                     strategy.run = match result {
                         Ok(report) => Run::Done(report),
                         Err(error) => Run::Failed(error),
@@ -2289,6 +2295,7 @@ impl Persephone {
             tile.strategy = Some(Strategy {
                 spec,
                 run: Run::Waiting,
+                win_rate: None,
                 generation,
             });
             tile.live = None;
@@ -2494,6 +2501,7 @@ impl Persephone {
                 strategy: strategy.map(|spec| Strategy {
                     spec,
                     run: Run::Waiting,
+                    win_rate: None,
                     generation: 0,
                 }),
                 chart: None,
@@ -4348,8 +4356,8 @@ fn strategy_summary<'a>(
             if compact {
                 pieces
             } else {
-                let win = report
-                    .stat("Win Rate")
+                let win = strategy
+                    .win_rate
                     .map_or("—".into(), |w| format!("{:.0}%", w * 100.0));
                 pieces
                     .push(mono(

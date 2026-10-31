@@ -430,6 +430,8 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
     const LEVERAGE: &str =
         "A position is worth capital × Size % × leverage. Margin calls aren't simulated.";
     const DIRECTION: &str = "Trade one way only; the other side's signals close positions instead. Paper trading follows it too.";
+    const SLIPPAGE_PERCENT: &str = "Every market order fills this percentage of the price worse, which means the same on any market.";
+    const COMPOUND: &str = "Size positions from the account as it is now, so profits grow them and losses shrink them. Off, every position is sized from the starting capital.";
     const INVERT: &str = "Trade the opposite of what the strategy says: sell when it buys and buy when it sells, at the same moments. Paper trading follows it too.";
     const SESSION: &str = "Outside these days and times, signals can close positions but not open them. Paper trading follows it too.";
     let ticks_box = |field: Field, suffix: &'a str, what: &'a str| -> Element<'a, PanelMessage> {
@@ -473,6 +475,17 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
             switch(settings.slippage.on, Edit::Slippage, SLIPPAGE),
             name("Slippage", SLIPPAGE),
             ticks_box(Field::Slippage, "ticks", SLIPPAGE),
+        ),
+        line(
+            switch(settings.slippage_percent.on, Edit::SlippagePercent, SLIPPAGE_PERCENT),
+            name("Slippage %", SLIPPAGE_PERCENT),
+            tip(
+                row![input(Field::SlippagePercent, 54.0), unit("%")]
+                    .spacing(3)
+                    .align_y(Alignment::Center),
+                SLIPPAGE_PERCENT,
+                None,
+            ),
         ),
         line(
             switch(settings.spread.on, Edit::Spread, SPREAD),
@@ -541,6 +554,11 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
         line(
             switch(settings.invert, Edit::Invert, INVERT),
             name("Invert", INVERT),
+            no_switch(),
+        ),
+        line(
+            switch(settings.compound, Edit::Compound, COMPOUND),
+            name("Compound", COMPOUND),
             no_switch(),
         ),
     ];

@@ -5,6 +5,7 @@
 //! random stretches of the market, to see whether it only worked in one of them.
 
 use std::{
+    collections::BTreeMap,
     ops::Range,
     sync::{
         Arc, Condvar, Mutex,
@@ -124,6 +125,51 @@ pub fn round_trips(report: &BacktestReport) -> Vec<RoundTrip> {
         trades.push(trade);
     }
     trades
+}
+
+/// The share of a backtest's trades that made money, counting one still open at the end at its last
+/// value, as its net return does. `None` if it made none. The engine's own "Win Rate" only counts
+/// closed positions, so a winning run holding to the end would show 0%.
+#[must_use]
+pub fn win_rate(report: &BacktestReport) -> Option<f64> {
+    let trades = round_trips(report);
+    let winners = trades.iter().filter(|t| t.profit > 0.0).count();
+    (!trades.is_empty()).then(|| winners as f64 / trades.len() as f64)
+}
+
+/// Profit figures over every trade, under the engine's names, counting one still open at the end at
+/// its last value. The engine's own in `report.pnl` only count closed positions. Figures with
+/// nothing to go on are NaN.
+#[must_use]
+pub fn pnl_by_trade(report: &BacktestReport) -> BTreeMap<String, f64> {
+    let trades = round_trips(report);
+    let profits = || trades.iter().map(|t| t.profit);
+    let winners = || profits().filter(|p| *p > 0.0);
+    let losers = || profits().filter(|p| *p <= 0.0);
+    let average = |count: usize, total: f64| {
+        if count == 0 {
+            f64::NAN
+        } else {
+            total / count as f64
+        }
+    };
+    // `f64::min` and `max` pass over the NaN each starts from.
+    let total: f64 = profits().sum();
+    [
+        ("PnL (total)", total),
+        ("PnL% (total)", total / report.starting_balance * 100.0),
+        ("Win Rate", average(trades.len(), winners().count() as f64)),
+        ("Expectancy", average(trades.len(), total)),
+        ("Avg Winner", average(winners().count(), winners().sum())),
+        ("Max Winner", winners().fold(f64::NAN, f64::max)),
+        ("Min Winner", winners().fold(f64::NAN, f64::min)),
+        ("Avg Loser", average(losers().count(), losers().sum())),
+        ("Max Loser", losers().fold(f64::NAN, f64::min)),
+        ("Min Loser", losers().fold(f64::NAN, f64::max)),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_owned(), value))
+    .collect()
 }
 
 /// What each trade the backtest made came to, after fees.
@@ -484,7 +530,7 @@ fn stride_for(points: usize) -> usize {
 }
 
 /// The value `share` of the way along `sorted`, between neighbours if it falls between them.
-pub(super) fn percentile(sorted: &[f64], share: f64) -> f64 {
+pub fn percentile(sorted: &[f64], share: f64) -> f64 {
     let Some(last) = sorted.len().checked_sub(1) else {
         return 0.0;
     };
@@ -1066,6 +1112,37 @@ mod tests {
         assert_eq!(trades.len(), 2);
         assert!(close(trades[0], 9.0), "{trades:?}");
         assert!(close(trades.iter().sum(), 14.5), "{trades:?}");
+    }
+
+    #[test]
+    fn a_run_holding_to_the_end_counts_as_the_win_it_is() {
+        // Bought with a fee of 1, and 40 up at the last close: the engine would call this a loss of 1.
+        let holding = report(vec![fill(Side::Buy, 100.0, 1.0, 1.0)], 1_039.0);
+        assert_eq!(win_rate(&holding), Some(1.0));
+        let figures = pnl_by_trade(&holding);
+        assert!(close(figures["PnL (total)"], 39.0), "{figures:?}");
+        assert!(close(figures["Max Winner"], 39.0), "{figures:?}");
+        assert!(figures["Avg Loser"].is_nan(), "{figures:?}");
+
+        // One win of 9 and one loss of 6, the larger and smaller reading the way their names do.
+        let both = report(
+            vec![
+                fill(Side::Buy, 100.0, 1.0, 0.0),
+                fill(Side::Sell, 109.0, 1.0, 0.0),
+                fill(Side::Buy, 110.0, 1.0, 0.0),
+                fill(Side::Sell, 104.0, 1.0, 0.0),
+            ],
+            1_003.0,
+        );
+        assert_eq!(win_rate(&both), Some(0.5));
+        let figures = pnl_by_trade(&both);
+        assert!(close(figures["Expectancy"], 1.5), "{figures:?}");
+        assert!(close(figures["Max Loser"], -6.0), "{figures:?}");
+        assert!(close(figures["Min Loser"], -6.0), "{figures:?}");
+
+        let none = report(Vec::new(), 1_000.0);
+        assert_eq!(win_rate(&none), None);
+        assert!(pnl_by_trade(&none)["Win Rate"].is_nan());
     }
 
     #[test]

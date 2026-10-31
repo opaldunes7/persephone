@@ -157,7 +157,7 @@ Returns: `strategies`, `plugin_errors`
 
 One strategy's parameters, with their defaults and limits. Works for a logic tree too.
 
-- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]}, each with optional "params": {"name": value}.
+- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional "params": {"name": value}.
 
 Returns: `name`, `description`, `params`
 
@@ -183,7 +183,7 @@ Returns: `id`, `kind`, `path`
 
 Backtests any strategy on any span with any settings. The run is saved, so its details can be read by run_id. Returns and falls are fractions, so 0.05 is 5%.
 
-- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]}, each with optional "params": {"name": value}.
+- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional "params": {"name": value}.
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
 - `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
@@ -198,7 +198,7 @@ Returns: `run_id`, `summary`
 
 Many backtests in one call, in parallel: much quicker for an agent than one call each. Every run is saved, so all the tools that take a run_id work on them. One that fails doesn't stop the rest.
 
-- `runs` (array, required): A list of arguments as run_backtest takes, up to 5,000.
+- `runs` (list_or_path, required): A list of arguments as run_backtest takes, up to 5,000, or a JSON file holding one.
 - `defaults` (object): Arguments every run shares, such as bars, from, to and settings. A run's own win.
 - `limit` (integer): How many runs to list, best return first. Default 100.
 
@@ -221,7 +221,7 @@ Returns: `trades`, `runs`, `median`, `low`, `high`, `drawdown`, `ruin`, `actual`
 
 Backtests random stretches of a span, to see whether a strategy works throughout. Returns and falls are fractions.
 
-- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]}, each with optional "params": {"name": value}.
+- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional "params": {"name": value}.
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
 - `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
@@ -232,14 +232,25 @@ Backtests random stretches of a span, to see whether a strategy works throughout
 - `length` (string): week, month (30 days, the default) or quarter (91 days).
 - `seed` (integer): The same seed gives the same stretches. Default 0.
 - `include_trades` (boolean): Include each block's trades.
+- `limit` (integer): How many blocks to list. Default 50.
 
-Returns: `profitable`, `median`, `best`, `worst`, `blocks`
+Returns: `profitable`, `median`, `best`, `worst`, `blocks`, `total`
+
+## `run_random_entries` *job*
+
+Whether a run beat chance: the same holds and directions at random times, on the same bars and settings, many times over. Returns and falls are fractions.
+
+- `run_id` (string, required): A run, from run_backtest or list_runs.
+- `runs` (integer): How many random placings. Default 200.
+- `seed` (integer): The same seed gives the same placings. Default 0.
+
+Returns: `runs`, `trades`, `actual_return`, `share_matching_return`, `share_matching_fall`, `median`, `low`, `high`
 
 ## `run_walk_forward` *job*
 
 Picks the best values on one stretch, tests them on the next, unseen, and slides along, giving what they did where they hadn't been picked. Returns and falls are fractions.
 
-- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]}, each with optional "params": {"name": value}.
+- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional "params": {"name": value}.
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
 - `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
@@ -260,7 +271,7 @@ Returns: `windows`, `unseen_return`, `profitable_windows`, `deepest_fall`, `trad
 
 Backtests a range of one or two parameters, scored by return, Monte Carlo or random blocks. Scores are fractions.
 
-- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]}, each with optional "params": {"name": value}.
+- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional "params": {"name": value}.
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
 - `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
@@ -281,7 +292,7 @@ Returns: `values`, `total`, `top`, `on_edge`, `held_out`, `backtests`
 
 ## `get_report`
 
-A run's full report: every statistic and note. Its own figures are fractions; pnl, returns and general are Nautilus's own.
+A run's full report: every statistic and note. Its own figures are fractions, and pnl counts a trade still open at its last value; closed_positions_pnl, returns and general are Nautilus's own.
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 
@@ -369,7 +380,7 @@ Returns: `job_id`, `status`
 
 ## `cancel_job`
 
-Asks a job to stop. What's under way finishes and is dropped.
+Asks a job to stop. What's under way finishes and is dropped. get_job then says status cancelled, or done with what it got, if it can answer in part.
 
 - `job_id` (string, required): A job id.
 
@@ -398,7 +409,7 @@ Returns: `drawings`
 Saves a strategy for the app, where it joins the backtest panel's strategy list.
 
 - `name` (string, required): What to call it.
-- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]}, each with optional "params": {"name": value}.
+- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional "params": {"name": value}.
 - `settings` (object): Costs and rules, as in run_backtest; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
 - `run_id` (string): A run, whose summary to keep with it.
 - `note` (string): Anything worth saying about it.

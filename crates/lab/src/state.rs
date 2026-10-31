@@ -428,7 +428,7 @@ impl Lab {
             "operations": logic::OPERATIONS,
             "comparisons": logic::COMPARISONS,
             "combinations": logic::COMBINATIONS,
-            "rules": "`long` and `short` ask for that position; on a bar with both or neither, `flat` asks to close, and otherwise the position stays.",
+            "rules": "`long` and `short` ask for that position. `flat` asks to close on a bar with both or neither, or when the one that's true is what's already held, so an exit beats an entry. Otherwise the position stays as it is.",
             "values": "A number, a field, a parameter as `$name`, or an object: {\"ema\": {\"of\": \"close\", \"length\": \"$fast\"}}, {\"ago\": {\"of\": \"close\", \"bars\": 1}}, {\"add\": [a, b]}.",
             "example": {
                 "name": "Fast over slow",

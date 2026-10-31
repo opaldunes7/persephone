@@ -16,6 +16,7 @@ use persephone_core::{
     signal::{Signal, SignalFactory},
     strategy::{StrategyInfo, StrategyKind, StrategySpec},
 };
+use rand::{RngExt as _, SeedableRng as _, rngs::StdRng, seq::SliceRandom};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -26,12 +27,28 @@ pub struct Positions {
 }
 
 impl Positions {
-    /// Reads a list of `[ts, position]`.
+    /// A list already worked out, in order.
+    #[must_use]
+    pub fn from_list(list: Vec<(UnixNanos, i8)>) -> Self {
+        Self {
+            list: Arc::new(list),
+        }
+    }
+
+    /// Reads a list of `[ts, position]`, or the path of a JSON file holding one, as a long list
+    /// costs an agent a lot to write out in a call.
     ///
     /// # Errors
     ///
     /// Returns a message saying which entry is wrong and why.
     pub fn parse(source: &Value) -> Result<Self, String> {
+        if let Some(path) = source.as_str() {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("positions: couldn't read {path}: {e}"))?;
+            let list: Value = serde_json::from_str(&text)
+                .map_err(|e| format!("positions: {path} isn't JSON: {e}"))?;
+            return Self::parse(&list);
+        }
         let items = source
             .as_array()
             .filter(|items| !items.is_empty())
@@ -124,6 +141,48 @@ impl SignalFactory for Positions {
     }
 }
 
+/// Random entries with the same holds as `holds` (each a direction and how many bars), in a random
+/// order and with random gaps, over the bars `first..end`. Gives each change of position's bar.
+/// Nothing overlaps. `None` if they don't fit.
+pub fn random_entries(
+    holds: &[(i8, usize)],
+    first: usize,
+    end: usize,
+    seed: u64,
+) -> Option<Vec<(usize, i8)>> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let rng = &mut rng;
+    let held: usize = holds.iter().map(|hold| hold.1).sum();
+    let spare = end.checked_sub(first)?.checked_sub(held)?;
+    let mut order: Vec<(i8, usize)> = holds.to_vec();
+    order.shuffle(rng);
+    // Where the gaps fall: as many cuts of the spare bars as there are holds.
+    let mut cuts: Vec<usize> = (0..order.len())
+        .map(|_| rng.random_range(0..=spare))
+        .collect();
+    cuts.sort_unstable();
+    let mut changes = Vec::with_capacity(order.len() * 2);
+    let mut used = 0;
+    for ((direction, bars), cut) in order.into_iter().zip(cuts) {
+        let entry = first + cut + used;
+        // Right after the last, the entry itself ends what came before.
+        if changes
+            .last()
+            .is_some_and(|last: &(usize, i8)| last.0 == entry)
+        {
+            changes.pop();
+        }
+        changes.push((entry, direction));
+        used += bars;
+        changes.push((entry + bars, 0));
+    }
+    // The last can run to the end, with no bar to close on.
+    if changes.last().is_some_and(|last| last.0 >= end) {
+        changes.pop();
+    }
+    Some(changes)
+}
+
 struct Running {
     list: Arc<Vec<(UnixNanos, i8)>>,
     next: usize,
@@ -189,6 +248,31 @@ mod tests {
         assert_eq!(*moved.list, vec![(199, 1), (299, 0)]);
         let error = list.at_closes(&[100, 300], &[299, 499]).unwrap_err();
         assert!(error.contains("no bar opens at 200"), "{error}");
+    }
+
+    #[test]
+    fn random_entries_keep_the_holds_and_never_overlap() {
+        let holds = [(1, 10), (-1, 5), (1, 30), (-1, 1), (1, 20)];
+        for seed in 0..200 {
+            let changes = random_entries(&holds, 100, 180, seed).unwrap();
+            assert!(
+                changes.windows(2).all(|pair| pair[0].0 < pair[1].0),
+                "{changes:?}"
+            );
+            assert!(changes.iter().all(|change| (100..180).contains(&change.0)));
+            // Bars held in each direction, walking the changes.
+            let (mut long, mut short) = (0, 0);
+            for (i, &(bar, position)) in changes.iter().enumerate() {
+                let until = changes.get(i + 1).map_or(180, |next| next.0);
+                match position {
+                    1 => long += until - bar,
+                    -1 => short += until - bar,
+                    _ => {}
+                }
+            }
+            assert_eq!((long, short), (60, 6), "{changes:?}");
+        }
+        assert!(random_entries(&holds, 0, 10, 0).is_none());
     }
 
     #[test]

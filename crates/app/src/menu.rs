@@ -1709,8 +1709,7 @@ fn statistics<'a>(report: &BacktestReport, quote: &str) -> Vec<Element<'a, MenuM
             .map_or("—".to_string(), |v| format!("{v:.2}"))
     };
     let net = report.net_pnl();
-    let win_rate = report
-        .stat("Win Rate")
+    let win_rate = crate::backtest::robustness::win_rate(report)
         .map_or("—".to_string(), |v| format!("{:.1}%", v * 100.0));
     let rows: [(&str, String, Color); 9] = [
         ("Net profit", format!("{net:+.2} {quote}"), signed(net)),

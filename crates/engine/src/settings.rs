@@ -13,6 +13,8 @@ pub struct SimSettings {
     pub fee_per_order: Option<f64>,
     /// Ticks every market order fills worse than the price it met.
     pub slippage_ticks: u32,
+    /// The same as a percentage of the price, for a cost that means the same on any market.
+    pub slippage_percent: f64,
     /// A spread to assume when the data has none (bars and trades), in ticks: buys pay the
     /// larger half of it above the price and sells the rest below. Quotes bring their own.
     pub spread_ticks: u32,
@@ -20,6 +22,8 @@ pub struct SimSettings {
     pub latency_ms: u32,
     /// How many times its share of the capital a position is worth (1 is no leverage).
     pub leverage: f64,
+    /// Size positions from the account as it is now, rather than as it started.
+    pub compound: bool,
 }
 
 impl Default for SimSettings {
@@ -27,9 +31,11 @@ impl Default for SimSettings {
         Self {
             fee_per_order: None,
             slippage_ticks: 0,
+            slippage_percent: 0.0,
             spread_ticks: 0,
             latency_ms: 0,
             leverage: 1.0,
+            compound: false,
         }
     }
 }

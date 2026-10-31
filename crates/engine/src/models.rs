@@ -18,13 +18,16 @@ use nautilus_model::{
 pub(crate) struct CostFillModel {
     slippage_ticks: u32,
     spread_ticks: u32,
+    /// Slippage as a share of the price, on top of the ticks.
+    slippage_share: f64,
 }
 
 impl CostFillModel {
-    pub(crate) fn new(slippage_ticks: u32, spread_ticks: u32) -> Self {
+    pub(crate) fn new(slippage_ticks: u32, spread_ticks: u32, slippage_percent: f64) -> Self {
         Self {
             slippage_ticks,
             spread_ticks,
+            slippage_share: slippage_percent / 100.0,
         }
     }
 
@@ -60,8 +63,15 @@ impl FillModel for CostFillModel {
         let (buy_cost, sell_cost) = self.costs(ask > bid);
         let tick = instrument.price_increment().as_f64();
         let precision = instrument.price_precision();
-        let ask = Price::new(ask.as_f64() + f64::from(buy_cost) * tick, precision);
-        let bid = Price::new(bid.as_f64() - f64::from(sell_cost) * tick, precision);
+        let (ask, bid) = (ask.as_f64(), bid.as_f64());
+        let ask = Price::new(
+            ask + f64::from(buy_cost) * tick + ask * self.slippage_share,
+            precision,
+        );
+        let bid = Price::new(
+            bid - f64::from(sell_cost) * tick - bid * self.slippage_share,
+            precision,
+        );
 
         // As deep as Nautilus's own models: every order fills in full at one price.
         let depth =
@@ -91,13 +101,13 @@ mod tests {
 
     #[test]
     fn costs_split_the_spread_and_add_the_slippage() {
-        let model = CostFillModel::new(2, 3);
+        let model = CostFillModel::new(2, 3, 0.0);
         assert_eq!(
             model.costs(false),
             (4, 3),
             "a 3-tick spread: 2 above, 1 below"
         );
         assert_eq!(model.costs(true), (2, 2), "quotes bring their own spread");
-        assert_eq!(CostFillModel::new(0, 0).costs(false), (0, 0));
+        assert_eq!(CostFillModel::new(0, 0, 0.0).costs(false), (0, 0));
     }
 }

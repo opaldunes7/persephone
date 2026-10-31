@@ -115,7 +115,7 @@ impl Lab {
         paths: Paths,
         source: Arc<dyn cache::BarSource>,
     ) -> Result<Arc<Self>, String> {
-        for dir in ["runs", "jobs", "results", "exports"] {
+        for dir in ["runs", "jobs", "results", "exports", "answers"] {
             std::fs::create_dir_all(paths.lab().join(dir)).map_err(|e| e.to_string())?;
         }
         std::fs::create_dir_all(&paths.models).map_err(|e| e.to_string())?;
@@ -136,6 +136,36 @@ impl Lab {
         }))
     }
 
+    /// An answer as text for an agent connected over MCP, whose context it all goes into: one too
+    /// big for that is saved to a file instead, saying where and how to ask for less.
+    #[must_use]
+    pub fn fit_for_agent(&self, answer: &Value) -> String {
+        let text = answer.to_string();
+        if text.len() <= MOST_ANSWER_BYTES {
+            return text;
+        }
+        let path = self
+            .paths
+            .lab()
+            .join("answers")
+            .join(format!("{}.json", new_id("answer")));
+        if let Err(error) = std::fs::write(&path, &text) {
+            return serde_json::json!({
+                "too_large": true,
+                "bytes": text.len(),
+                "hint": format!("It couldn't be saved ({error}). Ask for less with `limit`."),
+            })
+            .to_string();
+        }
+        serde_json::json!({
+            "too_large": true,
+            "bytes": text.len(),
+            "path": path,
+            "hint": "That's too much to read here, so the whole answer is in that file. Read it from there, or ask for less with `limit`.",
+        })
+        .to_string()
+    }
+
     /// The plugins loaded now.
     #[must_use]
     pub fn plugins(&self) -> Arc<Plugins> {
@@ -152,6 +182,9 @@ impl Lab {
         }
     }
 }
+
+/// The largest answer an agent over MCP gets directly, about 25,000 tokens.
+const MOST_ANSWER_BYTES: usize = 100_000;
 
 /// Unix milliseconds now.
 #[must_use]

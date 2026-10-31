@@ -44,6 +44,7 @@ pub enum Field {
     Capital,
     Commission,
     Slippage,
+    SlippagePercent,
     Spread,
     Latency,
     Leverage,

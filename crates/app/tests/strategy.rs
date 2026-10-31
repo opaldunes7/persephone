@@ -144,6 +144,27 @@ fn results_from_superseded_runs_are_dropped() {
 }
 
 #[test]
+fn the_win_rate_shown_counts_a_trade_still_open_at_the_end() {
+    let mut app = app();
+    set_strategy(&mut app, BuiltInStrategy::EmaCross);
+    let (generation, request) = app.backtest_request(0).expect("a backtest to run");
+    let mut report = persephone_engine::run_backtest(&request).unwrap();
+    // One buy, still held and well up. The engine's figures only know its fee.
+    report.fills.truncate(1);
+    report.fills[0].side = persephone_core::Side::Buy;
+    *report.equity.last_mut().unwrap() = report.starting_balance * 1.4;
+    report.pnl.insert("Win Rate".into(), 0.0);
+    let _ = app.update(Message::BacktestDone(0, generation, Ok(Arc::new(report))));
+
+    let mut ui = iced_test::Simulator::with_size(
+        iced::Settings::default(),
+        Size::new(1400.0, 900.0),
+        app.view(),
+    );
+    assert!(ui.find("Win 100%").is_ok(), "the chart's corner says 100%");
+}
+
+#[test]
 fn report_edits_are_validated() {
     let mut app = app();
     set_strategy(&mut app, BuiltInStrategy::EmaCross);
@@ -1411,6 +1432,20 @@ mod panel {
         // Clicking away from every line unpicks it.
         panel(&mut app, PanelMessage::SelectLine(None));
         assert_eq!(tests(&app), (None, false));
+    }
+
+    #[test]
+    fn compounding_and_percent_slippage_reach_the_backtest() {
+        let mut app = ready_panel(TestKind::Backtest);
+        panel(&mut app, PanelMessage::Edit(Edit::Compound(true)));
+        panel(&mut app, PanelMessage::Edit(Edit::SlippagePercent(true)));
+        let sim = app.backtest_request(0).unwrap().1.sim;
+        assert!(sim.compound);
+        assert!(sim.slippage_percent > 0.0);
+        panel(&mut app, PanelMessage::Edit(Edit::Stock(false)));
+        let sim = app.backtest_request(0).unwrap().1.sim;
+        assert!(!sim.compound, "off with the rest");
+        assert_eq!(sim.slippage_percent, 0.0);
     }
 
     #[test]

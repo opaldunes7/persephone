@@ -29,7 +29,7 @@ reqwest.workspace = true
 rmcp = { version = "1", default-features = false, features = ["server", "transport-io"] }
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 tiny_http = "0.12"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "time"] }
 
 [dev-dependencies]
 iced.workspace = true

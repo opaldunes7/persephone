@@ -1,6 +1,6 @@
 //! The tools over MCP on standard input and output, the way Claude Code and other agents connect.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt as _,
@@ -9,9 +9,9 @@ use rmcp::{
         PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
     },
     service::RequestContext,
-    transport::stdio,
 };
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt as _, AsyncRead, AsyncWriteExt as _, BufReader};
 
 use crate::{Lab, tools::tools};
 
@@ -62,9 +62,37 @@ impl ServerHandler for Server {
             .await
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
         Ok(match answer {
-            Ok(value) => CallToolResult::success(vec![Content::text(value.to_string())]),
+            Ok(value) => {
+                CallToolResult::success(vec![Content::text(self.lab.fit_for_agent(&value))])
+            }
             Err(error) => CallToolResult::error(vec![Content::text(error)]),
         })
+    }
+}
+
+/// rmcp leaves `id` out of its answer to a message it couldn't read, where JSON-RPC asks for a null
+/// one, and strict clients reject that.
+fn with_id(line: &str) -> String {
+    if line.contains("\"error\":")
+        && let Ok(Value::Object(mut answer)) = serde_json::from_str(line)
+        && answer.contains_key("error")
+        && !answer.contains_key("id")
+    {
+        answer.insert("id".into(), Value::Null);
+        return Value::Object(answer).to_string();
+    }
+    line.to_owned()
+}
+
+/// Passes the server's answers on to the agent.
+async fn forward(from_server: impl AsyncRead + Unpin) {
+    let mut lines = BufReader::new(from_server).lines();
+    let mut stdout = tokio::io::stdout();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let line = with_id(&line) + "\n";
+        if stdout.write_all(line.as_bytes()).await.is_err() || stdout.flush().await.is_err() {
+            return;
+        }
     }
 }
 
@@ -79,11 +107,36 @@ pub fn serve(lab: Arc<Lab>) -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
     runtime.block_on(async {
+        let (to_agent, from_server) = tokio::io::duplex(64 * 1024);
+        let forwarding = tokio::spawn(forward(from_server));
         let service = Server { lab }
-            .serve(stdio())
+            .serve((tokio::io::stdin(), to_agent))
             .await
             .map_err(|e| e.to_string())?;
         service.waiting().await.map_err(|e| e.to_string())?;
+        // Whatever's left to say, without hanging on it if the agent has stopped reading.
+        let _ = tokio::time::timeout(Duration::from_secs(5), forwarding).await;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_error_with_no_id_gets_one() {
+        let fixed: Value =
+            serde_json::from_str(&with_id(r#"{"jsonrpc":"2.0","error":{"code":-32700}}"#)).unwrap();
+        assert!(
+            fixed["id"].is_null() && fixed.get("id").is_some(),
+            "{fixed}"
+        );
+        for line in [
+            r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32600}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"result":{"text":"{\"error\":1}"}}"#,
+        ] {
+            assert_eq!(with_id(line), line);
+        }
+    }
 }
