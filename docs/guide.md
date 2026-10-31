@@ -247,10 +247,16 @@ this is the usual reason. A number typed without pressing Enter counts once you 
 - **Median**, **Best**, **Worst**: block returns, and the worst block's dates. A best far above the
   median means the result leans on a few good stretches.
 
-Pick a Monte Carlo line, or Best, Middle, Worst or The backtest in the list, to see **that run's
-trades** in the order it drew them, with the equity after each. They're your backtest's real trades
+Pick a Monte Carlo line, or Best, Middle, Worst or The backtest in the list, and the pane splits in
+half to show **that run's trades** beside the lines, in the order it drew them, with the equity after
+each. They're your backtest's real trades
 in a random mix, so one can repeat and another be left out. Click a trade to see where it really
-happened on the chart, and **All runs** to go back to the list.
+happened on the chart. The buttons above switch runs, and **All** goes back to the list.
+
+**Table**, beside **Lines**, splits the pane in half: every run on the left, with the backtest itself
+among them so you can see where it ranks, and the picked run's trades on the right. Click a run to
+see its trades, and a column to sort it. Random blocks has the same, one row per block with its
+dates; those trades really happened in that order, and clicking a block also moves the chart to it.
 
 On both tests, the list beside the lines says what the result means and how each one went. **Click a
 line or a row** to pick it out; hover over a line to see its return and worst fall. On Random blocks

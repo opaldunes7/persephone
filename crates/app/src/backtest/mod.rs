@@ -87,7 +87,7 @@ pub struct Panel {
 
 /// The results of the tests beyond the backtest itself. They aren't saved: they follow from the
 /// chart's backtest, and go when it changes.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Tests {
     /// Starts the same every time, so the same inputs give the same results until asked for
     /// another draw.
@@ -107,6 +107,43 @@ pub struct Tests {
     pub showing_trades: bool,
     /// The row of those trades last sent to the chart.
     pub trade_row: Option<usize>,
+    /// Monte Carlo as a table of runs rather than lines.
+    pub runs_table: bool,
+    /// The run picked in that table, and how the table is sorted and scrolled.
+    pub run: Option<usize>,
+    pub runs_sort: (RunColumn, bool),
+    pub runs_scroll: usize,
+}
+
+/// What the table of runs can be sorted by.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RunColumn {
+    #[default]
+    Return,
+    Fell,
+    Run,
+}
+
+impl Default for Tests {
+    fn default() -> Self {
+        Self {
+            seed: 0,
+            monte_carlo_run: None,
+            monte_carlo: None,
+            blocks: BlockRun::Idle,
+            optimize: OptimizeRun::Idle,
+            original: None,
+            line: None,
+            zoom: None,
+            showing_trades: false,
+            trade_row: None,
+            runs_table: false,
+            run: None,
+            // Best first.
+            runs_sort: (RunColumn::Return, true),
+            runs_scroll: 0,
+        }
+    }
 }
 
 /// Where an optimization has got.
@@ -149,12 +186,36 @@ impl Tests {
         self.original = None;
     }
 
+    /// Scrolls the table of runs so the picked run shows, a little way down it.
+    pub fn reveal_run(&mut self, blocks: bool) {
+        let Some(run) = self.run else {
+            return;
+        };
+        let mut rows = if blocks {
+            match &self.blocks {
+                BlockRun::Done(summary) => summary.ranked(),
+                _ => return,
+            }
+        } else {
+            match &self.monte_carlo {
+                Some(Ok(result)) => result.ranked_runs(),
+                _ => return,
+            }
+        };
+        robustness::sort_rows(&mut rows, self.runs_sort);
+        if let Some(place) = rows.iter().position(|row| row.run == run) {
+            self.runs_scroll = place.saturating_sub(2);
+        }
+    }
+
     /// Back to seeing a fan whole, with no line picked.
     pub fn reset_fan(&mut self) {
         self.line = None;
         self.zoom = None;
         self.showing_trades = false;
         self.trade_row = None;
+        self.run = None;
+        self.runs_scroll = 0;
     }
 
     pub fn clear_monte_carlo(&mut self) {
@@ -298,10 +359,17 @@ pub enum PanelMessage {
     Revert,
     /// Pick a line on a fan, or none.
     SelectLine(Option<usize>),
+    /// Show Monte Carlo as a table of runs, or as lines.
+    ShowRunsTable(bool),
+    /// Pick a run in the table, or none.
+    SelectRun(Option<usize>),
+    /// Sort the table of runs by this, or the other way round if it already is.
+    SortRuns(RunColumn),
+    /// Scroll the table of runs to this row.
+    ScrollRuns(usize),
     /// Back to Monte Carlo's notable runs, keeping the line picked.
     ShowRuns,
-    /// Move the chart to where this trade really happened: its row, and its place among the
-    /// backtest's trades.
+    /// Move the chart to where this trade really happened: its row, and the bar it ended on.
     ShowTrade(usize, usize),
     /// Show this much of a fan, from 0 to 1, or all of it.
     ZoomFan(Option<(f32, f32)>),

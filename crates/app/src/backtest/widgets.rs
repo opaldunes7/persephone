@@ -15,10 +15,10 @@ use persephone_chart::{PRICE_AXIS_WIDTH, Projection, theme, ticks};
 use persephone_core::{BarSpec, Candle, UnixNanos, time::DateTime};
 
 use super::{
-    History, PanelMessage, SPEED_LABELS,
+    History, PanelMessage, RunColumn, SPEED_LABELS,
     optimize::{OptimizeResult, Outcome},
     position_of,
-    robustness::LineStats,
+    robustness::{LineStats, RunRow},
     speed_at,
 };
 
@@ -712,6 +712,240 @@ impl canvas::Program<PanelMessage> for Fan<'_> {
             hover_label(&mut frame, label, x, y, pane.width);
         }
         vec![grid, lines, frame.into_geometry()]
+    }
+}
+
+// --- Monte Carlo's table of runs -------------------------------------------------------------
+
+const ROW_HEIGHT: f32 = 20.0;
+const RUN_COLUMNS: [&str; 5] = ["Rank", "Run", "Return", "Final equity", "Fell"];
+/// Each column's right edge, as a share of the width.
+const RUN_EDGES: [f32; 5] = [0.09, 0.42, 0.6, 0.82, 0.98];
+
+/// Every run, drawn rather than built from widgets so that only the rows showing cost anything,
+/// however many runs there are.
+pub struct RunsTable {
+    /// Sorted already, and whether there's an arrow on a column.
+    pub rows: Vec<RunRow>,
+    /// What to call the second column, and what each row is called there; its number if nothing.
+    pub noun: &'static str,
+    pub names: Vec<String>,
+    pub sort: (RunColumn, bool),
+    pub capital: f64,
+    pub ruin_at: f64,
+    pub scroll: usize,
+    /// The run whose trades show beside it.
+    pub picked: Option<usize>,
+    /// Room above for the legend.
+    pub top: f32,
+}
+
+impl RunsTable {
+    fn visible_rows(&self, height: f32) -> usize {
+        (((height - self.top - ROW_HEIGHT) / ROW_HEIGHT).floor() as usize).max(1)
+    }
+
+    /// The first row showing: where it's scrolled to, unless a resize left that past the end.
+    fn first_row(&self, height: f32) -> usize {
+        self.scroll
+            .min(self.rows.len().saturating_sub(self.visible_rows(height)))
+    }
+
+    fn row_at(&self, point: Point, size: Size) -> Option<&RunRow> {
+        let y = point.y - self.top - ROW_HEIGHT;
+        if y < 0.0 || point.x > size.width {
+            return None;
+        }
+        let shown = (y / ROW_HEIGHT) as usize;
+        if shown >= self.visible_rows(size.height) {
+            return None;
+        }
+        self.rows.get(self.first_row(size.height) + shown)
+    }
+
+    fn column_at(&self, x: f32, width: f32) -> usize {
+        RUN_EDGES
+            .iter()
+            .position(|edge| x <= edge * width)
+            .unwrap_or(RUN_EDGES.len() - 1)
+    }
+}
+
+impl canvas::Program<PanelMessage> for RunsTable {
+    type State = ();
+
+    fn update(
+        &self,
+        _state: &mut (),
+        event: &Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<canvas::Action<PanelMessage>> {
+        let Event::Mouse(event) = event else {
+            return None;
+        };
+        let point = cursor.position_in(bounds)?;
+        let size = bounds.size();
+        match event {
+            mouse::Event::CursorMoved { .. } => Some(canvas::Action::request_redraw()),
+            mouse::Event::WheelScrolled { delta } => {
+                let lines = match delta {
+                    ScrollDelta::Lines { y, .. } => *y * 3.0,
+                    ScrollDelta::Pixels { y, .. } => *y / ROW_HEIGHT,
+                };
+                let most = self
+                    .rows
+                    .len()
+                    .saturating_sub(self.visible_rows(size.height));
+                let from = self.first_row(size.height) as f32;
+                let row = (from - lines).clamp(0.0, most as f32).round();
+                Some(canvas::Action::publish(PanelMessage::ScrollRuns(row as usize)).and_capture())
+            }
+            mouse::Event::ButtonPressed(mouse::Button::Left) => {
+                if (self.top..self.top + ROW_HEIGHT).contains(&point.y) {
+                    let column = match self.column_at(point.x, size.width) {
+                        1 => RunColumn::Run,
+                        4 => RunColumn::Fell,
+                        _ => RunColumn::Return,
+                    };
+                    return Some(
+                        canvas::Action::publish(PanelMessage::SortRuns(column)).and_capture(),
+                    );
+                }
+                let row = self.row_at(point, size)?;
+                Some(canvas::Action::publish(PanelMessage::SelectRun(Some(row.run))).and_capture())
+            }
+            _ => None,
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        _state: &(),
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        let over = cursor.position_in(bounds).is_some_and(|point| {
+            (self.top..self.top + ROW_HEIGHT).contains(&point.y)
+                || self.row_at(point, bounds.size()).is_some()
+        });
+        if over {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::default()
+        }
+    }
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let size = bounds.size();
+        let mut frame = Frame::new(renderer, size);
+        let width = size.width - 12.0;
+        let cell = |frame: &mut Frame, content: String, column: usize, y: f32, color: Color| {
+            frame.fill_text(Text {
+                content,
+                position: Point::new(RUN_EDGES[column] * width, y + ROW_HEIGHT / 2.0),
+                color,
+                size: 11.0.into(),
+                font: iced::Font::MONOSPACE,
+                align_x: text::Alignment::Right,
+                align_y: alignment::Vertical::Center,
+                ..Text::default()
+            });
+        };
+        let (sorted, descending) = self.sort;
+        let arrow = if descending { " ↓" } else { " ↑" };
+        for (column, name) in RUN_COLUMNS.iter().enumerate() {
+            let this = match column {
+                1 => Some(RunColumn::Run),
+                4 => Some(RunColumn::Fell),
+                2 => Some(RunColumn::Return),
+                _ => None,
+            };
+            let name = if column == 1 { self.noun } else { *name };
+            let content = if this == Some(sorted) {
+                format!("{name}{arrow}")
+            } else {
+                name.to_owned()
+            };
+            cell(&mut frame, content, column, self.top, theme::TEXT_MUTED);
+        }
+        frame.fill_rectangle(
+            Point::new(0.0, self.top + ROW_HEIGHT - 1.0),
+            Size::new(size.width, 1.0),
+            theme::AXIS_LINE,
+        );
+        let visible = self.visible_rows(size.height);
+        let hovered = cursor
+            .position_in(bounds)
+            .and_then(|point| self.row_at(point, size))
+            .map(|row| row.run);
+        let first = self.first_row(size.height);
+        for (shown, row) in self.rows.iter().skip(first).take(visible).enumerate() {
+            let y = self.top + ROW_HEIGHT * (shown + 1) as f32;
+            if self.picked == Some(row.run) {
+                frame.fill_rectangle(
+                    Point::new(0.0, y),
+                    Size::new(size.width, ROW_HEIGHT),
+                    Color {
+                        a: 0.3,
+                        ..theme::ACCENT
+                    },
+                );
+            } else if hovered == Some(row.run) {
+                frame.fill_rectangle(
+                    Point::new(0.0, y),
+                    Size::new(size.width, ROW_HEIGHT),
+                    theme::GRID,
+                );
+            }
+            let change = if row.stats.return_ >= 0.0 {
+                theme::UP
+            } else {
+                theme::DOWN
+            };
+            let ruined = row.stats.drawdown >= self.ruin_at;
+            let plain = if row.backtest { EQUITY } else { theme::TEXT };
+            cell(&mut frame, row.rank.to_string(), 0, y, plain);
+            let name = if row.backtest {
+                "The backtest".to_owned()
+            } else {
+                self.names
+                    .get(row.run)
+                    .cloned()
+                    .unwrap_or_else(|| (row.run + 1).to_string())
+            };
+            cell(&mut frame, name, 1, y, plain);
+            cell(&mut frame, percent(row.stats.return_), 2, y, change);
+            let equity = self.capital * (1.0 + row.stats.return_);
+            cell(&mut frame, format!("{equity:.2}"), 3, y, plain);
+            cell(
+                &mut frame,
+                format!("{:.2}%", row.stats.drawdown * 100.0),
+                4,
+                y,
+                if ruined { theme::DOWN } else { plain },
+            );
+        }
+        // Where it's scrolled to, as there are usually far more rows than fit.
+        if self.rows.len() > visible {
+            let track = visible as f32 * ROW_HEIGHT;
+            let thumb = (track * visible as f32 / self.rows.len() as f32).max(12.0);
+            let most = (self.rows.len() - visible).max(1) as f32;
+            let y = self.top + ROW_HEIGHT + (track - thumb) * first as f32 / most;
+            frame.fill_rectangle(
+                Point::new(size.width - 5.0, y),
+                Size::new(3.0, thumb),
+                theme::TEXT_MUTED,
+            );
+        }
+        vec![frame.into_geometry()]
     }
 }
 

@@ -455,7 +455,7 @@ mod panel {
     use std::time::{Duration, Instant};
 
     use persephone::backtest::{
-        BlockLength, BlockRun, History, OptimizeRun, ScoreBy, TestKind,
+        BlockLength, BlockRun, History, OptimizeRun, RunColumn, ScoreBy, TestKind,
         calendar::{Calendar, Level},
         optimize::{OptimizeResult, Outcome},
         robustness::round_trips,
@@ -1395,9 +1395,8 @@ mod panel {
         assert!((made - expected).abs() < 1e-6, "{made} against {expected}");
 
         // A trade can be seen where it really happened, even though the run's order isn't real.
-        let (row, trade) = (2, draws[2]);
-        let exit = trades[trade].exit_bar;
-        panel(&mut app, PanelMessage::ShowTrade(row, trade));
+        let exit = trades[draws[2]].exit_bar;
+        panel(&mut app, PanelMessage::ShowTrade(2, exit));
         assert_eq!(app.panel().unwrap().tests.trade_row, Some(2));
         let right = app.tile_chart(0).unwrap().viewport().right;
         assert!((right - exit as f64).abs() < 30.0, "{right} for {exit}");
@@ -1433,5 +1432,155 @@ mod panel {
         // The master switch turns it off with the rest.
         panel(&mut app, PanelMessage::Edit(Edit::Stock(false)));
         assert!(!app.backtest_request(0).unwrap().1.rules.invert);
+    }
+
+    #[test]
+    fn monte_carlo_shows_every_run_as_a_table_and_two_tables_for_one() {
+        let mut app = ready_panel(TestKind::MonteCarlo);
+        app.monte_carlo_now();
+        let result = app
+            .panel()
+            .unwrap()
+            .tests
+            .monte_carlo
+            .clone()
+            .unwrap()
+            .unwrap();
+        let tests = |app: &Persephone| {
+            let tests = &app.panel().unwrap().tests;
+            (tests.runs_table, tests.run, tests.line)
+        };
+
+        panel(&mut app, PanelMessage::ShowRunsTable(true));
+        assert_eq!(tests(&app), (true, None, None));
+        measure(&mut app);
+
+        // Any run can be picked, drawn as a line or not, and the backtest itself.
+        let hidden = (0..result.all_stats.len())
+            .find(|&run| result.line_of_run(run).is_none())
+            .expect("more runs than lines");
+        for run in [hidden, result.all_stats.len()] {
+            panel(&mut app, PanelMessage::SelectRun(Some(run)));
+            assert_eq!(app.panel().unwrap().tests.run, Some(run));
+            measure(&mut app);
+        }
+
+        // Picking a run leaves the table where it is, as it stays on screen beside the trades.
+        panel(&mut app, PanelMessage::ScrollRuns(40));
+        panel(&mut app, PanelMessage::SelectRun(Some(hidden)));
+        assert_eq!(app.panel().unwrap().tests.runs_scroll, 40);
+        panel(&mut app, PanelMessage::SelectRun(None));
+        assert_eq!(tests(&app), (true, None, None));
+
+        // Sorting flips on a second click, and goes back to the top.
+        assert_eq!(
+            app.panel().unwrap().tests.runs_sort,
+            (RunColumn::Return, true)
+        );
+        panel(&mut app, PanelMessage::SortRuns(RunColumn::Return));
+        assert_eq!(
+            app.panel().unwrap().tests.runs_sort,
+            (RunColumn::Return, false)
+        );
+        assert_eq!(app.panel().unwrap().tests.runs_scroll, 0);
+        panel(&mut app, PanelMessage::SortRuns(RunColumn::Fell));
+        assert_eq!(
+            app.panel().unwrap().tests.runs_sort,
+            (RunColumn::Fell, false)
+        );
+        measure(&mut app);
+
+        // The same run stays picked going between lines and the table.
+        panel(
+            &mut app,
+            PanelMessage::SelectRun(result.run_of_line(result.best)),
+        );
+        panel(&mut app, PanelMessage::ShowRunsTable(false));
+        assert_eq!(tests(&app), (false, None, Some(result.best)));
+        assert!(app.panel().unwrap().tests.showing_trades);
+        panel(&mut app, PanelMessage::ShowRunsTable(true));
+        assert_eq!(tests(&app).1, result.run_of_line(result.best));
+
+        // Picked from the lines, it comes into sight in the table, however it's sorted.
+        panel(&mut app, PanelMessage::ShowRunsTable(false));
+        panel(&mut app, PanelMessage::SelectLine(Some(result.worst)));
+        panel(&mut app, PanelMessage::ShowRunsTable(true));
+        let worst = result.run_of_line(result.worst).unwrap();
+        let mut rows = result.ranked_runs();
+        persephone::backtest::robustness::sort_rows(
+            &mut rows,
+            app.panel().unwrap().tests.runs_sort,
+        );
+        let place = rows.iter().position(|r| r.run == worst).unwrap();
+        assert_eq!(
+            app.panel().unwrap().tests.runs_scroll,
+            place.saturating_sub(2)
+        );
+        panel(&mut app, PanelMessage::SortRuns(RunColumn::Run));
+        assert_eq!(
+            app.panel().unwrap().tests.runs_scroll,
+            worst.saturating_sub(2)
+        );
+
+        // A changed backtest starts over, but stays a table.
+        panel(&mut app, PanelMessage::Edit(Edit::Slippage(true)));
+        assert_eq!(tests(&app), (true, None, None));
+    }
+
+    #[test]
+    fn random_blocks_shows_every_block_as_a_table_with_its_real_trades() {
+        let mut app = ready_panel(TestKind::RandomBlocks);
+        panel(&mut app, PanelMessage::BlockLength(BlockLength::Week));
+        panel(&mut app, PanelMessage::Input(Field::Blocks, "6".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Blocks));
+        app.blocks_now();
+        let summary = match &app.panel().unwrap().tests.blocks {
+            BlockRun::Done(summary) => Arc::clone(summary),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(summary.trades.len(), 6);
+        panel(&mut app, PanelMessage::ShowRunsTable(true));
+        measure(&mut app);
+        let rows = summary.ranked();
+        assert_eq!(rows.len(), 6);
+        assert!(rows[0].stats.return_ >= rows[5].stats.return_);
+
+        // Each block's trades add up to it, and happened inside it on the chart.
+        let candles = app.tile_chart(0).unwrap().data().candles.clone();
+        let (with, block) = summary
+            .trades
+            .iter()
+            .zip(&summary.blocks)
+            .find(|(trades, _)| !trades.is_empty())
+            .expect("a block with trades");
+        let made: f64 = with.iter().map(|t| t.profit).sum();
+        assert!((made / 100_000.0 - block.stats.return_).abs() < 1e-9);
+        for trade in with {
+            assert!(trade.entry_ts >= block.from, "traded while warming up");
+            assert!(trade.exit_bar <= block.last_bar);
+            // Its bar is the chart's: the fill came at that bar's close or just after.
+            assert!(candles[trade.entry_bar].ts <= trade.entry_ts);
+        }
+
+        // Picking one shows its trades beside the table, and the chart goes there.
+        let run = rows[0].run;
+        panel(&mut app, PanelMessage::SelectRun(Some(run)));
+        assert_eq!(app.panel().unwrap().tests.run, Some(run));
+        let right = app.tile_chart(0).unwrap().viewport().right;
+        let last = summary.blocks[run].last_bar as f64;
+        assert!((right - last).abs() < 20.0, "{right} for {last}");
+        measure(&mut app);
+
+        // One with no trades at all still draws.
+        if let Some(quiet) = summary.trades.iter().position(Vec::is_empty) {
+            panel(&mut app, PanelMessage::SelectRun(Some(quiet)));
+            measure(&mut app);
+        }
+
+        // The same block stays picked going back to lines.
+        panel(&mut app, PanelMessage::SelectRun(Some(run)));
+        panel(&mut app, PanelMessage::ShowRunsTable(false));
+        assert_eq!(app.panel().unwrap().tests.line, Some(run));
+        measure(&mut app);
     }
 }

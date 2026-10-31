@@ -3135,23 +3135,78 @@ impl Persephone {
             return Task::none();
         };
         match message {
+            P::ShowRunsTable(table) => {
+                // The same run stays picked either way, if it can. A block's line is its run.
+                let blocks = self.tiles.get(&id).map(|t| t.backtest.test)
+                    == Some(backtest::TestKind::RandomBlocks);
+                let found = panel
+                    .tests
+                    .monte_carlo
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok());
+                if table != panel.tests.runs_table {
+                    if table {
+                        let line = panel.tests.line.filter(|_| panel.tests.showing_trades);
+                        panel.tests.run = if blocks {
+                            line
+                        } else {
+                            line.and_then(|line| found?.run_of_line(line))
+                        };
+                    } else if let Some(run) = panel.tests.run.take() {
+                        panel.tests.line = if blocks {
+                            Some(run)
+                        } else {
+                            found.and_then(|r| r.line_of_run(run))
+                        };
+                        panel.tests.showing_trades = panel.tests.line.is_some();
+                    }
+                }
+                panel.tests.runs_table = table;
+                panel.tests.trade_row = None;
+                panel.tests.reveal_run(blocks);
+                return Task::none();
+            }
+            P::SelectRun(run) => {
+                panel.tests.run = run;
+                panel.tests.trade_row = None;
+                // A block happened at a real time, so the chart can go there.
+                if let (backtest::BlockRun::Done(summary), Some(run)) = (&panel.tests.blocks, run)
+                    && self.tiles.get(&id).map(|t| t.backtest.test)
+                        == Some(backtest::TestKind::RandomBlocks)
+                    && let Some(block) = summary.blocks.get(run)
+                    && let Some(chart) = self.tiles.get_mut(&id).and_then(|t| t.chart.as_mut())
+                {
+                    chart.show_bar(block.last_bar);
+                }
+                return Task::none();
+            }
+            P::SortRuns(column) => {
+                let (sorted, descending) = panel.tests.runs_sort;
+                panel.tests.runs_sort = if sorted == column {
+                    (column, !descending)
+                } else {
+                    // Numbers read best from the start: the best return or the smallest fall.
+                    (column, column == backtest::RunColumn::Return)
+                };
+                panel.tests.runs_scroll = 0;
+                // The picked run stays in sight, however it's sorted.
+                let blocks = self.tiles.get(&id).map(|t| t.backtest.test)
+                    == Some(backtest::TestKind::RandomBlocks);
+                panel.tests.reveal_run(blocks);
+                return Task::none();
+            }
+            P::ScrollRuns(row) => {
+                panel.tests.runs_scroll = row;
+                return Task::none();
+            }
             P::ShowRuns => {
                 panel.tests.showing_trades = false;
                 panel.tests.trade_row = None;
                 return Task::none();
             }
-            P::ShowTrade(row, trade) => {
+            P::ShowTrade(row, exit) => {
                 panel.tests.trade_row = Some(row);
-                let Some(tile) = self.tiles.get_mut(&id) else {
-                    return Task::none();
-                };
-                let exit = match tile.strategy.as_ref().map(|s| &s.run) {
-                    Some(Run::Done(report)) => backtest::robustness::round_trips(report)
-                        .get(trade)
-                        .map(|trade| trade.exit_bar),
-                    _ => None,
-                };
-                if let (Some(exit), Some(chart)) = (exit, tile.chart.as_mut()) {
+                if let Some(chart) = self.tiles.get_mut(&id).and_then(|t| t.chart.as_mut()) {
                     // A little past its end, so what came next shows too.
                     let last = chart.data().candles.len().saturating_sub(1);
                     chart.show_bar((exit + backtest::REPLAY_LEAD_BARS).min(last));

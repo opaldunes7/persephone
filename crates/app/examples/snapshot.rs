@@ -166,6 +166,21 @@ fn main() -> anyhow::Result<()> {
                     let _ = app.update(Message::BacktestDone(focused, generation, result));
                 }
             }
+            '[' => {
+                // Monte Carlo as a table of its runs.
+                let _ = app.update(Message::Backtest(PanelMessage::ShowRunsTable(true)));
+            }
+            ']' => {
+                // And the run ranked in the middle picked in it.
+                let run = app.panel().and_then(|panel| {
+                    if let persephone::backtest::BlockRun::Done(summary) = &panel.tests.blocks {
+                        return Some(summary.ranked()[0].run);
+                    }
+                    let found = panel.tests.monte_carlo.as_ref()?.as_ref().ok()?;
+                    Some(found.ranked_runs()[found.runs as usize / 2].run)
+                });
+                let _ = app.update(Message::Backtest(PanelMessage::SelectRun(run)));
+            }
             '~' => {
                 // The stock settings folded away.
                 let _ = app.update(Message::Backtest(PanelMessage::StockOpen(false)));

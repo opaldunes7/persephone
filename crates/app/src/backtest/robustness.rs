@@ -17,7 +17,7 @@ use persephone_data::binance::MAX_RANGE_BARS;
 use persephone_engine::{BacktestReport, BacktestRequest};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
-use super::{BlockLength, WARM_UP_BARS};
+use super::{BlockLength, RunColumn, WARM_UP_BARS};
 
 /// Fewer trades than this say too little to draw from.
 pub const MIN_TRADES: usize = 10;
@@ -181,7 +181,11 @@ pub struct MonteCarlo {
     /// The trades as they really came, and how that went.
     pub actual: Vec<f64>,
     pub actual_stats: LineStats,
-    /// Which run each line is, and the seed, to work out again what a line drew.
+    /// How every run went, drawn as a line or not.
+    pub all_stats: Vec<LineStats>,
+    /// The fall that counts as ruin, as a fraction.
+    pub ruin_at: f64,
+    /// Which run each line is, and the seed, to work out again what a run drew.
     kept_runs: Vec<usize>,
     seed: u64,
     /// Trades between a line's points.
@@ -203,6 +207,139 @@ impl MonteCarlo {
                 .map(|_| rng.random_range(0..self.trades))
                 .collect(),
         )
+    }
+
+    /// Which of the backtest's trades a run drew, as [`Self::draws`] does for a line. The run
+    /// after the last is the backtest itself.
+    #[must_use]
+    pub fn draws_of_run(&self, run: usize) -> Option<Vec<usize>> {
+        if run == self.all_stats.len() {
+            return Some((0..self.trades).collect());
+        }
+        (run < self.all_stats.len()).then(|| {
+            let mut rng = run_rng(self.seed, run);
+            (0..self.trades)
+                .map(|_| rng.random_range(0..self.trades))
+                .collect()
+        })
+    }
+
+    /// How a run went; the run after the last is the backtest itself.
+    #[must_use]
+    pub fn stats_of_run(&self, run: usize) -> Option<LineStats> {
+        if run == self.all_stats.len() {
+            return Some(self.actual_stats);
+        }
+        self.all_stats.get(run).copied()
+    }
+
+    /// Which run a line is; the line after the last is the backtest itself.
+    #[must_use]
+    pub fn run_of_line(&self, line: usize) -> Option<usize> {
+        if line == self.paths.len() {
+            return Some(self.all_stats.len());
+        }
+        self.kept_runs.get(line).copied()
+    }
+
+    /// Which line a run is, if it's one of those drawn.
+    #[must_use]
+    pub fn line_of_run(&self, run: usize) -> Option<usize> {
+        if run == self.all_stats.len() {
+            return Some(self.paths.len());
+        }
+        self.kept_runs.iter().position(|&kept| kept == run)
+    }
+
+    /// Every run and the backtest itself, best return first.
+    #[must_use]
+    pub fn ranked_runs(&self) -> Vec<RunRow> {
+        let mut rows: Vec<RunRow> = self
+            .all_stats
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.actual_stats))
+            .enumerate()
+            .map(|(run, stats)| RunRow {
+                rank: 0,
+                run,
+                stats,
+                backtest: run == self.all_stats.len(),
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.stats
+                .return_
+                .total_cmp(&a.stats.return_)
+                .then(a.run.cmp(&b.run))
+        });
+        for (place, row) in rows.iter_mut().enumerate() {
+            row.rank = place + 1;
+        }
+        rows
+    }
+}
+
+/// `rows` as the table of runs shows them, sorted by `column`, the largest first if `descending`.
+pub fn sort_rows(rows: &mut [RunRow], (column, descending): (RunColumn, bool)) {
+    rows.sort_by(|a, b| {
+        let order = match column {
+            RunColumn::Return => a.stats.return_.total_cmp(&b.stats.return_),
+            RunColumn::Fell => a.stats.drawdown.total_cmp(&b.stats.drawdown),
+            RunColumn::Run => a.run.cmp(&b.run),
+        };
+        if descending { order.reverse() } else { order }
+    });
+}
+
+/// One row of the table of runs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RunRow {
+    /// Its place by return, from 1.
+    pub rank: usize,
+    pub run: usize,
+    pub stats: LineStats,
+    /// It's the backtest itself, not a draw.
+    pub backtest: bool,
+}
+
+/// What a run's trades came to, for its table of figures.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RunSummary {
+    pub trades: usize,
+    /// How many of the backtest's trades it drew at least once.
+    pub different: usize,
+    pub winners: usize,
+    pub best: f64,
+    pub worst: f64,
+    pub average: f64,
+    /// The most losing trades in a row.
+    pub losing_streak: usize,
+}
+
+/// Sums up what a run drew, by their places in `profits`.
+#[must_use]
+pub fn summarize_run(draws: &[usize], profits: &[f64]) -> RunSummary {
+    let drawn: Vec<f64> = draws
+        .iter()
+        .filter_map(|&i| profits.get(i).copied())
+        .collect();
+    let mut seen = draws.to_vec();
+    seen.sort_unstable();
+    seen.dedup();
+    let (mut streak, mut losing_streak) = (0, 0);
+    for profit in &drawn {
+        streak = if *profit < 0.0 { streak + 1 } else { 0 };
+        losing_streak = losing_streak.max(streak);
+    }
+    RunSummary {
+        trades: drawn.len(),
+        different: seen.len(),
+        winners: drawn.iter().filter(|p| **p > 0.0).count(),
+        best: drawn.iter().copied().fold(f64::MIN, f64::max),
+        worst: drawn.iter().copied().fold(f64::MAX, f64::min),
+        average: drawn.iter().sum::<f64>() / drawn.len().max(1) as f64,
+        losing_streak,
     }
 }
 
@@ -348,6 +485,8 @@ pub fn monte_carlo(
         middle,
         actual,
         actual_stats,
+        all_stats: in_order,
+        ruin_at,
         kept_runs,
         seed,
         stride,
@@ -513,6 +652,8 @@ pub struct BlockResult {
     pub last_bar: usize,
     /// Equity at the block's bars' closes.
     pub path: Vec<f64>,
+    /// What it traded, with bars counted as on the chart.
+    pub trades: Vec<RoundTrip>,
 }
 
 /// How one block went, without its line.
@@ -523,6 +664,34 @@ pub struct BlockStats {
     pub stats: LineStats,
     pub fills: usize,
     pub last_bar: usize,
+}
+
+impl BlockSummary {
+    /// Every block, best return first, as rows of the table of runs.
+    #[must_use]
+    pub fn ranked(&self) -> Vec<RunRow> {
+        let mut rows: Vec<RunRow> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(run, block)| RunRow {
+                rank: 0,
+                run,
+                stats: block.stats,
+                backtest: false,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.stats
+                .return_
+                .total_cmp(&a.stats.return_)
+                .then(a.run.cmp(&b.run))
+        });
+        for (place, row) in rows.iter_mut().enumerate() {
+            row.rank = place + 1;
+        }
+        rows
+    }
 }
 
 /// How all the blocks went.
@@ -536,8 +705,9 @@ pub struct BlockSummary {
     pub worst: f64,
     /// When the worst block was.
     pub worst_dates: (UnixNanos, UnixNanos),
-    /// Each block, in the same order as its line.
+    /// Each block, in the same order as its line, and what each traded.
     pub blocks: Vec<BlockStats>,
+    pub trades: Vec<Vec<RoundTrip>>,
     /// Which lines ended highest and lowest.
     pub best_line: usize,
     pub worst_line: usize,
@@ -579,7 +749,8 @@ pub fn summarize(results: Vec<BlockResult>, stride: usize) -> BlockSummary {
             last_bar: r.last_bar,
         })
         .collect();
-    let paths: Vec<Vec<f64>> = results.into_iter().map(|r| r.path).collect();
+    let (paths, trades): (Vec<Vec<f64>>, Vec<Vec<RoundTrip>>) =
+        results.into_iter().map(|r| (r.path, r.trades)).unzip();
     BlockSummary {
         profitable: returns.iter().filter(|r| **r > 0.0).count() as f64
             / returns.len().max(1) as f64,
@@ -588,6 +759,7 @@ pub fn summarize(results: Vec<BlockResult>, stride: usize) -> BlockSummary {
         worst: returns.first().copied().unwrap_or(0.0),
         worst_dates,
         blocks,
+        trades,
         best_line,
         worst_line,
         median_path: median_path(&paths),
@@ -702,6 +874,12 @@ impl BlockJob {
         };
         let capital = request.starting_balance;
         let report = backtest(request)?;
+        // Its bars count from where its warm-up began; the chart's from its first bar.
+        let mut trades = round_trips(&report);
+        for trade in &mut trades {
+            trade.entry_bar += warm_from;
+            trade.exit_bar += warm_from;
+        }
         let equity = report
             .equity
             .get(block.start - warm_from..)
@@ -715,6 +893,7 @@ impl BlockJob {
             fills: report.fills.len(),
             last_bar: block.end - 1,
             path: equity.iter().copied().step_by(stride).collect(),
+            trades,
         })
     }
 }
@@ -925,6 +1104,55 @@ mod tests {
     }
 
     #[test]
+    fn every_run_and_the_backtest_are_ranked_and_can_be_worked_out_again() {
+        let trades: Vec<f64> = (0..40).map(|i| f64::from(i - 15) * 3.0).collect();
+        let result = monte_carlo(&trades, 1_000.0, 500, 0.5, 7).unwrap();
+        let rows = result.ranked_runs();
+        assert_eq!(
+            rows.len(),
+            501,
+            "all 500 runs, not just those drawn, and the backtest"
+        );
+        assert_eq!(rows.iter().filter(|r| r.backtest).count(), 1);
+        assert_eq!(rows[0].rank, 1);
+        for pair in rows.windows(2) {
+            assert!(pair[0].stats.return_ >= pair[1].stats.return_);
+            assert_eq!(pair[0].rank + 1, pair[1].rank);
+        }
+        // Whichever run, drawn as a line or not, what it drew adds up to how it went.
+        for row in [rows[0], rows[250], rows[500]] {
+            let draws = result.draws_of_run(row.run).unwrap();
+            let made: f64 = draws.iter().map(|&i| trades[i]).sum();
+            assert!((made / 1_000.0 - row.stats.return_).abs() < 1e-9);
+            assert_eq!(result.stats_of_run(row.run), Some(row.stats));
+        }
+        assert_eq!(result.draws_of_run(502), None);
+        // Sorting keeps the ranks they earned.
+        let mut by_fall = rows.clone();
+        sort_rows(&mut by_fall, (RunColumn::Fell, false));
+        assert!(by_fall[0].stats.drawdown <= by_fall[500].stats.drawdown);
+        assert_eq!(by_fall.iter().map(|r| r.rank).max(), Some(501));
+        // Runs and lines map onto each other, where a run has a line.
+        for line in [0, result.best, result.paths.len()] {
+            let run = result.run_of_line(line).unwrap();
+            assert_eq!(result.line_of_run(run), Some(line));
+        }
+    }
+
+    #[test]
+    fn a_runs_summary_counts_what_it_drew() {
+        let profits = [10.0, -5.0, -1.0, 2.0];
+        // The first trade twice, the last not at all.
+        let summary = summarize_run(&[1, 2, 0, 0, 1, 1, 2], &profits);
+        assert_eq!(summary.trades, 7);
+        assert_eq!(summary.different, 3);
+        assert_eq!(summary.winners, 2);
+        assert_eq!((summary.best, summary.worst), (10.0, -5.0));
+        assert!((summary.average - (10.0 + 10.0 - 5.0 - 1.0 - 5.0 - 5.0 - 1.0) / 7.0).abs() < 1e-9);
+        assert_eq!(summary.losing_streak, 3);
+    }
+
+    #[test]
     fn the_real_order_of_trades_is_kept_to_compare_with() {
         let trades: Vec<f64> = [50.0, -100.0, 20.0].repeat(5);
         let result = monte_carlo(&trades, 1_000.0, 20, 0.5, 7).unwrap();
@@ -1056,6 +1284,7 @@ mod tests {
             fills: 1,
             last_bar: 0,
             path: vec![100.0, 100.0 * (1.0 + return_)],
+            trades: Vec::new(),
         };
         let summary = summarize(
             vec![
