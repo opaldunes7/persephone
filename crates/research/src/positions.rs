@@ -9,16 +9,28 @@
 //! that bar's close, as any strategy's does, and holds until the next entry. Nothing stops a list looking ahead: that's up to whoever
 //! made it.
 
-use std::{fmt::Write as _, sync::Arc};
+use std::{
+    fmt::Write as _,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
 
 use persephone_core::{
     Candle, UnixNanos,
     signal::{Signal, SignalFactory},
     strategy::{StrategyInfo, StrategyKind, StrategySpec},
 };
+use persephone_engine::{BacktestReport, BacktestRequest};
 use rand::{RngExt as _, SeedableRng as _, rngs::StdRng, seq::SliceRandom};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+use crate::{
+    results::with_params,
+    robustness::{backtest, percentile, pool, round_trips},
+};
 
 /// Wanted positions by time, in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,6 +123,17 @@ impl Positions {
         Ok(Self {
             list: Arc::new(list),
         })
+    }
+
+    /// The list as [`Self::parse`] reads it, with any file's contents written out.
+    #[must_use]
+    pub fn to_json(&self) -> Value {
+        Value::Array(
+            self.list
+                .iter()
+                .map(|&(ts, position)| serde_json::json!([ts, position]))
+                .collect(),
+        )
     }
 
     /// A short id for this exact list.
@@ -209,6 +232,129 @@ impl Signal for Running {
         // Asked for on every bar, as a list says what to hold from then on: a span or random block
         // starting partway through takes up what's wanted by its first bar that can trade.
         Ok(self.wanted)
+    }
+}
+
+/// A backtest's holds at random times, many times over, ready to go to worker threads.
+pub struct RandomEntriesJob {
+    pub report: Arc<BacktestReport>,
+    /// The backtest, on its bars.
+    pub request: BacktestRequest,
+    /// Where the span starts in the bars.
+    pub from_index: usize,
+    pub runs: usize,
+    pub seed: u64,
+    pub workers: usize,
+    pub stop: Arc<AtomicBool>,
+}
+
+/// What the same trading comes to with entries owing nothing to the strategy.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RandomEntries {
+    pub runs: usize,
+    pub trades: usize,
+    pub actual_return: f64,
+    pub actual_fell: f64,
+    /// The share of random placings that did at least as well as the backtest.
+    pub share_matching_return: f64,
+    pub share_matching_fall: f64,
+    pub median: f64,
+    pub low: f64,
+    pub high: f64,
+}
+
+/// What's said when there's too little for the test to mean anything.
+pub const ONE_TRADE: &str =
+    "With one trade there's little to place at random, so this says almost nothing.";
+
+impl RandomEntriesJob {
+    /// # Errors
+    ///
+    /// Returns a message if the run has no trades or they don't fit, a backtest fails, or it's
+    /// stopped before any finish.
+    pub fn run(self, progress: &(impl Fn(usize) + Sync)) -> Result<RandomEntries, String> {
+        let report = &self.report;
+        let holds: Vec<(i8, usize)> = round_trips(report)
+            .iter()
+            .map(|trade| {
+                let bars = if trade.open {
+                    report.equity.len().saturating_sub(trade.entry_bar)
+                } else {
+                    trade.exit_bar.saturating_sub(trade.entry_bar)
+                };
+                (if trade.long { 1 } else { -1 }, bars.max(1))
+            })
+            .collect();
+        if holds.is_empty() {
+            return Err("That run made no trades, so there's nothing to place at random.".into());
+        }
+        let mut request = self.request;
+        request.ticks = None;
+        request.fill_bars = None;
+        let opens: Vec<u64> = request.candles.iter().map(|c| c.ts).collect();
+        let closes = request.bars.closes(&request.candles);
+        // Sized as the run was, with positions in place of its strategy.
+        let shell = Positions::from_list(Vec::new());
+        request.strategy = with_params(
+            shell.spec().kind,
+            Arc::new(shell.info()),
+            &serde_json::json!({"params": {"Size %": request.strategy.size_fraction() * 100.0}}),
+        )?;
+        let seeds: Vec<u64> = (0..self.runs as u64).collect();
+        let done = AtomicUsize::new(0);
+        let results = pool(
+            &seeds,
+            self.workers,
+            &self.stop,
+            &|| progress(done.fetch_add(1, Ordering::Relaxed) + 1),
+            &|&draw| {
+                let changes = random_entries(
+                    &holds,
+                    self.from_index,
+                    opens.len(),
+                    self.seed ^ (draw << 16),
+                )
+                .ok_or("Its trades don't fit the span.")?;
+                let list = changes
+                    .iter()
+                    .map(|&(bar, position)| (closes[bar], position))
+                    .collect();
+                let mut trying = request.clone();
+                trying.plugin = Some(Arc::new(Positions::from_list(list)));
+                backtest(trying).map(|run| {
+                    let capital = run.starting_balance;
+                    let last = run.equity.last().copied().unwrap_or(capital);
+                    (last / capital - 1.0, run.max_drawdown.abs())
+                })
+            },
+        );
+        let mut returns = Vec::with_capacity(self.runs);
+        let mut falls = Vec::with_capacity(self.runs);
+        for result in results.into_iter().flatten() {
+            let (returned, fell) = result?;
+            returns.push(returned);
+            falls.push(fell);
+        }
+        if returns.is_empty() {
+            return Err("Stopped.".into());
+        }
+        returns.sort_by(f64::total_cmp);
+        falls.sort_by(f64::total_cmp);
+        let capital = report.starting_balance;
+        let actual = report.equity.last().copied().unwrap_or(capital) / capital - 1.0;
+        let fell = report.max_drawdown.abs();
+        let count = returns.len() as f64;
+        Ok(RandomEntries {
+            runs: returns.len(),
+            trades: holds.len(),
+            actual_return: actual,
+            actual_fell: fell,
+            share_matching_return: returns.iter().filter(|r| **r >= actual).count() as f64 / count,
+            share_matching_fall: falls.iter().filter(|f| **f <= fell).count() as f64 / count,
+            median: percentile(&returns, 0.5),
+            low: percentile(&returns, 0.05),
+            high: percentile(&returns, 0.95),
+        })
     }
 }
 

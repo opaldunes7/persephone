@@ -43,10 +43,11 @@ use persephone_data::{
 };
 use persephone_engine::{BacktestReport, live::LiveMode};
 use persephone_plugin_host::Plugins;
+use persephone_research::figures::RunFigures;
 use persephone_tiling::TileId;
 
 use crate::{
-    Hidden, Run,
+    Costs, Hidden, Run,
     live::{Live, LiveState},
 };
 
@@ -407,6 +408,9 @@ pub struct TileInfo<'a> {
     pub spacing: Option<Spacing>,
     pub specs: &'a [IndicatorSpec],
     pub strategy: Option<(&'a StrategySpec, &'a Run)>,
+    /// What its finished run came to, and what costs did to it.
+    pub figures: Option<&'a RunFigures>,
+    pub costs: Option<&'a Costs>,
     /// Trading the strategy live: the session, if one ran, or why the chart can't.
     pub live: LiveInfo<'a>,
     /// What the Active list has hidden.
@@ -553,7 +557,12 @@ pub fn view<'a>(
         Popup::Report { .. } => {
             let sweep = tile.sweep.as_ref().map_or(0, |(_, rows)| rows.len() + 2);
             let notes = match tile.strategy {
-                Some((_, Run::Done(report))) => 2 * report.notes.len(),
+                // And the rows beyond the usual figures: costs, the market, and each year.
+                Some((_, Run::Done(report))) => {
+                    2 * report.notes.len()
+                        + 9
+                        + tile.figures.map_or(0, |figures| figures.by_year.len())
+                }
                 _ => 0,
             };
             let ai = match tile.ai_allowed {
@@ -1487,7 +1496,7 @@ fn report<'a>(
         ),
         Run::Running => body.push(text("Backtesting…").size(11).color(theme::TEXT_MUTED)),
         Run::Failed(message) => body.push(text(message.as_str()).size(12).color(theme::DOWN)),
-        Run::Done(report) => body.extend(statistics(report, quote)),
+        Run::Done(report) => body.extend(statistics(report, quote, tile.figures, tile.costs)),
     };
     if let Some((name, rows)) = &tile.sweep {
         body = body.push(separator()).push(
@@ -1701,47 +1710,123 @@ fn wide_button(label: &str, on_press: MenuMessage) -> Element<'_, MenuMessage> {
 }
 
 /// Label/value rows for a finished backtest.
-fn statistics<'a>(report: &BacktestReport, quote: &str) -> Vec<Element<'a, MenuMessage>> {
+fn statistics<'a>(
+    report: &BacktestReport,
+    quote: &str,
+    figures: Option<&RunFigures>,
+    costs: Option<&Costs>,
+) -> Vec<Element<'a, MenuMessage>> {
     let signed = |v: f64| if v >= 0.0 { theme::UP } else { theme::DOWN };
-    let stat = |name: &str| {
-        report
-            .stat(name)
-            .map_or("—".to_string(), |v| format!("{v:.2}"))
-    };
+    let number = |v: Option<f64>| v.map_or("—".to_string(), |v| format!("{v:.2}"));
+    let share = |v: Option<f64>| v.map_or("—".to_string(), |v| format!("{:.1}%", v * 100.0));
     let net = report.net_pnl();
-    let win_rate = crate::backtest::robustness::win_rate(report)
-        .map_or("—".to_string(), |v| format!("{:.1}%", v * 100.0));
-    let rows: [(&str, String, Color); 9] = [
-        ("Net profit", format!("{net:+.2} {quote}"), signed(net)),
+    let bright = theme::TEXT_BRIGHT;
+    let mut rows: Vec<(String, String, Color)> = vec![
         (
-            "Return",
+            "Net profit".into(),
+            format!("{net:+.2} {quote}"),
+            signed(net),
+        ),
+        (
+            "Return".into(),
             format!("{:+.2}%", report.net_return() * 100.0),
             signed(net),
         ),
         (
-            "Max drawdown",
+            "Max drawdown".into(),
             format!("{:.2}%", report.max_drawdown * 100.0),
             theme::DOWN,
         ),
         (
-            "Sharpe",
-            stat("Sharpe Ratio (252 days)"),
-            theme::TEXT_BRIGHT,
+            "Sharpe".into(),
+            number(figures.and_then(|f| f.sharpe)),
+            bright,
         ),
         (
-            "Sortino",
-            stat("Sortino Ratio (252 days)"),
-            theme::TEXT_BRIGHT,
+            "Sortino (252 days)".into(),
+            number(report.stat("Sortino Ratio (252 days)")),
+            bright,
         ),
-        ("Profit factor", stat("Profit Factor"), theme::TEXT_BRIGHT),
-        ("Win rate", win_rate, theme::TEXT_BRIGHT),
-        ("Trades", report.fills.len().to_string(), theme::TEXT_BRIGHT),
         (
-            "Fees",
-            format!("{:.2} {quote}", report.fees),
-            theme::TEXT_BRIGHT,
+            "Profit factor".into(),
+            number(figures.and_then(|f| f.profit_factor)),
+            bright,
         ),
+        (
+            "Win rate".into(),
+            share(figures.and_then(|f| f.win_rate)),
+            bright,
+        ),
+        (
+            "Trades".into(),
+            figures.map_or("—".to_string(), |f| f.trades.to_string()),
+            bright,
+        ),
+        ("Fills".into(), report.fills.len().to_string(), bright),
+        (
+            "In a position".into(),
+            share(figures.map(|f| f.exposure)),
+            bright,
+        ),
+        ("Fees".into(), format!("{:.2} {quote}", report.fees), bright),
     ];
+    match costs {
+        Some(Costs::Done(costs)) => {
+            rows.push((
+                "Before costs".into(),
+                format!("{:+.2}%", costs.gross_return * 100.0),
+                signed(costs.gross_return),
+            ));
+            rows.push((
+                "Costs paid".into(),
+                format!("{:.2} {quote}", costs.costs_paid),
+                bright,
+            ));
+            rows.push((
+                "Break-even a fill".into(),
+                costs
+                    .break_even_bp
+                    .map_or("—".to_string(), |bp| format!("{bp:.1} bp")),
+                bright,
+            ));
+        }
+        Some(Costs::Running) => {
+            rows.push((
+                "Before costs".into(),
+                "working out…".into(),
+                theme::TEXT_MUTED,
+            ));
+        }
+        Some(Costs::NotRun) => rows.push((
+            "Before costs".into(),
+            "not run: it could spend on AI".into(),
+            theme::TEXT_MUTED,
+        )),
+        Some(Costs::Failed(_)) => {
+            rows.push(("Before costs".into(), "couldn't run".into(), theme::DOWN));
+        }
+        Some(Costs::Idle) | None => {}
+    }
+    if let Some(held) = figures.and_then(|f| f.benchmark.as_ref()) {
+        rows.push((
+            "Market return".into(),
+            format!("{:+.2}%", held.return_ * 100.0),
+            signed(held.return_),
+        ));
+        rows.push(("Market Sharpe".into(), number(held.sharpe), bright));
+        rows.push((
+            "Market drawdown".into(),
+            format!("{:.2}%", held.max_drawdown * 100.0),
+            theme::DOWN,
+        ));
+    }
+    for (year, made) in figures.iter().flat_map(|f| &f.by_year) {
+        rows.push((
+            year.to_string(),
+            format!("{:+.2}%", made * 100.0),
+            signed(*made),
+        ));
+    }
     rows.into_iter()
         .map(|(label, value, color)| {
             row![

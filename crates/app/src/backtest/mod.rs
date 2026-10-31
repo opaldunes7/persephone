@@ -31,12 +31,12 @@ use persephone_engine::BacktestReport;
 use persephone_tiling::TileId;
 
 pub use persephone_research::{
-    Field, RunColumn, WARM_UP_BARS, calendar, optimize, robustness,
+    Field, RunColumn, WARM_UP_BARS, calendar, figures, optimize, positions, robustness,
     settings::{
         self, BlockLength, Commission, Edit, FillTiming, OneWay, OptimizeSettings, Precision,
         ScoreBy, Section, SessionRule, Settings, TestKind, Variable, parse_time, time_text,
     },
-    thousands,
+    thousands, walk_forward,
 };
 
 pub use self::view::{PLUGIN_SLOTS, PanelInfo, Status, panel};
@@ -94,6 +94,8 @@ pub struct Tests {
     pub monte_carlo: Option<Result<Arc<robustness::MonteCarlo>, String>>,
     pub blocks: BlockRun,
     pub optimize: OptimizeRun,
+    pub walk_forward: TestRun<walk_forward::WalkForward>,
+    pub random_entries: TestRun<positions::RandomEntries>,
     /// The strategy's parameters before a result was applied, to go back to.
     pub original: Option<Vec<f64>>,
     /// The line picked on a Monte Carlo or Random blocks fan; one past the last for the backtest.
@@ -120,6 +122,8 @@ impl Default for Tests {
             monte_carlo: None,
             blocks: BlockRun::Idle,
             optimize: OptimizeRun::Idle,
+            walk_forward: TestRun::Idle,
+            random_entries: TestRun::Idle,
             original: None,
             line: None,
             zoom: None,
@@ -149,6 +153,44 @@ pub enum OptimizeRun {
     Failed(String),
 }
 
+/// Where a test running as a batch has got.
+#[derive(Debug, Default)]
+pub enum TestRun<T> {
+    #[default]
+    Idle,
+    Running {
+        run: u64,
+        done: usize,
+        total: usize,
+        stop: StopOnDrop,
+    },
+    Done(Arc<T>),
+    Failed(String),
+}
+
+impl<T> TestRun<T> {
+    /// Moves a running batch on, if `run` is still the one running.
+    pub fn progress(&mut self, run: u64, count: usize) {
+        if let Self::Running {
+            run: running, done, ..
+        } = self
+            && *running == run
+        {
+            *done = (*done).max(count);
+        }
+    }
+
+    /// Takes a batch's result, if `run` is still the one running.
+    pub fn finish(&mut self, run: u64, result: Result<Arc<T>, String>) {
+        if matches!(self, Self::Running { run: running, .. } if *running == run) {
+            *self = match result {
+                Ok(found) => Self::Done(found),
+                Err(error) => Self::Failed(error),
+            };
+        }
+    }
+}
+
 /// Where a batch of Random blocks has got.
 #[derive(Debug, Default)]
 pub enum BlockRun {
@@ -171,6 +213,8 @@ impl Tests {
         self.clear_monte_carlo();
         self.blocks = BlockRun::Idle;
         self.optimize = OptimizeRun::Idle;
+        self.walk_forward = TestRun::Idle;
+        self.random_entries = TestRun::Idle;
         self.original = None;
     }
 
@@ -341,6 +385,10 @@ pub enum PanelMessage {
     HoldOut(bool),
     RunOptimize,
     StopOptimize,
+    RunWalkForward,
+    StopWalkForward,
+    RunRandomEntries,
+    StopRandomEntries,
     /// Put this result of the optimization on the strategy, by its place in the results.
     Apply(usize),
     /// Back to the strategy's parameters from before any result was applied.

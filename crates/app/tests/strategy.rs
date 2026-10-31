@@ -1448,6 +1448,127 @@ mod panel {
         assert_eq!(sim.slippage_percent, 0.0);
     }
 
+    /// Delivers everything a task sends back, as the app would.
+    fn deliver(app: &mut Persephone, task: iced::Task<Message>) {
+        use iced_runtime::{Action as Sent, task::into_stream};
+        let Some(mut events) = into_stream(task) else {
+            return;
+        };
+        while let Some(action) =
+            iced::futures::executor::block_on(iced::futures::StreamExt::next(&mut events))
+        {
+            if let Sent::Output(message) = action {
+                let next = app.update(message);
+                deliver(app, next);
+            }
+        }
+    }
+
+    fn shows(app: &Persephone, words: &str) -> bool {
+        let mut ui = iced_test::Simulator::with_size(
+            iced::Settings::default(),
+            Size::new(1400.0, 900.0),
+            app.view(),
+        );
+        ui.find(words).is_ok()
+    }
+
+    #[test]
+    fn the_statistics_show_what_costs_took_and_what_the_market_did() {
+        let mut app = app();
+        set_strategy(&mut app, BuiltInStrategy::EmaCross);
+        finish_backtest(&mut app);
+        let task = app.update(Message::OpenReport(0));
+        deliver(&mut app, task);
+        assert!(!shows(&app, "working out…"));
+        for words in [
+            "Before costs",
+            "Costs paid",
+            "Break-even a fill",
+            "Market return",
+            "Market Sharpe",
+            "Market drawdown",
+            "Trades",
+            "Fills",
+            "In a position",
+        ] {
+            assert!(shows(&app, words), "{words}");
+        }
+    }
+
+    #[test]
+    fn walk_forward_runs_from_the_panel_and_shows_its_windows() {
+        let mut app = ready_panel(TestKind::WalkForward);
+        panel(&mut app, PanelMessage::Input(Field::Windows, "2".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Windows));
+        set_range(&mut app, 0, "5", "8", "3");
+        run_task(&mut app, PanelMessage::RunWalkForward);
+        let persephone::backtest::TestRun::Done(found) = &app.panel().unwrap().tests.walk_forward
+        else {
+            panic!("{:?}", app.panel().unwrap().tests.walk_forward);
+        };
+        assert_eq!(found.windows.len(), 2);
+        assert!(found.windows.iter().all(|window| window.picked.is_some()));
+        assert!(shows(&app, "Unseen"));
+        assert!(shows(&app, "Unseen stretch"));
+    }
+
+    #[test]
+    fn random_entries_runs_from_the_panel_and_shows_how_it_compares() {
+        let mut app = ready_panel(TestKind::RandomEntries);
+        panel(&mut app, PanelMessage::Input(Field::Entries, "8".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Entries));
+        run_task(&mut app, PanelMessage::RunRandomEntries);
+        let persephone::backtest::TestRun::Done(found) = &app.panel().unwrap().tests.random_entries
+        else {
+            panic!("{:?}", app.panel().unwrap().tests.random_entries);
+        };
+        assert_eq!(found.runs, 8);
+        assert!(shows(&app, "As good"));
+    }
+
+    #[test]
+    fn a_list_of_positions_saved_by_lab_runs_on_a_chart() {
+        let dir = results_dir();
+        let mut app = app();
+        let times: Vec<u64> = app
+            .tile_chart(0)
+            .unwrap()
+            .data()
+            .candles
+            .iter()
+            .map(|c| c.ts)
+            .collect();
+        save_result(
+            &dir,
+            "list",
+            serde_json::json!({"positions": [[times[600], 1], [times[700], -1], [times[800], 0]]}),
+            serde_json::Value::Null,
+        );
+        save_result(
+            &dir,
+            "bad",
+            serde_json::json!({"positions": [[times[600] + 1, 1]]}),
+            serde_json::Value::Null,
+        );
+        let _ = app.use_results_dir(dir);
+        let _ = app.update(Message::Key(Action::Backtest));
+        let _ = app.update(Message::Backtest(choice("list")));
+        finish_backtest(&mut app);
+        let Run::Done(report) = run_state(&app) else {
+            panic!("{:?}", run_state(&app));
+        };
+        assert_eq!(report.fills.len(), 3);
+
+        // One that doesn't fit these bars says so.
+        let _ = app.update(Message::Backtest(choice("bad")));
+        finish_backtest(&mut app);
+        let Run::Failed(error) = run_state(&app) else {
+            panic!("{:?}", run_state(&app));
+        };
+        assert!(error.contains("no bar opens at"), "{error}");
+    }
+
     #[test]
     fn filling_at_the_next_open_reaches_the_backtest() {
         use persephone::backtest::FillTiming;

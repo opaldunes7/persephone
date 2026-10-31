@@ -199,8 +199,8 @@ an error.
 | `session` | When positions may open: `days` from Monday, `from` and `to` in minutes after midnight, `zone` as `UTC`, `-05:00` or `America/New_York`, and `close_after` to close when it ends. Outside it a signal can close a position, but not open or reverse one. An end before its start runs overnight, and equal times are all day |
 | `precision` | `"standard"`, or `"high"` to fill on ticks or 1-minute bars. Slower |
 
-The panel's own choices, `test`, `runs`, `ruin`, `blocks`, `block_length`, `optimize`, `plugins` and
-`stock_open`, are accepted and ignored here. Tests take their own arguments instead.
+The panel's own choices, `test`, `runs`, `ruin`, `blocks`, `block_length`, `windows`, `entries`, `optimize`,
+`plugins` and `stock_open`, are accepted and ignored here. Tests take their own arguments instead.
 
 ## units
 

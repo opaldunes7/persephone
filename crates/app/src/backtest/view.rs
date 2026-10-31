@@ -14,8 +14,10 @@ use persephone_engine::BacktestReport;
 use super::{
     BlockLength, BlockRun, Commission, Edit, Field, FillTiming, NO_VARIABLE, OneWay, OptimizeRun,
     Panel, PanelMessage, Precision, RunColumn, ScoreBy, Settings, StrategyChoice, TestKind,
+    TestRun,
     calendar::{Calendar, Level, Total, days_in_month, weeks},
     optimize::{OptimizeResult, Outcome},
+    positions::ONE_TRADE,
     progress,
     robustness::Problem,
     robustness::{
@@ -23,6 +25,7 @@ use super::{
         round_trips, sort_rows, summarize_run,
     },
     speed_text,
+    walk_forward::WalkForward,
     widgets::heat,
     widgets::{
         Edge, Equity, Fan, Glyph, HeatScale, Icon, Landscape, RunsTable, Span, Speed, percent,
@@ -92,6 +95,8 @@ pub struct PanelInfo<'a> {
     pub bar_nanos: UnixNanos,
     /// How orders fill, when worth saying.
     pub fills: Option<String>,
+    /// How the finished run compares: with no costs, and with the market.
+    pub summary: Option<String>,
     /// The strategies to pick from, and the chart's own.
     pub strategies: Vec<StrategyChoice>,
     pub strategy: Option<StrategyChoice>,
@@ -200,7 +205,7 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                     "Drawdown: the deepest fall from a peak in equity so far.",
                 ))
                 .push(figure(
-                    "Trades",
+                    "Fills",
                     now.trades.to_string(),
                     theme::TEXT,
                     "How many orders have filled so far.",
@@ -211,6 +216,9 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                     theme::TEXT,
                     "What the account is worth by this point: cash plus the open position at the last close.",
                 ));
+            if note.is_none() {
+                note = info.summary.clone().map(muted);
+            }
             let view = panel.calendar;
             heading = heading.push(
                 row![
@@ -345,6 +353,121 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
             Some(Err(_)) => Space::new().width(Fill).height(Fill).into(),
             None => {
                 note = Some(muted("Drawing the trades…".into()));
+                Space::new().width(Fill).height(Fill).into()
+            }
+        },
+        (status, TestKind::WalkForward) if !matches!(status, Status::NoStrategy) => {
+            match &panel.tests.walk_forward {
+                TestRun::Done(found) => {
+                    heading = heading
+                        .push(figure(
+                            "Unseen",
+                            percent(found.unseen_return),
+                            up_or_down(found.unseen_return),
+                            "What the unseen stretches returned, added up. This is the figure to trust: none of it was used to pick the values.",
+                        ))
+                        .push(figure(
+                            "Market",
+                            percent(found.buy_and_hold_return),
+                            up_or_down(found.buy_and_hold_return),
+                            "What the market did over the same stretches, added up.",
+                        ))
+                        .push(figure(
+                            "Profitable",
+                            format!("{} of {}", found.profitable_windows, found.windows.len()),
+                            theme::TEXT,
+                            "How many unseen stretches made money.",
+                        ))
+                        .push(figure(
+                            "Worst fall",
+                            format!("{:.1}%", found.deepest_fall * 100.0),
+                            theme::TEXT,
+                            "The deepest fall from a peak in any unseen stretch.",
+                        ));
+                    note = Some(muted(format!(
+                        "Each window picks on {} bars, then is tested on the next {}. Each starts from the same capital.",
+                        found.train_bars, found.test_bars,
+                    )));
+                    walk_forward_table(found)
+                }
+                TestRun::Running { done, total, .. } => {
+                    note = Some(muted(format!("Running backtest {done} of {total}…")));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+                TestRun::Failed(message) => {
+                    note = Some(
+                        text(message.as_str())
+                            .size(theme::TEXT_SIZE)
+                            .color(theme::DOWN),
+                    );
+                    Space::new().width(Fill).height(Fill).into()
+                }
+                TestRun::Idle => {
+                    if info.problem.is_none() {
+                        note = Some(muted(
+                            "Pick a variable and its range, then press Run.".to_owned(),
+                        ));
+                    }
+                    Space::new().width(Fill).height(Fill).into()
+                }
+            }
+        }
+        (Status::Done(_), TestKind::RandomEntries) => match &panel.tests.random_entries {
+            TestRun::Done(found) => {
+                heading = heading
+                    .push(figure(
+                        "Backtest",
+                        percent(found.actual_return),
+                        up_or_down(found.actual_return),
+                        "What the backtest itself returned.",
+                    ))
+                    .push(figure(
+                        "Median",
+                        percent(found.median),
+                        up_or_down(found.median),
+                        "The return half the random placings beat.",
+                    ))
+                    .push(figure(
+                        "As good",
+                        format!("{:.0}%", found.share_matching_return * 100.0),
+                        theme::TEXT,
+                        "The share of random placings that returned at least as much. Near 50% means the entries add nothing.",
+                    ))
+                    .push(figure(
+                        "As safe",
+                        format!("{:.0}%", found.share_matching_fall * 100.0),
+                        theme::TEXT,
+                        "The share of random placings that fell no further than the backtest did.",
+                    ));
+                note = Some(if found.trades < 2 {
+                    text(ONE_TRADE).size(theme::TEXT_SIZE).color(theme::DOWN)
+                } else {
+                    muted(format!(
+                        "{} trades placed at random {} times, holding each as long. 19 in 20 returned between {} and {}.",
+                        found.trades,
+                        found.runs,
+                        percent(found.low),
+                        percent(found.high),
+                    ))
+                });
+                Space::new().width(Fill).height(Fill).into()
+            }
+            TestRun::Running { done, total, .. } => {
+                note = Some(muted(format!("Running backtest {done} of {total}…")));
+                Space::new().width(Fill).height(Fill).into()
+            }
+            TestRun::Failed(message) => {
+                note = Some(
+                    text(message.as_str())
+                        .size(theme::TEXT_SIZE)
+                        .color(theme::DOWN),
+                );
+                Space::new().width(Fill).height(Fill).into()
+            }
+            TestRun::Idle => {
+                note = Some(muted(
+                    "Press Run to place this backtest's trades at random.".to_owned(),
+                ));
                 Space::new().width(Fill).height(Fill).into()
             }
         },
@@ -725,6 +848,61 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
 }
 
 /// A button showing a drawn icon, naming itself (and its shortcut) when hovered.
+/// Each window of a walk-forward: what it picked, and how that did on what it hadn't seen.
+fn walk_forward_table(found: &WalkForward) -> Element<'_, PanelMessage> {
+    let day = |ts: UnixNanos| DateTime::from_nanos(ts).date();
+    let cell = |value: String, width: f32, color: Color| {
+        text(value)
+            .size(SMALL)
+            .width(width)
+            .color(color)
+            .font(iced::Font::MONOSPACE)
+    };
+    let mut rows = column![row![
+        cell("Unseen stretch".into(), 190.0, theme::TEXT_MUTED),
+        cell("Picked".into(), 170.0, theme::TEXT_MUTED),
+        cell("Return".into(), 80.0, theme::TEXT_MUTED),
+        cell("Market".into(), 80.0, theme::TEXT_MUTED),
+        cell("Fell".into(), 70.0, theme::TEXT_MUTED),
+        cell("Trades".into(), 60.0, theme::TEXT_MUTED),
+    ]]
+    .spacing(3);
+    for window in &found.windows {
+        let stretch = format!("{} to {}", day(window.test_from), day(window.test_to));
+        rows = rows.push(match &window.picked {
+            Some(picked) => {
+                let color = if picked.unseen_return >= 0.0 {
+                    theme::UP
+                } else {
+                    theme::DOWN
+                };
+                row![
+                    cell(stretch, 190.0, theme::TEXT),
+                    cell(picked.label.clone(), 170.0, theme::TEXT),
+                    cell(percent(picked.unseen_return), 80.0, color),
+                    cell(percent(picked.buy_and_hold_return), 80.0, theme::TEXT),
+                    cell(format!("{:.1}%", picked.fell * 100.0), 70.0, theme::TEXT),
+                    cell(picked.trades.to_string(), 60.0, theme::TEXT),
+                ]
+            }
+            None => row![
+                cell(stretch, 190.0, theme::TEXT),
+                cell("nothing traded".into(), 170.0, theme::TEXT_MUTED),
+            ],
+        });
+    }
+    // Below the legend, which sits over the top of the pane.
+    iced::widget::scrollable(rows.padding(Padding {
+        top: 84.0,
+        right: 12.0,
+        bottom: 8.0,
+        left: 12.0,
+    }))
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
 fn icon_button<'a>(
     glyph: Glyph,
     what: &'a str,

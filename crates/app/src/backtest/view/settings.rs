@@ -130,9 +130,9 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
     let tests = row![
         name(
             "Test",
-            "How to test the strategy. One backtest can't tell skill from luck; the other two show how far its result could have gone either way.",
+            "How to test the strategy. One backtest can't tell skill from luck; the others show how far its result could have gone either way, and whether it beats chance.",
         ),
-        container(
+        container(column![
             row![
                 chip_button(
                     "Backtest",
@@ -159,8 +159,25 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                     "Tries a range of one or two of the strategy's variables and shows which values do best and how steady they are.",
                 ),
             ]
-            .spacing(2)
-        )
+            .spacing(2),
+            row![
+                chip_button(
+                    "Walk-forward",
+                    settings.test == TestKind::WalkForward,
+                    PanelMessage::Test(TestKind::WalkForward),
+                    "Optimizes on a stretch, tries the best values on the unseen stretch after it, and slides along. The fairest test of whether optimizing helps.",
+                ),
+                chip_button(
+                    "Random entries",
+                    settings.test == TestKind::RandomEntries,
+                    PanelMessage::Test(TestKind::RandomEntries),
+                    "Places the backtest's trades at random times many times over, keeping how long each was held. If that does as well, the entries are worth nothing.",
+                ),
+            ]
+            .spacing(2),
+        ]
+        .spacing(2)
+        .align_x(Alignment::End))
         .align_right(Fill),
     ]
     .spacing(7)
@@ -292,7 +309,44 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                     .into(),
             )
         }
-        TestKind::Optimize => {
+        TestKind::RandomEntries => {
+            let run = match &panel.tests.random_entries {
+                TestRun::Running { .. } => action(
+                    "Cancel",
+                    false,
+                    Some(PanelMessage::StopRandomEntries),
+                    "Stop these runs; what they've found so far is dropped.".to_owned(),
+                ),
+                TestRun::Done(_) => action(
+                    "Run again",
+                    false,
+                    can_run.then_some(PanelMessage::RunAgain),
+                    run_or("Place them at other random times. Otherwise the same inputs give the same results."),
+                ),
+                _ => action(
+                    "Run",
+                    true,
+                    can_run.then_some(PanelMessage::RunRandomEntries),
+                    run_or("Backtest the same holds at random times, that many times over."),
+                ),
+            };
+            Some(
+                row![
+                    boxed(
+                        "Runs",
+                        Field::Entries,
+                        "",
+                        "How many times to place the trades at random. Press Enter to apply.",
+                    ),
+                    container(run).align_right(Fill),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .into(),
+            )
+        }
+        TestKind::Optimize | TestKind::WalkForward => {
+            let walking = settings.test == TestKind::WalkForward;
             let chosen = &settings.optimize;
             let small = |label: &'a str, field: Field, what: &'a str| {
                 tip(
@@ -348,7 +402,15 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                 line
             };
             let score = tip_at(
-                pick_list(ScoreBy::ALL, Some(chosen.score), PanelMessage::ScoreBy)
+                pick_list(
+                    if walking {
+                        &ScoreBy::ALL[..2]
+                    } else {
+                        &ScoreBy::ALL[..]
+                    },
+                    Some(chosen.score),
+                    PanelMessage::ScoreBy,
+                )
                     .text_size(SMALL)
                     .padding([3, 6])
                     .width(128)
@@ -375,7 +437,26 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                 "Pick values on the span's first 70%, then show how the top 5 did on the last 30%. A value that only fit the past usually falls apart there.",
                 None,
             );
-            let run = match &panel.tests.optimize {
+            let run = match &panel.tests.walk_forward {
+                TestRun::Running { .. } if walking => action(
+                    "Cancel",
+                    false,
+                    Some(PanelMessage::StopWalkForward),
+                    "Stop this walk-forward; what it has found so far is dropped.".to_owned(),
+                ),
+                TestRun::Done(_) if walking => action(
+                    "Run again",
+                    false,
+                    can_run.then_some(PanelMessage::RunAgain),
+                    run_or("Run it again with new random numbers."),
+                ),
+                _ if walking => action(
+                    "Run",
+                    true,
+                    can_run.then_some(PanelMessage::RunWalkForward),
+                    run_or("Optimize and test each window in turn. Orders fill on the chart's bars."),
+                ),
+                _ => match &panel.tests.optimize {
                 OptimizeRun::Running { .. } => action(
                     "Cancel",
                     false,
@@ -396,16 +477,26 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                     run_or("Backtest every value in the range. Orders fill on the chart's bars.",
                     ),
                 ),
+                },
+            };
+            let extra: Element<'a, PanelMessage> = if walking {
+                small(
+                    "Windows",
+                    Field::Windows,
+                    "How many times to slide along: each picks on a stretch three times the length of the unseen one after it.",
+                )
+            } else {
+                keep
             };
             let mut rows = column![
                 variable_row(0),
                 variable_row(1),
-                row![score, keep, container(run).align_right(Fill)]
+                row![score, extra, container(run).align_right(Fill)]
                     .spacing(8)
                     .align_y(Alignment::Center),
             ]
             .spacing(5);
-            if chosen.score == ScoreBy::RandomBlocks {
+            if chosen.score == ScoreBy::RandomBlocks && !walking {
                 rows = rows.push(
                     row![blocks_box(), lengths()]
                         .spacing(10)

@@ -1910,13 +1910,20 @@ fn a_backtest_worked_out_by_hand_comes_to_the_same() {
         )
         .unwrap_err();
     assert!(error.contains("no bar opens at"), "{error}");
-    let refused = lab
-        .dispatch(
-            "save_result",
-            &json!({"name": "List", "strategy": {"positions": [[times[3], 1]]}}),
-        )
-        .unwrap_err();
-    assert!(refused.contains("only fits"), "{refused}");
+
+    // A list saved for the app's charts is written out, in case it came from a file.
+    let file = lab.paths.lab().join("list.json");
+    fs::write(&file, json!([[times[3], 1]]).to_string()).unwrap();
+    lab.dispatch(
+        "save_result",
+        &json!({"name": "List", "strategy": {"positions": file}}),
+    )
+    .unwrap();
+    let saved = lab.dispatch("list_results", &json!({})).unwrap();
+    assert_eq!(
+        saved["results"][0]["strategy"]["positions"][0][1], 1,
+        "{saved}"
+    );
 }
 
 #[test]

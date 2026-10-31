@@ -17,6 +17,7 @@ use persephone_ml::models::Tensor;
 use persephone_plugin_host::Plugin;
 use persephone_research::{
     logic,
+    positions::Positions,
     results::{SavedResult, load_results, results_dir},
 };
 use serde_json::{Value, json};
@@ -530,12 +531,11 @@ impl Lab {
     }
 
     pub(crate) fn save_result(&self, args: &Value) -> Result<Value, String> {
-        let strategy = args.get("strategy").cloned().unwrap_or(Value::Null);
+        let mut strategy = args.get("strategy").cloned().unwrap_or(Value::Null);
         self.resolve(&strategy)?;
-        if strategy.get("positions").is_some() {
-            return Err(
-                "`strategy`: a list of positions only fits the bars it was made for, so it can't be saved for the app's charts".into(),
-            );
+        // Written out, as a file it names may not be there when the app reads this.
+        if let Some(list) = strategy.get("positions") {
+            strategy["positions"] = Positions::parse(list)?.to_json();
         }
         let settings = args.get("settings").map(read_settings).transpose()?;
         let summary = match args.get("run_id").and_then(Value::as_str) {

@@ -2,6 +2,7 @@
 //! settings, loading markets, and the tests beyond a backtest.
 
 pub mod calendar;
+pub mod figures;
 pub mod logic;
 pub mod market;
 pub mod optimize;
@@ -9,6 +10,7 @@ pub mod positions;
 pub mod results;
 pub mod robustness;
 pub mod settings;
+pub mod walk_forward;
 
 use self::settings::TestKind;
 
@@ -54,6 +56,10 @@ pub enum Field {
     Runs,
     Ruin,
     Blocks,
+    /// How many windows a walk-forward makes.
+    Windows,
+    /// How many times Random entries places the trades.
+    Entries,
     /// An Optimize variable's range: the first variable or the second.
     Min(usize),
     Max(usize),
@@ -68,7 +74,8 @@ impl Field {
             TestKind::Backtest => false,
             TestKind::MonteCarlo => matches!(self, Self::Runs | Self::Ruin),
             TestKind::RandomBlocks => matches!(self, Self::Blocks),
-            TestKind::Optimize => self.belongs_to_tests(),
+            TestKind::Optimize | TestKind::WalkForward => self.belongs_to_tests(),
+            TestKind::RandomEntries => matches!(self, Self::Entries),
         }
     }
 
@@ -77,7 +84,14 @@ impl Field {
     pub const fn belongs_to_tests(self) -> bool {
         matches!(
             self,
-            Self::Runs | Self::Ruin | Self::Blocks | Self::Min(_) | Self::Max(_) | Self::Step(_)
+            Self::Runs
+                | Self::Ruin
+                | Self::Blocks
+                | Self::Windows
+                | Self::Entries
+                | Self::Min(_)
+                | Self::Max(_)
+                | Self::Step(_)
         )
     }
 }

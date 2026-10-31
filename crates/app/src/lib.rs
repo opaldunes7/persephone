@@ -51,7 +51,7 @@ use persephone_chart::{
 use persephone_core::{
     BarSpec, Candle, InstrumentSpec, Timeframe, UnixNanos,
     indicator::{IndicatorKind, IndicatorSpec},
-    signal::SignalFactory,
+    signal::{Note, Signal, SignalFactory},
     strategy::{StrategyKind, StrategySpec},
     tick::{TickFeed, TickKind},
 };
@@ -66,7 +66,9 @@ use persephone_engine::{
 };
 use persephone_plugin_host::{Host, Plugins, StrategyPlugin};
 use persephone_research::{
+    figures::{self, Friction, RunFigures},
     logic::Logic,
+    positions::Positions,
     results::{SavedResult, StrategyRef, load_results, with_params},
 };
 use persephone_tiling::{Layout, Rect, TileId};
@@ -172,11 +174,26 @@ pub enum Run {
     Failed(String),
 }
 
+/// What costs did to a finished run. It takes a second backtest with costs off, so that only runs
+/// when someone's looking, and never for a strategy that could spend money doing it.
+#[derive(Clone, Debug, Default)]
+pub enum Costs {
+    #[default]
+    Idle,
+    Running,
+    Done(Friction),
+    Failed(String),
+    /// The strategy asks AI models, so a second run could cost real money.
+    NotRun,
+}
+
 struct Strategy {
     spec: StrategySpec,
     run: Run,
-    /// The finished run's, kept as the chart's corner shows it on every redraw.
-    win_rate: Option<f64>,
+    /// The finished run's figures, kept as the chart's corner shows them on every redraw.
+    figures: Option<RunFigures>,
+    /// What costs did to it, from a second run made once it's being looked at.
+    costs: Costs,
     /// Bumped on every new run so results from older runs are dropped.
     generation: u64,
 }
@@ -278,6 +295,8 @@ pub struct Persephone {
     results_dir: Option<PathBuf>,
     lab_results: Vec<SavedResult>,
     lab_logic: HashMap<String, Arc<Logic>>,
+    /// Lists of positions Lab has saved, by the same kind of name.
+    lab_positions: HashMap<String, Positions>,
     /// What's loaded from `plugin_dir`.
     plugins: Arc<Plugins>,
     /// A reload is already on its way.
@@ -359,6 +378,15 @@ pub enum Message {
     /// This many of an optimization's backtests are done: run, count.
     OptimizeProgress(u64, usize),
     OptimizeDone(u64, Result<Arc<backtest::optimize::OptimizeResult>, String>),
+    WalkForwardProgress(u64, usize),
+    WalkForwardDone(
+        u64,
+        Result<Arc<backtest::walk_forward::WalkForward>, String>,
+    ),
+    RandomEntriesProgress(u64, usize),
+    RandomEntriesDone(u64, Result<Arc<backtest::positions::RandomEntries>, String>),
+    /// What costs did to a run: tile, the run it's about, and the outcome.
+    CostsDone(TileId, u64, Result<Friction, String>),
     /// 1-minute bars for a market's span, for High precision.
     FineLoaded(Market, Result<Arc<Vec<Candle>>, String>),
     /// A market's whole history, for the backtest panel's span: tile, (venue, symbol), result.
@@ -442,6 +470,7 @@ impl Persephone {
             results_dir: None,
             lab_results: Vec::new(),
             lab_logic: HashMap::new(),
+            lab_positions: HashMap::new(),
             plugins: Arc::default(),
             reloading: false,
             store: Store::default_root().map(Store::new),
@@ -529,6 +558,7 @@ impl Persephone {
             results_dir: None,
             lab_results: Vec::new(),
             lab_logic: HashMap::new(),
+            lab_positions: HashMap::new(),
             plugins: Arc::default(),
             reloading: false,
             store: None,
@@ -818,6 +848,18 @@ impl Persephone {
                     self.lab_logic
                         .get(id)
                         .map(|logic| Arc::clone(logic) as Arc<dyn SignalFactory>)
+                })
+                .or_else(|| {
+                    self.lab_positions.get(id).map(|list| {
+                        // Given by when bars open, and heard by when they close.
+                        let candles = &market.data.candles;
+                        let opens: Vec<u64> = candles.iter().map(|c| c.ts).collect();
+                        let closes = tile.market.bars.closes(candles);
+                        match list.at_closes(&opens, &closes) {
+                            Ok(list) => Arc::new(list) as Arc<dyn SignalFactory>,
+                            Err(error) => Arc::new(CantRun(error)),
+                        }
+                    })
                 }),
             StrategyKind::BuiltIn(_) => None,
         };
@@ -998,8 +1040,12 @@ impl Persephone {
             Message::OpenReport(id) => {
                 let open = matches!(&self.popup, Some(Popup::Report { tile, .. }) if *tile == id);
                 self.popup = if open { None } else { self.report_popup(id) };
+                if !open {
+                    return self.run_costs(id);
+                }
             }
-            Message::BacktestDone(id, generation, result) => {
+            Message::BacktestDone(id, generation, mut result) => {
+                let figures = self.finish_report(id, &mut result);
                 // The chart may be on another workspace by now; it's redrawn when it's back.
                 let on_screen = self.tiles.contains_key(&id);
                 let tile = if on_screen {
@@ -1011,10 +1057,8 @@ impl Persephone {
                     .and_then(|t| t.strategy.as_mut())
                     .filter(|s| s.generation == generation)
                 {
-                    strategy.win_rate = result
-                        .as_ref()
-                        .ok()
-                        .and_then(|report| backtest::robustness::win_rate(report));
+                    strategy.figures = figures;
+                    strategy.costs = Costs::Idle;
                     strategy.run = match result {
                         Ok(report) => Run::Done(report),
                         Err(error) => Run::Failed(error),
@@ -1025,7 +1069,11 @@ impl Persephone {
                     if let Some(panel) = self.panel.as_mut().filter(|p| p.tile == id) {
                         panel.tests.clear_monte_carlo();
                         self.refresh_variables(id);
-                        return Task::batch([self.draw_monte_carlo(), self.auto_run_blocks()]);
+                        return Task::batch([
+                            self.draw_monte_carlo(),
+                            self.auto_run_blocks(),
+                            self.run_costs(id),
+                        ]);
                     }
                 }
             }
@@ -1060,6 +1108,41 @@ impl Persephone {
                         Ok(summary) => backtest::BlockRun::Done(summary),
                         Err(error) => backtest::BlockRun::Failed(error),
                     };
+                }
+            }
+            Message::CostsDone(id, generation, result) => {
+                let tile = match self.tiles.get_mut(&id) {
+                    Some(tile) => Some(tile),
+                    None => self.stash.values_mut().find_map(|w| w.tiles.get_mut(&id)),
+                };
+                if let Some(strategy) = tile
+                    .and_then(|t| t.strategy.as_mut())
+                    .filter(|s| s.generation == generation)
+                {
+                    strategy.costs = match result {
+                        Ok(friction) => Costs::Done(friction),
+                        Err(error) => Costs::Failed(error),
+                    };
+                }
+            }
+            Message::WalkForwardProgress(run, count) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.walk_forward.progress(run, count);
+                }
+            }
+            Message::WalkForwardDone(run, result) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.walk_forward.finish(run, result);
+                }
+            }
+            Message::RandomEntriesProgress(run, count) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.random_entries.progress(run, count);
+                }
+            }
+            Message::RandomEntriesDone(run, result) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.random_entries.finish(run, result);
                 }
             }
             Message::OptimizeProgress(run, count) => {
@@ -2295,7 +2378,8 @@ impl Persephone {
             tile.strategy = Some(Strategy {
                 spec,
                 run: Run::Waiting,
-                win_rate: None,
+                figures: None,
+                costs: Costs::Idle,
                 generation,
             });
             tile.live = None;
@@ -2367,10 +2451,17 @@ impl Persephone {
         };
         self.lab_results = load_results(dir);
         self.lab_logic.clear();
+        self.lab_positions.clear();
         for result in &self.lab_results {
-            if let Ok(StrategyRef::Logic(logic)) = StrategyRef::parse(&result.strategy) {
-                self.lab_logic
-                    .insert(format!("{LAB_PREFIX}{}", result.id), Arc::new(*logic));
+            let name = format!("{LAB_PREFIX}{}", result.id);
+            match StrategyRef::parse(&result.strategy) {
+                Ok(StrategyRef::Logic(logic)) => {
+                    self.lab_logic.insert(name, Arc::new(*logic));
+                }
+                Ok(StrategyRef::Positions(list)) => {
+                    self.lab_positions.insert(name, list);
+                }
+                _ => {}
             }
         }
         let waiting: Vec<(TileId, StrategySpec)> = self
@@ -2381,8 +2472,11 @@ impl Persephone {
                 let StrategyKind::Plugin(plugin) = &strategy.spec.kind else {
                     return None;
                 };
-                let logic = self.lab_logic.get(plugin)?;
-                let info = Arc::new(logic.info());
+                let info = match self.lab_logic.get(plugin) {
+                    Some(logic) => logic.info(),
+                    None => self.lab_positions.get(plugin)?.info(),
+                };
+                let info = Arc::new(info);
                 (strategy.spec.info != info).then(|| {
                     (
                         id,
@@ -2438,8 +2532,8 @@ impl Persephone {
             Ok(StrategyRef::Logic(logic)) => {
                 with_params(kind, Arc::new(logic.info()), &saved.strategy)
             }
-            Ok(StrategyRef::Positions(_)) => {
-                Err("a list of positions only fits the bars it was made for".into())
+            Ok(StrategyRef::Positions(list)) => {
+                with_params(kind, Arc::new(list.info()), &saved.strategy)
             }
             Err(error) => Err(error),
         };
@@ -2501,7 +2595,8 @@ impl Persephone {
                 strategy: strategy.map(|spec| Strategy {
                     spec,
                     run: Run::Waiting,
-                    win_rate: None,
+                    figures: None,
+                    costs: Costs::Idle,
                     generation: 0,
                 }),
                 chart: None,
@@ -2642,6 +2737,7 @@ impl Persephone {
             self.load_history(id),
             self.draw_monte_carlo(),
             self.auto_run_blocks(),
+            self.run_costs(id),
         ])
     }
 
@@ -2704,7 +2800,10 @@ impl Persephone {
         let Some(Bars::Ready(market)) = self.bars.get(&tile.market) else {
             return Some(robustness::Problem::new("Waiting for the chart's bars."));
         };
-        if settings.test == TestKind::MonteCarlo {
+        if matches!(
+            settings.test,
+            TestKind::MonteCarlo | TestKind::RandomEntries
+        ) {
             return None;
         }
         if self
@@ -2720,6 +2819,33 @@ impl Persephone {
         let mut end = candles.len();
         let mut blocks = settings.test == TestKind::RandomBlocks;
         let mut share = 1.0;
+        if settings.test == TestKind::WalkForward {
+            let chosen = &settings.optimize;
+            if chosen.score == ScoreBy::RandomBlocks {
+                return Some(robustness::Problem::new(
+                    "Walk-forward scores by a backtest or Monte Carlo. Pick one of those.",
+                ));
+            }
+            let grid = match optimize::Grid::build(chosen, &strategy.spec.info.params) {
+                Ok(grid) => grid,
+                Err(error) => return Some(robustness::Problem::new(error)),
+            };
+            let total = settings.windows as usize * (grid.cells() + 1);
+            if total > optimize::MAX_BACKTESTS {
+                return Some(robustness::Problem::new(format!(
+                    "That's {total} backtests, more than the {} allowed. Use a larger Step, fewer \
+                     windows, or one variable.",
+                    optimize::MAX_BACKTESTS
+                )));
+            }
+            return backtest::walk_forward::stretches(
+                end.saturating_sub(from),
+                settings.windows as usize,
+                backtest::walk_forward::RATIO,
+            )
+            .err()
+            .map(robustness::Problem::new);
+        }
         if settings.test == TestKind::Optimize {
             let chosen = &settings.optimize;
             let grid = match optimize::Grid::build(chosen, &strategy.spec.info.params) {
@@ -2950,6 +3076,200 @@ impl Persephone {
             stop: backtest::StopOnDrop(stop),
         };
         Some((run, job))
+    }
+
+    /// Sets a walk-forward going on the panel, unless there's a reason not to.
+    fn start_walk_forward(&mut self) -> Option<(u64, backtest::walk_forward::WalkForwardJob)> {
+        use backtest::{TestRun, optimize, walk_forward};
+        let id = self.panel.as_ref()?.tile;
+        if self.tiles.get(&id)?.backtest.test != backtest::TestKind::WalkForward {
+            return None;
+        }
+        if let Some(problem) = self.test_problem(id) {
+            self.panel.as_mut()?.tests.walk_forward = TestRun::Failed(problem.message);
+            return None;
+        }
+        let (_, mut request) = self.backtest_request(id)?;
+        let workers = self.test_workers(&request.strategy);
+        let tile = self.tiles.get(&id)?;
+        let panel = self.panel.as_mut()?;
+        let settings = &tile.backtest;
+        let chosen = &settings.optimize;
+        let grid = optimize::Grid::build(chosen, &request.strategy.info.params).ok()?;
+        let candles = std::mem::take(&mut request.candles);
+        let from = span_start(&candles, tile.market.span);
+        // On the chart's bars whatever the precision, to keep a batch quick.
+        request.ticks = None;
+        request.fill_bars = None;
+        let run = backtest::next_run();
+        let stop = Arc::new(AtomicBool::new(false));
+        let job = walk_forward::WalkForwardJob {
+            request,
+            candles,
+            from,
+            grid,
+            score: chosen.score,
+            windows: settings.windows as usize,
+            ratio: walk_forward::RATIO,
+            warm_up: backtest::WARM_UP_BARS as usize,
+            runs: settings.runs,
+            ruin_at: settings.ruin / 100.0,
+            seed: panel.tests.seed,
+            workers,
+            stop: Arc::clone(&stop),
+        };
+        panel.tests.walk_forward = TestRun::Running {
+            run,
+            done: 0,
+            total: job.total(),
+            stop: backtest::StopOnDrop(stop),
+        };
+        Some((run, job))
+    }
+
+    fn run_walk_forward(&mut self) -> Task<Message> {
+        let Some((run, job)) = self.start_walk_forward() else {
+            return Task::none();
+        };
+        batch_task(
+            run,
+            move |progress| job.run(&|count| progress(count)),
+            Message::WalkForwardProgress,
+            Message::WalkForwardDone,
+        )
+    }
+
+    /// Sets Random entries going on the panel, once there's a backtest to take its trades from.
+    fn start_random_entries(&mut self) -> Option<(u64, backtest::positions::RandomEntriesJob)> {
+        use backtest::TestRun;
+        let id = self.panel.as_ref()?.tile;
+        let tile = self.tiles.get(&id)?;
+        if tile.backtest.test != backtest::TestKind::RandomEntries {
+            return None;
+        }
+        let Run::Done(report) = &tile.strategy.as_ref()?.run else {
+            self.panel.as_mut()?.tests.random_entries =
+                TestRun::Failed("Waiting for the backtest.".into());
+            return None;
+        };
+        let report = Arc::clone(report);
+        let runs = tile.backtest.entries as usize;
+        let span = tile.market.span;
+        let (_, request) = self.backtest_request(id)?;
+        let workers = self.test_workers(&request.strategy);
+        let from_index = span_start(&request.candles, span);
+        let panel = self.panel.as_mut()?;
+        let run = backtest::next_run();
+        let stop = Arc::new(AtomicBool::new(false));
+        let job = backtest::positions::RandomEntriesJob {
+            report,
+            request,
+            from_index,
+            runs,
+            seed: panel.tests.seed,
+            workers,
+            stop: Arc::clone(&stop),
+        };
+        panel.tests.random_entries = TestRun::Running {
+            run,
+            done: 0,
+            total: runs,
+            stop: backtest::StopOnDrop(stop),
+        };
+        Some((run, job))
+    }
+
+    fn run_random_entries(&mut self) -> Task<Message> {
+        let Some((run, job)) = self.start_random_entries() else {
+            return Task::none();
+        };
+        batch_task(
+            run,
+            move |progress| job.run(&|count| progress(count)),
+            Message::RandomEntriesProgress,
+            Message::RandomEntriesDone,
+        )
+    }
+
+    /// A finished run's figures, and any warning only the app can give, as it knows the tree.
+    fn finish_report(
+        &self,
+        id: TileId,
+        result: &mut Result<Arc<BacktestReport>, String>,
+    ) -> Option<RunFigures> {
+        let tile = self
+            .tiles
+            .get(&id)
+            .or_else(|| self.stash.values().find_map(|w| w.tiles.get(&id)))?;
+        let Some(Bars::Ready(market)) = self.bars.get(&tile.market) else {
+            return None;
+        };
+        let report = result.as_mut().ok()?;
+        let candles = &market.data.candles;
+        let from_index = span_start(candles, tile.market.span);
+        if let Some(strategy) = &tile.strategy
+            && let StrategyKind::Plugin(plugin) = &strategy.spec.kind
+            && let Some(logic) = self.lab_logic.get(plugin)
+            && let Some(warning) = figures::look_back_warning(
+                logic.look_back(strategy.spec.own_params()),
+                from_index,
+                candles.len(),
+            )
+            && let Some(report) = Arc::get_mut(report)
+        {
+            report.notes.push(Note {
+                text: warning,
+                warning: true,
+            });
+        }
+        let bars: Vec<(u64, f64)> = candles.iter().map(|c| (c.ts, c.close)).collect();
+        Some(RunFigures::of(report, from_index, &bars))
+    }
+
+    /// Works out what costs did to tile `id`'s finished run, if that isn't known yet.
+    fn run_costs(&mut self, id: TileId) -> Task<Message> {
+        let Some(strategy) = self.tiles.get(&id).and_then(|t| t.strategy.as_ref()) else {
+            return Task::none();
+        };
+        let Run::Done(report) = &strategy.run else {
+            return Task::none();
+        };
+        if !matches!(strategy.costs, Costs::Idle) {
+            return Task::none();
+        }
+        let report = Arc::clone(report);
+        let spends = self
+            .strategy_plugin(&strategy.spec)
+            .is_some_and(|p| p.uses_ai);
+        let request = self.backtest_request(id);
+        let set = |lab: &mut Self, costs: Costs| {
+            if let Some(strategy) = lab.tiles.get_mut(&id).and_then(|t| t.strategy.as_mut()) {
+                strategy.costs = costs;
+            }
+        };
+        if spends {
+            set(self, Costs::NotRun);
+            return Task::none();
+        }
+        let Some((generation, request)) = request else {
+            return Task::none();
+        };
+        let (sim, precision) = (request.sim, request.instrument.price_precision);
+        if !figures::costs_something(&request) {
+            let friction = figures::friction(&report, &report, &sim, precision);
+            set(self, Costs::Done(friction));
+            return Task::none();
+        }
+        set(self, Costs::Running);
+        let free = figures::without_costs(&request);
+        Task::perform(
+            async move {
+                backtest_on_thread(free)
+                    .await
+                    .map(|free| figures::friction(&report, &free, &sim, precision))
+            },
+            move |result| Message::CostsDone(id, generation, result),
+        )
     }
 
     /// Makes sure Optimize's variables are ones tile `id`'s strategy has, with the first always
@@ -3464,6 +3784,8 @@ impl Persephone {
                 return match self.tiles.get(&id).map(|t| t.backtest.test) {
                     Some(backtest::TestKind::RandomBlocks) => self.run_blocks(),
                     Some(backtest::TestKind::Optimize) => self.run_optimize(),
+                    Some(backtest::TestKind::WalkForward) => self.run_walk_forward(),
+                    Some(backtest::TestKind::RandomEntries) => self.run_random_entries(),
                     _ => self.draw_monte_carlo(),
                 };
             }
@@ -3475,6 +3797,26 @@ impl Persephone {
             }
             P::StopOptimize => {
                 panel.tests.optimize = backtest::OptimizeRun::Idle;
+                return Task::none();
+            }
+            P::RunWalkForward => {
+                if !self.apply_typed(id) {
+                    return Task::none();
+                }
+                return self.run_walk_forward();
+            }
+            P::StopWalkForward => {
+                panel.tests.walk_forward = backtest::TestRun::Idle;
+                return Task::none();
+            }
+            P::RunRandomEntries => {
+                if !self.apply_typed(id) {
+                    return Task::none();
+                }
+                return self.run_random_entries();
+            }
+            P::StopRandomEntries => {
+                panel.tests.random_entries = backtest::TestRun::Idle;
                 return Task::none();
             }
             P::WidenSpan => {
@@ -3995,9 +4337,21 @@ impl Persephone {
         let plan = params.and_then(|spec| {
             let chosen = &tile.backtest.optimize;
             let grid = backtest::optimize::Grid::build(chosen, &spec.info.params).ok()?;
+            if tile.backtest.test == backtest::TestKind::WalkForward {
+                let windows = tile.backtest.windows as usize;
+                return Some(format!(
+                    "{} values in each of {windows} windows: {} backtests.",
+                    grid.cells(),
+                    windows * (grid.cells() + 1),
+                ));
+            }
             Some(grid.describe(chosen.score, tile.backtest.blocks))
         });
         backtest::PanelInfo {
+            summary: tile
+                .strategy
+                .as_ref()
+                .and_then(|s| run_summary(s, ready.map_or("", |m| m.instrument.quote.as_str()))),
             problem: self.test_problem(panel.tile),
             plan,
             params: params.map_or(&[], |spec| spec.params.as_slice()),
@@ -4104,6 +4458,8 @@ impl Persephone {
                 spacing: self.local_spacing(&tile.market),
                 specs: &tile.indicators,
                 strategy: tile.strategy.as_ref().map(|s| (&s.spec, &s.run)),
+                figures: tile.strategy.as_ref().and_then(|s| s.figures.as_ref()),
+                costs: tile.strategy.as_ref().map(|s| &s.costs),
                 live: LiveInfo {
                     session: tile.live.as_ref(),
                     unavailable: self.live_unavailable(popup.tile()),
@@ -4357,16 +4713,18 @@ fn strategy_summary<'a>(
             if compact {
                 pieces
             } else {
-                let win = strategy
-                    .win_rate
+                let figures = strategy.figures.as_ref();
+                let win = figures
+                    .and_then(|f| f.win_rate)
                     .map_or("—".into(), |w| format!("{:.0}%", w * 100.0));
+                let trades = figures.map_or(0, |f| f.trades);
                 pieces
                     .push(mono(
                         format!("DD {:.1}%", report.max_drawdown * 100.0),
                         theme::TEXT,
                     ))
                     .push(mono(format!("Win {win}"), theme::TEXT))
-                    .push(mono(format!("{} trades", report.fills.len()), theme::TEXT))
+                    .push(mono(format!("{trades} trades"), theme::TEXT))
             }
         }
     };
@@ -4740,6 +5098,38 @@ fn batch_task<R: Send + Sync + 'static>(
 /// The first bar of a chart's span.
 fn span_start(candles: &[Candle], span: Option<(UnixNanos, UnixNanos)>) -> usize {
     span.map_or(0, |(from, _)| candles.partition_point(|c| c.ts < from))
+}
+
+/// A strategy that couldn't be set up, which says why when it's run.
+#[derive(Debug)]
+struct CantRun(String);
+
+impl SignalFactory for CantRun {
+    fn create(&self, _params: &[f64]) -> Result<Box<dyn Signal>, String> {
+        Err(self.0.clone())
+    }
+}
+
+/// One line on how a finished run compares: with no costs, and with the market.
+fn run_summary(strategy: &Strategy, quote: &str) -> Option<String> {
+    let figures = strategy.figures.as_ref()?;
+    let mut parts = Vec::new();
+    if let Costs::Done(costs) = &strategy.costs {
+        parts.push(format!("Before costs {:+.2}%", costs.gross_return * 100.0));
+        parts.push(format!("costs {:.2} {quote}", costs.costs_paid));
+        if let Some(bp) = costs.break_even_bp {
+            parts.push(format!("break-even {bp:.1} bp a fill"));
+        }
+    }
+    if let Some(held) = &figures.benchmark {
+        parts.push(format!(
+            "market {:+.2}%, fell {:.1}%",
+            held.return_ * 100.0,
+            held.max_drawdown * 100.0
+        ));
+    }
+    parts.push(format!("in a position {:.0}%", figures.exposure * 100.0));
+    Some(parts.join(" · "))
 }
 
 /// How long a span must be for blocks of `length` when only `share` of it can be sampled.

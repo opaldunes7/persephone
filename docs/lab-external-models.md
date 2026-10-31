@@ -18,7 +18,7 @@ Using a model you trained: testing its predictions, and what a time means in eac
    It fills at that bar's close and holds until the next entry. A list can run past the span at either end: a span or
    random block starting later takes up what's wanted by then, and later entries are left out. Inside the span, a time
    that isn't a bar's is an error. It runs in parallel, but nothing checks the list only used what was known by then:
-   train and predict on separate stretches. It can't go in `save_result`, as it only fits the bars it was made for.
+   train and predict on separate stretches. `save_result` writes the list out, so it can go on the app's charts, on markets and timeframes whose bars it names; on others, the chart says which time doesn't fit.
 2. **A program over a socket,** for a full Python stack. It's told one bar at a time, so it can't see ahead, but
    backtests run one at a time. Listen on a local socket, with a thread per connection, answering one JSON line per
    request:

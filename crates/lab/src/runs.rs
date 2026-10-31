@@ -12,25 +12,26 @@ use std::{
 
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 
-use persephone_core::time::civil_from_days;
 use persephone_core::{
     Candle, Side, Timeframe,
     signal::{Note, SignalFactory},
     strategy::{StrategyKind, StrategySpec},
 };
-use persephone_engine::{BacktestReport, BacktestRequest, FeeRates, Fill, SimSettings};
+use persephone_engine::{BacktestReport, BacktestRequest, Fill};
 use persephone_research::{
     WARM_UP_BARS,
     calendar::{Calendar, days_in_month, weeks},
+    figures,
     market::{MAX_FINE_BARS, MarketBars, fine_bars},
-    optimize::{Grid, OptimizeJob, Outcome, rank, split_at},
-    positions::{Positions, random_entries},
+    optimize::{Grid, OptimizeJob, Outcome, split_at},
+    positions::{ONE_TRADE, Positions, RandomEntriesJob},
     results::{StrategyRef, with_params},
     robustness::{
         BlockJob, MonteCarlo, RoundTrip, backtest, closed_trades, monte_carlo,
-        monte_carlo_compounding, percentile, pick_blocks, pnl_by_trade, pool, round_trips,
+        monte_carlo_compounding, pick_blocks, pnl_by_trade, pool, round_trips,
     },
     settings::{BlockLength, FillTiming, OptimizeSettings, Precision, ScoreBy, Settings, Variable},
+    walk_forward::{RATIO, WINDOWS, WalkForwardJob, stretches},
 };
 use serde_json::{Map, Value, json};
 
@@ -73,10 +74,6 @@ const BATCH_COLUMNS: [&str; 21] = [
     "warnings",
     "error",
 ];
-/// How many windows `run_walk_forward` makes unless asked, and how many times longer each one's
-/// picking stretch is than its unseen one.
-const WALK_WINDOWS: u64 = 5;
-const WALK_RATIO: f64 = 3.0;
 const TRADE_COLUMNS: [&str; 14] = [
     "trade",
     "side",
@@ -225,13 +222,15 @@ fn summary_of(
         "winners": winners,
         "win_rate": winners as f64 / trades.len().max(1) as f64,
         "bars": report.equity.len().saturating_sub(from_index),
-        "buy_and_hold_return": buy_and_hold(bars, from_index),
-        "benchmark": benchmark(report.starting_balance, bars, from_index),
-        "sharpe": sharpe(report, from_index, bars),
+        "buy_and_hold_return": figures::buy_and_hold(bars, from_index),
+        "benchmark": figures::benchmark(report.starting_balance, bars, from_index).map(|held| {
+            json!({"return": held.return_, "sharpe": held.sharpe, "max_drawdown": held.max_drawdown})
+        }),
+        "sharpe": figures::sharpe(report, from_index, bars),
         "profit_factor": (losses > 0.0).then(|| gains / losses),
-        "exposure": exposure(report, from_index),
+        "exposure": figures::exposure(report, from_index),
         "average_trade": (!trades.is_empty()).then(|| profit / trades.len() as f64),
-        "by_year": by_year(report, from_index, bars),
+        "by_year": figures::by_year(report, from_index, bars),
         "warnings": warnings_of(report),
     })
 }
@@ -252,57 +251,6 @@ fn warnings_of(report: &BacktestReport) -> Vec<String> {
     warnings
 }
 
-/// Whether a backtest has anything to pay: fees, slippage or spread.
-fn costs_something(request: &BacktestRequest) -> bool {
-    let sim = &request.sim;
-    request.fees.maker != 0.0
-        || request.fees.taker != 0.0
-        || sim.fee_per_order.is_some()
-        || sim.slippage_ticks > 0
-        || sim.slippage_percent > 0.0
-        || sim.spread_ticks > 0
-}
-
-/// The same backtest with nothing to pay.
-fn without_costs(request: &BacktestRequest) -> BacktestRequest {
-    let mut free = request.clone();
-    free.fees = FeeRates::ZERO;
-    free.sim.fee_per_order = None;
-    free.sim.slippage_ticks = 0;
-    free.sim.slippage_percent = 0.0;
-    free.sim.spread_ticks = 0;
-    free
-}
-
-/// Fees plus what slippage and spread took from each fill, worked back from its price as
-/// `CostFillModel` moved it. A market's own quotes bring their own spread, which isn't known here.
-fn costs_paid(report: &BacktestReport, sim: &SimSettings, price_precision: u8) -> f64 {
-    let tick = 10_f64.powi(-i32::from(price_precision));
-    let share = sim.slippage_percent / 100.0;
-    let moved: f64 = report
-        .fills
-        .iter()
-        .map(|fill| {
-            let (spread, sign) = if fill.side == Side::Buy {
-                (sim.spread_ticks.div_ceil(2), 1.0)
-            } else {
-                (sim.spread_ticks / 2, -1.0)
-            };
-            let ticks = f64::from(sim.slippage_ticks + spread) * tick;
-            let met = (fill.price - sign * ticks) / (1.0 + sign * share);
-            fill.qty * (fill.price - met) * sign
-        })
-        .sum();
-    report.fees + moved
-}
-
-/// What a backtest with no costs made, per fill, as basis points of the value traded: the cost per
-/// fill that would bring it to nothing.
-fn break_even_bp(free: &BacktestReport) -> Option<f64> {
-    let traded: f64 = free.fills.iter().map(|fill| fill.qty * fill.price).sum();
-    (traded > 0.0).then(|| free.net_pnl() / traded * 10_000.0)
-}
-
 /// A page whose rows are objects, so has no columns to name.
 fn named_rows(mut page: Value) -> Value {
     if let Some(page) = page.as_object_mut() {
@@ -319,128 +267,6 @@ fn look_back_of(args: &Value, params: &[f64]) -> usize {
             Ok(StrategyRef::Logic(logic)) => logic.look_back(params),
             _ => 0,
         })
-}
-
-/// Said when a tree's rules can't be true for at least 5% of the span, which trades or not is easy
-/// to miss, as a rule that isn't ready is just false. Less is usual and not worth saying every run.
-fn look_back_warning(look_back: usize, before: usize, bars: usize) -> Option<String> {
-    let unready = look_back.saturating_sub(before);
-    let span = bars.saturating_sub(before);
-    (unready > 0 && unready * 20 >= span).then(|| {
-        format!(
-            "A look-back here needs about {look_back} bars, with {before} before the span, so rules on it can't be true for about its first {unready} bars of {span}."
-        )
-    })
-}
-
-/// What each UTC year added, as a fraction of the starting capital, so they add up to `net_return`.
-fn by_year(report: &BacktestReport, from_index: usize, bars: &[(u64, f64)]) -> Value {
-    const NANOS_PER_DAY: u64 = 86_400_000_000_000;
-    let capital = report.starting_balance;
-    let mut years = Map::new();
-    let mut before = capital;
-    for (&(ts, _), &equity) in bars.iter().zip(&report.equity).skip(from_index) {
-        let (year, _, _) = civil_from_days((ts / NANOS_PER_DAY) as i64);
-        let added = years.entry(year.to_string()).or_insert(json!(0.0));
-        *added = json!(added.as_f64().unwrap_or(0.0) + (equity - before) / capital);
-        before = equity;
-    }
-    Value::Object(years)
-}
-
-/// What holding the market made: from the close of the first bar it could trade at, as a strategy's
-/// first order fills there, to the last close.
-fn buy_and_hold(bars: &[(u64, f64)], from_index: usize) -> Option<f64> {
-    let first = bars.get(from_index)?.1;
-    let last = bars.last()?.1;
-    (first > 0.0).then(|| last / first - 1.0)
-}
-
-/// Buying at the first close that could trade and holding to the end, with no costs: the same
-/// figures a run gets, to compare it with.
-fn benchmark(capital: f64, bars: &[(u64, f64)], from_index: usize) -> Value {
-    let span = bars.get(from_index..).unwrap_or(&[]);
-    let Some(&(_, first)) = span.first().filter(|(_, first)| *first > 0.0) else {
-        return Value::Null;
-    };
-    let mut peak = 0.0_f64;
-    let mut fall = 0.0_f64;
-    for &(_, close) in span {
-        peak = peak.max(close);
-        fall = fall.max(1.0 - close / peak);
-    }
-    json!({
-        "return": buy_and_hold(bars, from_index),
-        "sharpe": daily_sharpe(
-            capital,
-            span.iter().map(|&(ts, close)| (ts, capital * close / first)),
-        ),
-        "max_drawdown": fall,
-    })
-}
-
-fn sharpe(report: &BacktestReport, from_index: usize, bars: &[(u64, f64)]) -> Option<f64> {
-    let points = bars.iter().zip(&report.equity).skip(from_index);
-    daily_sharpe(
-        report.starting_balance,
-        points.map(|(&(ts, _), &equity)| (ts, equity)),
-    )
-}
-
-/// The Sharpe ratio of daily returns, with no risk-free rate, over 365 days a year as crypto trades
-/// every day. A day's value is its last bar's equity. `None` if there are too few days to say, or
-/// nothing ever moved.
-fn daily_sharpe(start: f64, points: impl Iterator<Item = (u64, f64)>) -> Option<f64> {
-    const NANOS_PER_DAY: u64 = 86_400_000_000_000;
-    let mut days = vec![start];
-    let mut last_day = None;
-    for (ts, equity) in points {
-        let day = ts / NANOS_PER_DAY;
-        if last_day == Some(day) {
-            *days.last_mut()? = equity;
-        } else {
-            days.push(equity);
-            last_day = Some(day);
-        }
-    }
-    let returns: Vec<f64> = days
-        .windows(2)
-        .filter(|pair| pair[0] > 0.0)
-        .map(|pair| pair[1] / pair[0] - 1.0)
-        .collect();
-    if returns.len() < 2 {
-        return None;
-    }
-    let count = returns.len() as f64;
-    let mean = returns.iter().sum::<f64>() / count;
-    let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (count - 1.0);
-    (variance > 0.0).then(|| mean / variance.sqrt() * 365.0_f64.sqrt())
-}
-
-/// The share of the bars traded on that began with a position open. A position's first such bar is
-/// the one after the close it filled at.
-fn exposure(report: &BacktestReport, from_index: usize) -> f64 {
-    let bars = report.equity.len().saturating_sub(from_index);
-    if bars == 0 {
-        return 0.0;
-    }
-    let mut position = 0.0;
-    let mut fills = report.fills.iter().peekable();
-    let mut held = 0;
-    for bar in from_index..report.equity.len() {
-        while let Some(fill) = fills.next_if(|fill| fill.bar < bar) {
-            position += if fill.side == Side::Buy {
-                fill.qty
-            } else {
-                -fill.qty
-            };
-        }
-        // Rounding can leave dust where a position closed.
-        if f64::abs(position) > 1e-12 {
-            held += 1;
-        }
-    }
-    f64::from(held) / bars as f64
 }
 
 fn map_of(map: &BTreeMap<String, f64>) -> Value {
@@ -711,20 +537,17 @@ impl Lab {
             .get("friction")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        let free = (wanted && costs_something(&request)).then(|| without_costs(&request));
+        let free = (wanted && figures::costs_something(&request))
+            .then(|| figures::without_costs(&request));
         let report = backtest(request)?;
         let free = free.map(backtest).transpose()?;
         let mut summary = summary_of(&report, from_index, &name, &bars);
         if wanted {
             let gross = free.as_ref().unwrap_or(&report);
-            summary["gross_return"] = json!(
-                gross
-                    .equity
-                    .last()
-                    .map_or(0.0, |last| last / gross.starting_balance - 1.0)
-            );
-            summary["total_costs_paid"] = json!(costs_paid(&report, &sim, price_precision));
-            summary["break_even_cost_per_fill"] = json!(break_even_bp(gross));
+            let friction = figures::friction(&report, gross, &sim, price_precision);
+            summary["gross_return"] = json!(friction.gross_return);
+            summary["total_costs_paid"] = json!(friction.costs_paid);
+            summary["break_even_cost_per_fill"] = json!(friction.break_even_bp);
         } else {
             for figure in [
                 "gross_return",
@@ -734,7 +557,7 @@ impl Lab {
                 summary[figure] = Value::Null;
             }
         }
-        if let Some(warning) = look_back_warning(look_back, from_index, times.len())
+        if let Some(warning) = figures::look_back_warning(look_back, from_index, times.len())
             && let Some(warnings) = summary["warnings"].as_array_mut()
         {
             warnings.push(json!(warning));
@@ -794,85 +617,30 @@ impl Lab {
     pub(crate) fn run_random_entries(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {
         let run = self.load_run(text(args, "run_id")?)?;
         let report = report_from(&run);
-        let holds: Vec<(i8, usize)> = round_trips(&report)
-            .iter()
-            .map(|trade| {
-                let bars = if trade.open {
-                    report.equity.len().saturating_sub(trade.entry_bar)
-                } else {
-                    trade.exit_bar.saturating_sub(trade.entry_bar)
-                };
-                (if trade.long { 1 } else { -1 }, bars.max(1))
-            })
-            .collect();
-        if holds.is_empty() {
-            return Err("that run made no trades, so there's nothing to place at random".into());
-        }
-        let (mut request, from_index, _) = self.prepare(&run["request"])?;
-        request.ticks = None;
-        request.fill_bars = None;
-        let opens: Vec<u64> = request.candles.iter().map(|c| c.ts).collect();
-        let closes = request.bars.closes(&request.candles);
-        // Sized as the run was, with positions in place of its strategy.
-        let shell = Positions::from_list(Vec::new());
-        request.strategy = with_params(
-            shell.spec().kind,
-            Arc::new(shell.info()),
-            &json!({"params": {"Size %": request.strategy.size_fraction() * 100.0}}),
-        )?;
+        let (request, from_index, _) = self.prepare(&run["request"])?;
         let draws = number(args, "runs", 200).clamp(1, MAX_BACKTESTS as u64) as usize;
-        let seed = number(args, "seed", 0);
-        let seeds: Vec<u64> = (0..draws as u64).collect();
         job.total.store(draws, Ordering::Relaxed);
-        let results = pool(
-            &seeds,
-            self.workers_for(&request.strategy),
-            &job.stop,
-            &|| {
-                job.done.fetch_add(1, Ordering::Relaxed);
-            },
-            &|&draw| {
-                let changes = random_entries(&holds, from_index, opens.len(), seed ^ (draw << 16))
-                    .ok_or("its trades don't fit the span")?;
-                let list = changes
-                    .iter()
-                    .map(|&(bar, position)| (closes[bar], position))
-                    .collect();
-                let mut trying = request.clone();
-                trying.plugin = Some(Arc::new(Positions::from_list(list)));
-                backtest(trying).map(|report| {
-                    let capital = report.starting_balance;
-                    let last = report.equity.last().copied().unwrap_or(capital);
-                    (last / capital - 1.0, report.max_drawdown.abs())
-                })
-            },
-        );
-        let mut returns = Vec::with_capacity(draws);
-        let mut falls = Vec::with_capacity(draws);
-        for result in results.into_iter().flatten() {
-            let (returned, fell) = result?;
-            returns.push(returned);
-            falls.push(fell);
+        let found = RandomEntriesJob {
+            report: Arc::new(report),
+            workers: self.workers_for(&request.strategy),
+            request,
+            from_index,
+            runs: draws,
+            seed: number(args, "seed", 0),
+            stop: Arc::clone(&job.stop),
         }
-        if returns.is_empty() {
-            return Err("Stopped.".into());
-        }
-        returns.sort_by(f64::total_cmp);
-        falls.sort_by(f64::total_cmp);
-        let actual = run["summary"]["net_return"].as_f64().unwrap_or(f64::NAN);
-        let fell = run["summary"]["max_drawdown"].as_f64().unwrap_or(f64::NAN);
-        let count = returns.len() as f64;
+        .run(&|done| job.done.store(done, Ordering::Relaxed))?;
         Ok(json!({
-            "runs": returns.len(),
-            "trades": holds.len(),
-            "actual_return": actual,
-            "actual_fell": fell,
-            "share_matching_return": returns.iter().filter(|r| **r >= actual).count() as f64 / count,
-            "share_matching_fall": falls.iter().filter(|f| **f <= fell).count() as f64 / count,
-            "warning": (holds.len() < 2).then_some("With one trade there's little to place at random, so this says almost nothing."),
-            "median": percentile(&returns, 0.5),
-            "low": percentile(&returns, 0.05),
-            "high": percentile(&returns, 0.95),
+            "runs": found.runs,
+            "trades": found.trades,
+            "actual_return": found.actual_return,
+            "actual_fell": found.actual_fell,
+            "share_matching_return": found.share_matching_return,
+            "share_matching_fall": found.share_matching_fall,
+            "warning": (found.trades < 2).then_some(ONE_TRADE),
+            "median": found.median,
+            "low": found.low,
+            "high": found.high,
         }))
     }
 
@@ -1455,105 +1223,70 @@ impl Lab {
         request.ticks = None;
         request.fill_bars = None;
         let from = candles.partition_point(|c| c.ts < request.trade_from);
-        let windows = number(args, "windows", WALK_WINDOWS).max(1) as usize;
+        let windows = number(args, "windows", WINDOWS as u64).max(1) as usize;
         let ratio = args
             .get("train_ratio")
             .and_then(Value::as_f64)
             .filter(|ratio| *ratio > 0.0)
-            .unwrap_or(WALK_RATIO);
-        let bars = candles.len().saturating_sub(from);
-        let test = (bars as f64 / (windows as f64 + ratio)) as usize;
-        let train = (test as f64 * ratio) as usize;
-        if test < 2 || train < 2 {
-            return Err(format!(
-                "{bars} bars is too few for {windows} windows; widen the span or ask for fewer"
-            ));
-        }
-        // The last unseen stretch ends on the last bar.
-        let first = candles.len() - windows * test - train;
-        job.total
-            .store(windows * (grid.cells() + 1), Ordering::Relaxed);
-        let warm_up = WARM_UP_BARS as usize;
-        let mut finished = 0;
-        let mut rows = Vec::with_capacity(windows);
-        let (mut unseen_total, mut held_total) = (0.0, 0.0);
-        let (mut trades, mut profitable, mut deepest) = (0, 0, 0.0_f64);
-        for window in 0..windows {
-            let train_start = first + window * test;
-            let train_end = train_start + train;
-            let test_end = train_end + test;
-            let warm_from = train_start.saturating_sub(warm_up);
-            let mut picking = request.clone();
-            picking.trade_from = candles[train_start].ts;
-            let batch = OptimizeJob {
-                request: picking,
-                candles: candles[warm_from..train_end].to_vec(),
-                grid: grid.clone(),
-                score: chosen.score,
-                split: None,
-                blocks: Vec::new(),
-                warm_up,
-                runs: number(args, "runs", 1_000) as u32,
-                ruin_at: args
-                    .get("ruin_percent")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(50.0)
-                    / 100.0,
-                seed: number(args, "seed", 0),
-                workers,
-                stop: Arc::clone(&job.stop),
-            };
-            let found = batch.run(&|done| job.done.store(finished + done, Ordering::Relaxed))?;
-            finished += grid.cells();
-            let scores: Vec<Option<f64>> = found.outcomes.iter().map(Outcome::score).collect();
-            let times = json!({
-                "train_from": time_text(candles[train_start].ts),
-                "test_from": time_text(candles[train_end].ts),
-                "test_to": time_text(candles[test_end - 1].ts),
-            });
-            let mut row = times;
-            let Some(&(cell, _)) = rank(&scores, grid.width()).first() else {
-                row["status"] = json!("nothing-to-pick");
-                rows.push(row);
-                continue;
-            };
-            let mut trying = request.clone();
-            for (index, value) in grid.values_of(cell) {
-                trying.strategy.set_param(index, value)?;
-            }
-            trying.candles = candles[train_end.saturating_sub(warm_up)..test_end].to_vec();
-            trying.trade_from = candles[train_end].ts;
-            let report = backtest(trying)?;
-            finished += 1;
-            job.done.store(finished, Ordering::Relaxed);
-            let capital = report.starting_balance;
-            let unseen = report.equity.last().copied().unwrap_or(capital) / capital - 1.0;
-            let made = round_trips(&report).len();
-            // From the close before the stretch's first order could fill, as a strategy's does.
-            let held = candles[test_end - 1].close / candles[train_end].close - 1.0;
-            held_total += held;
-            row["buy_and_hold_return"] = json!(held);
-            unseen_total += unseen;
-            trades += made;
-            profitable += usize::from(unseen > 0.0);
-            deepest = deepest.max(report.max_drawdown.abs());
-            row["values"] = names_of(&grid, cell);
-            row["picked_score"] = json!(scores[cell]);
-            row["unseen_return"] = json!(unseen);
-            row["fell"] = json!(report.max_drawdown.abs());
-            row["trades"] = json!(made);
-            row["status"] = json!("tested");
-            rows.push(row);
-        }
+            .unwrap_or(RATIO);
+        stretches(candles.len().saturating_sub(from), windows, ratio)?;
+        let batch = WalkForwardJob {
+            request,
+            candles,
+            from,
+            grid,
+            score: chosen.score,
+            windows,
+            ratio,
+            warm_up: WARM_UP_BARS as usize,
+            runs: number(args, "runs", 1_000) as u32,
+            ruin_at: args
+                .get("ruin_percent")
+                .and_then(Value::as_f64)
+                .unwrap_or(50.0)
+                / 100.0,
+            seed: number(args, "seed", 0),
+            workers,
+            stop: Arc::clone(&job.stop),
+        };
+        job.total.store(batch.total(), Ordering::Relaxed);
+        let found = batch.run(&|done| job.done.store(done, Ordering::Relaxed))?;
+        let rows: Vec<Value> = found
+            .windows
+            .iter()
+            .map(|window| {
+                let mut row = json!({
+                    "train_from": time_text(window.train_from),
+                    "test_from": time_text(window.test_from),
+                    "test_to": time_text(window.test_to),
+                    "status": "nothing-to-pick",
+                });
+                if let Some(picked) = &window.picked {
+                    let values: Map<String, Value> = picked
+                        .values
+                        .iter()
+                        .map(|(name, value)| (name.clone(), json!(value)))
+                        .collect();
+                    row["buy_and_hold_return"] = json!(picked.buy_and_hold_return);
+                    row["values"] = Value::Object(values);
+                    row["picked_score"] = json!(picked.score);
+                    row["unseen_return"] = json!(picked.unseen_return);
+                    row["fell"] = json!(picked.fell);
+                    row["trades"] = json!(picked.trades);
+                    row["status"] = json!("tested");
+                }
+                row
+            })
+            .collect();
         Ok(json!({
             "windows": rows,
-            "unseen_return": unseen_total,
-            "buy_and_hold_return": held_total,
-            "profitable_windows": profitable,
-            "deepest_fall": deepest,
-            "trades": trades,
-            "train_bars": train,
-            "test_bars": test,
+            "unseen_return": found.unseen_return,
+            "buy_and_hold_return": found.buy_and_hold_return,
+            "profitable_windows": found.profitable_windows,
+            "deepest_fall": found.deepest_fall,
+            "trades": found.trades,
+            "train_bars": found.train_bars,
+            "test_bars": found.test_bars,
         }))
     }
 

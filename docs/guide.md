@@ -116,10 +116,10 @@ The chart then shows:
 - arrows at every fill, labelled with the position they leave (Long, Short, Close);
 - a tint behind the bars while a position is open;
 - an **Equity** pane with the account value at each bar;
-- a summary in the top-right corner: return, drawdown, win rate, trades.
+- a summary in the top-right corner: return, drawdown, win rate, trades. A trade is flat to flat, so a reversal counts as two; fills are counted separately in the statistics.
 
 Click the summary for the **report**. It has the parameters (editing one reruns the backtest),
-net profit, return, max drawdown, Sharpe, Sortino, profit factor, win rate, trades and fees.
+net profit, return, max drawdown, Sharpe, Sortino, profit factor, win rate, trades, fills, time in a position and fees. It also shows the return before costs, what costs took and the break-even cost a fill, which take a second backtest with costs off that runs when you open it, unless the strategy asks AI models. Below those are what the market did on its own, its Sharpe and drawdown, and what each year added. A strategy that can only go wrong by rounding, running out of money or a mismatch with what it asked for shows a red `!` and says so here.
 Notes from the strategy go at the bottom, such as a language model's look-ahead warning.
 
 **How backtests run:**
@@ -278,6 +278,10 @@ result is to a parameter, and [paper trading](#paper-trading-in-the-app) is a fo
 the strategy has never seen.
 
 ## Optimizing a strategy
+
+**Walk-forward**, under **Test**, is Optimize done fairly. It picks the best values on a stretch, tests them on the unseen stretch after it, slides along and repeats, for as many **Windows** as you set. The heading's **Unseen** is what those stretches returned added up, beside what the **Market** did. It's the figure to trust, as none of it was used to pick anything. Its table shows what each window picked and how that did.
+
+**Random entries**, under **Test**, compares a backtest with chance. It places the same trades at random times, holding each as long, as many **Runs** as you set. **As good** is the share of placings that returned at least as much: near 50% means the entries add nothing.
 
 **Optimize**, under **Test** in the backtest panel, tries a range of one of the strategy's variables
 or two together (including Size %). Pick each variable's **Min**, **Max** and **Step**, what to

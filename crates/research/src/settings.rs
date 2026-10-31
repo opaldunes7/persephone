@@ -44,6 +44,10 @@ pub struct Settings {
     /// When orders fill on the bars.
     #[serde(default)]
     pub fill_timing: FillTiming,
+    /// How many windows a walk-forward makes.
+    pub windows: u32,
+    /// How many times Random entries places the trades.
+    pub entries: u32,
     /// Plugins added to the backtest, by name. They're only listed for now: no kind of
     /// backtest plugin exists yet.
     pub plugins: Vec<String>,
@@ -77,6 +81,8 @@ impl Default for Settings {
             session: Section::off(SessionRule::default()),
             precision: Precision::Standard,
             fill_timing: FillTiming::Close,
+            windows: 5,
+            entries: 200,
             plugins: Vec::new(),
             test: TestKind::Backtest,
             runs: 1_000,
@@ -101,6 +107,10 @@ pub enum TestKind {
     RandomBlocks,
     /// Backtests across a range of a strategy's parameters.
     Optimize,
+    /// Optimizing on a stretch and trying the best on the unseen one after it, sliding along.
+    WalkForward,
+    /// The backtest's holds placed at random times, to compare it with chance.
+    RandomEntries,
 }
 
 /// What the Optimize test varies and how it scores the results.
@@ -399,6 +409,8 @@ impl Settings {
             Field::Runs => self.runs.to_string(),
             Field::Ruin => trim(self.ruin),
             Field::Blocks => self.blocks.to_string(),
+            Field::Windows => self.windows.to_string(),
+            Field::Entries => self.entries.to_string(),
             Field::Min(slot) | Field::Max(slot) | Field::Step(slot) => {
                 let Some(variable) = &self.optimize.variables[slot] else {
                     return String::new();
@@ -458,6 +470,8 @@ impl Settings {
             Field::Runs => self.runs = number(10.0, 10_000.0, "Runs")?.round() as u32,
             Field::Ruin => self.ruin = number(1.0, 100.0, "Ruin")?,
             Field::Blocks => self.blocks = number(2.0, 1_000.0, "Blocks")?.round() as u32,
+            Field::Windows => self.windows = number(1.0, 100.0, "Windows")?.round() as u32,
+            Field::Entries => self.entries = number(2.0, 5_000.0, "Runs")?.round() as u32,
             Field::Min(slot) | Field::Max(slot) | Field::Step(slot) => {
                 let value = number(-1e12, 1e12, "Min, Max and Step each")?;
                 if let Some(variable) = &mut self.optimize.variables[slot] {
