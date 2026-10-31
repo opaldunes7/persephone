@@ -52,6 +52,7 @@ fn request(candles: Vec<Candle>, strategy: StrategySpec) -> BacktestRequest {
         rules: TradingRules::default(),
         trade_from: 0,
         fill_bars: None,
+        funding: None,
     }
 }
 

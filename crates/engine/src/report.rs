@@ -15,6 +15,7 @@ pub(crate) struct RawFill {
     pub(crate) price: f64,
     pub(crate) qty: f64,
     pub(crate) fee: f64,
+    pub(crate) maker: bool,
 }
 
 /// One execution, for trade markers on the chart.
@@ -28,6 +29,8 @@ pub struct Fill {
     pub qty: f64,
     /// Commission paid, in the quote currency.
     pub fee: f64,
+    /// It rested on the book rather than taking what was there.
+    pub maker: bool,
 }
 
 /// What a finished backtest hands back to the app.
@@ -44,6 +47,14 @@ pub struct BacktestReport {
     pub fees: f64,
     pub total_orders: usize,
     pub total_positions: usize,
+    /// How many limit orders went out, and how many of them filled.
+    pub limit_orders: usize,
+    pub limits_filled: usize,
+    /// What funding came to, positive when it cost, and what borrowing for shorts cost.
+    pub funding_paid: f64,
+    pub borrow_paid: f64,
+    /// Every limit order that went out, and what became of it.
+    pub limit_log: Vec<LimitOrderRow>,
     /// PnL statistics in the quote currency (e.g. "PnL (total)", "Win Rate").
     pub pnl: BTreeMap<String, f64>,
     /// Return statistics (e.g. "Sharpe Ratio (252 days)", "Profit Factor").
@@ -86,6 +97,7 @@ impl BacktestReport {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build(
     result: &BacktestResult,
     raw: Vec<RawFill>,
@@ -94,17 +106,25 @@ pub(crate) fn build(
     starting_balance: f64,
     quote: &str,
     next_open: bool,
+    holding: Holding<'_>,
 ) -> BacktestReport {
     let fills = assign_bars(&raw, closes, next_open);
-    let equity = equity_curve(&fills, candles, starting_balance);
+    let (equity, funding_paid, borrow_paid) =
+        equity_curve(&fills, candles, closes, starting_balance, &holding);
     BacktestReport {
         max_drawdown: max_drawdown(&equity),
-        fees: fills.iter().map(|f| f.fee).sum(),
+        // Adding to zero, as an empty sum is negative zero, which prints as a loss.
+        fees: fills.iter().map(|f| f.fee).sum::<f64>() + 0.0,
         fills,
         equity,
         starting_balance,
         total_orders: result.total_orders,
         total_positions: result.total_positions,
+        limit_orders: 0,
+        limits_filled: 0,
+        funding_paid,
+        borrow_paid,
+        limit_log: Vec::new(),
         pnl: result.stats_pnls.get(quote).map(sorted).unwrap_or_default(),
         returns: sorted(&result.stats_returns),
         general: sorted(&result.stats_general),
@@ -135,20 +155,162 @@ fn assign_bars(raw: &[RawFill], closes: &[UnixNanos], next_open: bool) -> Vec<Fi
                 price: f.price,
                 qty: f.qty,
                 fee: f.fee,
+                maker: f.maker,
             }
         })
         .collect()
 }
 
-/// Cash plus the position valued at each close. Fills are applied at the bar they belong to.
-fn equity_curve(fills: &[Fill], candles: &[Candle], starting_balance: f64) -> Vec<f64> {
+/// What became of a limit order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitOutcome {
+    Filled,
+    /// Its time ran out.
+    Lapsed,
+    /// A newer wish took its place.
+    Replaced,
+    /// What it would have changed had gone, as a stop or target fired.
+    Cancelled,
+    /// The venue wouldn't have it.
+    Refused,
+    /// It was still resting when the run ended.
+    Open,
+}
+
+/// A limit order as the strategy saw it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RawLimit {
+    pub(crate) placed: UnixNanos,
+    pub(crate) side: Side,
+    pub(crate) price: f64,
+    pub(crate) qty: f64,
+    pub(crate) outcome: LimitOutcome,
+    pub(crate) ended: UnixNanos,
+}
+
+/// A limit order, and how the market treated it: what shows whether those that fill are the bad ones.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LimitOrderRow {
+    /// The close it went out at.
+    pub placed: UnixNanos,
+    pub side: Side,
+    pub price: f64,
+    pub qty: f64,
+    pub outcome: LimitOutcome,
+    /// When it filled or stopped resting.
+    pub ended: UnixNanos,
+    /// How many bars it rested through.
+    pub bars: usize,
+    /// How far past its price the market traded while it rested, as a percentage. Below zero, how far
+    /// off it stayed.
+    pub reached_percent: f64,
+    /// How far the market moved its way, from the close it went out at, one bar and 24 bars on, as
+    /// percentages: above zero is the way the order wanted to go. `None` near the end of the bars.
+    pub move_1_percent: Option<f64>,
+    pub move_24_percent: Option<f64>,
+}
+
+/// Works out how the market treated each limit order.
+pub(crate) fn limit_rows(
+    raw: &[RawLimit],
+    candles: &[Candle],
+    closes: &[UnixNanos],
+) -> Vec<LimitOrderRow> {
+    raw.iter()
+        .filter_map(|order| {
+            let at = closes
+                .partition_point(|close| *close <= order.placed)
+                .checked_sub(1)?;
+            let until = closes
+                .partition_point(|close| *close < order.ended)
+                .min(candles.len().saturating_sub(1))
+                .max(at);
+            let rested = candles.get(at + 1..=until).unwrap_or(&[]);
+            let reached = match order.side {
+                Side::Buy => {
+                    let low = rested.iter().map(|c| c.low).fold(f64::MAX, f64::min);
+                    (order.price - low) / order.price
+                }
+                Side::Sell => {
+                    let high = rested.iter().map(|c| c.high).fold(f64::MIN, f64::max);
+                    (high - order.price) / order.price
+                }
+            };
+            let sign = if order.side == Side::Buy { 1.0 } else { -1.0 };
+            let from = candles.get(at)?.close;
+            let moved = |bars: usize| {
+                candles
+                    .get(at + bars)
+                    .map(|c| sign * (c.close / from - 1.0) * 100.0)
+            };
+            Some(LimitOrderRow {
+                placed: order.placed,
+                side: order.side,
+                price: order.price,
+                qty: order.qty,
+                outcome: order.outcome,
+                ended: order.ended,
+                bars: rested.len(),
+                reached_percent: if rested.is_empty() {
+                    f64::NAN
+                } else {
+                    reached * 100.0
+                },
+                move_1_percent: moved(1),
+                move_24_percent: moved(24),
+            })
+        })
+        .collect()
+}
+
+/// What holding a position costs over time, which the venue doesn't charge in a backtest.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Holding<'a> {
+    /// Rates by when they're paid.
+    pub(crate) funding: &'a [(UnixNanos, f64)],
+    pub(crate) borrow_percent_per_year: f64,
+}
+
+/// What a year is, for charging borrowing.
+pub(crate) const NANOS_PER_YEAR: f64 = 365.0 * 86_400_000_000_000.0;
+
+/// Cash plus the position valued at each close, and what funding and borrowing took. Fills are
+/// applied at the bar they belong to. What's held into a bar pays what falls due from its open up to
+/// its close, at its open, so a rate stamped on the hour falls to what was held going into that hour.
+fn equity_curve(
+    fills: &[Fill],
+    candles: &[Candle],
+    closes: &[UnixNanos],
+    starting_balance: f64,
+    holding: &Holding<'_>,
+) -> (Vec<f64>, f64, f64) {
     let mut cash = starting_balance;
     let mut position = 0.0;
     let mut next = 0;
-    candles
+    let mut due = 0;
+    let (mut funding_paid, mut borrow_paid) = (0.0, 0.0);
+    let mut last_close = candles.first().map_or(0, |candle| candle.ts);
+    let equity = candles
         .iter()
         .enumerate()
         .map(|(i, candle)| {
+            let close = closes.get(i).copied().unwrap_or(candle.ts);
+            while let Some(&(when, rate)) = holding.funding.get(due).filter(|f| f.0 < close) {
+                if when >= last_close {
+                    let paid = position * candle.open * rate;
+                    cash -= paid;
+                    funding_paid += paid;
+                }
+                due += 1;
+            }
+            if position < 0.0 && holding.borrow_percent_per_year > 0.0 {
+                let years = close.saturating_sub(last_close) as f64 / NANOS_PER_YEAR;
+                let paid =
+                    -position * candle.open * holding.borrow_percent_per_year / 100.0 * years;
+                cash -= paid;
+                borrow_paid += paid;
+            }
+            last_close = close;
             while let Some(fill) = fills.get(next).filter(|f| f.bar <= i) {
                 let signed = if fill.side == Side::Buy {
                     fill.qty
@@ -161,7 +323,8 @@ fn equity_curve(fills: &[Fill], candles: &[Candle], starting_balance: f64) -> Ve
             }
             cash + position * candle.close
         })
-        .collect()
+        .collect();
+    (equity, funding_paid, borrow_paid)
 }
 
 fn max_drawdown(equity: &[f64]) -> f64 {
@@ -207,6 +370,7 @@ mod tests {
             price,
             qty,
             fee,
+            maker: false,
         }
     }
 
@@ -218,7 +382,8 @@ mod tests {
             fill(1, Side::Buy, 100.0, 2.0, 1.0),
             fill(3, Side::Sell, 120.0, 4.0, 2.0),
         ];
-        let equity = equity_curve(&fills, &data, 1_000.0);
+        let closes: Vec<u64> = data.iter().map(|c| c.ts).collect();
+        let (equity, _, _) = equity_curve(&fills, &data, &closes, 1_000.0, &Holding::default());
         assert_eq!(equity, vec![1_000.0, 999.0, 1_019.0, 1_037.0, 1_097.0]);
         assert!((max_drawdown(&equity) - (999.0 / 1_000.0 - 1.0)).abs() < 1e-12);
     }
@@ -233,6 +398,7 @@ mod tests {
             price: 2.0,
             qty: 1.0,
             fee: 0.0,
+            maker: false,
         }];
         let closes: Vec<u64> = data.iter().map(|c| c.ts + tf).collect();
         assert_eq!(

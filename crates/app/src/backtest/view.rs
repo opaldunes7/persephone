@@ -8,8 +8,9 @@ use iced::{
     },
 };
 use persephone_chart::{PRICE_AXIS_WIDTH, theme};
-use persephone_core::{BarSpec, Candle, UnixNanos, time::DateTime};
-use persephone_engine::BacktestReport;
+use persephone_core::{BarSpec, Candle, Side, UnixNanos, time::DateTime};
+use persephone_engine::{BacktestReport, LimitOutcome};
+use persephone_research::figures::LimitSummary;
 
 use super::{
     BlockLength, BlockRun, Commission, Edit, Field, FillTiming, NO_VARIABLE, OneWay, OptimizeRun,
@@ -234,7 +235,7 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                         button(text("Equity").size(HINT).center())
                             .padding([2, 7])
                             .on_press(PanelMessage::ShowCalendar(false))
-                            .style(move |_, status| chip(!view.shown, status)),
+                            .style(move |_, status| chip(!view.shown && !panel.limits_shown, status)),
                         "The account's value over the span.",
                         None,
                     ),
@@ -249,7 +250,20 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                 ]
                 .spacing(2),
             );
-            if view.shown {
+            if !report.limit_log.is_empty() {
+                let shown = panel.limits_shown;
+                heading = heading.push(tip(
+                    button(text("Limits").size(HINT).center())
+                        .padding([2, 7])
+                        .on_press(PanelMessage::ShowLimits(!shown))
+                        .style(move |_, status| chip(shown, status)),
+                    "Every limit order: what became of it, how far past its price the market traded, and how far the market then moved its way.",
+                    None,
+                ));
+            }
+            if panel.limits_shown && !report.limit_log.is_empty() {
+                limit_orders_table(report)
+            } else if view.shown {
                 let last = info.candles.last().map_or(0, |c| c.ts);
                 let calendar = Calendar::new(round_trips(report), last);
                 crumbs = Some(calendar_crumbs(view.level));
@@ -898,6 +912,92 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
 }
 
 /// A button showing a drawn icon, naming itself (and its shortcut) when hovered.
+/// How many rows of limit orders to draw, which is plenty to read and keeps a redraw quick.
+const LIMIT_ROWS: usize = 500;
+
+/// Each limit order, under how those that filled did against those that missed.
+fn limit_orders_table(report: &BacktestReport) -> Element<'_, PanelMessage> {
+    let cell = |value: String, width: f32, color: Color| {
+        text(value)
+            .size(SMALL)
+            .width(width)
+            .color(color)
+            .font(iced::Font::MONOSPACE)
+    };
+    let day = |ts: UnixNanos| {
+        let at = DateTime::from_nanos(ts);
+        format!("{} {}", at.date(), at.time())
+    };
+    let moved = |value: Option<f64>| value.map_or("—".to_owned(), |v| format!("{v:+.2}%"));
+    let summary = LimitSummary::of(report);
+    let mut rows = column![
+        text(format!(
+            "A bar on, those that filled moved {} their way, and those that missed {}. 24 bars on: {} and {}. {} of {} fills barely went past their price.",
+            moved(summary.filled_move_1),
+            moved(summary.missed_move_1),
+            moved(summary.filled_move_24),
+            moved(summary.missed_move_24),
+            summary.barely_filled,
+            summary.filled,
+        ))
+        .size(SMALL)
+        .color(theme::TEXT),
+        row![
+            cell("Placed".into(), 150.0, theme::TEXT_MUTED),
+            cell("Side".into(), 46.0, theme::TEXT_MUTED),
+            cell("Price".into(), 92.0, theme::TEXT_MUTED),
+            cell("Became".into(), 80.0, theme::TEXT_MUTED),
+            cell("Reached".into(), 70.0, theme::TEXT_MUTED),
+            cell("A bar on".into(), 72.0, theme::TEXT_MUTED),
+            cell("24 on".into(), 72.0, theme::TEXT_MUTED),
+        ],
+    ]
+    .spacing(3);
+    for order in report.limit_log.iter().take(LIMIT_ROWS) {
+        let (became, color) = match order.outcome {
+            LimitOutcome::Filled => ("filled", theme::UP),
+            LimitOutcome::Lapsed => ("lapsed", theme::TEXT_MUTED),
+            LimitOutcome::Replaced => ("replaced", theme::TEXT_MUTED),
+            LimitOutcome::Cancelled => ("cancelled", theme::TEXT_MUTED),
+            LimitOutcome::Refused => ("refused", theme::DOWN),
+            LimitOutcome::Open => ("open", theme::TEXT),
+        };
+        let side = if order.side == Side::Buy {
+            "buy"
+        } else {
+            "sell"
+        };
+        rows = rows.push(row![
+            cell(day(order.placed), 150.0, theme::TEXT),
+            cell(side.to_owned(), 46.0, theme::TEXT),
+            cell(format!("{:.2}", order.price), 92.0, theme::TEXT),
+            cell(became.to_owned(), 80.0, color),
+            cell(format!("{:+.2}%", order.reached_percent), 70.0, theme::TEXT),
+            cell(moved(order.move_1_percent), 72.0, theme::TEXT),
+            cell(moved(order.move_24_percent), 72.0, theme::TEXT),
+        ]);
+    }
+    if report.limit_log.len() > LIMIT_ROWS {
+        rows = rows.push(
+            text(format!(
+                "And {} more. `get_limit_orders` in Lab has them all.",
+                report.limit_log.len() - LIMIT_ROWS
+            ))
+            .size(SMALL)
+            .color(theme::TEXT_MUTED),
+        );
+    }
+    iced::widget::scrollable(rows.padding(Padding {
+        top: WALK_TOP,
+        right: 12.0,
+        bottom: 8.0,
+        left: 12.0,
+    }))
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
 /// Each window of a walk-forward: what it picked, and how that did on what it hadn't seen.
 fn walk_forward_table(found: &WalkForward) -> Element<'_, PanelMessage> {
     let day = |ts: UnixNanos| DateTime::from_nanos(ts).date();

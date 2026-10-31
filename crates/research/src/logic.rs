@@ -1286,6 +1286,7 @@ mod tests {
                 rules: TradingRules::default(),
                 trade_from: 0,
                 fill_bars: None,
+                funding: None,
             };
         let logic = Arc::new(Logic::parse(&cross(5.0, 20.0)).unwrap());
         let mut spec = logic.spec();

@@ -10,6 +10,16 @@ use persephone_core::{Candle, InstrumentSpec, Timeframe, UnixNanos};
 use serde::Deserialize;
 
 const BASE_URL: &str = "https://data-api.binance.vision";
+/// Binance's USD-M futures, for perpetuals.
+const FUTURES_URL: &str = "https://fapi.binance.com";
+/// What marks a symbol as a perpetual here, as in `BTCUSDT-PERP`. Binance itself calls it `BTCUSDT`.
+pub const PERP_SUFFIX: &str = "-PERP";
+
+/// Whether `symbol` names a perpetual future.
+#[must_use]
+pub fn is_perp(symbol: &str) -> bool {
+    symbol.ends_with(PERP_SUFFIX)
+}
 const VENUE: &str = "BINANCE";
 /// Binance's maximum klines per request.
 pub const PAGE_LIMIT: usize = 1000;
@@ -25,6 +35,7 @@ const MOST_RETRY_WAIT_SECS: u64 = 60;
 pub struct BinanceClient {
     http: reqwest::blocking::Client,
     base: String,
+    futures_base: String,
 }
 
 /// How long to wait before asking again after a response of `status`, if it's worth asking again:
@@ -51,6 +62,7 @@ impl BinanceClient {
         Ok(Self {
             http,
             base: BASE_URL.to_owned(),
+            futures_base: FUTURES_URL.to_owned(),
         })
     }
 
@@ -89,6 +101,21 @@ impl BinanceClient {
     ///
     /// Returns an error if the request fails or the symbol is unknown.
     pub fn instrument(&self, symbol: &str) -> anyhow::Result<InstrumentSpec> {
+        if let Some(future) = symbol.strip_suffix(PERP_SUFFIX) {
+            // It lists them all, with no asking for just one.
+            let url = format!("{}/fapi/v1/exchangeInfo", self.futures_base);
+            let info: ExchangeInfo = self.get(url)?.json()?;
+            let raw = info
+                .symbols
+                .into_iter()
+                .find(|raw| {
+                    raw.symbol == future && raw.contract_type.as_deref() == Some("PERPETUAL")
+                })
+                .with_context(|| format!("Binance has no perpetual `{future}`"))?;
+            let mut spec = raw.into_spec()?;
+            spec.symbol = symbol.to_owned();
+            return Ok(spec);
+        }
         let url = format!("{}/api/v3/exchangeInfo?symbol={symbol}", self.base);
         let info: ExchangeInfo = self
             .get(url)
@@ -108,9 +135,9 @@ impl BinanceClient {
     ///
     /// Returns an error if the request fails or Binance has no bars for it.
     pub fn first_bar_time(&self, symbol: &str, timeframe: Timeframe) -> anyhow::Result<UnixNanos> {
+        let (base, path, symbol) = self.klines_at(symbol);
         let url = format!(
-            "{}/api/v3/klines?symbol={symbol}&interval={}&startTime=0&limit=1",
-            self.base,
+            "{base}{path}?symbol={symbol}&interval={}&startTime=0&limit=1",
             timeframe.label()
         );
         let body = self.get(url)?.text()?;
@@ -135,11 +162,11 @@ impl BinanceClient {
         let mut candles = Vec::new();
         let mut cursor_ms = start / NANOS_PER_MILLI;
         let end_ms = end / NANOS_PER_MILLI;
+        let (base, path, symbol) = self.klines_at(symbol);
 
         while cursor_ms < end_ms {
             let url = format!(
-                "{}/api/v3/klines?symbol={symbol}&interval={}&startTime={cursor_ms}&endTime={}&limit={PAGE_LIMIT}",
-                self.base,
+                "{base}{path}?symbol={symbol}&interval={}&startTime={cursor_ms}&endTime={}&limit={PAGE_LIMIT}",
                 timeframe.label(),
                 end_ms - 1,
             );
@@ -157,6 +184,80 @@ impl BinanceClient {
 
         Ok(candles)
     }
+}
+
+impl BinanceClient {
+    /// Where a symbol's bars are: its host and path, and what Binance calls it.
+    fn klines_at<'a>(&self, symbol: &'a str) -> (&str, &'static str, &'a str) {
+        match symbol.strip_suffix(PERP_SUFFIX) {
+            Some(future) => (&self.futures_base, "/fapi/v1/klines", future),
+            None => (&self.base, "/api/v3/klines", symbol),
+        }
+    }
+
+    /// A perpetual's funding rates paid in `[start, end)`, as when and how much, oldest first.
+    /// Anything else has none.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a request fails or Binance's answer can't be read.
+    pub fn funding(
+        &self,
+        symbol: &str,
+        start: UnixNanos,
+        end: UnixNanos,
+    ) -> anyhow::Result<Vec<(UnixNanos, f64)>> {
+        let Some(future) = symbol.strip_suffix(PERP_SUFFIX) else {
+            return Ok(Vec::new());
+        };
+        const FUNDING_PAGE: usize = 1_000;
+        let mut rates = Vec::new();
+        let mut cursor_ms = start / NANOS_PER_MILLI;
+        let end_ms = end / NANOS_PER_MILLI;
+        while cursor_ms < end_ms {
+            let url = format!(
+                "{}/fapi/v1/fundingRate?symbol={future}&startTime={cursor_ms}&endTime={}&limit={FUNDING_PAGE}",
+                self.futures_base,
+                end_ms - 1,
+            );
+            let page = parse_funding(&self.get(url)?.text()?)?;
+            let Some(&(last, _)) = page.last() else { break };
+            cursor_ms = last / NANOS_PER_MILLI + 1;
+            let full_page = page.len() == FUNDING_PAGE;
+            rates.extend(page);
+            if !full_page {
+                break;
+            }
+        }
+        Ok(rates)
+    }
+}
+
+/// Parses a `/fapi/v1/fundingRate` response body.
+///
+/// # Errors
+///
+/// Returns an error if it isn't one, as when Binance answers with an error instead.
+pub fn parse_funding(body: &str) -> anyhow::Result<Vec<(UnixNanos, f64)>> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Rate {
+        funding_time: u64,
+        funding_rate: String,
+    }
+    let rates: Vec<Rate> =
+        serde_json::from_str(body).with_context(|| format!("unexpected funding rates: {body}"))?;
+    rates
+        .into_iter()
+        .map(|rate| {
+            Ok((
+                rate.funding_time * NANOS_PER_MILLI,
+                rate.funding_rate
+                    .parse()
+                    .with_context(|| format!("a funding rate of `{}`", rate.funding_rate))?,
+            ))
+        })
+        .collect()
 }
 
 /// Checks that `[start, end)` holds at most [`MAX_RANGE_BARS`] bars of `timeframe`.
@@ -231,6 +332,9 @@ struct RawSymbol {
     base_asset: String,
     quote_asset: String,
     filters: Vec<serde_json::Value>,
+    /// Futures only: `PERPETUAL`, or a delivery date's kind.
+    #[serde(default)]
+    contract_type: Option<String>,
 }
 
 impl RawSymbol {
@@ -254,6 +358,24 @@ impl RawSymbol {
             base: self.base_asset,
             quote: self.quote_asset,
         })
+    }
+}
+
+#[cfg(test)]
+mod funding_tests {
+    use super::*;
+
+    #[test]
+    fn funding_rates_read_as_when_and_how_much() {
+        let body = r#"[{"symbol":"BTCUSDT","fundingTime":1000,"fundingRate":"0.00010000","markPrice":"1"},
+                       {"symbol":"BTCUSDT","fundingTime":2000,"fundingRate":"-0.00020000"}]"#;
+        assert_eq!(
+            parse_funding(body).unwrap(),
+            [(1_000_000_000, 0.0001), (2_000_000_000, -0.0002)]
+        );
+        assert!(parse_funding(r#"{"code":-1121,"msg":"Invalid symbol."}"#).is_err());
+        assert!(is_perp("BTCUSDT-PERP"));
+        assert!(!is_perp("BTCUSDT"));
     }
 }
 

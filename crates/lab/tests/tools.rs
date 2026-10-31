@@ -224,6 +224,7 @@ fn calls(lab: &Arc<Lab>, dir: &std::path::Path) -> Vec<(&'static str, Value)> {
         ("get_report", json!({"run_id": run_id})),
         ("get_trades", json!({"run_id": run_id})),
         ("get_fills", json!({"run_id": run_id})),
+        ("get_limit_orders", json!({"run_id": run_id})),
         ("get_equity", json!({"run_id": run_id, "limit": 5})),
         ("get_returns", json!({"run_id": run_id})),
         ("get_calendar", json!({"run_id": run_id})),
@@ -246,10 +247,12 @@ fn calls(lab: &Arc<Lab>, dir: &std::path::Path) -> Vec<(&'static str, Value)> {
 
 /// Tools that need something these tests don't have: the network, a compiled plugin or a job to stop.
 /// Each is exercised on its own elsewhere as far as it can be offline.
-const NOT_CALLED_HERE: [&str; 5] = [
+const NOT_CALLED_HERE: [&str; 6] = [
     "get_ticks",
     "import_data",
     "fetch_archive",
+    // Needs a perpetual, which the local market in these calls isn't; has its own test.
+    "get_funding",
     "install_plugin",
     "cancel_job",
 ];
@@ -469,6 +472,7 @@ fn a_request_is_built_as_the_app_builds_it() {
         fees: theirs.fees,
         ticks: None,
         fills: None,
+        funding: None,
     };
     let ours = build_request(
         market,
@@ -865,6 +869,7 @@ fn a_run_saved_before_they_were_packed_still_reads() {
 
 /// A market from "Binance" with no network: `HOURS` of hourly bars from `START`, counting requests.
 struct FakeBinance {
+    funding_requests: AtomicUsize,
     requests: AtomicUsize,
     /// Hours from `START` with no bars, as an exchange outage leaves.
     hole: Option<(u64, u64)>,
@@ -873,6 +878,19 @@ struct FakeBinance {
 const HOURS: u64 = 3_000;
 
 impl BarSource for FakeBinance {
+    fn funding(&self, symbol: &str, start: u64, end: u64) -> Result<Vec<(u64, f64)>, String> {
+        if !symbol.ends_with("-PERP") {
+            return Ok(Vec::new());
+        }
+        self.funding_requests.fetch_add(1, Ordering::Relaxed);
+        let every = 8 * HOUR;
+        Ok((start.div_ceil(every)..)
+            .map(|step| step * every)
+            .take_while(|when| *when < end)
+            .map(|when| (when, 0.0001))
+            .collect())
+    }
+
     fn instrument(&self, symbol: &str) -> Result<persephone_core::InstrumentSpec, String> {
         Ok(persephone_core::InstrumentSpec {
             symbol: symbol.into(),
@@ -920,6 +938,7 @@ impl BarSource for FakeBinance {
 
 fn binance_lab() -> (Arc<Lab>, Arc<FakeBinance>) {
     let source = Arc::new(FakeBinance {
+        funding_requests: AtomicUsize::new(0),
         requests: AtomicUsize::new(0),
         hole: None,
     });
@@ -2182,6 +2201,7 @@ fn a_program_over_a_socket_can_be_added_and_backtested() {
 #[test]
 fn two_labs_sharing_a_folder_download_a_cold_market_once() {
     let source = Arc::new(FakeBinance {
+        funding_requests: AtomicUsize::new(0),
         requests: AtomicUsize::new(0),
         hole: None,
     });
@@ -2284,6 +2304,31 @@ fn many_kinds_of_call_at_once_all_finish() {
 
 /// Against the real Binance, to prove the live format still matches. It needs the network, so it only
 /// runs when asked: `cargo test -p persephone-lab -- --ignored`.
+#[test]
+#[ignore = "needs the network"]
+fn real_binance_perpetuals_parse_and_pay_real_funding() {
+    let dir = std::env::temp_dir().join(format!("persephone-lab-perp-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let lab = Lab::new(Paths::under(&dir)).unwrap();
+    let market =
+        json!({"symbol": "BTCUSDT-PERP", "bars": "1h", "from": "2024-01-01", "to": "2024-03-01"});
+    let info = lab
+        .dispatch("get_instrument", &json!({"symbol": "BTCUSDT-PERP"}))
+        .unwrap();
+    assert_eq!(info["fees"]["taker"], 0.0005, "{info}");
+    let mut args = market.clone();
+    args["strategy"] =
+        json!({"positions": [[1_704_067_200_000_000_000_u64, 1]], "params": {"Size %": 100}});
+    args["wait_seconds"] = json!(120);
+    let run = lab.dispatch("run_backtest", &args).unwrap();
+    // Funding on BTC was well above zero then, every eight hours, and a long paid it.
+    assert!(
+        run["summary"]["funding_paid"].as_f64().unwrap() > 0.0,
+        "{run}"
+    );
+    assert_eq!(run["summary"]["warnings"], json!([]), "{run}");
+}
+
 #[test]
 #[ignore = "needs the network"]
 fn real_binance_bars_parse_are_closed_and_cache_exactly() {
@@ -3402,6 +3447,258 @@ fn everything_moves_to_another_lab_in_one_file_and_no_keys_go_with_it() {
 }
 
 #[test]
+fn limits_stops_fees_and_impact_work_from_settings_and_report_what_they_did() {
+    let closes: Vec<f64> = (0..120)
+        .map(|h| 100.0 + 5.0 * (f64::from(h) / 4.0).sin())
+        .collect();
+    let (lab, times) = market_of(&closes);
+    let list = json!([
+        [times[10], 1],
+        [times[40], 0],
+        [times[60], -1],
+        [times[90], 0]
+    ]);
+    let run = |settings: Value| {
+        lab.dispatch(
+            "run_backtest",
+            &on_hand_market(json!({"strategy": {"positions": list}, "settings": settings})),
+        )
+        .unwrap()
+    };
+    // Bars here have no range to speak of, so only closes matter: a limit must be through at a close.
+    let limited = run(json!({
+        "commission": {"on": true, "value": {"rates": {"maker": 0.01, "taker": 0.05}}},
+        "limit": {"on": true, "value": {"offset_percent": 0.5, "expires_bars": 5}},
+    }));
+    let summary = &limited["summary"];
+    assert!(summary["limit_orders"].as_u64().unwrap() >= 4, "{summary}");
+    assert_eq!(
+        summary["limits_filled"].as_u64().unwrap() as f64
+            / summary["limit_orders"].as_f64().unwrap(),
+        summary["fill_rate"].as_f64().unwrap()
+    );
+    assert!(summary["maker_fees"].as_f64().unwrap() > 0.0, "{summary}");
+    let fills = lab
+        .dispatch("get_fills", &json!({"run_id": limited["run_id"]}))
+        .unwrap();
+    assert_eq!(fills["columns"][6], "maker");
+    assert!(
+        fills["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row[6] == true),
+        "{fills}"
+    );
+
+    // A bad choice says so.
+    let error = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({
+                "strategy": {"positions": list},
+                "settings": {
+                    "fill_timing": "next_open",
+                    "limit": {"on": true, "value": {"offset_percent": 0.5, "expires_bars": 5}},
+                },
+            })),
+        )
+        .unwrap_err();
+    assert!(error.contains("limit orders"), "{error}");
+
+    // Costs that only exist while held and only when ordered still come out of the gross.
+    let impact = run(json!({"impact_percent": {"on": true, "value": 5}}));
+    let plain = run(json!({"commission": {"on": true, "value": {"percent": 0}}}));
+    assert!(
+        impact["summary"]["net_return"].as_f64().unwrap()
+            < impact["summary"]["gross_return"].as_f64().unwrap(),
+        "{impact}"
+    );
+    assert_eq!(plain["summary"]["limit_orders"], 0);
+    assert!(plain["summary"]["fill_rate"].is_null(), "{plain}");
+    let borrowed = run(json!({"borrow_percent_per_year": {"on": true, "value": 50}}));
+    assert!(
+        borrowed["summary"]["borrow_paid"].as_f64().unwrap() > 0.0,
+        "{borrowed}"
+    );
+}
+
+#[test]
+fn many_backtests_of_a_perpetual_at_once_all_finish() {
+    // They all want its funding at the same moment, which once failed some with a file gone missing.
+    let (lab, source) = binance_lab();
+    let at = |hour: u64| START + hour * HOUR;
+    let runs: Vec<Value> = (5..37)
+        .map(|fast| json!({"strategy": {"builtin": "ema-cross", "params": {"Fast": fast, "Slow": 60}}}))
+        .collect();
+    let batch = lab
+        .dispatch(
+            "run_backtests",
+            &json!({
+                "defaults": {"symbol": "BTCUSDT-PERP", "bars": "1h", "from": at(0), "to": at(500)},
+                "runs": runs,
+                "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    assert_eq!(batch["failed"], 0, "{batch}");
+    assert_eq!(
+        source.funding_requests.load(Ordering::Relaxed),
+        1,
+        "fetched once"
+    );
+
+    // The rates themselves, as an agent checking it needs them.
+    let rates = lab
+        .dispatch(
+            "get_funding",
+            &json!({"symbol": "BTCUSDT-PERP", "from": at(0), "to": at(100), "limit": 3}),
+        )
+        .unwrap();
+    assert_eq!(rates["columns"][2], "rate");
+    assert_eq!(rates["rows"][0][2], 0.0001, "{rates}");
+    let spot = lab
+        .dispatch("get_funding", &json!({"symbol": "BTCUSDT"}))
+        .unwrap_err();
+    assert!(spot.contains("BTCUSDT-PERP"), "{spot}");
+
+    // The market's return, and what it left after funding.
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &json!({
+                "symbol": "BTCUSDT-PERP", "bars": "1h", "from": at(0), "to": at(500),
+                "strategy": {"builtin": "ema-cross"}, "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    let held = &run["summary"]["benchmark"];
+    assert!(
+        held["return_after_funding"].as_f64().unwrap() < held["return"].as_f64().unwrap(),
+        "{held}"
+    );
+}
+
+#[test]
+fn a_perpetual_has_its_own_market_fees_and_pays_funding() {
+    let (lab, source) = binance_lab();
+    let at = |hour: u64| START + hour * HOUR;
+    let args = |symbol: &str| {
+        json!({
+            "symbol": symbol, "bars": "1h", "from": at(0), "to": at(200), "wait_seconds": 120,
+            "strategy": {"positions": [[at(10), 1]]},
+        })
+    };
+    let perp = lab.dispatch("run_backtest", &args("BTCUSDT-PERP")).unwrap();
+    let summary = &perp["summary"];
+    // FakeBinance pays 0.01% every 8 hours, and a long pays that.
+    assert!(summary["funding_paid"].as_f64().unwrap() > 0.0, "{summary}");
+    assert!(
+        summary["total_costs_paid"].as_f64().unwrap() > summary["funding_paid"].as_f64().unwrap()
+    );
+    let spot = lab.dispatch("run_backtest", &args("BTCUSDT")).unwrap();
+    assert_eq!(spot["summary"]["funding_paid"], json!(0.0));
+    // The perp's taker fee is 0.05% against spot's 0.1%.
+    let fee = |run: &Value| run["summary"]["fees"].as_f64().unwrap();
+    assert!(
+        (fee(&spot) / fee(&perp) - 2.0).abs() < 0.2,
+        "{} {}",
+        fee(&spot),
+        fee(&perp)
+    );
+    // Rates are downloaded once.
+    let asked = source.funding_requests.load(Ordering::Relaxed);
+    lab.dispatch("run_backtest", &args("BTCUSDT-PERP")).unwrap();
+    assert_eq!(source.funding_requests.load(Ordering::Relaxed), asked);
+}
+
+#[test]
+fn every_limit_order_can_be_read_with_what_followed_and_a_queue_can_be_required() {
+    // A wave with real range, so limits are reached by some bars and not others.
+    let (lab, _source) = binance_lab();
+    let at = |hour: u64| START + hour * HOUR;
+    let cycle: Vec<Value> = (0..200)
+        .map(|i| json!([at(10 + i * 3), if i % 2 == 0 { 1 } else { 0 }]))
+        .collect();
+    let args = |through: f64| {
+        json!({
+            "symbol": "BTCUSDT", "bars": "1h", "from": at(0), "wait_seconds": 120,
+            "strategy": {"positions": cycle},
+            "settings": {"limit": {"on": true, "value": {
+                "offset_percent": 0.02, "expires_bars": 2, "through_percent": through,
+            }}},
+        })
+    };
+    let free = lab.dispatch("run_backtest", &args(0.0)).unwrap();
+    let queued = lab.dispatch("run_backtest", &args(0.3)).unwrap();
+    let filled = |run: &Value| run["summary"]["limits_filled"].as_f64().unwrap();
+    assert!(
+        filled(&free) > filled(&queued),
+        "{} {}",
+        filled(&free),
+        filled(&queued)
+    );
+
+    let page = lab
+        .dispatch(
+            "get_limit_orders",
+            &json!({"run_id": free["run_id"], "limit": 1000}),
+        )
+        .unwrap();
+    assert_eq!(page["columns"][5], "outcome");
+    let rows = page["rows"].as_array().unwrap();
+    assert_eq!(
+        rows.len() as u64,
+        free["summary"]["limit_orders"].as_u64().unwrap()
+    );
+    let summary = &free["summary"]["limit_summary"];
+    assert_eq!(
+        rows.iter().filter(|row| row[5] == "filled").count() as u64,
+        summary["filled"].as_u64().unwrap(),
+        "{summary}"
+    );
+    // Every fill reached past its price, and every miss didn't get there.
+    for row in rows {
+        let reached = row[8].as_f64().unwrap_or(f64::NAN);
+        if row[5] == "filled" {
+            assert!(reached > 0.0, "{row}");
+        } else if row[5] == "lapsed" {
+            assert!(reached <= 0.0, "{row}");
+        }
+    }
+    let only = lab
+        .dispatch(
+            "get_limit_orders",
+            &json!({"run_id": free["run_id"], "outcome": "lapsed", "limit": 1000}),
+        )
+        .unwrap();
+    assert!(
+        only["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row[5] == "lapsed"),
+        "{only}"
+    );
+    assert!(
+        free["summary"]["limit_summary"]["filled_move_1"].is_number(),
+        "{summary}"
+    );
+
+    // None sent, none to say.
+    let market = lab
+        .dispatch(
+            "run_backtest",
+            &json!({
+                "symbol": "BTCUSDT", "bars": "1h", "from": at(0), "wait_seconds": 120,
+                "strategy": {"positions": cycle},
+            }),
+        )
+        .unwrap();
+    assert!(market["summary"]["limit_summary"].is_null(), "{market}");
+}
+
+#[test]
 fn a_look_back_longer_than_the_warm_up_says_so_even_when_it_trades() {
     let (lab, _source) = binance_lab();
     let at = |hour: u64| START + hour * HOUR;
@@ -3462,6 +3759,7 @@ fn the_batch_table_has_each_runs_years() {
 #[test]
 fn pages_and_exports_carry_on_past_a_hole_in_the_market() {
     let source = Arc::new(FakeBinance {
+        funding_requests: AtomicUsize::new(0),
         requests: AtomicUsize::new(0),
         hole: Some((400, 700)),
     });

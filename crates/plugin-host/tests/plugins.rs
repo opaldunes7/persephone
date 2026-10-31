@@ -216,6 +216,7 @@ fn request(strategy: StrategySpec, plugin: Option<Arc<dyn SignalFactory>>) -> Ba
         rules: TradingRules::default(),
         trade_from: 0,
         fill_bars: None,
+        funding: None,
     }
 }
 

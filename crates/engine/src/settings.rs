@@ -27,6 +27,29 @@ pub struct SimSettings {
     /// Fill at the next bar's open rather than the close the decision came at, a realistic delay
     /// with no finer data needed. On time bars, and not alongside latency or ticks.
     pub next_open: bool,
+    /// Send orders as limits rather than at the market.
+    pub limit: Option<LimitOrders>,
+    /// A stop this far from the entry, as a percentage, resting while a position's held.
+    pub stop_loss_percent: Option<f64>,
+    /// A target this far from the entry, as a percentage, resting while a position's held.
+    pub take_profit_percent: Option<f64>,
+    /// What borrowing costs a short, as a percentage of its value a year.
+    pub borrow_percent_per_year: Option<f64>,
+    /// How far a market order fills worse, as a percentage, when it's all of its bar's volume. It
+    /// moves with the square root of its share of that volume.
+    pub impact_percent: f64,
+}
+
+/// How a strategy's orders go out as limits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LimitOrders {
+    /// How far from the close it rests, on the better side, as a percentage.
+    pub offset_percent: f64,
+    /// How many bars it rests before it's cancelled: an entry lapses, and an exit goes at the market.
+    pub expires_bars: u32,
+    /// How far past its price the market must trade before it fills, as a percentage, standing in for
+    /// the queue ahead of it, which a bar can't show. It still fills at its own price.
+    pub through_percent: f64,
 }
 
 impl Default for SimSettings {
@@ -40,6 +63,11 @@ impl Default for SimSettings {
             leverage: 1.0,
             compound: false,
             next_open: false,
+            limit: None,
+            stop_loss_percent: None,
+            take_profit_percent: None,
+            borrow_percent_per_year: None,
+            impact_percent: 0.0,
         }
     }
 }

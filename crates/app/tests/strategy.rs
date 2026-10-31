@@ -1728,6 +1728,62 @@ mod panel {
     }
 
     #[test]
+    fn limits_stops_and_costs_reach_the_backtest_but_never_a_live_session() {
+        use persephone_engine::live::LiveMode;
+        let mut app = ready_panel(TestKind::Backtest);
+        panel(&mut app, PanelMessage::Edit(Edit::Limit(true)));
+        panel(&mut app, PanelMessage::Edit(Edit::StopLoss(true)));
+        panel(&mut app, PanelMessage::Edit(Edit::MakerTaker(true)));
+        panel(&mut app, PanelMessage::Edit(Edit::Commission(true)));
+        let (_, request) = app.backtest_request(0).unwrap();
+        assert!(request.sim.limit.is_some());
+        assert!(request.sim.stop_loss_percent.is_some());
+        assert!(
+            (request.fees.taker - 0.001).abs() < 1e-12,
+            "{:?}",
+            request.fees
+        );
+
+        // A session wouldn't do what the backtest showed, so it says so and doesn't start.
+        let _ = app.update(Message::OpenReport(0));
+        let _ = app.update(Message::Menu(MenuMessage::GoLive(LiveMode::Paper)));
+        assert!(app.tile_live(0).is_none(), "it started");
+
+        // With them off, it's as it was.
+        panel(&mut app, PanelMessage::Edit(Edit::Limit(false)));
+        panel(&mut app, PanelMessage::Edit(Edit::StopLoss(false)));
+        let _ = app.update(Message::Menu(MenuMessage::GoLive(LiveMode::Paper)));
+        assert!(
+            app.tile_live(0).is_some(),
+            "market orders on spot still trade"
+        );
+    }
+
+    #[test]
+    fn the_panel_shows_each_limit_order_and_how_they_compare() {
+        let mut app = ready_panel(TestKind::Backtest);
+        panel(&mut app, PanelMessage::Edit(Edit::Limit(true)));
+        panel(
+            &mut app,
+            PanelMessage::Input(Field::LimitOffset, "0.01".into()),
+        );
+        panel(&mut app, PanelMessage::Submit(Field::LimitOffset));
+        panel(
+            &mut app,
+            PanelMessage::Input(Field::LimitThrough, "0.02".into()),
+        );
+        panel(&mut app, PanelMessage::Submit(Field::LimitThrough));
+        let (_, request) = app.backtest_request(0).unwrap();
+        assert!((request.sim.limit.unwrap().through_percent - 0.02).abs() < 1e-12);
+        finish_backtest(&mut app);
+        assert!(shows(&app, "Limits"));
+        panel(&mut app, PanelMessage::ShowLimits(true));
+        assert!(shows(&app, "Became"));
+        panel(&mut app, PanelMessage::ShowCalendar(false));
+        assert!(!shows(&app, "Became"), "back to the equity curve");
+    }
+
+    #[test]
     fn filling_at_the_next_open_reaches_the_backtest() {
         use persephone::backtest::FillTiming;
         let mut app = ready_panel(TestKind::Backtest);

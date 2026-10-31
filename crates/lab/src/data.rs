@@ -15,7 +15,7 @@ use parquet::arrow::ArrowWriter;
 use persephone_core::{BarSpec, Candle, Timeframe, UnixNanos, tick::Ticks};
 use persephone_data::{
     archive,
-    binance::{BinanceClient, check_range},
+    binance::{BinanceClient, check_range, is_perp},
     import::{self, MarketOptions, Overrides},
 };
 use persephone_engine::FeeRates;
@@ -130,6 +130,12 @@ impl Lab {
         };
         let instrument = self.cache.instrument(&market.symbol)?;
         let candles = self.cache.bars(&market.symbol, timeframe, start, end)?;
+        let perp = is_perp(&market.symbol);
+        let funding = if perp {
+            Some(Arc::new(self.cache.funding(&market.symbol, start, end)?))
+        } else {
+            None
+        };
         if candles.is_empty() {
             return Err(format!(
                 "Binance has no closed {} bars of {} there",
@@ -144,9 +150,14 @@ impl Lab {
             price_precision: instrument.price_precision,
             candles,
             instrument,
-            fees: FeeRates::BINANCE_SPOT,
+            fees: if perp {
+                FeeRates::BINANCE_PERP
+            } else {
+                FeeRates::BINANCE_SPOT
+            },
             ticks: None,
             fills: None,
+            funding,
         })
     }
 
@@ -194,7 +205,14 @@ impl Lab {
                     },
                 )
             }
-            None => (self.cache.instrument(&symbol)?, FeeRates::BINANCE_SPOT),
+            None => (
+                self.cache.instrument(&symbol)?,
+                if is_perp(&symbol) {
+                    FeeRates::BINANCE_PERP
+                } else {
+                    FeeRates::BINANCE_SPOT
+                },
+            ),
         };
         Ok(json!({
             "symbol": instrument.symbol,
@@ -205,6 +223,31 @@ impl Lab {
             "size_precision": instrument.size_precision,
             "fees": {"maker": fees.maker, "taker": fees.taker},
         }))
+    }
+
+    /// A perpetual's funding rates, in pages.
+    pub(crate) fn get_funding(&self, args: &Value) -> Result<Value, String> {
+        let market = MarketArgs::parse(args)?;
+        if !is_perp(&market.symbol) {
+            return Err(format!(
+                "`{}` isn't a perpetual, so has no funding; try `{}-PERP`",
+                market.symbol, market.symbol
+            ));
+        }
+        let end = market
+            .to
+            .unwrap_or_else(|| self.cache.forming(Timeframe::H1));
+        // From when asked, or for a year back: all of them is a lot to fetch to read a few.
+        let year = 365 * persephone_core::time::NANOS_PER_DAY;
+        let start = market.from.unwrap_or_else(|| end.saturating_sub(year));
+        let rates = self.cache.funding(&market.symbol, start, end)?;
+        Ok(crate::tools::page_of(
+            &["ts", "time", "rate"],
+            rates.len(),
+            args,
+            DEFAULT_ROWS,
+            |i| serde_json::json!([rates[i].0, crate::time_text(rates[i].0), rates[i].1]),
+        ))
     }
 
     pub(crate) fn get_history_range(&self, args: &Value) -> Result<Value, String> {

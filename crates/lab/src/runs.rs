@@ -17,7 +17,7 @@ use persephone_core::{
     signal::{Note, SignalFactory},
     strategy::{StrategyKind, StrategySpec},
 };
-use persephone_engine::{BacktestReport, BacktestRequest, Fill};
+use persephone_engine::{BacktestReport, BacktestRequest, Fill, LimitOutcome};
 use persephone_research::{
     WARM_UP_BARS,
     calendar::{Calendar, days_in_month, weeks},
@@ -51,7 +51,7 @@ const LISTED_RUNS: usize = 20;
 const LISTED_VALUES: usize = 50;
 /// The most backtests `run_backtests` takes in one call.
 const MAX_BACKTESTS: usize = 5_000;
-const BATCH_COLUMNS: [&str; 21] = [
+const BATCH_COLUMNS: [&str; 27] = [
     "index",
     "run_id",
     "label",
@@ -71,6 +71,12 @@ const BATCH_COLUMNS: [&str; 21] = [
     "gross_return",
     "total_costs_paid",
     "break_even_cost_per_fill",
+    "maker_fees",
+    "taker_fees",
+    "funding_paid",
+    "limit_orders",
+    "limits_filled",
+    "fill_rate",
     "warnings",
     "error",
 ];
@@ -105,6 +111,7 @@ pub fn build_request(
     fill_bars: Option<Arc<Vec<Candle>>>,
 ) -> Result<BacktestRequest, String> {
     let high = settings.precision == Precision::High;
+    let funding = market.funding;
     Ok(BacktestRequest {
         fees: settings.fees(market.fees),
         ticks: market.ticks.filter(|_| high),
@@ -118,6 +125,7 @@ pub fn build_request(
         rules: settings.rules()?,
         trade_from,
         fill_bars,
+        funding,
     })
 }
 
@@ -199,6 +207,7 @@ fn summary_of(
     from_index: usize,
     name: &str,
     bars: &[(u64, f64)],
+    funding: &[(u64, f64)],
 ) -> Value {
     let trades = round_trips(report);
     let profit: f64 = trades.iter().map(|t| t.profit).sum();
@@ -223,8 +232,13 @@ fn summary_of(
         "win_rate": winners as f64 / trades.len().max(1) as f64,
         "bars": report.equity.len().saturating_sub(from_index),
         "buy_and_hold_return": figures::buy_and_hold(bars, from_index),
-        "benchmark": figures::benchmark(report.starting_balance, bars, from_index).map(|held| {
-            json!({"return": held.return_, "sharpe": held.sharpe, "max_drawdown": held.max_drawdown})
+        "benchmark": figures::benchmark(report.starting_balance, bars, from_index, funding).map(|held| {
+            json!({
+                "return": held.return_,
+                "return_after_funding": held.return_after_funding,
+                "sharpe": held.sharpe,
+                "max_drawdown": held.max_drawdown,
+            })
         }),
         "sharpe": figures::sharpe(report, from_index, bars),
         "profit_factor": (losses > 0.0).then(|| gains / losses),
@@ -249,6 +263,17 @@ fn warnings_of(report: &BacktestReport) -> Vec<String> {
         ));
     }
     warnings
+}
+
+fn limit_outcome(outcome: LimitOutcome) -> &'static str {
+    match outcome {
+        LimitOutcome::Filled => "filled",
+        LimitOutcome::Lapsed => "lapsed",
+        LimitOutcome::Replaced => "replaced",
+        LimitOutcome::Cancelled => "cancelled",
+        LimitOutcome::Refused => "refused",
+        LimitOutcome::Open => "open",
+    }
 }
 
 /// Whether a call asks for every line a fan draws, rather than the few that sum it up.
@@ -354,6 +379,7 @@ fn report_from(run: &Value) -> BacktestReport {
                 price: fill[3].as_f64().unwrap_or(f64::NAN),
                 qty: fill[4].as_f64().unwrap_or(f64::NAN),
                 fee: fill[5].as_f64().unwrap_or(0.0),
+                maker: fill[6].as_bool().unwrap_or(false),
             })
             .collect()
     });
@@ -386,6 +412,11 @@ fn report_from(run: &Value) -> BacktestReport {
         fees: run["fees"].as_f64().unwrap_or(0.0),
         total_orders: run["total_orders"].as_u64().unwrap_or(0) as usize,
         total_positions: run["total_positions"].as_u64().unwrap_or(0) as usize,
+        limit_orders: run["summary"]["limit_orders"].as_u64().unwrap_or(0) as usize,
+        limits_filled: run["summary"]["limits_filled"].as_u64().unwrap_or(0) as usize,
+        funding_paid: run["summary"]["funding_paid"].as_f64().unwrap_or(0.0),
+        borrow_paid: run["summary"]["borrow_paid"].as_f64().unwrap_or(0.0),
+        limit_log: Vec::new(),
         pnl: map_from(&run["pnl"]),
         returns: map_from(&run["returns"]),
         general: map_from(&run["general"]),
@@ -581,6 +612,7 @@ impl Lab {
         let bars: Vec<(u64, f64)> = request.candles.iter().map(|c| (c.ts, c.close)).collect();
         let look_back = look_back_of(args, request.strategy.own_params());
         let market_share = request.strategy.size_fraction() * request.sim.leverage;
+        let funding = request.funding.as_deref().cloned().unwrap_or_default();
         let fills_on = if request.sim.next_open {
             "next_open"
         } else if request.ticks.is_some() {
@@ -596,16 +628,19 @@ impl Lab {
             .get("friction")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let volumes: Vec<f64> = request.candles.iter().map(|c| c.volume).collect();
         let free = (wanted && figures::costs_something(&request))
             .then(|| figures::without_costs(&request));
         let report = backtest(request)?;
         let free = free.map(backtest).transpose()?;
-        let mut summary = summary_of(&report, from_index, &name, &bars);
+        let mut summary = summary_of(&report, from_index, &name, &bars, &funding);
         if wanted {
             let gross = free.as_ref().unwrap_or(&report);
-            let friction = figures::friction(&report, gross, &sim, price_precision);
+            let friction = figures::friction(&report, gross, &sim, price_precision, &volumes);
             summary["gross_return"] = json!(friction.gross_return);
             summary["total_costs_paid"] = json!(friction.costs_paid);
+            summary["maker_fees"] = json!(friction.maker_fees);
+            summary["taker_fees"] = json!(friction.taker_fees);
             summary["break_even_cost_per_fill"] = json!(friction.break_even_bp);
         } else {
             for figure in [
@@ -616,16 +651,40 @@ impl Lab {
                 summary[figure] = Value::Null;
             }
         }
-        if let Some(warning) = figures::look_back_warning(look_back, from_index, times.len())
-            && let Some(warnings) = summary["warnings"].as_array_mut()
+        let limits = figures::LimitSummary::of(&report);
+        for warning in [
+            figures::look_back_warning(look_back, from_index, times.len()),
+            limits.warning(),
+        ]
+        .into_iter()
+        .flatten()
         {
-            warnings.push(json!(warning));
+            if let Some(warnings) = summary["warnings"].as_array_mut() {
+                warnings.push(json!(warning));
+            }
         }
+        summary["limit_summary"] = json!((report.limit_orders > 0).then(|| json!({
+            "filled": limits.filled,
+            "missed": limits.missed,
+            "barely_filled": limits.barely_filled,
+            "filled_move_1": limits.filled_move_1,
+            "missed_move_1": limits.missed_move_1,
+            "filled_move_24": limits.filled_move_24,
+            "missed_move_24": limits.missed_move_24,
+        })));
         if let Some(label) = args.get("label") {
             summary["label"] = label.clone();
         }
         // Which bars these were, as a span with no end moves on as new bars close.
         summary["fills_on"] = json!(fills_on);
+        summary["funding_paid"] = json!(report.funding_paid);
+        summary["borrow_paid"] = json!(report.borrow_paid);
+        summary["limit_orders"] = json!(report.limit_orders);
+        summary["limits_filled"] = json!(report.limits_filled);
+        summary["fill_rate"] = json!(
+            (report.limit_orders > 0)
+                .then(|| report.limits_filled as f64 / report.limit_orders as f64)
+        );
         summary["first_bar"] = json!(times.get(from_index).copied().map(time_text));
         summary["last_bar"] = json!(times.last().copied().map(time_text));
         let run_id = new_id("run");
@@ -638,9 +697,22 @@ impl Lab {
             "times": times,
             "equity": report.equity,
             "closes": bars.iter().map(|(_, close)| close).collect::<Vec<_>>(),
+            "limit_log": report.limit_log.iter().map(|order| json!([
+                order.placed,
+                time_text(order.placed),
+                if order.side == Side::Buy { "buy" } else { "sell" },
+                order.price,
+                order.qty,
+                limit_outcome(order.outcome),
+                order.ended,
+                order.bars,
+                order.reached_percent,
+                order.move_1_percent,
+                order.move_24_percent,
+            ])).collect::<Vec<_>>(),
             "market_share": market_share,
             "fills": report.fills.iter().map(|f| json!([
-                f.ts, f.bar, if f.side == Side::Buy { "buy" } else { "sell" }, f.price, f.qty, f.fee,
+                f.ts, f.bar, if f.side == Side::Buy { "buy" } else { "sell" }, f.price, f.qty, f.fee, f.maker,
             ])).collect::<Vec<_>>(),
             "starting_balance": report.starting_balance,
             "max_drawdown": report.max_drawdown,
@@ -811,6 +883,12 @@ impl Lab {
                     summary["gross_return"],
                     summary["total_costs_paid"],
                     summary["break_even_cost_per_fill"],
+                    summary["maker_fees"],
+                    summary["taker_fees"],
+                    summary["funding_paid"],
+                    summary["limit_orders"],
+                    summary["limits_filled"],
+                    summary["fill_rate"],
                     summary["warnings"],
                     null,
                 ])
@@ -932,12 +1010,44 @@ impl Lab {
         ))
     }
 
+    /// Every limit order a run sent, filled or not, with what the market then did.
+    pub(crate) fn get_limit_orders(&self, args: &Value) -> Result<Value, String> {
+        let run = self.load_run(text(args, "run_id")?)?;
+        let empty = Vec::new();
+        let wanted = args.get("outcome").and_then(Value::as_str);
+        let rows: Vec<&Value> = run["limit_log"]
+            .as_array()
+            .unwrap_or(&empty)
+            .iter()
+            .filter(|row| wanted.is_none_or(|outcome| row[5] == outcome))
+            .collect();
+        Ok(page_of(
+            &[
+                "placed_ts",
+                "placed",
+                "side",
+                "price",
+                "size",
+                "outcome",
+                "ended_ts",
+                "bars",
+                "reached_percent",
+                "move_1_percent",
+                "move_24_percent",
+            ],
+            rows.len(),
+            args,
+            DEFAULT_ROWS,
+            |i| rows[i].clone(),
+        ))
+    }
+
     pub(crate) fn get_fills(&self, args: &Value) -> Result<Value, String> {
         let run = self.load_run(text(args, "run_id")?)?;
         let empty = Vec::new();
         let fills = run["fills"].as_array().unwrap_or(&empty);
         Ok(page_of(
-            &["ts", "bar", "side", "price", "size", "fee"],
+            &["ts", "bar", "side", "price", "size", "fee", "maker"],
             fills.len(),
             args,
             DEFAULT_ROWS,

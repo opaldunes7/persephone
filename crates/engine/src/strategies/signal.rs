@@ -1,16 +1,16 @@
 //! The bridge from "which position do I want?" to Nautilus orders.
 
-use std::{cell::RefCell, fmt, rc::Rc};
+use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
 
 use nautilus_common::actor::DataActor;
 use nautilus_model::{
     data::{Bar, BarType},
-    enums::OrderSide,
+    enums::{LiquiditySide, OrderSide},
     events::{OrderDenied, OrderFilled, OrderRejected},
-    identifiers::{ClientOrderId, StrategyId},
+    identifiers::{ClientOrderId, InstrumentId, StrategyId},
     instruments::Instrument,
-    orders::Order as _,
-    types::Quantity,
+    orders::{Order as _, OrderAny},
+    types::{Price, Quantity},
 };
 use nautilus_trading::{
     nautilus_strategy,
@@ -18,7 +18,11 @@ use nautilus_trading::{
 };
 use persephone_core::{Candle, Side, UnixNanos, signal::Signal};
 
-use crate::{report::RawFill, settings::TradingRules};
+use crate::{
+    models::BarNow,
+    report::{LimitOutcome, NANOS_PER_YEAR, RawFill, RawLimit},
+    settings::{LimitOrders, TradingRules},
+};
 
 /// Hears what a live strategy sees and does, as it happens.
 pub(crate) trait Watcher {
@@ -62,6 +66,34 @@ pub(crate) struct SignalStrategy {
     last_refused: bool,
     /// Where what's held didn't match what was asked for, for the report.
     missed: Rc<RefCell<Missed>>,
+    price_precision: u8,
+    /// What orders resting further off than they offered pay when they fill.
+    quoted: Vec<(ClientOrderId, f64)>,
+    /// How orders go out as limits, and stops and targets while a position's held.
+    limit: Option<LimitOrders>,
+    stop_loss: Option<f64>,
+    take_profit: Option<f64>,
+    /// The limit order resting now, if any.
+    resting: Option<Resting>,
+    /// The stop and target resting now.
+    brackets: Brackets,
+    /// Each bar's close, open, high, low and real volume (what's handed to Nautilus is deliberately
+    /// more, so it doesn't cap fills), only to tell when one reaches both a stop and a target. Which
+    /// came first can't be known from a bar, so the target stands down for it and the stop goes first.
+    /// Its open tells the fill model where a stop passed on the way should fill.
+    bars_ahead: Arc<Vec<BarAhead>>,
+    /// Orders fill on finer data, which shows what came first, so nothing needs assuming.
+    fills_finer: bool,
+    bar_now: Arc<BarNow>,
+    /// The last close seen, for what's done when a fill comes in.
+    last_candle: Option<Candle>,
+    /// What holding costs, charged to `cash`, so positions sized from the account feel it.
+    funding: Arc<Vec<(UnixNanos, f64)>>,
+    next_funding: usize,
+    borrow_percent_per_year: f64,
+    last_bar: Option<UnixNanos>,
+    /// Impact's on, so orders large against their bar's volume are worth saying.
+    watch_volume: bool,
     /// Shared with the engine thread that runs this strategy; collected after the run.
     fills: Rc<RefCell<Vec<RawFill>>>,
     /// Set when the signal fails; the strategy stops trading and the run reports it.
@@ -99,6 +131,22 @@ impl SignalStrategy {
             asked_size: 0.0,
             last_refused: false,
             missed: Rc::default(),
+            price_precision: 8,
+            quoted: Vec::new(),
+            limit: None,
+            stop_loss: None,
+            take_profit: None,
+            resting: None,
+            brackets: Brackets::default(),
+            bars_ahead: Arc::default(),
+            fills_finer: false,
+            bar_now: Arc::default(),
+            last_candle: None,
+            funding: Arc::default(),
+            next_funding: 0,
+            borrow_percent_per_year: 0.0,
+            last_bar: None,
+            watch_volume: false,
             fills,
             failure,
             long_only: false,
@@ -123,6 +171,57 @@ impl SignalStrategy {
     pub(crate) const fn compounding(mut self, balance: Option<f64>) -> Self {
         self.compound_from = balance;
         self
+    }
+
+    /// Sends orders as limits, and keeps stops and targets on what's held, as these say.
+    pub(crate) fn with_orders(
+        mut self,
+        limit: Option<LimitOrders>,
+        stop_loss: Option<f64>,
+        take_profit: Option<f64>,
+        bars_ahead: Arc<Vec<BarAhead>>,
+        fills_finer: bool,
+        bar_now: Arc<BarNow>,
+    ) -> Self {
+        self.limit = limit;
+        self.stop_loss = stop_loss;
+        self.take_profit = take_profit;
+        self.bars_ahead = bars_ahead;
+        self.fills_finer = fills_finer;
+        self.bar_now = bar_now;
+        self
+    }
+
+    /// Charges what holding costs, and says when orders are large against their bars.
+    pub(crate) fn holding(
+        mut self,
+        funding: Arc<Vec<(UnixNanos, f64)>>,
+        borrow_percent_per_year: Option<f64>,
+        impact_percent: f64,
+    ) -> Self {
+        self.funding = funding;
+        self.borrow_percent_per_year = borrow_percent_per_year.unwrap_or(0.0);
+        self.watch_volume = impact_percent > 0.0;
+        self
+    }
+
+    /// Takes what fell due over this bar from the cash, as the report's equity does.
+    fn charge_holding(&mut self, candle: &Candle) {
+        while let Some(&(when, rate)) = self.funding.get(self.next_funding) {
+            if when >= candle.ts {
+                break;
+            }
+            self.cash -= self.position * candle.open * rate;
+            self.next_funding += 1;
+        }
+        if self.position < 0.0
+            && let Some(last) = self.last_bar
+        {
+            let years = candle.ts.saturating_sub(last) as f64 / NANOS_PER_YEAR;
+            self.cash +=
+                self.position.abs() * -candle.open * self.borrow_percent_per_year / 100.0 * years;
+        }
+        self.last_bar = Some(candle.ts);
     }
 
     /// Keeps count of bars that didn't get what the strategy asked for in `missed`.
@@ -162,6 +261,10 @@ impl SignalStrategy {
     fn refuse(&mut self, order: ClientOrderId, message: String) {
         self.in_flight.retain(|(id, _)| *id != order);
         self.last_refused = true;
+        if let Some(resting) = self.resting.filter(|resting| resting.id == order) {
+            self.resting = None;
+            self.log_end(resting.logged, LimitOutcome::Refused);
+        }
         let mut refused = self.refused.borrow_mut();
         refused.0 += 1;
         refused.1.get_or_insert_with(|| message.clone());
@@ -194,6 +297,30 @@ impl SignalStrategy {
     }
 }
 
+/// A bar's close time, open, high, low and real volume.
+pub(crate) type BarAhead = (UnixNanos, f64, f64, f64, f64);
+
+/// A limit order resting on the book.
+#[derive(Clone, Copy, Debug)]
+struct Resting {
+    id: ClientOrderId,
+    /// The position it's to bring about.
+    target: i8,
+    /// How many bars it's been there.
+    bars: u32,
+    /// It closes or reverses what's held, so can't just lapse.
+    closes_position: bool,
+    /// Its place in the log.
+    logged: usize,
+}
+
+/// The stop and target on what's held.
+#[derive(Clone, Copy, Debug, Default)]
+struct Brackets {
+    stop: Option<ClientOrderId>,
+    take: Option<ClientOrderId>,
+}
+
 /// Where a run didn't do what its strategy asked, with nothing else having said so.
 #[derive(Debug, Default)]
 pub(crate) struct Missed {
@@ -203,6 +330,14 @@ pub(crate) struct Missed {
     /// Bars where the position asked for rounded to nothing, and the first of them.
     pub(crate) too_small: usize,
     pub(crate) first_too_small: UnixNanos,
+    /// Orders over a tenth of their bar's volume, and the first of them.
+    pub(crate) over_volume: usize,
+    pub(crate) first_over_volume: UnixNanos,
+    /// Every limit order, as they went out.
+    pub(crate) limits: Vec<RawLimit>,
+    /// How many limit orders went out, and filled.
+    pub(crate) limit_orders: usize,
+    pub(crate) limits_filled: usize,
 }
 
 impl Missed {
@@ -211,6 +346,13 @@ impl Missed {
             self.first_unmet = ts;
         }
         self.unmet += 1;
+    }
+
+    fn over_volume(&mut self, ts: UnixNanos) {
+        if self.over_volume == 0 {
+            self.first_over_volume = ts;
+        }
+        self.over_volume += 1;
     }
 
     fn too_small(&mut self, ts: UnixNanos) {
@@ -272,20 +414,30 @@ nautilus_strategy!(SignalStrategy, {
                 self.in_flight.remove(at);
             }
         }
-        let value = qty * event.last_px.as_f64();
+        // An order resting further off than it offered pays what it offered, and its fee on that.
+        let offered = self
+            .quoted
+            .iter()
+            .position(|(id, _)| *id == event.client_order_id)
+            .map(|at| self.quoted.swap_remove(at).1);
+        let price = offered.unwrap_or_else(|| event.last_px.as_f64());
+        let fee = event.commission.map_or(0.0, |fee| fee.as_f64()) * price / event.last_px.as_f64();
+        let value = qty * price;
         self.cash += if side == Side::Buy { -value } else { value };
-        self.cash -= event.commission.map_or(0.0, |fee| fee.as_f64());
+        self.cash -= fee;
         if self.position == 0.0 {
             self.entry_price = f64::NAN;
         } else if before == 0.0 || before.is_sign_positive() != self.position.is_sign_positive() {
-            self.entry_price = event.last_px.as_f64();
+            self.entry_price = price;
         }
+        self.after_fill(event.client_order_id, event.ts_event.as_u64());
         let fill = RawFill {
             ts: event.ts_event.as_u64(),
             side,
-            price: event.last_px.as_f64(),
+            price,
             qty,
-            fee: event.commission.map_or(0.0, |fee| fee.as_f64()),
+            fee,
+            maker: event.liquidity_side == LiquiditySide::Maker,
         };
         if let Some(watcher) = &mut self.watcher {
             watcher.fill(&fill);
@@ -323,6 +475,7 @@ impl DataActor for SignalStrategy {
         // Live, the venue's own instrument may trade in finer or coarser steps than ours.
         if let Some(instrument) = self.cache().instrument(&self.bar_type.instrument_id()) {
             self.size_precision = instrument.size_precision();
+            self.price_precision = instrument.price_precision();
         }
         self.subscribe_bars(self.bar_type, None, None);
         if let Some(watcher) = &mut self.watcher {
@@ -364,10 +517,29 @@ impl DataActor for SignalStrategy {
                 return Ok(());
             }
         };
+        let next = self.bars_ahead.partition_point(|bar| bar.0 <= candle.ts);
+        if let Some(bar) = self.bars_ahead.get(next).filter(|_| !self.fills_finer) {
+            self.bar_now.set_open(bar.1);
+        }
+        let volume = next
+            .checked_sub(1)
+            .and_then(|at| self.bars_ahead.get(at))
+            .map_or(0.0, |bar| bar.4);
+        self.bar_now.set_volume(volume);
+        self.last_candle = Some(candle);
+        self.charge_holding(&candle);
         // Bars are stamped with their close: the moment an order would go out.
         if candle.ts <= self.trade_from {
             return Ok(());
         }
+        self.decide(&candle, wanted)?;
+        self.keep_brackets(&candle)
+    }
+}
+
+impl SignalStrategy {
+    /// Acts on what the strategy wants at this close.
+    fn decide(&mut self, candle: &Candle, wanted: Option<i8>) -> anyhow::Result<()> {
         // A check on everything below, so it mustn't lean on any of it: what's asked for by now
         // should be held, unless an order is still on its way or was refused.
         if self.in_flight.is_empty()
@@ -381,8 +553,13 @@ impl DataActor for SignalStrategy {
         {
             self.missed.borrow_mut().unmet(candle.ts);
         }
+        let lapsed = self.age_resting()?;
         let expected = self.expected();
-        let Some(target) = self.rules.target(wanted, sign_of(expected), candle.ts) else {
+        let target = self.rules.target(wanted, sign_of(expected), candle.ts);
+        // An exit that didn't fill as a limit still has to happen.
+        let at_market =
+            target.is_none() && lapsed.is_some() || target == lapsed && lapsed.is_some();
+        let Some(target) = target.or(lapsed) else {
             return Ok(());
         };
         let target = if self.long_only {
@@ -394,6 +571,14 @@ impl DataActor for SignalStrategy {
         if candle.close <= 0.0 || self.is_exiting() {
             return Ok(());
         }
+        // A newer wish replaces what's resting; the same one leaves it be.
+        if let Some(resting) = self.resting {
+            if resting.target == target {
+                return Ok(());
+            }
+            self.end_resting(LimitOutcome::Replaced)?;
+        }
+        let expected = self.expected();
         if sign_of(expected) == target {
             self.asked = target;
             return Ok(());
@@ -412,6 +597,17 @@ impl DataActor for SignalStrategy {
             }
             return Ok(());
         }
+        let volume = self
+            .bars_ahead
+            .get(
+                self.bars_ahead
+                    .partition_point(|bar| bar.0 <= candle.ts)
+                    .wrapping_sub(1),
+            )
+            .map_or(0.0, |bar| bar.4);
+        if self.watch_volume && volume > 0.0 && qty.as_f64() > volume * 0.1 {
+            self.missed.borrow_mut().over_volume(candle.ts);
+        }
         self.asked = target;
         self.asked_size = size;
         self.last_refused = false;
@@ -421,22 +617,280 @@ impl DataActor for SignalStrategy {
             OrderSide::Sell
         };
         let instrument_id = self.bar_type.instrument_id();
-        let order = self.order().market(
-            instrument_id,
-            side,
-            qty,
-            None, // time_in_force
-            None, // reduce_only
-            None, // quote_quantity
-            None, // exec_algorithm_id
-            None, // exec_algorithm_params
-            None, // tags
-            None, // client_order_id
-        );
+        let limit = self.limit.filter(|_| !at_market);
+        let order = match limit {
+            None => {
+                // What's held is going, so what guards it goes first.
+                self.cancel_brackets()?;
+                self.order().market(
+                    instrument_id,
+                    side,
+                    qty,
+                    None, // time_in_force
+                    None, // reduce_only
+                    None, // quote_quantity
+                    None, // exec_algorithm_id
+                    None, // exec_algorithm_params
+                    None, // tags
+                    None, // client_order_id
+                )
+            }
+            Some(limit) => {
+                let share = limit.offset_percent / 100.0;
+                let sign = if delta > 0.0 { 1.0 } else { -1.0 };
+                let quoted = candle.close * (1.0 - sign * share);
+                // It rests further off, so the market has to trade that far past before it
+                // fills, but pays what it offered.
+                let past = limit.through_percent / 100.0;
+                let resting_at = Price::new(quoted * (1.0 - sign * past), self.price_precision);
+                let quoted = Price::new(quoted, self.price_precision);
+                let order = self.limit_order(instrument_id, side, qty, resting_at, true);
+                self.quoted.push((order.client_order_id(), quoted.as_f64()));
+                let mut missed = self.missed.borrow_mut();
+                missed.limits.push(RawLimit {
+                    placed: candle.ts,
+                    side: if delta > 0.0 { Side::Buy } else { Side::Sell },
+                    price: quoted.as_f64(),
+                    qty: qty.as_f64(),
+                    outcome: LimitOutcome::Open,
+                    ended: candle.ts,
+                });
+                let logged = missed.limits.len() - 1;
+                missed.limit_orders += 1;
+                drop(missed);
+                self.resting = Some(Resting {
+                    id: order.client_order_id(),
+                    target,
+                    bars: 0,
+                    closes_position: sign_of(self.position) != 0,
+                    logged,
+                });
+                order
+            }
+        };
         // Before it goes, as a refusal can come back straight away.
         self.in_flight
             .push((order.client_order_id(), delta.signum() * qty.as_f64()));
         self.submit_order(order, None, None, None)
+    }
+
+    fn limit_order(
+        &mut self,
+        instrument_id: InstrumentId,
+        side: OrderSide,
+        qty: Quantity,
+        price: Price,
+        rests: bool,
+    ) -> OrderAny {
+        self.order().limit(
+            instrument_id,
+            side,
+            qty,
+            price,
+            None,         // time_in_force
+            None,         // expire_time
+            Some(rests),  // post_only: an entry's offset means it rests
+            Some(!rests), // reduce_only: a target only ever closes
+            None,         // quote_quantity
+            None,         // display_qty
+            None,         // emulation_trigger
+            None,         // trigger_instrument_id
+            None,         // exec_algorithm_id
+            None,         // exec_algorithm_params
+            None,         // tags
+            None,         // client_order_id
+        )
+    }
+
+    /// One more bar for what's resting. If its time's up it goes, and an exit's target is returned,
+    /// as that has to go ahead at the market. An entry just lapses.
+    fn age_resting(&mut self) -> anyhow::Result<Option<i8>> {
+        let (Some(limit), Some(resting)) = (self.limit, self.resting.as_mut()) else {
+            return Ok(None);
+        };
+        resting.bars += 1;
+        if resting.bars < limit.expires_bars {
+            return Ok(None);
+        }
+        let resting = *resting;
+        self.end_resting(LimitOutcome::Lapsed)?;
+        self.asked = sign_of(self.position);
+        Ok(resting.closes_position.then_some(resting.target))
+    }
+
+    fn end_resting(&mut self, outcome: LimitOutcome) -> anyhow::Result<()> {
+        if let Some(resting) = self.resting.take() {
+            self.in_flight.retain(|(id, _)| *id != resting.id);
+            self.log_end(resting.logged, outcome);
+            self.cancel_order(resting.id, None, None)?;
+        }
+        Ok(())
+    }
+
+    fn log_end(&mut self, logged: usize, outcome: LimitOutcome) {
+        let ended = self.last_candle.map_or(0, |candle| candle.ts);
+        if let Some(order) = self.missed.borrow_mut().limits.get_mut(logged) {
+            order.outcome = outcome;
+            order.ended = ended;
+        }
+    }
+
+    fn cancel_brackets(&mut self) -> anyhow::Result<()> {
+        for id in [self.brackets.stop.take(), self.brackets.take.take()]
+            .into_iter()
+            .flatten()
+        {
+            self.cancel_order(id, None, None)?;
+        }
+        self.brackets = Brackets::default();
+        Ok(())
+    }
+
+    /// What follows a fill: what it replaces, or what's now out of date, goes.
+    fn after_fill(&mut self, order: ClientOrderId, filled_at: UnixNanos) {
+        let bracket = self.brackets.stop == Some(order) || self.brackets.take == Some(order);
+        if bracket {
+            // The position's gone, and with it what guarded it and any exit still waiting.
+            self.asked = 0;
+            let _ = self.cancel_brackets_except(order);
+            let _ = self.end_resting(LimitOutcome::Cancelled);
+            return;
+        }
+        if self.resting.is_some_and(|resting| resting.id == order) {
+            if let Some(resting) = self.resting.take() {
+                self.log_end(resting.logged, LimitOutcome::Filled);
+                if let Some(order) = self.missed.borrow_mut().limits.get_mut(resting.logged) {
+                    order.ended = filled_at;
+                }
+            }
+            self.missed.borrow_mut().limits_filled += 1;
+            let _ = self.cancel_brackets();
+            return;
+        }
+        // A market order fills at the close it went out on, so its guards rest through the next bar.
+        // A limit's fills partway through one, so they start at that bar's close.
+        if let Some(candle) = self.last_candle {
+            let _ = self.keep_brackets(&candle);
+        }
+    }
+
+    fn cancel_brackets_except(&mut self, filled: ClientOrderId) -> anyhow::Result<()> {
+        if self.brackets.stop == Some(filled) {
+            self.brackets.stop = None;
+        }
+        if self.brackets.take == Some(filled) {
+            self.brackets.take = None;
+        }
+        self.cancel_brackets()
+    }
+
+    /// Keeps a stop and a target on what's held, from the bar after it's entered.
+    fn keep_brackets(&mut self, candle: &Candle) -> anyhow::Result<()> {
+        if self.stop_loss.is_none() && self.take_profit.is_none() {
+            return Ok(());
+        }
+        let held = self.held();
+        if held == 0
+            || !self
+                .in_flight
+                .iter()
+                .all(|order| self.resting.is_some_and(|r| r.id == order.0))
+            || !self.entry_price.is_finite()
+            || self.is_exiting()
+        {
+            return Ok(());
+        }
+        let side = f64::from(held);
+        let instrument_id = self.bar_type.instrument_id();
+        let qty = Quantity::new(self.position.abs(), self.size_precision);
+        let closing = if held > 0 {
+            OrderSide::Sell
+        } else {
+            OrderSide::Buy
+        };
+        let stop_at = self
+            .stop_loss
+            .map(|percent| self.entry_price * (1.0 - side * percent / 100.0));
+        let take_at = self
+            .take_profit
+            .map(|percent| self.entry_price * (1.0 + side * percent / 100.0));
+        // Already past the stop at this close, there's nothing to rest: out now.
+        if self.brackets.stop.is_none()
+            && stop_at.is_some_and(|at| (candle.close - at) * side <= 0.0)
+        {
+            self.cancel_brackets()?;
+            self.end_resting(LimitOutcome::Cancelled)?;
+            self.asked = 0;
+            let order = self.order().market(
+                instrument_id,
+                closing,
+                qty,
+                None,       // time_in_force
+                Some(true), // reduce_only
+                None,       // quote_quantity
+                None,       // exec_algorithm_id
+                None,       // exec_algorithm_params
+                None,       // tags
+                None,       // client_order_id
+            );
+            self.in_flight
+                .push((order.client_order_id(), -side * qty.as_f64()));
+            return self.submit_order(order, None, None, None);
+        }
+        if let (Some(at), None) = (stop_at, self.brackets.stop) {
+            let order = self.order().stop_market(
+                instrument_id,
+                closing,
+                qty,
+                Price::new(at, self.price_precision),
+                None,       // trigger_type
+                None,       // time_in_force
+                None,       // expire_time
+                Some(true), // reduce_only
+                None,       // quote_quantity
+                None,       // display_qty
+                None,       // emulation_trigger
+                None,       // trigger_instrument_id
+                None,       // exec_algorithm_id
+                None,       // exec_algorithm_params
+                None,       // tags
+                None,       // client_order_id
+            );
+            self.brackets.stop = Some(order.client_order_id());
+            self.submit_order(order, None, None, None)?;
+        }
+        let Some(take) = take_at else {
+            return Ok(());
+        };
+        // On a bar reaching both, it's unknowable which came first, so assume the worse.
+        let next = self.bars_ahead.partition_point(|bar| bar.0 <= candle.ts);
+        let both = stop_at.is_some_and(|stop| {
+            self.bars_ahead
+                .get(next)
+                .filter(|_| !self.fills_finer)
+                .is_some_and(|&(_, _, high, low, _)| {
+                    let reaches = |level: f64| low <= level && level <= high;
+                    reaches(stop) && reaches(take)
+                })
+        });
+        match (both, self.brackets.take) {
+            (true, Some(id)) => {
+                self.brackets.take = None;
+                self.cancel_order(id, None, None)?;
+            }
+            (false, None) => {
+                let past = self
+                    .limit
+                    .map_or(0.0, |limit| limit.through_percent / 100.0);
+                let price = Price::new(take * (1.0 + side * past), self.price_precision);
+                let order = self.limit_order(instrument_id, closing, qty, price, false);
+                self.quoted.push((order.client_order_id(), take));
+                self.brackets.take = Some(order.client_order_id());
+                self.submit_order(order, None, None, None)?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 

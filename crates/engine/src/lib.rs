@@ -45,11 +45,12 @@ use persephone_core::{
 };
 use rust_decimal::Decimal;
 
-pub use report::{BacktestReport, Fill};
-pub use settings::{Direction, Session, SimSettings, TradingRules};
+pub use models::impact_share;
+pub use report::{BacktestReport, Fill, LimitOrderRow, LimitOutcome};
+pub use settings::{Direction, LimitOrders, Session, SimSettings, TradingRules};
 
 use crate::{
-    models::CostFillModel,
+    models::{BarNow, CostFillModel},
     strategies::{SignalStrategy, builtins, signal::Missed},
 };
 
@@ -79,6 +80,9 @@ pub struct BacktestRequest {
     /// 1-minute bars spanning the candles, for orders to fill on when there are no ticks; the
     /// strategy still decides on the candles.
     pub fill_bars: Option<Arc<Vec<Candle>>>,
+    /// A perpetual's funding rates, by when they're paid, as fractions. Each time, a position pays
+    /// its value times the rate: longs when it's positive, shorts when it's negative.
+    pub funding: Option<Arc<Vec<(UnixNanos, f64)>>>,
 }
 
 /// Maker/taker fee rates as fractions (0.001 = 0.1%).
@@ -97,6 +101,11 @@ impl FeeRates {
     pub const BINANCE_SPOT: Self = Self {
         maker: 0.001,
         taker: 0.001,
+    };
+    /// Binance USD-M futures' base tier.
+    pub const BINANCE_PERP: Self = Self {
+        maker: 0.0002,
+        taker: 0.0005,
     };
 }
 
@@ -133,7 +142,29 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
             request.sim.leverage
         )));
     }
+    if let Some(limit) = request.sim.limit {
+        if request.sim.next_open {
+            return Err(EngineError::InvalidRequest(
+                "limit orders can't go with filling at the next open; pick one".into(),
+            ));
+        }
+        if request.sim.latency_ms > 0 {
+            return Err(EngineError::InvalidRequest(
+                "limit orders can't go with latency: a limit priced from a close it can't reach in time isn't resting; pick one".into(),
+            ));
+        }
+        if limit.offset_percent <= 0.0 || limit.offset_percent.is_nan() || limit.expires_bars == 0 {
+            return Err(EngineError::InvalidRequest(
+                "a limit order needs an offset above zero, or it'd take the market, and at least a bar to rest".into(),
+            ));
+        }
+    }
     if request.sim.next_open {
+        if request.sim.stop_loss_percent.is_some() || request.sim.take_profit_percent.is_some() {
+            return Err(EngineError::InvalidRequest(
+                "stops and targets need to see inside a bar, which filling at the next open doesn't; pick one".into(),
+            ));
+        }
         if request.sim.latency_ms > 0 || request.ticks.is_some() || request.fill_bars.is_some() {
             return Err(EngineError::InvalidRequest(
                 "filling at the next open can't go with latency or high precision; pick one".into(),
@@ -155,7 +186,13 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
         .ticks
         .as_deref()
         .or(opens.as_ref().map(|opens| opens as &dyn TickFeed));
-    engine.add_venue(venue_config(request, quote, feed.is_none())?)?;
+    let bar_now = Arc::new(BarNow::default());
+    engine.add_venue(venue_config(
+        request,
+        quote,
+        feed.is_none(),
+        Arc::clone(&bar_now),
+    )?)?;
     engine.add_instrument(&instrument)?;
 
     let closes = request.bars.closes(&request.candles);
@@ -199,6 +236,13 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
     let refused = Rc::new(RefCell::new((0, None)));
     let missed = Rc::new(RefCell::new(Missed::default()));
     let signal = Rc::new(RefCell::new(signal));
+    let bars_ahead = Arc::new(
+        closes
+            .iter()
+            .zip(&request.candles)
+            .map(|(&close, candle)| (close, candle.open, candle.high, candle.low, candle.volume))
+            .collect::<Vec<_>>(),
+    );
     engine.add_strategy(
         SignalStrategy::new(
             bar_type,
@@ -211,6 +255,19 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
         .ruled(request.rules.clone(), request.trade_from)
         .counting_refusals(Rc::clone(&refused))
         .counting_misses(Rc::clone(&missed))
+        .with_orders(
+            request.sim.limit,
+            request.sim.stop_loss_percent,
+            request.sim.take_profit_percent,
+            bars_ahead,
+            request.ticks.is_some() || request.fill_bars.is_some(),
+            bar_now,
+        )
+        .holding(
+            request.funding.clone().unwrap_or_default(),
+            request.sim.borrow_percent_per_year,
+            request.sim.impact_percent,
+        )
         .compounding(request.sim.compound.then_some(request.starting_balance)),
     )?;
 
@@ -246,6 +303,10 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
         request.starting_balance,
         &request.instrument.quote,
         request.sim.next_open,
+        report::Holding {
+            funding: request.funding.as_deref().map_or(&[], Vec::as_slice),
+            borrow_percent_per_year: request.sim.borrow_percent_per_year.unwrap_or(0.0),
+        },
     );
     engine.dispose();
     report.notes = signal.borrow_mut().notes();
@@ -258,10 +319,32 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
         });
     }
     let missed = missed.borrow();
+    report.limit_orders = missed.limit_orders;
+    report.limits_filled = missed.limits_filled;
+    report.limit_log = report::limit_rows(&missed.limits, &request.candles, &closes);
     let at = |ts| {
         let at = DateTime::from_nanos(ts);
         format!("{} {}", at.date(), at.time())
     };
+    if missed.over_volume > 0 {
+        report.notes.push(Note {
+            text: format!(
+                "{} orders were over a tenth of their bar's volume, first at {}. Fills like those are fiction whatever the costs say: a smaller position is the real answer.",
+                missed.over_volume,
+                at(missed.first_over_volume),
+            ),
+            warning: true,
+        });
+    }
+    if missed.limit_orders >= 5 && missed.limits_filled * 2 < missed.limit_orders {
+        report.notes.push(Note {
+            text: format!(
+                "Only {} of {} limit orders filled. Those that miss are often the ones that would have won, as price ran away, so this flatters the result.",
+                missed.limits_filled, missed.limit_orders,
+            ),
+            warning: true,
+        });
+    }
     let left = report.equity.last().copied().unwrap_or(0.0);
     // Compounding sizes from the account, so a position rounding to nothing means it has shrunk.
     let enough = request.starting_balance * if request.sim.compound { 0.5 } else { 0.01 };
@@ -435,6 +518,7 @@ fn venue_config(
     request: &BacktestRequest,
     quote: Currency,
     bar_execution: bool,
+    bar_now: Arc<BarNow>,
 ) -> Result<SimulatedVenueConfig, EngineError> {
     let decimal = |what: &str, v: f64| {
         Decimal::try_from(v).map_err(|e| EngineError::InvalidRequest(format!("{what} {v}: {e}")))
@@ -461,6 +545,8 @@ fn venue_config(
             sim.slippage_ticks,
             sim.spread_ticks,
             sim.slippage_percent,
+            sim.impact_percent,
+            bar_now,
         )))
         .maybe_latency_model((sim.latency_ms > 0 || sim.next_open).then(|| {
             let ms = if sim.next_open {

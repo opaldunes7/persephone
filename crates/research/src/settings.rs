@@ -8,7 +8,7 @@ use persephone_core::{
     time::{NANOS_PER_DAY, NANOS_PER_MINUTE},
 };
 use persephone_data::import::Zone;
-use persephone_engine::{Direction, FeeRates, Session, SimSettings, TradingRules};
+use persephone_engine::{Direction, FeeRates, LimitOrders, Session, SimSettings, TradingRules};
 use serde::{Deserialize, Serialize};
 
 use crate::Field;
@@ -29,6 +29,15 @@ pub struct Settings {
     pub slippage: Section<u32>,
     /// Slippage as a percentage of the price, on top of any in ticks.
     pub slippage_percent: Section<f64>,
+    /// Sending orders as limits rather than at the market.
+    pub limit: Section<LimitChoice>,
+    /// A stop and a target, as percentages from the entry, resting while a position's held.
+    pub stop_loss_percent: Section<f64>,
+    pub take_profit_percent: Section<f64>,
+    /// What borrowing costs a short, as a percentage of its value a year.
+    pub borrow_percent_per_year: Section<f64>,
+    /// How far a market order fills worse, as a percentage, when it's all of its bar's volume.
+    pub impact_percent: Section<f64>,
     /// A spread assumed for bar data, in ticks.
     pub spread: Section<u32>,
     /// Milliseconds orders take to reach the venue.
@@ -72,6 +81,15 @@ impl Default for Settings {
             commission: Section::off(Commission::Percent(0.1)),
             slippage: Section::off(1),
             slippage_percent: Section::off(0.01),
+            limit: Section::off(LimitChoice {
+                offset_percent: 0.05,
+                expires_bars: 3,
+                through_percent: 0.0,
+            }),
+            stop_loss_percent: Section::off(2.0),
+            take_profit_percent: Section::off(4.0),
+            borrow_percent_per_year: Section::off(10.0),
+            impact_percent: Section::off(1.0),
             spread: Section::off(2),
             latency: Section::off(100),
             leverage: Section::off(2.0),
@@ -222,6 +240,22 @@ pub enum Commission {
     Percent(f64),
     /// A flat amount per order, in the quote currency.
     PerOrder(f64),
+    /// Percents of each fill's value: one for orders that rested, which can be below zero for a
+    /// rebate, and one for those that took what was there.
+    Rates { maker: f64, taker: f64 },
+}
+
+/// How orders go out as limits.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LimitChoice {
+    /// How far from the close it rests, on the better side, as a percentage.
+    pub offset_percent: f64,
+    /// How many bars it rests before it's cancelled.
+    pub expires_bars: u32,
+    /// How far past its price the market must trade before it fills, as a percentage, standing in for
+    /// the queue ahead of it.
+    #[serde(default)]
+    pub through_percent: f64,
 }
 
 /// Trading one way only.
@@ -342,6 +376,12 @@ pub enum Edit {
     PerOrder(bool),
     Slippage(bool),
     SlippagePercent(bool),
+    MakerTaker(bool),
+    Limit(bool),
+    StopLoss(bool),
+    TakeProfit(bool),
+    Borrow(bool),
+    Impact(bool),
     Spread(bool),
     Latency(bool),
     Leverage(bool),
@@ -364,13 +404,35 @@ impl Settings {
             Edit::Commission(on) => self.commission.on = on,
             Edit::PerOrder(per_order) => {
                 self.commission.value = match (per_order, self.commission.value) {
-                    (true, Commission::Percent(_)) => Commission::PerOrder(1.0),
+                    (true, Commission::Percent(_) | Commission::Rates { .. }) => {
+                        Commission::PerOrder(1.0)
+                    }
                     (false, Commission::PerOrder(_)) => Commission::Percent(0.1),
+                    (false, Commission::Rates { taker, .. }) => Commission::Percent(taker),
                     (_, same) => same,
                 };
             }
             Edit::Slippage(on) => self.slippage.on = on,
             Edit::SlippagePercent(on) => self.slippage_percent.on = on,
+            Edit::MakerTaker(on) => {
+                self.commission.value = match (on, self.commission.value) {
+                    (true, Commission::Percent(rate)) => Commission::Rates {
+                        maker: rate,
+                        taker: rate,
+                    },
+                    (true, Commission::PerOrder(_)) => Commission::Rates {
+                        maker: 0.02,
+                        taker: 0.05,
+                    },
+                    (false, Commission::Rates { taker, .. }) => Commission::Percent(taker),
+                    (_, same) => same,
+                };
+            }
+            Edit::Limit(on) => self.limit.on = on,
+            Edit::StopLoss(on) => self.stop_loss_percent.on = on,
+            Edit::TakeProfit(on) => self.take_profit_percent.on = on,
+            Edit::Borrow(on) => self.borrow_percent_per_year.on = on,
+            Edit::Impact(on) => self.impact_percent.on = on,
             Edit::Spread(on) => self.spread.on = on,
             Edit::Latency(on) => self.latency.on = on,
             Edit::Leverage(on) => self.leverage.on = on,
@@ -397,7 +459,19 @@ impl Settings {
             Field::Capital => trim(self.capital),
             Field::Commission => match self.commission.value {
                 Commission::Percent(v) | Commission::PerOrder(v) => trim(v),
+                Commission::Rates { maker, .. } => trim(maker),
             },
+            Field::Taker => match self.commission.value {
+                Commission::Rates { taker, .. } => trim(taker),
+                _ => String::new(),
+            },
+            Field::LimitOffset => trim(self.limit.value.offset_percent),
+            Field::LimitBars => self.limit.value.expires_bars.to_string(),
+            Field::LimitThrough => trim(self.limit.value.through_percent),
+            Field::StopLoss => trim(self.stop_loss_percent.value),
+            Field::TakeProfit => trim(self.take_profit_percent.value),
+            Field::Borrow => trim(self.borrow_percent_per_year.value),
+            Field::Impact => trim(self.impact_percent.value),
             Field::Slippage => self.slippage.value.to_string(),
             Field::SlippagePercent => trim(self.slippage_percent.value),
             Field::Spread => self.spread.value.to_string(),
@@ -452,8 +526,37 @@ impl Settings {
                         Commission::Percent(number(0.0, 10.0, "A percentage")?)
                     }
                     Commission::PerOrder(_) => Commission::PerOrder(number(0.0, 1e6, "A fee")?),
+                    Commission::Rates { taker, .. } => Commission::Rates {
+                        maker: number(-1.0, 10.0, "A maker's fee")?,
+                        taker,
+                    },
                 };
             }
+            Field::Taker => {
+                if let Commission::Rates { maker, .. } = self.commission.value {
+                    self.commission.value = Commission::Rates {
+                        maker,
+                        taker: number(0.0, 10.0, "A taker's fee")?,
+                    };
+                }
+            }
+            Field::LimitOffset => {
+                self.limit.value.offset_percent = number(0.0001, 50.0, "A limit's offset")?;
+            }
+            Field::LimitThrough => {
+                self.limit.value.through_percent = number(0.0, 10.0, "How far through")?;
+            }
+            Field::LimitBars => {
+                self.limit.value.expires_bars = number(1.0, 10_000.0, "Bars")?.round() as u32;
+            }
+            Field::StopLoss => self.stop_loss_percent.value = number(0.01, 99.0, "A stop")?,
+            Field::TakeProfit => {
+                self.take_profit_percent.value = number(0.01, 1_000.0, "A target")?
+            }
+            Field::Borrow => {
+                self.borrow_percent_per_year.value = number(0.0, 1_000.0, "A borrowing rate")?;
+            }
+            Field::Impact => self.impact_percent.value = number(0.0, 100.0, "Impact")?,
             Field::Slippage => self.slippage.value = whole(10_000, "Slippage")?,
             Field::SlippagePercent => {
                 self.slippage_percent.value = number(0.0, 10.0, "A percentage")?;
@@ -492,6 +595,11 @@ impl Settings {
         self.commission.on as usize
             + self.slippage.on as usize
             + self.slippage_percent.on as usize
+            + self.limit.on as usize
+            + self.stop_loss_percent.on as usize
+            + self.take_profit_percent.on as usize
+            + self.borrow_percent_per_year.on as usize
+            + self.impact_percent.on as usize
             + self.spread.on as usize
             + self.latency.on as usize
             + self.leverage.on as usize
@@ -513,6 +621,10 @@ impl Settings {
                 maker: percent / 100.0,
                 taker: percent / 100.0,
             },
+            Some(Commission::Rates { maker, taker }) => FeeRates {
+                maker: maker / 100.0,
+                taker: taker / 100.0,
+            },
             _ => market,
         }
     }
@@ -531,6 +643,15 @@ impl Settings {
             leverage: self.on(&self.leverage).copied().unwrap_or(1.0),
             compound: self.stock && self.compound,
             next_open: self.fill_timing == FillTiming::NextOpen,
+            limit: self.on(&self.limit).map(|limit| LimitOrders {
+                offset_percent: limit.offset_percent,
+                expires_bars: limit.expires_bars,
+                through_percent: limit.through_percent,
+            }),
+            stop_loss_percent: self.on(&self.stop_loss_percent).copied(),
+            take_profit_percent: self.on(&self.take_profit_percent).copied(),
+            borrow_percent_per_year: self.on(&self.borrow_percent_per_year).copied(),
+            impact_percent: self.on(&self.impact_percent).copied().unwrap_or(0.0),
         }
     }
 
@@ -570,6 +691,7 @@ impl Settings {
         self.on(&self.commission).map(|c| match c {
             Commission::Percent(p) => format!("{p}%"),
             Commission::PerOrder(fee) => format!("{fee} per order"),
+            Commission::Rates { maker, taker } => format!("{maker}% maker, {taker}% taker"),
         })
     }
 }

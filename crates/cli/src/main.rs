@@ -212,6 +212,7 @@ fn backtest(args: &BacktestArgs) -> anyhow::Result<()> {
         rules: TradingRules::default(),
         trade_from: 0,
         fill_bars: None,
+        funding: None,
     };
 
     let run_started = Instant::now();

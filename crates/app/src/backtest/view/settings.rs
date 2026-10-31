@@ -561,6 +561,16 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
     };
 
     let per_order = matches!(settings.commission.value, Commission::PerOrder(_));
+    let rates = matches!(settings.commission.value, Commission::Rates { .. });
+    let fees_taker: Element<'a, PanelMessage> = if rates {
+        tip(
+            input(Field::Taker, 46.0),
+            "A taker's fee, as a percentage.",
+            None,
+        )
+    } else {
+        Space::new().width(0).into()
+    };
     const CAPITAL: &str =
         "Starting cash, in the market's quote currency. Paper trading starts with it too.";
     const FEES: &str =
@@ -573,6 +583,11 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
     const DIRECTION: &str = "Trade one way only; the other side's signals close positions instead. Paper trading follows it too.";
     const SLIPPAGE_PERCENT: &str = "Every market order fills this percentage of the price worse, which means the same on any market.";
     const NEXT_OPEN: &str = "Fill orders at the next bar's open instead of the close they were decided on: a realistic delay, with no finer data needed. Not with Latency or High precision.";
+    const LIMIT: &str = "Send orders as limits this far better than the close, resting this many bars. They only fill when price trades through them, at their own price. An entry that doesn't fill lapses, and an exit goes at the market.";
+    const STOP: &str = "A real stop this far from the entry, from the bar after it. It fills inside a bar at its level, or at the open on a gap.";
+    const TARGET: &str = "A real target this far from the entry, from the bar after it. On a bar reaching both, the stop's assumed to have come first.";
+    const IMPACT: &str = "How far a market order fills worse when it's all of its bar's volume. It moves with the square root of its share of that volume. A rough assumption.";
+    const BORROW: &str = "What borrowing costs a short, as a percentage of its value a year. Perpetuals pay funding instead.";
     const COMPOUND: &str = "Size positions from the account as it is now, so profits grow them and losses shrink them. Off, every position is sized from the starting capital.";
     const INVERT: &str = "Trade the opposite of what the strategy says: sell when it buys and buy when it sells, at the same moments. Paper trading follows it too.";
     const SESSION: &str = "Outside these days and times, signals can close positions but not open them. Paper trading follows it too.";
@@ -585,19 +600,15 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
             None,
         )
     };
-    let simulation = vec![
-        line(
-            no_switch(),
-            name("Capital", CAPITAL),
-            tip(input(Field::Capital, 92.0), CAPITAL, None),
-        ),
+    // These two have more to them, so get the width of the section.
+    let wide: Vec<Element<'a, PanelMessage>> = vec![
         line(
             switch(settings.commission.on, Edit::Commission, FEES),
             name("Fees", FEES),
             row![
                 choice(
                     "%",
-                    !per_order,
+                    !per_order && !rates,
                     Edit::PerOrder(false),
                     "A percentage of each fill's value.",
                 ),
@@ -607,11 +618,48 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                     Edit::PerOrder(true),
                     "The same amount for every order, in the quote currency.",
                 ),
+                choice(
+                    "m/t",
+                    rates,
+                    Edit::MakerTaker(!rates),
+                    "Different rates for orders that rest and those that take. A maker's can be below zero, for a rebate.",
+                ),
                 tip(input(Field::Commission, 54.0), FEES, None),
+                fees_taker,
             ]
             .spacing(2)
             .align_y(Alignment::Center)
             .into(),
+        ),
+        line(
+            switch(settings.limit.on, Edit::Limit, LIMIT),
+            name("Limit orders", LIMIT),
+            tip(
+                row![
+                    input(Field::LimitOffset, 54.0),
+                    unit("%"),
+                    input(Field::LimitBars, 46.0),
+                    unit("bars"),
+                    tip(
+                        row![unit("through"), input(Field::LimitThrough, 46.0), unit("%")]
+                            .spacing(3)
+                            .align_y(Alignment::Center),
+                        "How far past its price the market must trade before it fills, standing in for the queue ahead of it, which a bar can't show. It still pays its own price. Raise it to see how much a result leans on fills that might not have happened.",
+                        None,
+                    ),
+                ]
+                .spacing(3)
+                .align_y(Alignment::Center),
+                LIMIT,
+                None,
+            ),
+        ),
+    ];
+    let simulation = vec![
+        line(
+            no_switch(),
+            name("Capital", CAPITAL),
+            tip(input(Field::Capital, 92.0), CAPITAL, None),
         ),
         line(
             switch(settings.slippage.on, Edit::Slippage, SLIPPAGE),
@@ -626,6 +674,50 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                     .spacing(3)
                     .align_y(Alignment::Center),
                 SLIPPAGE_PERCENT,
+                None,
+            ),
+        ),
+        line(
+            switch(settings.stop_loss_percent.on, Edit::StopLoss, STOP),
+            name("Stop loss", STOP),
+            tip(
+                row![input(Field::StopLoss, 54.0), unit("%")]
+                    .spacing(3)
+                    .align_y(Alignment::Center),
+                STOP,
+                None,
+            ),
+        ),
+        line(
+            switch(settings.take_profit_percent.on, Edit::TakeProfit, TARGET),
+            name("Target", TARGET),
+            tip(
+                row![input(Field::TakeProfit, 54.0), unit("%")]
+                    .spacing(3)
+                    .align_y(Alignment::Center),
+                TARGET,
+                None,
+            ),
+        ),
+        line(
+            switch(settings.impact_percent.on, Edit::Impact, IMPACT),
+            name("Impact", IMPACT),
+            tip(
+                row![input(Field::Impact, 54.0), unit("%")]
+                    .spacing(3)
+                    .align_y(Alignment::Center),
+                IMPACT,
+                None,
+            ),
+        ),
+        line(
+            switch(settings.borrow_percent_per_year.on, Edit::Borrow, BORROW),
+            name("Borrow a year", BORROW),
+            tip(
+                row![input(Field::Borrow, 54.0), unit("%")]
+                    .spacing(3)
+                    .align_y(Alignment::Center),
+                BORROW,
                 None,
             ),
         ),
@@ -849,7 +941,10 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
     }
     body = body.push(stock_title);
     if open {
-        body = body.push(grid(simulation, columns)).push(session_row);
+        body = body
+            .extend(wide)
+            .push(grid(simulation, columns))
+            .push(session_row);
     }
     body = body.push(plugin_row);
 

@@ -560,7 +560,7 @@ pub fn view<'a>(
                 // And the rows beyond the usual figures: costs, the market, and each year.
                 Some((_, Run::Done(report))) => {
                     2 * report.notes.len()
-                        + 9
+                        + 15
                         + tile.figures.map_or(0, |figures| figures.by_year.len())
                 }
                 _ => 0,
@@ -1772,6 +1772,18 @@ fn statistics<'a>(
     ];
     match costs {
         Some(Costs::Done(costs)) => {
+            if costs.maker_fees != 0.0 {
+                rows.push((
+                    "Maker fees".into(),
+                    format!("{:.2} {quote}", costs.maker_fees),
+                    bright,
+                ));
+                rows.push((
+                    "Taker fees".into(),
+                    format!("{:.2} {quote}", costs.taker_fees),
+                    bright,
+                ));
+            }
             rows.push((
                 "Before costs".into(),
                 format!("{:+.2}%", costs.gross_return * 100.0),
@@ -1807,12 +1819,59 @@ fn statistics<'a>(
         }
         Some(Costs::Idle) | None => {}
     }
+    if let Some(rate) = figures.and_then(|f| f.fill_rate) {
+        rows.push((
+            "Limits filled".into(),
+            format!(
+                "{} of {} ({:.0}%)",
+                report.limits_filled,
+                report.limit_orders,
+                rate * 100.0
+            ),
+            bright,
+        ));
+    }
+    if report.limit_orders > 0 {
+        let limits = persephone_research::figures::LimitSummary::of(report);
+        let moved = |value: Option<f64>| value.map_or("—".to_string(), |v| format!("{v:+.3}%"));
+        rows.push((
+            "Filled, a bar on".into(),
+            moved(limits.filled_move_1),
+            bright,
+        ));
+        rows.push((
+            "Missed, a bar on".into(),
+            moved(limits.missed_move_1),
+            bright,
+        ));
+    }
+    if report.funding_paid != 0.0 {
+        rows.push((
+            "Funding paid".into(),
+            format!("{:.2} {quote}", report.funding_paid),
+            signed(-report.funding_paid),
+        ));
+    }
+    if report.borrow_paid != 0.0 {
+        rows.push((
+            "Borrowing paid".into(),
+            format!("{:.2} {quote}", report.borrow_paid),
+            bright,
+        ));
+    }
     if let Some(held) = figures.and_then(|f| f.benchmark.as_ref()) {
         rows.push((
             "Market return".into(),
             format!("{:+.2}%", held.return_ * 100.0),
             signed(held.return_),
         ));
+        if held.return_after_funding != held.return_ {
+            rows.push((
+                "After funding".into(),
+                format!("{:+.2}%", held.return_after_funding * 100.0),
+                signed(held.return_after_funding),
+            ));
+        }
         rows.push(("Market Sharpe".into(), number(held.sharpe), bright));
         rows.push((
             "Market drawdown".into(),

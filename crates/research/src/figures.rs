@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 
 use persephone_core::{Side, time::civil_from_days};
-use persephone_engine::{BacktestReport, BacktestRequest, FeeRates, SimSettings};
+use persephone_engine::{
+    BacktestReport, BacktestRequest, FeeRates, LimitOutcome, SimSettings, impact_share,
+};
 
 use crate::robustness::round_trips;
 
@@ -24,11 +26,18 @@ pub struct Benchmark {
     pub return_: f64,
     pub sharpe: Option<f64>,
     pub max_drawdown: f64,
+    /// The return once a perpetual's funding has been paid on it. What holding one really made.
+    pub return_after_funding: f64,
 }
 
 /// The same figures a run gets, to compare it with.
 #[must_use]
-pub fn benchmark(capital: f64, bars: &[(u64, f64)], from_index: usize) -> Option<Benchmark> {
+pub fn benchmark(
+    capital: f64,
+    bars: &[(u64, f64)],
+    from_index: usize,
+    funding: &[(u64, f64)],
+) -> Option<Benchmark> {
     let span = bars.get(from_index..)?;
     let first = span.first().map(|(_, close)| *close).filter(|c| *c > 0.0)?;
     let mut peak = 0.0_f64;
@@ -37,8 +46,18 @@ pub fn benchmark(capital: f64, bars: &[(u64, f64)], from_index: usize) -> Option
         peak = peak.max(close);
         fall = fall.max(1.0 - close / peak);
     }
+    // As a share of the capital: the position's value when each falls due, times its rate.
+    let paid: f64 = funding
+        .iter()
+        .filter_map(|&(when, rate)| {
+            let at = span.partition_point(|bar| bar.0 <= when).checked_sub(1)?;
+            Some(span[at].1 / first * rate)
+        })
+        .sum();
+    let return_ = buy_and_hold(bars, from_index)?;
     Some(Benchmark {
-        return_: buy_and_hold(bars, from_index)?,
+        return_,
+        return_after_funding: return_ - paid,
         sharpe: daily_sharpe(
             capital,
             span.iter()
@@ -158,8 +177,11 @@ pub fn look_back_warning(look_back: usize, before: usize, bars: usize) -> Option
 pub struct Friction {
     /// The return with no fees, slippage or spread.
     pub gross_return: f64,
-    /// Fees plus what slippage and spread took, in the quote currency.
+    /// Fees, slippage, spread, impact, funding and borrowing, in the quote currency.
     pub costs_paid: f64,
+    /// The fees on orders that rested, below zero if they earned a rebate, and on those that took.
+    pub maker_fees: f64,
+    pub taker_fees: f64,
     /// The cost per fill that would bring the costless run to nothing, in basis points of the value
     /// traded. `None` if it traded nothing.
     pub break_even_bp: Option<f64>,
@@ -172,13 +194,25 @@ pub fn friction(
     free: &BacktestReport,
     sim: &SimSettings,
     price_precision: u8,
+    volumes: &[f64],
 ) -> Friction {
+    let fees_of = |maker: bool| -> f64 {
+        report
+            .fills
+            .iter()
+            .filter(|fill| fill.maker == maker)
+            .map(|fill| fill.fee)
+            .sum::<f64>()
+            + 0.0
+    };
     Friction {
+        maker_fees: fees_of(true),
+        taker_fees: fees_of(false),
         gross_return: free
             .equity
             .last()
             .map_or(0.0, |last| last / free.starting_balance - 1.0),
-        costs_paid: costs_paid(report, sim, price_precision),
+        costs_paid: costs_paid(report, sim, price_precision, volumes),
         break_even_bp: break_even_bp(free),
     }
 }
@@ -193,6 +227,12 @@ pub fn costs_something(request: &BacktestRequest) -> bool {
         || sim.slippage_ticks > 0
         || sim.slippage_percent > 0.0
         || sim.spread_ticks > 0
+        || sim.impact_percent > 0.0
+        || sim.borrow_percent_per_year.is_some()
+        || request
+            .funding
+            .as_ref()
+            .is_some_and(|rates| !rates.is_empty())
 }
 
 /// The same backtest with nothing to pay.
@@ -204,29 +244,41 @@ pub fn without_costs(request: &BacktestRequest) -> BacktestRequest {
     free.sim.slippage_ticks = 0;
     free.sim.slippage_percent = 0.0;
     free.sim.spread_ticks = 0;
+    free.sim.impact_percent = 0.0;
+    free.sim.borrow_percent_per_year = None;
+    free.funding = None;
     free
 }
 
-/// Fees plus what slippage and spread took from each fill, worked back from its price as the fill
-/// model moved it. A market's own quotes bring their own spread, which isn't known here.
-fn costs_paid(report: &BacktestReport, sim: &SimSettings, price_precision: u8) -> f64 {
+/// All a run paid: fees, funding and borrowing as they were charged, and what slippage, spread and
+/// impact took from each order that didn't rest, worked back from its price as the fill model moved
+/// it. A market's own quotes bring their own spread, which isn't known here.
+fn costs_paid(
+    report: &BacktestReport,
+    sim: &SimSettings,
+    price_precision: u8,
+    volumes: &[f64],
+) -> f64 {
     let tick = 10_f64.powi(-i32::from(price_precision));
-    let share = sim.slippage_percent / 100.0;
     let moved: f64 = report
         .fills
         .iter()
+        .filter(|fill| !fill.maker)
         .map(|fill| {
             let (spread, sign) = if fill.side == Side::Buy {
                 (sim.spread_ticks.div_ceil(2), 1.0)
             } else {
                 (sim.spread_ticks / 2, -1.0)
             };
+            let volume = volumes.get(fill.bar).copied().unwrap_or(0.0);
+            let share =
+                sim.slippage_percent / 100.0 + impact_share(sim.impact_percent, fill.qty, volume);
             let ticks = f64::from(sim.slippage_ticks + spread) * tick;
             let met = (fill.price - sign * ticks) / (1.0 + sign * share);
             fill.qty * (fill.price - met) * sign
         })
         .sum();
-    report.fees + moved
+    report.fees + moved + report.funding_paid + report.borrow_paid
 }
 
 /// What a backtest with no costs made, per fill, as basis points of the value traded.
@@ -283,6 +335,71 @@ impl Histogram {
     }
 }
 
+/// How limit orders that filled did against those that missed: whether the market fills the bad ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LimitSummary {
+    pub filled: usize,
+    pub missed: usize,
+    /// Fills that went less than a hundredth of a percent past their price: the ones most likely not
+    /// to have filled at all, behind others in the queue.
+    pub barely_filled: usize,
+    /// How far the market moved each order's way, on average, as percentages, from the close it went
+    /// out at. `None` without any to go on.
+    pub filled_move_1: Option<f64>,
+    pub missed_move_1: Option<f64>,
+    pub filled_move_24: Option<f64>,
+    pub missed_move_24: Option<f64>,
+}
+
+impl LimitSummary {
+    #[must_use]
+    pub fn of(report: &BacktestReport) -> Self {
+        let log = &report.limit_log;
+        let is_fill = |outcome: LimitOutcome| outcome == LimitOutcome::Filled;
+        let is_miss = |outcome: LimitOutcome| {
+            matches!(outcome, LimitOutcome::Lapsed | LimitOutcome::Replaced)
+        };
+        let average = |wanted: &dyn Fn(LimitOutcome) -> bool, bars_on: bool| {
+            let moves: Vec<f64> = log
+                .iter()
+                .filter(|row| wanted(row.outcome))
+                .filter_map(|row| {
+                    if bars_on {
+                        row.move_24_percent
+                    } else {
+                        row.move_1_percent
+                    }
+                })
+                .collect();
+            (!moves.is_empty()).then(|| moves.iter().sum::<f64>() / moves.len() as f64)
+        };
+        Self {
+            filled: log.iter().filter(|row| is_fill(row.outcome)).count(),
+            missed: log.iter().filter(|row| is_miss(row.outcome)).count(),
+            barely_filled: log
+                .iter()
+                .filter(|row| is_fill(row.outcome) && row.reached_percent < 0.01)
+                .count(),
+            filled_move_1: average(&is_fill, false),
+            missed_move_1: average(&is_miss, false),
+            filled_move_24: average(&is_fill, true),
+            missed_move_24: average(&is_miss, true),
+        }
+    }
+
+    /// Said when orders that missed did clearly better than those that filled, whatever the fill rate:
+    /// a result built on the rest is being paid to take the bad side.
+    #[must_use]
+    pub fn warning(&self) -> Option<String> {
+        let (filled, missed) = (self.filled_move_1?, self.missed_move_1?);
+        (self.filled >= 20 && self.missed >= 20 && missed - filled >= 0.05).then(|| {
+            format!(
+                "Limit orders that missed moved {missed:+.2}% their way a bar later, and those that filled {filled:+.2}%. Fills are the worse side of the bargain here, so test with `through_percent`, and see `get_limit_orders`."
+            )
+        })
+    }
+}
+
 /// A finished run's figures, to show beside it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunFigures {
@@ -294,11 +411,18 @@ pub struct RunFigures {
     pub exposure: f64,
     pub by_year: BTreeMap<i64, f64>,
     pub benchmark: Option<Benchmark>,
+    /// The share of limit orders that filled, if any went out.
+    pub fill_rate: Option<f64>,
 }
 
 impl RunFigures {
     #[must_use]
-    pub fn of(report: &BacktestReport, from_index: usize, bars: &[(u64, f64)]) -> Self {
+    pub fn of(
+        report: &BacktestReport,
+        from_index: usize,
+        bars: &[(u64, f64)],
+        funding: &[(u64, f64)],
+    ) -> Self {
         let trades = round_trips(report);
         let winners = trades.iter().filter(|t| t.profit > 0.0).count();
         Self {
@@ -308,7 +432,9 @@ impl RunFigures {
             profit_factor: profit_factor(report),
             exposure: exposure(report, from_index),
             by_year: by_year(report, from_index, bars),
-            benchmark: benchmark(report.starting_balance, bars, from_index),
+            benchmark: benchmark(report.starting_balance, bars, from_index, funding),
+            fill_rate: (report.limit_orders > 0)
+                .then(|| report.limits_filled as f64 / report.limit_orders as f64),
         }
     }
 }
@@ -339,6 +465,23 @@ mod tests {
         let found = Histogram::of(&[0.2, 0.2], 4, 0.2);
         assert_eq!(found.counts.iter().sum::<usize>(), 2);
         assert!(found.hi > found.lo);
+    }
+
+    #[test]
+    fn holding_a_perpetual_pays_its_funding_at_what_it_was_worth() {
+        const DAY: u64 = 86_400_000_000_000;
+        let bars = [(0, 100.0), (DAY, 200.0), (2 * DAY, 200.0)];
+        // Half a percent while at 100, and 1% while at twice that, on the same position.
+        let funding = [(10, 0.005), (DAY + 10, 0.01)];
+        let held = benchmark(1_000.0, &bars, 0, &funding).unwrap();
+        assert!((held.return_ - 1.0).abs() < 1e-12);
+        assert!((held.return_after_funding - (1.0 - 0.005 - 0.02)).abs() < 1e-12);
+        assert_eq!(
+            benchmark(1_000.0, &bars, 0, &[])
+                .unwrap()
+                .return_after_funding,
+            1.0
+        );
     }
 
     #[test]

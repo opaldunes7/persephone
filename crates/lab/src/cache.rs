@@ -46,6 +46,20 @@ pub trait BarSource: Send + Sync {
         end: UnixNanos,
     ) -> Result<Vec<Candle>, String>;
 
+    /// A perpetual's funding rates paid in `start..end`. Nothing else has any.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if they can't be fetched.
+    fn funding(
+        &self,
+        _symbol: &str,
+        _start: UnixNanos,
+        _end: UnixNanos,
+    ) -> Result<Vec<(UnixNanos, f64)>, String> {
+        Ok(Vec::new())
+    }
+
     /// The time now.
     fn now(&self) -> UnixNanos {
         SystemTime::now()
@@ -53,6 +67,9 @@ pub trait BarSource: Send + Sync {
             .map_or(0, |d| d.as_nanos() as UnixNanos)
     }
 }
+
+/// A perpetual's funding file: the span it covers, and the rates in it.
+type SavedFunding = (UnixNanos, UnixNanos, Vec<(UnixNanos, f64)>);
 
 /// Binance itself, over one client, whose connections are reused between requests.
 #[derive(Default)]
@@ -85,6 +102,17 @@ impl BarSource for Binance {
     ) -> Result<Vec<Candle>, String> {
         self.client()?
             .klines(symbol, timeframe, start, end)
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    fn funding(
+        &self,
+        symbol: &str,
+        start: UnixNanos,
+        end: UnixNanos,
+    ) -> Result<Vec<(UnixNanos, f64)>, String> {
+        self.client()?
+            .funding(symbol, start, end)
             .map_err(|e| format!("{e:#}"))
     }
 }
@@ -165,6 +193,7 @@ fn cover(covered: &mut Vec<(UnixNanos, UnixNanos)>, from: UnixNanos, to: UnixNan
 pub struct BarCache {
     dir: PathBuf,
     source: Arc<dyn BarSource>,
+    funding_lock: Mutex<()>,
     /// Each entry's `downloading` lock is what makes one download at a time: workers wanting bars
     /// that aren't here wait on it, and find they've been fetched.
     markets: Mutex<HashMap<String, Arc<Entry>>>,
@@ -177,6 +206,7 @@ impl BarCache {
         Self {
             dir,
             source,
+            funding_lock: Mutex::new(()),
             markets: Mutex::default(),
             uses: Mutex::new(0),
         }
@@ -204,6 +234,49 @@ impl BarCache {
     /// # Errors
     ///
     /// Returns a message if they aren't known and can't be fetched.
+    /// A perpetual's funding rates in `start..end`, downloaded once. What's been paid doesn't
+    /// change, so the file only ever grows, and two Labs writing it just write the same.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if they can't be fetched or saved.
+    pub fn funding(
+        &self,
+        symbol: &str,
+        start: UnixNanos,
+        end: UnixNanos,
+    ) -> Result<Vec<(UnixNanos, f64)>, String> {
+        // One at a time: parallel backtests all want this at once, and only the first need fetch.
+        let _turn = self.funding_lock.lock().map_err(|e| e.to_string())?;
+        let path = self.dir.join(format!("{symbol}.funding.json"));
+        let saved: Option<SavedFunding> = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok());
+        let known = saved.as_ref().map(|(from, until, _)| (*from, *until));
+        let (from, until, mut rates) = saved.unwrap_or((start, start, Vec::new()));
+        let (from, until, rates) = if start < from {
+            (start, end, self.source.funding(symbol, start, end)?)
+        } else if until < end {
+            rates.extend(self.source.funding(symbol, until, end)?);
+            (from, end, rates)
+        } else {
+            (from, until, rates)
+        };
+        if known != Some((from, until)) {
+            fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
+            // Named for this process, as another Lab may be saving it too.
+            let partial = path.with_extension(format!("{}.partial", std::process::id()));
+            let text = serde_json::to_string(&(from, until, &rates)).map_err(|e| e.to_string())?;
+            fs::write(&partial, text)
+                .and_then(|()| fs::rename(&partial, &path))
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(rates
+            .into_iter()
+            .filter(|(when, _)| (start..end).contains(when))
+            .collect())
+    }
+
     pub fn instrument(&self, symbol: &str) -> Result<InstrumentSpec, String> {
         let path = self.dir.join(format!("{symbol}.instrument"));
         let fresh = fs::metadata(&path)

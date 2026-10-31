@@ -77,11 +77,11 @@ persephone-lab call run_backtest '{"symbol": "BTCUSDT", "bars": "1h", "from": "2
 | For | Tools |
 |---|---|
 | For agents | `get_guide`, `get_settings` |
-| Markets and data | `list_markets`, `get_instrument`, `get_history_range`, `get_bars`, `get_ticks`, `export_data`, `import_data`, `fetch_archive` |
+| Markets and data | `list_markets`, `get_instrument`, `get_history_range`, `get_funding`, `get_bars`, `get_ticks`, `export_data`, `import_data`, `fetch_archive` |
 | Indicators and models | `list_indicators`, `compute_indicator`, `list_models`, `run_model` |
 | Strategies | `list_strategies`, `describe_strategy`, `validate_logic`, `install_plugin` (compiled, or a program over a socket) |
 | Running tests | `run_backtest`, `run_backtests`, `run_monte_carlo`, `run_random_blocks`, `run_optimize`, `run_walk_forward`, `run_random_entries` |
-| Reading a run | `get_report`, `get_trades`, `get_fills`, `get_equity`, `get_returns`, `get_calendar`, `list_runs`, `compare_runs` |
+| Reading a run | `get_report`, `get_trades`, `get_fills`, `get_limit_orders`, `get_equity`, `get_returns`, `get_calendar`, `list_runs`, `compare_runs` |
 | Long jobs | `get_job`, `cancel_job` |
 | The app | `get_layout`, `get_chart_settings`, `get_drawings`, `save_result`, `list_results` |
 | Moving your setup | `export_state`, `import_state` |
@@ -140,6 +140,12 @@ arguments lists everything a tree can be made of, and with one says where it's w
   stays as it is.
 - **No looking ahead:** a tree only ever gets one closed bar at a time, so it can't. `sma`, `ema`, `rsi`
   and `atr` are the same ones charts and built-in strategies use.
+
+## Orders and costs
+
+Backtests can send limit orders, keep real stops and targets, pay separate maker and taker fees and charge market impact, all as
+`settings`. A symbol like `BTCUSDT-PERP` is a perpetual, with its funding charged. Limits fill only when price trades through them.
+The `backtests` topic in [the agents' guide](lab-agents.md) has the details.
 
 ## Moving your setup
 

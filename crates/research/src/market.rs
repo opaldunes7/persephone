@@ -11,7 +11,7 @@ use persephone_core::{
     tick::{TickFeed, TickKind},
 };
 use persephone_data::{
-    binance::{BinanceClient, check_range},
+    binance::{BinanceClient, check_range, is_perp},
     store::{MarketKind, Store},
 };
 use persephone_engine::FeeRates;
@@ -42,6 +42,8 @@ pub struct MarketBars {
     pub ticks: Option<Arc<dyn TickFeed>>,
     /// How backtest orders fill, for the report; `None` for a plain bar market.
     pub fills: Option<String>,
+    /// A perpetual's funding rates, by when they're paid.
+    pub funding: Option<Arc<Vec<(UnixNanos, f64)>>>,
 }
 
 /// The 1-minute bars of `from..to`, for High precision to fill orders on when there are no ticks.
@@ -140,6 +142,7 @@ pub fn load_local(
         },
         ticks,
         fills: Some(fills),
+        funding: None,
     })
 }
 
@@ -172,6 +175,12 @@ pub fn load_binance(
     let instrument = binance.instrument(symbol)?;
     let candles = binance.klines(symbol, timeframe, start, end)?;
     anyhow::ensure!(!candles.is_empty(), "Binance returned no bars for {symbol}");
+    let perp = is_perp(symbol);
+    let funding = if perp {
+        Some(Arc::new(binance.funding(symbol, start, end)?))
+    } else {
+        None
+    };
     Ok(MarketBars {
         symbol: instrument.symbol.clone(),
         venue: instrument.venue.clone(),
@@ -179,8 +188,13 @@ pub fn load_binance(
         price_precision: instrument.price_precision,
         candles,
         instrument,
-        fees: FeeRates::BINANCE_SPOT,
+        fees: if perp {
+            FeeRates::BINANCE_PERP
+        } else {
+            FeeRates::BINANCE_SPOT
+        },
         ticks: None,
         fills: None,
+        funding,
     })
 }

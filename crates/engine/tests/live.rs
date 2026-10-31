@@ -123,6 +123,7 @@ fn paper_trading_fills_like_a_backtest_from_where_it_starts() {
         rules: TradingRules::default(),
         trade_from: 0,
         fill_bars: None,
+        funding: None,
     })
     .join()
     .unwrap()

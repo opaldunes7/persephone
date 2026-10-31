@@ -33,6 +33,18 @@ A market's details: quote currency, precision and fees.
 
 Returns: `symbol`, `venue`, `base`, `quote`, `price_precision`, `size_precision`, `fees`
 
+## `get_funding`
+
+A perpetual's funding rates, in pages: when each was paid, and the rate as a fraction. A long pays its value times a positive rate, and a short receives it.
+
+- `symbol` (string, required): The market's symbol, like BTCUSDT.
+- `from` (time): Start, in UTC. Default a year back.
+- `to` (time): End (not included), in UTC.
+- `cursor` (string): Where to carry on, from the last page's next_cursor.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
+
+Returns: `columns`, `rows`, `next_cursor`
+
 ## `get_history_range`
 
 When a market's history starts and ends.
@@ -316,6 +328,17 @@ Returns: `columns`, `rows`, `next_cursor`
 A run's fills, in pages.
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
+- `cursor` (string): Where to carry on, from the last page's next_cursor.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
+
+Returns: `columns`, `rows`, `next_cursor`
+
+## `get_limit_orders`
+
+Every limit order a run sent, in pages, filled or not: what became of it, how far past its price the market traded (reached_percent), and how far the market moved its way a bar and 24 bars later. Shows whether those that fill are the bad ones.
+
+- `run_id` (string, required): A run, from run_backtest or list_runs.
+- `outcome` (string): Only filled, lapsed, replaced, cancelled, refused or open.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 

@@ -1069,6 +1069,7 @@ mod tests {
             price,
             qty,
             fee,
+            maker: false,
         }
     }
 
@@ -1086,6 +1087,7 @@ mod tests {
             general: BTreeMap::new(),
             returns_series: Vec::new(),
             notes: Vec::new(),
+            ..BacktestReport::default()
         }
     }
 

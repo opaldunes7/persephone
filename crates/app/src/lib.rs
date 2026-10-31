@@ -139,6 +139,8 @@ pub struct MarketData {
     pub ticks: Option<Arc<dyn TickFeed>>,
     /// How backtest orders fill, for the report; `None` for a plain bar market.
     pub fills: Option<String>,
+    /// A perpetual's funding rates, by when they're paid.
+    pub funding: Option<Arc<Vec<(UnixNanos, f64)>>>,
 }
 
 impl From<persephone_research::market::MarketBars> for MarketData {
@@ -155,6 +157,7 @@ impl From<persephone_research::market::MarketBars> for MarketData {
             fees: market.fees,
             ticks: market.ticks,
             fills: market.fills,
+            funding: market.funding,
         }
     }
 }
@@ -567,6 +570,7 @@ impl Persephone {
                     fees: FeeRates::BINANCE_SPOT,
                     ticks: None,
                     fills: None,
+                    funding: None,
                 }),
             )]),
             window,
@@ -904,6 +908,7 @@ impl Persephone {
                 }
                 _ => None,
             },
+            funding: market.funding.clone(),
         };
         Some((strategy.generation, request))
     }
@@ -1391,6 +1396,18 @@ impl Persephone {
         }
         if tile.market.local.is_some() {
             return Some("Live trading needs a Binance market; this one is from your files.");
+        }
+        if persephone_data::binance::is_perp(&tile.market.symbol) {
+            return Some("Paper and live trading are for spot markets; this one is a perpetual.");
+        }
+        let sim = tile.backtest.sim();
+        if sim.limit.is_some()
+            || sim.stop_loss_percent.is_some()
+            || sim.take_profit_percent.is_some()
+        {
+            return Some(
+                "Paper and live trading use market orders for now. Turn off limit orders, stops and targets first.",
+            );
         }
         match tile.market.bars.timeframe() {
             None => return Some("Live trading uses time bars."),
@@ -3590,8 +3607,22 @@ impl Persephone {
                 warning: true,
             });
         }
+        if let Some(warning) = figures::LimitSummary::of(report).warning()
+            && let Some(report) = Arc::get_mut(report)
+        {
+            report.notes.push(Note {
+                text: warning
+                    .replace("`through_percent`", "a higher Through")
+                    .replace(
+                        ", and see `get_limit_orders`",
+                        ", and see Limits in the panel",
+                    ),
+                warning: true,
+            });
+        }
         let bars: Vec<(u64, f64)> = candles.iter().map(|c| (c.ts, c.close)).collect();
-        Some(RunFigures::of(report, from_index, &bars))
+        let funding = market.funding.as_deref().map_or(&[][..], Vec::as_slice);
+        Some(RunFigures::of(report, from_index, &bars, funding))
     }
 
     /// Works out what costs did to tile `id`'s finished run, if that isn't known yet.
@@ -3623,8 +3654,9 @@ impl Persephone {
             return Task::none();
         };
         let (sim, precision) = (request.sim, request.instrument.price_precision);
+        let volumes: Vec<f64> = request.candles.iter().map(|c| c.volume).collect();
         if !figures::costs_something(&request) {
-            let friction = figures::friction(&report, &report, &sim, precision);
+            let friction = figures::friction(&report, &report, &sim, precision, &volumes);
             set(self, Costs::Done(friction));
             return Task::none();
         }
@@ -3634,7 +3666,7 @@ impl Persephone {
             async move {
                 backtest_on_thread(free)
                     .await
-                    .map(|free| figures::friction(&report, &free, &sim, precision))
+                    .map(|free| figures::friction(&report, &free, &sim, precision, &volumes))
             },
             move |result| Message::CostsDone(id, generation, result),
         )
@@ -4085,7 +4117,14 @@ impl Persephone {
                 self.save();
                 return Task::none();
             }
-            P::ShowCalendar(shown) => panel.calendar.shown = shown,
+            P::ShowCalendar(shown) => {
+                panel.calendar.shown = shown;
+                panel.limits_shown = false;
+            }
+            P::ShowLimits(shown) => {
+                panel.limits_shown = shown;
+                panel.calendar.shown = false;
+            }
             P::CalendarLevel(level) => panel.calendar.level = level,
             P::ReplayTrade(index) => {
                 let Some(Run::Done(report)) = self
@@ -5556,6 +5595,9 @@ fn run_summary(strategy: &Strategy, quote: &str) -> Option<String> {
         ));
     }
     parts.push(format!("in a position {:.0}%", figures.exposure * 100.0));
+    if let Some(rate) = figures.fill_rate {
+        parts.push(format!("limits filled {:.0}%", rate * 100.0));
+    }
     Some(parts.join(" · "))
 }
 

@@ -78,6 +78,8 @@ pub struct Panel {
     pub settings_height: f32,
     /// Whether exporting everything includes full runs, which can be large.
     pub export_runs: bool,
+    /// Showing each limit order in the backtest's pane.
+    pub limits_shown: bool,
     /// How the last export or import went, and whether it failed.
     pub notice: Option<(String, bool)>,
     /// The search for plugins to add: every kind not already on.
@@ -284,6 +286,7 @@ impl Panel {
         Self {
             settings_height: 0.0,
             export_runs: false,
+            limits_shown: false,
             notice: None,
             plugin_search: plugin_search(settings),
             tests: Tests::default(),
@@ -429,6 +432,8 @@ pub enum PanelMessage {
     StockOpen(bool),
     /// Show the backtest's calendar, or its equity curve.
     ShowCalendar(bool),
+    /// Show each limit order rather than the equity curve or calendar.
+    ShowLimits(bool),
     CalendarLevel(calendar::Level),
     /// Move the playhead to just before this trade opened, by its place in the backtest's trades.
     ReplayTrade(usize),
@@ -1057,6 +1062,7 @@ mod tests {
                     price: 1.0,
                     qty: 1.0,
                     fee: 0.0,
+                    maker: false,
                 },
                 persephone_engine::Fill {
                     ts: 0,
@@ -1065,6 +1071,7 @@ mod tests {
                     price: 1.0,
                     qty: 1.0,
                     fee: 0.0,
+                    maker: false,
                 },
             ],
             ..BacktestReport::default()

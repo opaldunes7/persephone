@@ -48,7 +48,7 @@ How a backtest works, which decides what its numbers mean.
   With `precision: "high"`, it fills on what's next inside the bars instead: ticks, or 1-minute bars. So `high` only
   changes results alongside `latency`, or on ticks, and otherwise just takes longer.
 - **A strategy says what position it wants:** long, short or flat. One position at a time, in one
-  direction; reversing is one order, twice the size. There are no stops or limit orders.
+  direction; reversing is one order, twice the size. Orders go at the market unless `limit` is set.
 - **Size:** each position is worth capital × `Size %` × leverage, worked out from the **starting**
   capital, at the price when it opens. Profits aren't compounded unless `compound` is set, which sizes from the
   account as it is at the time. `Size %` is a parameter of every
@@ -63,7 +63,7 @@ How a backtest works, which decides what its numbers mean.
 
 - A decision and its fill share one close. Real orders go after it, so set `slippage_percent` or `latency`. Prefer
   `slippage_percent` to `slippage`, which is in ticks and so means different things on different markets.
-- Stops are checked at closes too, so one fills at the close that broke it, which may be well past its level.
+- A stop in a logic tree is checked at closes, so it fills at the close that broke it, which may be well past its level.
 - Shorts are allowed on spot markets, with no borrowing or funding costs. Paper and live spot accounts can't short.
 - No margin calls or financing costs, and any size fills in full, while the account can pay. If it can't, as with
   `Size %` near 100 or high leverage, the order's refused, the position stays as it was, and the summary's `warnings`
@@ -72,7 +72,30 @@ How a backtest works, which decides what its numbers mean.
   order refused is a fault in the backtest, and one where the position rounds to nothing means raising the capital or size.
 - Unless `compound` is set, a strategy trading in and out falls behind `buy_and_hold_return` as profits build. To
   compare fairly, use `Size %` 100 and `compound`.
-- One market at a time: there are no portfolios or limit orders.
+- One market at a time: there are no portfolios.
+- **`limit` orders** rest from the close by `offset_percent`, for `expires_bars`. They fill only when price trades **through**
+  them, as a bar can't show a place in the queue, at their own price, even on a gap past them, and pay the maker's fee. An entry
+  that doesn't fill lapses, and an exit goes at the market, including all of a reversal at the taker's fee. A level-based strategy will
+  place it again next bar, and each counts as a new order in `fill_rate`. It can't go with `latency` or `fill_timing: "next_open"`.
+  **Limit fills flatter unless tested.** A bar can't show the queue ahead of an order, so by default one tick through counts as filled. Set
+  `through_percent` to require the market to trade that far past first, at its own price all the same: `0.01` is 1 basis point. A trial found
+  that alone turned a small profit into a loss, so run a result at a few values. Orders that fill also tend to do worse than those that
+  miss, as price runs away from the latter. `limit_summary` compares them, `get_limit_orders` lists every order, and `warnings` says when
+  the gap's wide. So treat a small profit that depends on limits as unproven.
+- **`stop_loss_percent` and `take_profit_percent`** are real orders. After a market entry they rest through the very next bar. After a
+  limit entry, which fills partway through a bar, they start at that bar's close, so that bar's own low isn't checked against the stop,
+  which flatters. A stop fills at its level, or the open on a gap, plus slippage. A target fills at its level, and only when price trades
+  through it. On a bar reaching both, the stop's assumed to have come first. A strategy still asking for the position goes back in next
+  bar. They can't go with `fill_timing: "next_open"`.
+- **Perpetuals:** a symbol like `BTCUSDT-PERP` is Binance's USD-M perpetual, with its bars, and 0.02% maker and 0.05% taker fees
+  unless `commission` says otherwise. Funding falls due on what's held going into the bar it's in, at that bar's open, in `funding_paid`,
+  positive when it cost, and `get_funding` lists the rates. A limit filled partway through a bar counts from that bar's close. Trades in
+  `get_trades` don't include funding, though `net_return` and equity do. `buy_and_hold_return` doesn't either, so compare with
+  `benchmark.return_after_funding` on a perpetual. Spot shorts cost nothing unless `borrow_percent_per_year` is set, and that
+  isn't realistic.
+- **`impact_percent`** is a rough assumption: market orders fill worse by it times the square root of the order's share of its bar's volume.
+  `warnings` says when an order's over a tenth of its bar, where fills are fiction anyway.
+
 
 A strategy is `{"builtin": id}`, `{"plugin": id}`, `{"logic": tree}` or `{"positions": list}`, each with optional
 `"params"`.
@@ -186,7 +209,12 @@ an error.
 |---|---|
 | `stock` | `false` turns all of the below off at once, except `capital` and `precision` |
 | `capital` | Starting cash, in the quote currency |
-| `commission` | `{"percent": 0.1}` of each fill, or `{"per-order": 1.5}` flat, instead of the market's fee |
+| `commission` | `{"percent": 0.1}` of each fill, `{"per-order": 1.5}` flat, or `{"rates": {"maker": 0.02, "taker": 0.05}}`, instead of the market's fee. A maker's can be below zero, for a rebate |
+| `limit` | `{"offset_percent": 0.05, "expires_bars": 3, "through_percent": 0.01}`: send orders as limits, `through_percent` being optional. See `backtests` |
+| `stop_loss_percent` | A real stop this far from the entry |
+| `take_profit_percent` | A real target this far from the entry |
+| `borrow_percent_per_year` | What borrowing costs a short |
+| `impact_percent` | How far a market order fills worse at all of its bar's volume |
 | `slippage` | Ticks every market order fills worse. A tick is `10^-price_precision`, from `get_instrument` |
 | `slippage_percent` | Percent of the price every market order fills worse, on top of any in ticks: `0.01` is 1 basis point |
 | `compound` | `true` sizes positions from the account as it is now. Monte Carlo then draws such trades as returns on the account and multiplies, so a fall can't pass 100% |
@@ -216,14 +244,19 @@ What every number means, the same everywhere.
 - **`profit_factor`** is winning trades' profit over losing trades' loss, null if there were no losses.
 - **`exposure`** is the fraction of bars that began with a position open.
 - **`average_trade`** is net profit per trade, in the quote currency, after fees.
-- **`gross_return`** is `net_return` from a second backtest with fees, slippage and spread off, so it's exact with `compound`
-  and with an account that ran out. **`total_costs_paid`** is fees plus what slippage and spread took, in the quote
+- **`gross_return`** is `net_return` from a second backtest with fees, slippage, spread, impact, funding and borrowing off, so it's exact with `compound`
+  and with an account that ran out. **`total_costs_paid`** is fees, funding and borrowing, plus what slippage, spread and impact took, in the quote
   currency. **`break_even_cost_per_fill`** is the cost per fill that would bring the costless run to nothing, in basis
   points of the value traded: negative if it loses before costs. It's a guide under `compound`, where costs also
   shrink later positions. A run with costs takes twice as long, so `friction: false` leaves these out for huge
   batches. A plugin that doesn't repeat itself may differ between the two runs.
 - **`benchmark`** has `return`, `sharpe` and `max_drawdown` for buying at the first close that could trade and holding to
   the end, with no costs. `return` is the same as `buy_and_hold_return`.
+- **`limit_orders`, `limits_filled` and `fill_rate`** say how limits went, and `maker` in `get_fills` which fills rested.
+  **`limit_summary`** has how far the market then moved each order's way, on average, as percentages: `filled_move_1` and `missed_move_1`
+  a bar on, the same with `_24` for 24 bars on, and `barely_filled`, how many fills went under a hundredth of a percent past their price.
+  **`get_limit_orders`** lists each order, with `reached_percent` for how far past its price the market traded, below zero if it stayed off.
+  **`maker_fees` and `taker_fees`** split the fees, and **`funding_paid` and `borrow_paid`** are what holding cost.
 - **`fills_on`** in a summary says how orders filled: `bars`, `ticks`, `minute_bars` or `next_open`.
 - **`get_equity`'s `market`** is the app's market line: what holding the market with a position the run's size would be
   worth, from the first close that could trade. It's null on runs saved before it was added.
@@ -260,7 +293,7 @@ Which bars a call uses, their limits, and what's cached.
 
 - **`bars`:** `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`, `1w` or `1M`. On local markets, also `100t` for every
   100 ticks and `2.5v` by volume. Default `1h`.
-- **Binance markets:** any spot symbol, with no `venue`. Only **closed** bars are used.
+- **Binance markets:** any spot symbol, with no `venue`, or a USD-M perpetual as `BTCUSDT-PERP`. Only **closed** bars are used.
 - **Local markets:** `venue` from `list_markets`.
 - **Without `from`:** the latest 5,000 bars, so a call with no `to` moves as new bars close. A summary's
   `first_bar` and `last_bar` say which bars it used. Give both ends to get the same answer every time.
@@ -392,7 +425,7 @@ A sensible order for testing an idea, cheapest first. Nothing here is required.
 
 1. **Try it once, with costs:** `run_backtest` with `slippage_percent` set, and read `warnings`. If it loses before costs
    too (set `commission` to 0), stop: cheaper fills won't save it.
-2. **Compare fairly:** `Size %` 100 and `compound` against `buy_and_hold_return`, and look at `by_year`, as one good year
+2. **Compare fairly:** `Size %` 100 and `compound` against `buy_and_hold_return`, or for a strategy trading often, whose fees drain the account until orders are refused, a smaller size against holding at that size, and look at `by_year`, as one good year
    often explains everything.
    To test a model trained elsewhere, see the `models` topic.
 3. **Vary it:** `run_backtests` across parameters, symbols and costs, with a `label`. A real effect survives nearby values.
@@ -463,6 +496,10 @@ imports. API keys, what AI models a plugin may use, plugins' code and market dat
 | Random entries: both charts | `run_random_entries`' `return_chart` and `fall_chart` |
 | A parameter sweep | `run_optimize`, or `run_backtests` across the values |
 | Export and Import buttons | `export_state`, `import_state` |
+| Backtest: Limits view, each order and how they compare | `get_limit_orders`, `summary.limit_summary` |
+| A perpetual's funding, in its statistics | `summary.funding_paid`, `benchmark.return_after_funding`, `get_funding` |
+| Statistics: limits filled, maker and taker fees, funding, borrowing | `summary` |
+| Settings: limit orders, stop, target, impact, short borrow, maker and taker | `settings` |
 
 Every line and chart is the same data the panel draws. Lab gives numbers rather than images. Only paper and live sessions
 have no equivalent, as Lab can't trade.

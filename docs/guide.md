@@ -16,6 +16,7 @@ chart, in the strategy report, and in `persephone-cli`. This guide walks through
 - [Your own data](#your-own-data)
 - [Paper and live trading](#paper-and-live-trading)
 - [Plugins, models and AI](#plugins-models-and-ai)
+- [Limit orders, stops and funding](#limit-orders-stops-and-funding)
 - [Exporting and importing](#exporting-and-importing)
 - [Persephone Lab](#persephone-lab)
 - [Where files live](#where-files-live)
@@ -497,6 +498,24 @@ When a strategy plugin wants to ask language models, the app asks you first. The
 explains what's at stake (prompts leave your machine, and new calls can cost money) and has
 **Allow it to ask AI models**. Replies are recorded, so rerunning a backtest asks nothing
 new.
+
+## Limit orders, stops and funding
+
+The panel's stock settings go beyond market orders:
+
+- **Limit orders** rest a set percentage better than the close, for a set number of bars. They fill only when price trades through
+  them, at their own price, and pay the maker's fee. An entry that doesn't fill lapses; an exit goes at the market. **Through** requires the
+  market to trade that much further first, standing in for the queue ahead of an order, which a bar can't show. Try a few values: small profits
+  often vanish. The **Limits** view beside Equity and Calendar lists every order, and compares how far the market moved after those that
+  filled against those that missed. Those that miss are often the ones that would have won.
+- **Stop loss** and **Target** are real orders from the bar after an entry. On a bar reaching both, the stop's assumed to have come first.
+- **Fees** have an **m/t** choice, for separate maker and taker rates. A maker's can be below zero, for a rebate.
+- **Impact** makes market orders fill worse the larger they are against their bar's volume. It's a rough assumption.
+- **Borrow a year** charges shorts on spot, which otherwise cost nothing to hold, unlike in reality.
+
+For perpetuals, type a symbol like `BTCUSDT-PERP`. It uses Binance's USD-M futures bars and fees, and the statistics show **Funding paid**.
+
+Paper and live trading stay on market orders and spot markets for now, and won't start with any of this on.
 
 ## Exporting and importing
 
