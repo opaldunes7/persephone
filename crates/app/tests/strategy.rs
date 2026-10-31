@@ -1389,7 +1389,8 @@ mod panel {
             panic!("no backtest");
         };
         let trades = round_trips(report);
-        let draws = result.draws(result.worst).unwrap();
+        let run = result.run_of_line(result.worst).unwrap();
+        let draws = result.draws_of_run(run).unwrap();
         let made: f64 = draws.iter().map(|&i| trades[i].profit).sum();
         let expected = result.stats[result.worst].return_ * report.starting_balance;
         assert!((made - expected).abs() < 1e-6, "{made} against {expected}");

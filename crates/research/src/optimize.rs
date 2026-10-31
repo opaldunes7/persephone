@@ -20,6 +20,7 @@ use persephone_engine::{BacktestReport, BacktestRequest};
 use crate::{
     robustness::{backtest, closed_trades, monte_carlo, percentile, pool},
     settings::{OptimizeSettings, ScoreBy, Variable},
+    thousands,
 };
 
 /// A starting range around `value`: half to double, within the parameter's limits.
@@ -206,8 +207,8 @@ impl Grid {
     /// What a run comes to: `20 values × 50 blocks = 1,000 backtests`.
     #[must_use]
     pub fn describe(&self, score: ScoreBy, blocks: u32) -> String {
-        let total = thousands(self.backtests(score, blocks));
-        let cells = thousands(self.cells());
+        let total = thousands(self.backtests(score, blocks) as u64);
+        let cells = thousands(self.cells() as u64);
         match score {
             ScoreBy::RandomBlocks => {
                 format!("{cells} values × {blocks} blocks = {total} backtests")
@@ -215,18 +216,6 @@ impl Grid {
             _ => format!("{total} backtests"),
         }
     }
-}
-
-fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, digit) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(digit);
-    }
-    out
 }
 
 /// Where the bars values are picked on end, when the rest is kept back.

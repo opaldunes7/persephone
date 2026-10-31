@@ -3,12 +3,16 @@
 
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, File},
+    io::{Read as _, Write as _},
     sync::{Arc, atomic::Ordering},
+    time::Duration,
 };
 
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+
 use persephone_core::{
-    Candle, Side,
+    Candle, Side, Timeframe,
     signal::{Note, SignalFactory},
     strategy::{StrategyKind, StrategySpec},
 };
@@ -16,7 +20,7 @@ use persephone_engine::{BacktestReport, BacktestRequest, Fill};
 use persephone_research::{
     WARM_UP_BARS,
     calendar::{Calendar, days_in_month, weeks},
-    market::{MarketBars, fine_bars},
+    market::{MAX_FINE_BARS, MarketBars, fine_bars},
     optimize::{Grid, OptimizeJob, Outcome, split_at},
     results::{StrategyRef, with_params},
     robustness::{
@@ -32,9 +36,11 @@ use crate::{
     data::MarketArgs,
     jobs::{Job, check_id},
     new_id, now_ms, time_text,
-    tools::{page, text},
+    tools::{page, page_of, text},
 };
 
+/// How many runs to keep read.
+const RECENT_RUNS: usize = 4;
 const TRADE_COLUMNS: [&str; 14] = [
     "trade",
     "side",
@@ -142,7 +148,8 @@ fn summary_of(report: &BacktestReport, from_index: usize, name: &str) -> Value {
         "strategy": name,
         "net_return": last / report.starting_balance - 1.0,
         "final_equity": last,
-        "max_drawdown": report.max_drawdown,
+        // A fall is a positive fraction everywhere in Lab, though the engine's is negative.
+        "max_drawdown": report.max_drawdown.abs(),
         "fees": report.fees,
         "fills": report.fills.len(),
         "trades": trades.len(),
@@ -290,7 +297,7 @@ impl Lab {
         // High precision fills on ticks, or on 1-minute bars where there are none.
         let fine = if settings.precision == Precision::High
             && market.ticks.is_none()
-            && market.bars != persephone_core::Timeframe::M1.into()
+            && market.bars != Timeframe::M1.into()
         {
             let first = market.candles.first().map_or(0, |c| c.ts);
             let last = market
@@ -299,13 +306,22 @@ impl Lab {
                 .last()
                 .copied()
                 .unwrap_or(first);
-            let local = market_args
-                .venue
-                .as_deref()
-                .map(|venue| (&self.store, venue));
-            Some(Arc::new(
-                fine_bars(local, &market_args.symbol, first, last).map_err(|e| format!("{e:#}"))?,
-            ))
+            Some(Arc::new(match market_args.venue.as_deref() {
+                Some(venue) => {
+                    fine_bars(Some((&self.store, venue)), &market_args.symbol, first, last)
+                        .map_err(|e| format!("{e:#}"))?
+                }
+                None => {
+                    let minutes = last.saturating_sub(first) / Timeframe::M1.nanos();
+                    if minutes > MAX_FINE_BARS {
+                        return Err(format!(
+                            "High precision would need {minutes} 1-minute bars here, more than {MAX_FINE_BARS}; pick a shorter span"
+                        ));
+                    }
+                    self.cache
+                        .bars(&market_args.symbol, Timeframe::M1, first, last)?
+                }
+            }))
         } else {
             None
         };
@@ -317,7 +333,10 @@ impl Lab {
         let (request, from_index, name) = self.prepare(args)?;
         let times: Vec<u64> = request.candles.iter().map(|c| c.ts).collect();
         let report = backtest(request)?;
-        let summary = summary_of(&report, from_index, &name);
+        let mut summary = summary_of(&report, from_index, &name);
+        // Which bars these were, as a span with no end moves on as new bars close.
+        summary["first_bar"] = json!(times.get(from_index).copied().map(time_text));
+        summary["last_bar"] = json!(times.last().copied().map(time_text));
         let run_id = new_id("run");
         let run = json!({
             "run_id": run_id,
@@ -344,7 +363,11 @@ impl Lab {
                 .collect::<Vec<_>>(),
         });
         let dir = self.paths.lab().join("runs");
-        fs::write(dir.join(format!("{run_id}.json")), run.to_string())
+        let mut packed = GzEncoder::new(Vec::new(), Compression::fast());
+        packed
+            .write_all(run.to_string().as_bytes())
+            .and_then(|()| packed.finish())
+            .and_then(|bytes| fs::write(dir.join(format!("{run_id}.json.gz")), bytes))
             .and_then(|()| {
                 let brief = json!({"run_id": run_id, "created": now_ms(), "summary": summary});
                 fs::write(dir.join(format!("{run_id}.summary")), brief.to_string())
@@ -353,11 +376,64 @@ impl Lab {
         Ok(json!({"run_id": run_id, "summary": summary}))
     }
 
-    pub(crate) fn load_run(&self, id: &str) -> Result<Value, String> {
+    pub(crate) fn load_run(&self, id: &str) -> Result<Arc<Value>, String> {
         check_id(id)?;
-        let file = self.paths.lab().join("runs").join(format!("{id}.json"));
-        let text = fs::read_to_string(file).map_err(|_| format!("there's no run `{id}`"))?;
-        serde_json::from_str(&text).map_err(|e| e.to_string())
+        if let Ok(recent) = self.recent_runs.lock()
+            && let Some((_, run)) = recent.iter().find(|(known, _)| known == id)
+        {
+            return Ok(Arc::clone(run));
+        }
+        let dir = self.paths.lab().join("runs");
+        let missing = || format!("there's no run `{id}`");
+        let text = match File::open(dir.join(format!("{id}.json.gz"))) {
+            Ok(file) => {
+                let mut text = String::new();
+                GzDecoder::new(file)
+                    .read_to_string(&mut text)
+                    .map_err(|e| format!("couldn't read the run: {e}"))?;
+                text
+            }
+            // As they were saved before they were packed.
+            Err(_) => fs::read_to_string(dir.join(format!("{id}.json"))).map_err(|_| missing())?,
+        };
+        let run: Arc<Value> = Arc::new(serde_json::from_str(&text).map_err(|e| e.to_string())?);
+        if let Ok(mut recent) = self.recent_runs.lock() {
+            recent.push_front((id.to_owned(), Arc::clone(&run)));
+            recent.truncate(RECENT_RUNS);
+        }
+        Ok(run)
+    }
+
+    /// Removes Lab's own runs and job files older than `age`, for keeping its folder from growing
+    /// without limit. Markets, saved results and the call log aren't touched. Says how many it removed
+    /// and how many bytes that freed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if a folder can't be read.
+    pub fn prune(&self, age: Duration) -> Result<(usize, u64), String> {
+        let (mut files, mut bytes) = (0, 0);
+        for folder in ["runs", "jobs"] {
+            for entry in fs::read_dir(self.paths.lab().join(folder))
+                .map_err(|e| e.to_string())?
+                .flatten()
+            {
+                let Ok(meta) = entry.metadata() else { continue };
+                let old = meta
+                    .modified()
+                    .ok()
+                    .and_then(|at| at.elapsed().ok())
+                    .is_some_and(|elapsed| elapsed >= age);
+                if meta.is_file() && old && fs::remove_file(entry.path()).is_ok() {
+                    files += 1;
+                    bytes += meta.len();
+                }
+            }
+        }
+        if let Ok(mut recent) = self.recent_runs.lock() {
+            recent.clear();
+        }
+        Ok((files, bytes))
     }
 
     pub(crate) fn get_report(&self, args: &Value) -> Result<Value, String> {
@@ -367,7 +443,7 @@ impl Lab {
             "request": run["request"],
             "summary": run["summary"],
             "starting_balance": run["starting_balance"],
-            "max_drawdown": run["max_drawdown"],
+            "max_drawdown": run["max_drawdown"].as_f64().map(f64::abs),
             "fees": run["fees"],
             "total_orders": run["total_orders"],
             "total_positions": run["total_positions"],
@@ -406,25 +482,26 @@ impl Lab {
         let empty = Vec::new();
         let times = run["times"].as_array().unwrap_or(&empty);
         let equity = run["equity"].as_array().unwrap_or(&empty);
-        let rows = times
-            .iter()
-            .zip(equity)
-            .skip(from)
-            .map(|(ts, value)| {
-                let at = ts.as_u64().unwrap_or(0);
-                json!([at, time_text(at), value])
-            })
-            .collect();
-        Ok(page(&["ts", "time", "equity"], rows, args, 1_000))
+        let total = times.len().min(equity.len()).saturating_sub(from);
+        Ok(page_of(
+            &["ts", "time", "equity"],
+            total,
+            args,
+            1_000,
+            |i| {
+                let at = times[from + i].as_u64().unwrap_or(0);
+                json!([at, time_text(at), equity[from + i]])
+            },
+        ))
     }
 
     pub(crate) fn get_returns(&self, args: &Value) -> Result<Value, String> {
         let run = self.load_run(text(args, "run_id")?)?;
-        let rows = run["returns_series"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        Ok(page(&["ts", "return"], rows, args, 1_000))
+        let empty = Vec::new();
+        let rows = run["returns_series"].as_array().unwrap_or(&empty);
+        Ok(page_of(&["ts", "return"], rows.len(), args, 1_000, |i| {
+            rows[i].clone()
+        }))
     }
 
     pub(crate) fn get_calendar(&self, args: &Value) -> Result<Value, String> {

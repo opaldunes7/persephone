@@ -20,7 +20,9 @@ use persephone_core::{
     strategy::{BuiltInStrategy, StrategySpec},
 };
 use persephone_lab::{
-    Lab, Paths, http,
+    Lab, Paths,
+    cache::BarSource,
+    http,
     runs::build_request,
     tools::{reference, tools},
 };
@@ -147,6 +149,8 @@ fn calls(lab: &Arc<Lab>, dir: &std::path::Path) -> Vec<(&'static str, Value)> {
     .unwrap();
     fs::write(dir.join("drawings.ron"), "{\"BTCUSDT\": [Line((a: 1.5))]}").unwrap();
     vec![
+        ("get_guide", json!({"topic": "units"})),
+        ("get_settings", json!({})),
         ("list_markets", json!({})),
         (
             "get_instrument",
@@ -758,6 +762,194 @@ fn saved_results_are_there_for_the_app() {
 }
 
 #[test]
+fn prune_removes_old_runs_only_and_keeps_everything_else() {
+    let (lab, dir) = lab();
+    let old = backtest(&lab, &ema());
+    let saved = lab
+        .dispatch("save_result", &json!({"name": "Keep", "strategy": ema()}))
+        .unwrap();
+    // Nothing is old yet, so nothing goes.
+    assert_eq!(lab.prune(Duration::from_secs(3_600)).unwrap().0, 0);
+    let runs = dir.join("lab").join("runs");
+    let earlier = std::time::SystemTime::now() - Duration::from_secs(7_200);
+    for entry in fs::read_dir(&runs).unwrap().flatten() {
+        fs::File::options()
+            .write(true)
+            .open(entry.path())
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+    }
+    let new = backtest(&lab, &tree());
+    let (files, bytes) = lab.prune(Duration::from_secs(3_600)).unwrap();
+    assert_eq!(files, 2, "the old run and its summary");
+    assert!(bytes > 0);
+    assert!(
+        lab.dispatch("get_report", &json!({"run_id": old["run_id"]}))
+            .is_err()
+    );
+    assert!(
+        lab.dispatch("get_report", &json!({"run_id": new["run_id"]}))
+            .is_ok()
+    );
+    let list = lab.dispatch("list_results", &json!({})).unwrap();
+    assert_eq!(list["results"][0]["id"], saved["id"]);
+    assert_eq!(store_candles(&lab).len(), 2_000, "the market's still there");
+}
+
+#[test]
+fn a_run_saved_before_they_were_packed_still_reads() {
+    let (lab, dir) = lab();
+    let run = backtest(&lab, &ema());
+    let id = run["run_id"].as_str().unwrap();
+    let report = lab.dispatch("get_report", &json!({"run_id": id})).unwrap();
+    let runs = dir.join("lab").join("runs");
+    let packed = fs::read(runs.join(format!("{id}.json.gz"))).unwrap();
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&packed[..]), &mut text)
+        .unwrap();
+    fs::remove_file(runs.join(format!("{id}.json.gz"))).unwrap();
+    fs::write(runs.join(format!("{id}.json")), &text).unwrap();
+    let fresh = Lab::new(Paths::under(&dir)).unwrap();
+    assert_eq!(
+        fresh
+            .dispatch("get_report", &json!({"run_id": id}))
+            .unwrap(),
+        report
+    );
+    assert!(
+        packed.len() < text.len() / 2,
+        "{} against {}",
+        packed.len(),
+        text.len()
+    );
+}
+
+/// A market from "Binance" with no network: `HOURS` of hourly bars from `START`, counting requests.
+struct FakeBinance {
+    requests: AtomicUsize,
+}
+
+const HOURS: u64 = 3_000;
+
+impl BarSource for FakeBinance {
+    fn instrument(&self, symbol: &str) -> Result<persephone_core::InstrumentSpec, String> {
+        Ok(persephone_core::InstrumentSpec {
+            symbol: symbol.into(),
+            venue: "BINANCE".into(),
+            base: "BTC".into(),
+            quote: "USDT".into(),
+            price_precision: 2,
+            size_precision: 5,
+        })
+    }
+
+    fn klines(
+        &self,
+        _symbol: &str,
+        _timeframe: Timeframe,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<Candle>, String> {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        Ok((start / HOUR..end / HOUR)
+            .filter(|hour| (START / HOUR..=START / HOUR + HOURS).contains(hour))
+            .map(|hour| {
+                let mid = 50_000.0 + 1_500.0 * (hour as f64 / 30.0).sin();
+                Candle {
+                    ts: hour * HOUR,
+                    open: mid - 5.0,
+                    high: mid + 20.0,
+                    low: mid - 20.0,
+                    close: mid + 5.0,
+                    volume: 10.0,
+                }
+            })
+            .collect())
+    }
+
+    fn now(&self) -> u64 {
+        START + HOURS * HOUR + HOUR / 2
+    }
+}
+
+fn binance_lab() -> (Arc<Lab>, Arc<FakeBinance>) {
+    let source = Arc::new(FakeBinance {
+        requests: AtomicUsize::new(0),
+    });
+    let lab = Lab::with_source(Paths::under(temp_dir()), source.clone()).unwrap();
+    (lab, source)
+}
+
+#[test]
+fn backtests_of_binance_markets_repeat_exactly_without_asking_again() {
+    let (lab, source) = binance_lab();
+    let args = json!({
+        "symbol": "BTCUSDT", "bars": "1h", "strategy": ema(), "wait_seconds": 120,
+    });
+    let first = lab.dispatch("run_backtest", &args).unwrap();
+    let asked = source.requests.load(Ordering::Relaxed);
+    assert!(asked > 0);
+    let second = lab.dispatch("run_backtest", &args).unwrap();
+    assert_eq!(
+        source.requests.load(Ordering::Relaxed),
+        asked,
+        "nothing more"
+    );
+    assert_eq!(first["summary"], second["summary"]);
+
+    // It ends on the last closed bar, and says which that was.
+    let last = START / HOUR + HOURS - 1;
+    let (days, hours) = (last / 24, last % 24);
+    let (year, month, day) = persephone_core::time::civil_from_days(days as i64);
+    assert_eq!(
+        first["summary"]["last_bar"],
+        format!("{year:04}-{month:02}-{day:02} {hours:02}:00")
+    );
+
+    // Many workers on a cold market, through the tools: one download.
+    let (lab, source) = binance_lab();
+    let batch = lab
+        .dispatch(
+            "run_random_blocks",
+            &json!({
+                "symbol": "BTCUSDT", "bars": "1h", "strategy": ema(), "blocks": 8,
+                "length": "week", "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    assert_eq!(batch["blocks"].as_array().unwrap().len(), 8);
+    assert_eq!(source.requests.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn binance_pages_join_up_and_stop_at_the_last_closed_bar() {
+    let (lab, _source) = binance_lab();
+    let mut got = Vec::new();
+    let mut cursor = None::<String>;
+    loop {
+        let mut args = json!({"symbol": "BTCUSDT", "bars": "1h", "from": START, "limit": 700});
+        if let Some(cursor) = &cursor {
+            args["cursor"] = json!(cursor);
+        }
+        let answer = lab.dispatch("get_bars", &args).unwrap();
+        got.extend(
+            answer["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row[0].as_u64().unwrap()),
+        );
+        match answer["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_owned()),
+            None => break,
+        }
+    }
+    let expected: Vec<u64> = (0..HOURS).map(|hour| START + hour * HOUR).collect();
+    assert_eq!(got, expected);
+}
+
+#[test]
 fn a_plugin_that_isnt_one_is_refused_and_nothing_is_copied() {
     let (lab, dir) = lab();
     let fake = dir.join("fake.wasm");
@@ -1000,6 +1192,159 @@ fn every_way_in_gives_the_same_answer() {
         .dispatch("get_report", &json!({"run_id": run["run_id"]}))
         .unwrap();
     assert_eq!(report["summary"], run["summary"]);
+}
+
+/// Every call in the guide: each ```json block that names a tool.
+fn guide_calls() -> Vec<Value> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/lab-agents.md");
+    let text = fs::read_to_string(path).unwrap();
+    text.split("```json")
+        .skip(1)
+        .map(|block| {
+            let body = block.split("```").next().unwrap();
+            serde_json::from_str::<Value>(body)
+                .unwrap_or_else(|e| panic!("a call in the guide isn't JSON: {e}: {body}"))
+        })
+        .collect()
+}
+
+#[test]
+fn every_call_in_the_guide_works() {
+    let (lab, _source) = binance_lab();
+    let calls = guide_calls();
+    assert!(calls.len() >= 9, "{}", calls.len());
+    let mut run = String::new();
+    let mut most_trades = 0;
+    let mut job = String::new();
+    for call in calls {
+        let tool = call["tool"].as_str().unwrap();
+        // What the guide leaves for an earlier call to fill in.
+        let text = call["args"]
+            .to_string()
+            .replace("$RUN", &run)
+            .replace("$JOB", &job);
+        let mut args: Value = serde_json::from_str(&text).unwrap();
+        if tools().iter().any(|t| t.name == tool && t.job) {
+            args["wait_seconds"] = json!(120);
+        }
+        let answer = lab
+            .dispatch(tool, &args)
+            .unwrap_or_else(|error| panic!("{tool} from the guide: {error}"));
+        if tool == "validate_logic" {
+            assert_eq!(answer["valid"], true, "{answer}");
+        }
+        // `$RUN` is the run with the most trades so far, as Monte Carlo needs a few.
+        let trades = answer["summary"]["trades"].as_u64().unwrap_or(0);
+        if let Some(id) = answer["run_id"].as_str().filter(|_| trades >= most_trades) {
+            run = id.to_owned();
+            most_trades = trades;
+        }
+        if let Some(id) = answer["job_id"].as_str() {
+            job = id.to_owned();
+        }
+    }
+}
+
+#[test]
+fn the_guide_covers_every_setting_and_says_true_things() {
+    let (lab, _source) = binance_lab();
+    let whole = lab.dispatch("get_guide", &json!({"topic": "all"})).unwrap();
+    let text = whole["guide"].as_str().unwrap();
+    let defaults = lab.dispatch("get_settings", &json!({})).unwrap();
+    for name in defaults["settings"].as_object().unwrap().keys() {
+        assert!(
+            text.contains(&format!("`{name}`")),
+            "`{name}` isn't in the guide"
+        );
+    }
+
+    // What it says about how backtests work, against what they do.
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &json!({
+                "symbol": "BTCUSDT", "bars": "1h", "from": "2024-02-01", "to": "2024-03-01",
+                "strategy": {"builtin": "ema-cross", "params": {"Fast": 5, "Slow": 20}},
+                "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    assert!(
+        run["summary"]["max_drawdown"].as_f64().unwrap() >= 0.0,
+        "falls are positive"
+    );
+    let fills = lab
+        .dispatch("get_fills", &json!({"run_id": run["run_id"]}))
+        .unwrap();
+    let first = &fills["rows"][0];
+    // At the close of the bar that decided, with no costs set, for 10% of the capital.
+    let bars = lab
+        .dispatch(
+            "get_bars",
+            &json!({"symbol": "BTCUSDT", "bars": "1h", "from": "2024-01-01", "limit": 3_000}),
+        )
+        .unwrap();
+    let fill_ts = first[0].as_u64().unwrap();
+    let bar = bars["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|bar| bar[0].as_u64().unwrap() + HOUR == fill_ts)
+        .unwrap_or_else(|| panic!("no bar closes at the fill: {first}"));
+    let close = bar[5].as_f64().unwrap();
+    assert!(
+        (first[3].as_f64().unwrap() - close).abs() < 0.01,
+        "it fills at that bar's close: {first}"
+    );
+    let worth = first[3].as_f64().unwrap() * first[4].as_f64().unwrap();
+    assert!((worth - 10_000.0).abs() < 100.0, "{worth}");
+    // Every opening is the same size however the run has gone: reversals are the two together.
+    for fill in fills["rows"].as_array().unwrap().iter().take(40) {
+        let worth = fill[3].as_f64().unwrap() * fill[4].as_f64().unwrap();
+        assert!(worth > 9_000.0 && worth < 21_500.0, "{fill}");
+    }
+    let fee = first[5].as_f64().unwrap();
+    assert!((fee / worth - 0.001).abs() < 1e-6, "0.1% unless set: {fee}");
+}
+
+#[test]
+fn the_guide_comes_a_topic_at_a_time() {
+    let (lab, _source) = binance_lab();
+    let call = |args: Value| lab.dispatch("get_guide", &args);
+    let brief = call(json!({})).unwrap();
+    let listed = brief["topics"].as_array().unwrap();
+    assert!(listed.len() >= 8, "{listed:?}");
+    assert!(
+        brief["guide"].as_str().unwrap().len() < 800,
+        "only the opening"
+    );
+    let whole = call(json!({"topic": "all"})).unwrap()["guide"]
+        .as_str()
+        .unwrap()
+        .len();
+    for entry in listed {
+        let topic = entry["topic"].as_str().unwrap();
+        let about = entry["about"].as_str().unwrap();
+        assert!(about.ends_with('.'), "{topic}: {about}");
+        let text = call(json!({"topic": topic})).unwrap()["guide"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            text.len() > 100 && text.len() < whole / 2,
+            "{topic}: {}",
+            text.len()
+        );
+    }
+    let error = call(json!({"topic": "nope"})).unwrap_err();
+    assert!(
+        error.contains("settings") && error.contains("all"),
+        "{error}"
+    );
+    // The settings it describes are ones that can be given.
+    let defaults = lab.dispatch("get_settings", &json!({})).unwrap();
+    let settings: Settings = serde_json::from_value(defaults["settings"].clone()).unwrap();
+    assert_eq!(settings, Settings::default());
 }
 
 #[test]

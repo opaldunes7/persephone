@@ -22,6 +22,7 @@ anyhow.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 dirs.workspace = true
+flate2.workspace = true
 getrandom = "0.3"
 parquet.workspace = true
 reqwest.workspace = true
@@ -34,3 +35,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 iced.workspace = true
 persephone-chart.workspace = true
 persephone.workspace = true
+flate2.workspace = true

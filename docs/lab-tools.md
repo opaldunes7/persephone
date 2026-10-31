@@ -4,6 +4,20 @@ Generated from the tools themselves: `persephone-lab tools --markdown`.
 
 Tools marked *job* may answer with a `job_id` to check with `get_job` if they take longer than `wait_seconds`.
 
+## `get_guide`
+
+How to use Lab, written for agents. Read this first: without a topic it lists the topics, each short. They include backtests (how fills, sizing and warm-up work), logic, settings, units and data.
+
+- `topic` (string): A section's name, or `all` for the whole guide.
+
+Returns: `guide`, `topics`
+
+## `get_settings`
+
+The default settings as exact JSON, ready to edit and pass as `settings`.
+
+Returns: `settings`
+
 ## `list_markets`
 
 Markets in the local store. Binance spot symbols work anywhere a symbol does, without being listed.
@@ -25,7 +39,7 @@ When a market's history starts and ends.
 
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
-- `bars` (string): How bars are cut: 1m, 15m, 1h, 1d, 1w, 1M; or 100t for every 100 ticks and 5v by volume, on local markets. Default 1h.
+- `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
 
 Returns: `first`, `last`
 
@@ -35,7 +49,7 @@ A market's bars, in pages, oldest first. Without `from`, its latest bars.
 
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
-- `bars` (string): How bars are cut: 1m, 15m, 1h, 1d, 1w, 1M; or 100t for every 100 ticks and 5v by volume, on local markets. Default 1h.
+- `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
 - `from` (time): Start, in UTC: 2024-01-31 or 2024-01-31 09:30.
 - `to` (time): End (not included), in UTC.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
@@ -62,7 +76,7 @@ Writes bars or ticks to a file, for large pulls and training outside Persephone.
 
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
-- `bars` (string): How bars are cut: 1m, 15m, 1h, 1d, 1w, 1M; or 100t for every 100 ticks and 5v by volume, on local markets. Default 1h.
+- `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
 - `from` (time): Start, in UTC: 2024-01-31 or 2024-01-31 09:30.
 - `to` (time): End (not included), in UTC.
 - `ticks` (boolean): Ticks instead of bars, on a local market.
@@ -107,7 +121,7 @@ An indicator's values over a market's bars.
 
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
-- `bars` (string): How bars are cut: 1m, 15m, 1h, 1d, 1w, 1M; or 100t for every 100 ticks and 5v by volume, on local markets. Default 1h.
+- `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
 - `from` (time): Start, in UTC: 2024-01-31 or 2024-01-31 09:30.
 - `to` (time): End (not included), in UTC.
 - `indicator` (string, required): An id from list_indicators.
@@ -165,21 +179,21 @@ Returns: `id`, `kind`, `path`
 
 ## `run_backtest` *job*
 
-Backtests any strategy on any span with any settings. The run is saved, so its details can be read by run_id.
+Backtests any strategy on any span with any settings. The run is saved, so its details can be read by run_id. Returns and falls are fractions, so 0.05 is 5%.
 
 - `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"} or {"logic": {...tree...}}, each with optional "params": {"name": value}.
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
-- `bars` (string): How bars are cut: 1m, 15m, 1h, 1d, 1w, 1M; or 100t for every 100 ticks and 5v by volume, on local markets. Default 1h.
+- `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
 - `from` (time): Start, in UTC: 2024-01-31 or 2024-01-31 09:30.
 - `to` (time): End (not included), in UTC.
-- `settings` (object): Costs and rules, as the backtest panel has them; only what differs from the defaults is needed: capital, commission, slippage, spread, latency, leverage, direction, invert, session, precision.
+- `settings` (object): Costs and rules; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
 
 Returns: `run_id`, `summary`
 
 ## `run_monte_carlo` *job*
 
-Draws a run's trades at random many times, to see the range of results they could have given.
+Draws a run's trades at random many times, to see the range of results they could have given. Returns, falls and ruin are fractions.
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 - `runs` (integer): How many draws. Default 1,000.
@@ -192,15 +206,15 @@ Returns: `trades`, `runs`, `median`, `low`, `high`, `drawdown`, `ruin`, `actual`
 
 ## `run_random_blocks` *job*
 
-Backtests random stretches of a span, to see whether a strategy works throughout.
+Backtests random stretches of a span, to see whether a strategy works throughout. Returns and falls are fractions.
 
 - `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"} or {"logic": {...tree...}}, each with optional "params": {"name": value}.
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
-- `bars` (string): How bars are cut: 1m, 15m, 1h, 1d, 1w, 1M; or 100t for every 100 ticks and 5v by volume, on local markets. Default 1h.
+- `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
 - `from` (time): Start, in UTC: 2024-01-31 or 2024-01-31 09:30.
 - `to` (time): End (not included), in UTC.
-- `settings` (object): Costs and rules, as the backtest panel has them; only what differs from the defaults is needed: capital, commission, slippage, spread, latency, leverage, direction, invert, session, precision.
+- `settings` (object): Costs and rules; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
 - `blocks` (integer): How many stretches. Default 50.
 - `length` (string): week, month (30 days, the default) or quarter (91 days).
 - `seed` (integer): The same seed gives the same stretches. Default 0.
@@ -210,15 +224,15 @@ Returns: `profitable`, `median`, `best`, `worst`, `blocks`
 
 ## `run_optimize` *job*
 
-Backtests a range of one or two parameters, scored by return, Monte Carlo or random blocks.
+Backtests a range of one or two parameters, scored by return, Monte Carlo or random blocks. Scores are fractions.
 
 - `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"} or {"logic": {...tree...}}, each with optional "params": {"name": value}.
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
-- `bars` (string): How bars are cut: 1m, 15m, 1h, 1d, 1w, 1M; or 100t for every 100 ticks and 5v by volume, on local markets. Default 1h.
+- `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
 - `from` (time): Start, in UTC: 2024-01-31 or 2024-01-31 09:30.
 - `to` (time): End (not included), in UTC.
-- `settings` (object): Costs and rules, as the backtest panel has them; only what differs from the defaults is needed: capital, commission, slippage, spread, latency, leverage, direction, invert, session, precision.
+- `settings` (object): Costs and rules; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
 - `variables` (array, required): One or two of {"name", "min", "max", "step"}.
 - `score` (string): backtest (the default), monte-carlo or random-blocks.
 - `hold_out` (boolean): Score on the first 70% of the span and check the best on the rest. Default false.
@@ -232,7 +246,7 @@ Returns: `values`, `top`, `on_edge`, `held_out`, `backtests`
 
 ## `get_report`
 
-A run's full report: every statistic and note.
+A run's full report: every statistic and note. Its own figures are fractions; pnl, returns and general are Nautilus's own.
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 
@@ -240,7 +254,7 @@ Returns: `run_id`, `request`, `summary`, `pnl`, `returns`, `general`, `notes`
 
 ## `get_trades`
 
-A run's trades, from flat to flat, in pages.
+A run's trades, from flat to flat, in pages: profit in the quote currency, return_percent as a percentage of capital.
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
@@ -280,7 +294,7 @@ Returns: `columns`, `rows`, `next_cursor`
 
 ## `get_calendar`
 
-What a run made by month; with `year` and `month`, by day; with `day` too, that day's trades.
+What a run made, in the quote currency and as return_percent: by month; with `year` and `month`, by day; with `day` too, that day's trades.
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 - `year` (integer): A year.
@@ -346,7 +360,7 @@ Saves a strategy for the app, where it joins the backtest panel's strategy list.
 
 - `name` (string, required): What to call it.
 - `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"} or {"logic": {...tree...}}, each with optional "params": {"name": value}.
-- `settings` (object): Costs and rules, as the backtest panel has them; only what differs from the defaults is needed: capital, commission, slippage, spread, latency, leverage, direction, invert, session, precision.
+- `settings` (object): Costs and rules; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
 - `run_id` (string): A run, whose summary to keep with it.
 - `note` (string): Anything worth saying about it.
 

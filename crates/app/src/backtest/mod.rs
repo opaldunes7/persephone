@@ -36,6 +36,7 @@ pub use persephone_research::{
         self, BlockLength, Commission, Edit, OneWay, OptimizeSettings, Precision, ScoreBy, Section,
         SessionRule, Settings, TestKind, Variable, parse_time, time_text,
     },
+    thousands,
 };
 
 pub use self::view::{PLUGIN_SLOTS, PanelInfo, Status, panel};
@@ -537,18 +538,6 @@ pub fn speed_text(p: f32, bar_nanos: UnixNanos) -> String {
         }
     };
     format!("{multiple} · {rate}")
-}
-
-fn thousands(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
 }
 
 /// When each of a chart's bars closes, worked out once per set of bars: time bars a

@@ -14,11 +14,14 @@ use parquet::arrow::ArrowWriter;
 use persephone_core::{BarSpec, Candle, Timeframe, UnixNanos, tick::Ticks};
 use persephone_data::{
     archive,
-    binance::BinanceClient,
+    binance::{BinanceClient, check_range},
     import::{self, MarketOptions, Overrides},
 };
 use persephone_engine::FeeRates;
-use persephone_research::market::{MarketBars, load_binance, load_local};
+use persephone_research::{
+    WARM_UP_BARS,
+    market::{HISTORY_BARS, MarketBars, load_local},
+};
 use serde_json::{Value, json};
 
 use crate::{
@@ -102,14 +105,45 @@ impl Lab {
     /// A market's bars with what the engine needs, with bars before `from` to warm up on.
     pub(crate) fn load_market(&self, market: &MarketArgs) -> Result<MarketBars, String> {
         let span = market.span();
-        match &market.venue {
-            Some(venue) => load_local(&self.store, venue, &market.symbol, market.bars, span),
-            None => {
-                let span = span.map(|(from, to)| (from, to.min(now_nanos())));
-                load_binance(&market.symbol, market.timeframe()?, span)
-            }
+        if let Some(venue) = &market.venue {
+            return load_local(&self.store, venue, &market.symbol, market.bars, span)
+                .map_err(error_text);
         }
-        .map_err(error_text)
+        // Only closed bars, from the cache: the same span always gives the same answer.
+        let timeframe = market.timeframe()?;
+        let forming = self.cache.forming(timeframe);
+        let (start, end) = match span {
+            Some((from, to)) => {
+                let start = from.saturating_sub(WARM_UP_BARS * timeframe.nanos());
+                let end = to.min(forming);
+                check_range(timeframe, start, end).map_err(error_text)?;
+                (start, end)
+            }
+            None => (
+                forming.saturating_sub(HISTORY_BARS * timeframe.nanos()),
+                forming,
+            ),
+        };
+        let instrument = self.cache.instrument(&market.symbol)?;
+        let candles = self.cache.bars(&market.symbol, timeframe, start, end)?;
+        if candles.is_empty() {
+            return Err(format!(
+                "Binance has no closed {} bars of {} there",
+                timeframe.label(),
+                market.symbol
+            ));
+        }
+        Ok(MarketBars {
+            symbol: instrument.symbol.clone(),
+            venue: instrument.venue.clone(),
+            bars: timeframe.into(),
+            price_precision: instrument.price_precision,
+            candles,
+            instrument,
+            fees: FeeRates::BINANCE_SPOT,
+            ticks: None,
+            fills: None,
+        })
     }
 
     pub(crate) fn list_markets(&self) -> Result<Value, String> {
@@ -156,12 +190,7 @@ impl Lab {
                     },
                 )
             }
-            None => (
-                BinanceClient::new()
-                    .and_then(|client| client.instrument(&symbol))
-                    .map_err(error_text)?,
-                FeeRates::BINANCE_SPOT,
-            ),
+            None => (self.cache.instrument(&symbol)?, FeeRates::BINANCE_SPOT),
         };
         Ok(json!({
             "symbol": instrument.symbol,
@@ -214,12 +243,8 @@ impl Lab {
                 .map_err(error_text),
             None => {
                 let timeframe = market.timeframe()?;
-                let end = to
-                    .min(now_nanos().saturating_add(timeframe.nanos()))
-                    .min(from.saturating_add(limit as u64 * timeframe.nanos()));
-                BinanceClient::new()
-                    .and_then(|client| client.klines(&market.symbol, timeframe, from, end))
-                    .map_err(error_text)
+                let end = to.min(from.saturating_add(limit as u64 * timeframe.nanos()));
+                self.cache.bars(&market.symbol, timeframe, from, end)
             }
         }
     }
@@ -239,7 +264,18 @@ impl Lab {
         let more = bars.len() > limit;
         bars.truncate(limit);
         // Binance's bars stop at the page's end, so there may be more when a page is full.
-        let full = market.venue.is_none() && market.from.is_some() && bars.len() == limit;
+        let full = market.venue.is_none()
+            && market.from.is_some()
+            && bars.len() == limit
+            && market.timeframe().is_ok_and(|timeframe| {
+                bars.last().is_some_and(|bar| {
+                    timeframe.close_time(bar.ts)
+                        < market
+                            .to
+                            .unwrap_or(u64::MAX)
+                            .min(self.cache.forming(timeframe))
+                })
+            });
         let next = (more || full)
             .then(|| bars.last().map(|bar| (bar.ts + 1).to_string()))
             .flatten();

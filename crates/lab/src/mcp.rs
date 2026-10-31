@@ -26,7 +26,7 @@ impl ServerHandler for Server {
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.server_info = Implementation::new("persephone-lab", env!("CARGO_PKG_VERSION"));
         info.instructions = Some(
-            "Persephone's markets, tests and results. Call validate_logic with no arguments to see how to write a strategy without code; run_backtest tests one and gives a run_id to read the details by.".into(),
+            "Persephone's markets, backtests and tests, with no limits on how you research. Call get_guide first: it lists short topics on how backtests work, writing strategies without code, settings and units.".into(),
         );
         info
     }

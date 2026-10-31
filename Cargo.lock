@@ -4841,6 +4841,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "dirs",
+ "flate2",
  "getrandom 0.3.4",
  "iced",
  "parquet",

@@ -193,24 +193,9 @@ pub struct MonteCarlo {
 }
 
 impl MonteCarlo {
-    /// Which of the backtest's trades a line drew, in order, by their place among them. The line
+    /// Which of the backtest's trades a run drew, in order, by their place among them. The run
     /// after the last is the backtest itself, with each trade once as it came. Drawing with
     /// replacement, a run can have the same trade twice and leave others out.
-    #[must_use]
-    pub fn draws(&self, line: usize) -> Option<Vec<usize>> {
-        if line == self.paths.len() {
-            return Some((0..self.trades).collect());
-        }
-        let mut rng = run_rng(self.seed, *self.kept_runs.get(line)?);
-        Some(
-            (0..self.trades)
-                .map(|_| rng.random_range(0..self.trades))
-                .collect(),
-        )
-    }
-
-    /// Which of the backtest's trades a run drew, as [`Self::draws`] does for a line. The run
-    /// after the last is the backtest itself.
     #[must_use]
     pub fn draws_of_run(&self, run: usize) -> Option<Vec<usize>> {
         if run == self.all_stats.len() {
@@ -1087,17 +1072,21 @@ mod tests {
         let result = monte_carlo(&trades, 1_000.0, 5_000, 0.5, 7).unwrap();
         // Swapped-in extremes included, and whichever seed.
         for line in [0, result.best, result.worst, result.middle] {
-            let draws = result.draws(line).unwrap();
+            let draws = result
+                .draws_of_run(result.run_of_line(line).unwrap())
+                .unwrap();
             assert_eq!(draws.len(), trades.len());
             let made: f64 = draws.iter().map(|&i| trades[i]).sum();
             assert!((made / 1_000.0 - result.stats[line].return_).abs() < 1e-9);
         }
         // The line after the last is the trades as they came, each once.
-        let real = result.draws(result.paths.len()).unwrap();
+        let real = result.draws_of_run(result.all_stats.len()).unwrap();
         assert_eq!(real, (0..trades.len()).collect::<Vec<_>>());
-        assert_eq!(result.draws(result.paths.len() + 1), None);
+        assert_eq!(result.draws_of_run(result.all_stats.len() + 1), None);
         // It really does draw with replacement.
-        let mut drawn = result.draws(result.best).unwrap();
+        let mut drawn = result
+            .draws_of_run(result.run_of_line(result.best).unwrap())
+            .unwrap();
         drawn.sort_unstable();
         drawn.dedup();
         assert!(drawn.len() < trades.len());

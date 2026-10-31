@@ -1001,7 +1001,7 @@ pub(super) fn heat(score: f64, reach: f64) -> Color {
     )
 }
 
-fn percent(score: f64) -> String {
+pub(super) fn percent(score: f64) -> String {
     format!("{:+.2}%", score * 100.0)
 }
 

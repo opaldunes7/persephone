@@ -1378,7 +1378,7 @@ fn import_panel<'a>(
             };
             body.push(muted(format!(
                 "Importing… {percent:.0}% · {} rows",
-                thousands(progress.rows)
+                persephone_research::thousands(progress.rows)
             )))
         }
         ImportState::Done(summary) => {
@@ -1386,7 +1386,7 @@ fn import_panel<'a>(
             body = body.push(
                 text(format!(
                     "Imported {} {} into {}, {} → {}.",
-                    thousands(summary.imported),
+                    persephone_research::thousands(summary.imported),
                     market.info.kind,
                     market.id(),
                     DateTime::from_nanos(summary.first).date(),
@@ -1398,7 +1398,7 @@ fn import_panel<'a>(
             if summary.skipped > 0 {
                 body = body.push(muted(format!(
                     "Skipped {} rows that didn't fit:",
-                    thousands(summary.skipped)
+                    persephone_research::thousands(summary.skipped)
                 )));
                 for problem in summary.problems.iter().take(3) {
                     body = body.push(text(problem.as_str()).size(11).color(theme::TEXT_MUTED));
@@ -1437,19 +1437,6 @@ fn adds_to<'a>(market: &MarketInfo, detection: &Detection) -> Element<'a, MenuMe
         .color(theme::TEXT_MUTED),
     }
     .into()
-}
-
-/// `1234567` → `1,234,567`.
-fn thousands(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
 }
 
 fn settings<'a>(

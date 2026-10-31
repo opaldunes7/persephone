@@ -92,6 +92,7 @@ impl Lab {
             self.paths.lab().join("jobs").join(format!("{id}.json")),
         );
         let tool_name = tool.to_owned();
+        let job_id = id.clone();
         thread::spawn(move || {
             let result = thread::scope(|scope| {
                 scope
@@ -107,6 +108,10 @@ impl Lab {
             let _ = fs::write(file, saved.to_string());
             if let Ok(mut slot) = worker.result.lock() {
                 *slot = Some(result);
+            }
+            // Its answer's on disk now, so a long-lived server needn't keep it too.
+            if let Ok(mut jobs) = lab.jobs.lock() {
+                jobs.remove(&job_id);
             }
         });
 
@@ -142,6 +147,9 @@ impl Lab {
         let file = self.paths.lab().join("jobs").join(format!("{id}.json"));
         let text = fs::read_to_string(file).map_err(|_| format!("there's no job `{id}`"))?;
         let mut saved: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        if saved["status"] == "failed" {
+            return Err(saved["error"].as_str().unwrap_or("It failed.").to_owned());
+        }
         if let Some(object) = saved.as_object_mut() {
             object.insert("job_id".into(), json!(id));
         }

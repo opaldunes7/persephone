@@ -41,7 +41,7 @@ For Claude Code:
 claude mcp add persephone-lab -- /full/path/to/persephone-lab mcp
 ```
 
-Other MCP clients can run `persephone-lab mcp` the same way. It talks over standard input and output.
+Then tell it to use Lab. It's told to call `get_guide` first. Other MCP clients can run `persephone-lab mcp` the same way. It talks over standard input and output.
 
 ### HTTP, for scripts and custom agents
 
@@ -76,6 +76,7 @@ persephone-lab call run_backtest '{"symbol": "BTCUSDT", "bars": "1h", "from": "2
 
 | For | Tools |
 |---|---|
+| For agents | `get_guide`, `get_settings` |
 | Markets and data | `list_markets`, `get_instrument`, `get_history_range`, `get_bars`, `get_ticks`, `export_data`, `import_data`, `fetch_archive` |
 | Indicators and models | `list_indicators`, `compute_indicator`, `list_models`, `run_model` |
 | Strategies | `list_strategies`, `describe_strategy`, `validate_logic`, `install_plugin` |
@@ -93,6 +94,19 @@ persephone-lab call run_backtest '{"symbol": "BTCUSDT", "bars": "1h", "from": "2
   restart.
 - **The call log** in `lab/calls.jsonl` records every call, with its tool and arguments. Lab enforces
   nothing with it, but it's there for an agent's rules, such as counting attempts.
+
+**Binance bars are cached** in `lab/cache`, so a span costs a download once and repeats exactly. Lab only
+uses closed bars. Saved runs are compressed, but still grow without limit if an agent runs for long; this
+removes old ones, and nothing but this does:
+
+```bash
+persephone-lab prune --older-than 30d
+```
+
+Agents read [their own guide](lab-agents.md), which Lab serves through `get_guide`.
+
+To see how much of this an agent can work out alone, give a fresh session only the MCP connection and a
+goal with a small budget, then watch what it gets stuck on. That spends your API credit.
 
 ## Strategies without code
 

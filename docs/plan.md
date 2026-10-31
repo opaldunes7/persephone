@@ -244,6 +244,8 @@ world strategy {
 - **Three boundaries:** no API keys (and no language models, so nothing can spend money), no orders (built without the engine's `live` feature), and no deleting or overwriting data. HTTP is local only, with a token and Host and Origin checks.
 - **Shared code** moved to `crates/research` so the app and Lab can't drift: settings, market loading, Monte Carlo, random blocks, optimize, the calendar and saved results.
 - **Logic trees** (`research/logic.rs`): strategies as JSON that implement `SignalFactory`, so they run through the existing `BacktestRequest`. They only get one closed bar at a time, and `sma`, `ema`, `rsi` and `atr` use Nautilus's own through `indicators::Streaming`.
+- **Speed, measured** (`crates/lab/examples/profile.rs`): the slow part was re-downloading Binance's bars for every call, so closed bars are cached on disk (`lab/cache.rs`), tracking covered ranges to fill holes wherever they fall, with one download per market across threads and processes. Runs are gzipped, with recent ones held in memory. The panel's repeated ranking and sorting, Monte Carlo scoring and plugin startup all measured too small to be worth changing.
+- **For agents:** `docs/lab-agents.md`, served by topic through `get_guide`, with every example call run by a test.
 - **Results:** `save_result` writes a file the app watches with `notify`; they join the panel's strategy list under the kind `Plugin("lab:<id>")`, so they save with a layout like plugins.
 
 ## Milestones (each ends with something you can run)

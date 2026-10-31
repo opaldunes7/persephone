@@ -58,10 +58,11 @@ impl Tool {
             } else {
                 json!(arg.kind)
             };
-            properties.insert(
-                arg.name.to_owned(),
-                json!({"type": kind, "description": arg.what}),
-            );
+            let mut schema = json!({"type": kind, "description": arg.what});
+            if arg.name == "settings" {
+                schema["properties"] = settings_schema();
+            }
+            properties.insert(arg.name.to_owned(), schema);
         }
         let required: Vec<&str> = self
             .args
@@ -76,6 +77,47 @@ impl Tool {
             "additionalProperties": false,
         })
     }
+}
+
+/// `settings`' fields, so an agent has their exact shape from the tool list alone.
+fn settings_schema() -> Value {
+    let section = |value: Value, what: &str| {
+        json!({
+            "type": "object",
+            "description": what,
+            "properties": {"on": {"type": "boolean"}, "value": value},
+        })
+    };
+    let number = json!({"type": "number"});
+    let whole = json!({"type": "integer"});
+    json!({
+        "stock": {"type": "boolean", "description": "false turns the sections below off at once."},
+        "capital": {"type": "number", "description": "Starting cash, in the quote currency."},
+        "commission": section(
+            json!({"type": "object", "description": "{\"percent\": 0.1} of each fill, or {\"per-order\": 1.5} flat."}),
+            "Fees instead of the market's own.",
+        ),
+        "slippage": section(whole.clone(), "Ticks every market order fills worse."),
+        "spread": section(whole.clone(), "Ticks of spread assumed for bars and trades."),
+        "latency": section(whole, "Milliseconds before orders reach the venue."),
+        "leverage": section(number, "A multiple of position size, 1 or more."),
+        "direction": section(
+            json!({"enum": ["long-only", "short-only"]}),
+            "Trade one way; the other side's signals close instead.",
+        ),
+        "invert": {"type": "boolean", "description": "Take the opposite of every signal."},
+        "session": section(
+            json!({"type": "object", "properties": {
+                "days": {"type": "array", "description": "Seven booleans, Monday first."},
+                "from": {"type": "integer", "description": "Minutes after midnight."},
+                "to": {"type": "integer", "description": "Minutes after midnight."},
+                "zone": {"type": "string", "description": "UTC, -05:00 or America/New_York."},
+                "close_after": {"type": "boolean", "description": "Close when it ends."},
+            }}),
+            "When positions may open.",
+        ),
+        "precision": {"enum": ["standard", "high"], "description": "high fills on ticks or 1-minute bars."},
+    })
 }
 
 const WAIT: Arg = opt(
@@ -93,7 +135,7 @@ const VENUE: Arg = opt(
 const BARS: Arg = opt(
     "bars",
     "string",
-    "How bars are cut: 1m, 15m, 1h, 1d, 1w, 1M; or 100t for every 100 ticks and 5v by volume, on local markets. Default 1h.",
+    "How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.",
 );
 const FROM: Arg = opt(
     "from",
@@ -115,7 +157,7 @@ const STRATEGY: Arg = arg(
 const SETTINGS: Arg = opt(
     "settings",
     "object",
-    "Costs and rules, as the backtest panel has them; only what differs from the defaults is needed: capital, commission, slippage, spread, latency, leverage, direction, invert, session, precision.",
+    "Costs and rules; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.",
 );
 const RUN_ID: Arg = arg("run_id", "string", "A run, from run_backtest or list_runs.");
 
@@ -153,6 +195,22 @@ pub fn tools() -> Vec<Tool> {
         job: true,
     };
     vec![
+        tool(
+            "get_guide",
+            "How to use Lab, written for agents. Read this first: without a topic it lists the topics, each short. They include backtests (how fills, sizing and warm-up work), logic, settings, units and data.",
+            vec![opt(
+                "topic",
+                "string",
+                "A section's name, or `all` for the whole guide.",
+            )],
+            &["guide", "topics"],
+        ),
+        tool(
+            "get_settings",
+            "The default settings as exact JSON, ready to edit and pass as `settings`.",
+            vec![],
+            &["settings"],
+        ),
         tool(
             "list_markets",
             "Markets in the local store. Binance spot symbols work anywhere a symbol does, without being listed.",
@@ -329,13 +387,13 @@ pub fn tools() -> Vec<Tool> {
         ),
         job(
             "run_backtest",
-            "Backtests any strategy on any span with any settings. The run is saved, so its details can be read by run_id.",
+            "Backtests any strategy on any span with any settings. The run is saved, so its details can be read by run_id. Returns and falls are fractions, so 0.05 is 5%.",
             test_args(),
             &["run_id", "summary"],
         ),
         job(
             "run_monte_carlo",
-            "Draws a run's trades at random many times, to see the range of results they could have given.",
+            "Draws a run's trades at random many times, to see the range of results they could have given. Returns, falls and ruin are fractions.",
             vec![
                 RUN_ID,
                 opt("runs", "integer", "How many draws. Default 1,000."),
@@ -374,7 +432,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         job(
             "run_random_blocks",
-            "Backtests random stretches of a span, to see whether a strategy works throughout.",
+            "Backtests random stretches of a span, to see whether a strategy works throughout. Returns and falls are fractions.",
             with(
                 test_args(),
                 &[
@@ -396,7 +454,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         job(
             "run_optimize",
-            "Backtests a range of one or two parameters, scored by return, Monte Carlo or random blocks.",
+            "Backtests a range of one or two parameters, scored by return, Monte Carlo or random blocks. Scores are fractions.",
             with(
                 test_args(),
                 &[
@@ -438,7 +496,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "get_report",
-            "A run's full report: every statistic and note.",
+            "A run's full report: every statistic and note. Its own figures are fractions; pnl, returns and general are Nautilus's own.",
             vec![RUN_ID],
             &[
                 "run_id", "request", "summary", "pnl", "returns", "general", "notes",
@@ -446,7 +504,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "get_trades",
-            "A run's trades, from flat to flat, in pages.",
+            "A run's trades, from flat to flat, in pages: profit in the quote currency, return_percent as a percentage of capital.",
             vec![RUN_ID, CURSOR, LIMIT],
             &["columns", "rows", "next_cursor"],
         ),
@@ -470,7 +528,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "get_calendar",
-            "What a run made by month; with `year` and `month`, by day; with `day` too, that day's trades.",
+            "What a run made, in the quote currency and as return_percent: by month; with `year` and `month`, by day; with `day` too, that day's trades.",
             vec![
                 RUN_ID,
                 opt("year", "integer", "A year."),
@@ -647,6 +705,8 @@ impl Lab {
         })?;
         check_args(tool, args)?;
         match name {
+            "get_guide" => crate::guide::get_guide(args),
+            "get_settings" => Ok(crate::guide::get_settings()),
             "list_markets" => self.list_markets(),
             "get_instrument" => self.get_instrument(args),
             "get_history_range" => self.get_history_range(args),
@@ -728,6 +788,30 @@ pub(crate) fn page(columns: &[&str], rows: Vec<Value>, args: &Value, default: us
     let total = rows.len();
     let rows: Vec<Value> = rows.into_iter().skip(from).take(limit).collect();
     let end = from + rows.len();
+    json!({
+        "columns": columns,
+        "rows": rows,
+        "total": total,
+        "next_cursor": (end < total).then(|| end.to_string()),
+    })
+}
+
+/// One page of `total` rows, building only those on it.
+pub(crate) fn page_of(
+    columns: &[&str],
+    total: usize,
+    args: &Value,
+    default: usize,
+    row: impl Fn(usize) -> Value,
+) -> Value {
+    let from = args
+        .get("cursor")
+        .and_then(Value::as_str)
+        .and_then(|cursor| cursor.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(total);
+    let end = (from + limit_of(args, default)).min(total);
+    let rows: Vec<Value> = (from..end).map(row).collect();
     json!({
         "columns": columns,
         "rows": rows,

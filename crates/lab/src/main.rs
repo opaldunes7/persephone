@@ -5,16 +5,17 @@
 //! persephone-lab call NAME [ARGS-AS-JSON]  Call one tool
 //! persephone-lab mcp                       Serve agents over MCP on stdio
 //! persephone-lab serve [--port N]          Serve over local HTTP (default port 8765)
+//! persephone-lab prune --older-than 30d    Remove Lab's old saved runs and job files
 //! ```
 //!
 //! `--data DIR` before any of them uses another folder than the app's.
 
-use std::process::ExitCode;
+use std::{process::ExitCode, time::Duration};
 
 use persephone_lab::{Lab, Paths, http, mcp, tools};
 use serde_json::{Value, json};
 
-const USAGE: &str = "usage: persephone-lab [--data DIR] tools [--markdown] | call NAME [ARGS-AS-JSON] | mcp | serve [--port N]";
+const USAGE: &str = "usage: persephone-lab [--data DIR] tools [--markdown] | call NAME [ARGS-AS-JSON] | mcp | serve [--port N] | prune --older-than 30d";
 /// The command line waits as long as a job takes.
 const WAIT_FOR_EVER: f64 = 86_400.0;
 
@@ -65,6 +66,17 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         Some("mcp") => mcp::serve(lab),
+        Some("prune") => {
+            let days = (args.get(1).map(String::as_str) == Some("--older-than"))
+                .then(|| args.get(2))
+                .flatten()
+                .and_then(|age| age.strip_suffix('d'))
+                .and_then(|days| days.parse::<u64>().ok())
+                .ok_or("prune needs --older-than, like --older-than 30d")?;
+            let (files, bytes) = lab.prune(Duration::from_secs(days * 86_400))?;
+            println!("Removed {files} files, {} MB.", bytes >> 20);
+            Ok(())
+        }
         Some("serve") => {
             let port = match args.get(1).map(String::as_str) {
                 Some("--port") => args

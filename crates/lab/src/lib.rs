@@ -6,7 +6,9 @@
 //! only keeps a log of every call. Three things it doesn't offer: API keys, placing orders (it's built
 //! without the engine's live trading), and deleting or overwriting your data.
 
+pub mod cache;
 pub mod data;
+pub mod guide;
 pub mod http;
 pub mod jobs;
 pub mod mcp;
@@ -15,6 +17,7 @@ pub mod state;
 pub mod tools;
 
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -88,8 +91,11 @@ pub struct Lab {
     pub host: Host,
     pub models: Arc<Models>,
     plugins: Mutex<Arc<Plugins>>,
+    pub cache: cache::BarCache,
     pub(crate) jobs: Mutex<jobs::Jobs>,
     pub(crate) log: Mutex<()>,
+    /// Runs read lately, so reading a run a page at a time doesn't read it from disk each time.
+    pub(crate) recent_runs: Mutex<VecDeque<(String, Arc<Value>)>>,
 }
 
 impl Lab {
@@ -97,6 +103,18 @@ impl Lab {
     ///
     /// Returns a message if its folders can't be made or the plugin runtime can't start.
     pub fn new(paths: Paths) -> Result<Arc<Self>, String> {
+        Self::with_source(paths, Arc::new(cache::Binance))
+    }
+
+    /// One whose non-local bars come from `source`, for tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if its folders can't be made or the plugin runtime can't start.
+    pub fn with_source(
+        paths: Paths,
+        source: Arc<dyn cache::BarSource>,
+    ) -> Result<Arc<Self>, String> {
         for dir in ["runs", "jobs", "results", "exports"] {
             std::fs::create_dir_all(paths.lab().join(dir)).map_err(|e| e.to_string())?;
         }
@@ -110,8 +128,10 @@ impl Lab {
             host,
             models,
             plugins: Mutex::new(Arc::new(plugins)),
+            cache: cache::BarCache::new(paths.lab().join("cache"), source),
             jobs: Mutex::default(),
             log: Mutex::new(()),
+            recent_runs: Mutex::default(),
             paths,
         }))
     }
