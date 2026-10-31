@@ -370,9 +370,10 @@ impl Lab {
             other => return Err(format!("`format`: `{other}` isn't csv or parquet")),
         }
         .map_err(error_text)?;
-        Ok(
-            json!({"path": path, "rows": table.times.len(), "format": format, "columns": table.names}),
-        )
+        let columns: Vec<&str> = std::iter::once("ts")
+            .chain(table.names.iter().copied())
+            .collect();
+        Ok(json!({"path": path, "rows": table.times.len(), "format": format, "columns": columns}))
     }
 
     /// All the bars asked for however many there are, Binance's a page at a time.

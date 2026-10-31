@@ -2431,6 +2431,9 @@ impl Persephone {
             Ok(StrategyRef::Logic(logic)) => {
                 with_params(kind, Arc::new(logic.info()), &saved.strategy)
             }
+            Ok(StrategyRef::Positions(_)) => {
+                Err("a list of positions only fits the bars it was made for".into())
+            }
             Err(error) => Err(error),
         };
         let spec = match spec {

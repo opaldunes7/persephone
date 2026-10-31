@@ -201,6 +201,15 @@ fn calls(lab: &Arc<Lab>, dir: &std::path::Path) -> Vec<(&'static str, Value)> {
             }),
         ),
         (
+            "run_walk_forward",
+            with(json!({
+                "strategy": ema(),
+                "variables": [{"name": "Fast", "min": 4, "max": 8, "step": 2}],
+                "windows": 2,
+                "wait_seconds": 120,
+            })),
+        ),
+        (
             "run_optimize",
             with(json!({
                 "strategy": ema(),
@@ -1689,6 +1698,730 @@ fn runs_list_newest_first_and_compare_without_unpacking_them() {
         compared["runs"][0]["request"]["strategy"].is_object(),
         "{compared}"
     );
+}
+
+const JANUARY_2024: u64 = 19_723 * 24 * HOUR;
+
+/// A market of `closes`, one bar an hour from 2024-01-01, that doesn't move within a bar.
+fn market_of(closes: &[f64]) -> (Arc<Lab>, Vec<u64>) {
+    let (lab, dir) = lab();
+    let file = dir.join("hand.csv");
+    let mut text = String::from("time,open,high,low,close,volume\n");
+    for (i, close) in closes.iter().enumerate() {
+        text += &format!(
+            "2024-01-{:02} {:02}:00:00,{close},{close},{close},{close},10\n",
+            1 + i / 24,
+            i % 24
+        );
+    }
+    fs::write(&file, text).unwrap();
+    lab.dispatch(
+        "import_data",
+        &json!({"files": [file], "symbol": "HANDUSD", "venue": "HAND", "wait_seconds": 60}),
+    )
+    .unwrap();
+    let times = (0..closes.len() as u64)
+        .map(|i| JANUARY_2024 + i * HOUR)
+        .collect();
+    (lab, times)
+}
+
+fn on_hand_market(more: Value) -> Value {
+    let mut args = json!({
+        "symbol": "HANDUSD", "venue": "HAND", "bars": "1h", "from": "2024-01-01",
+        "wait_seconds": 120,
+        "settings": {"commission": {"on": true, "value": {"percent": 0.1}}},
+    });
+    for (key, value) in more.as_object().unwrap() {
+        args[key] = value.clone();
+    }
+    args
+}
+
+#[test]
+fn a_backtest_worked_out_by_hand_comes_to_the_same() {
+    // Five days: 100, up to 110 at hour 31, then 121 from hour 80.
+    let closes: Vec<f64> = (0..120)
+        .map(|hour| match hour {
+            0..=30 => 100.0,
+            31..=79 => 110.0,
+            _ => 121.0,
+        })
+        .collect();
+    let (lab, times) = market_of(&closes);
+    // Long from hour 10 to 31, which wins; short from hour 60, still open at the end, which loses.
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({"strategy": {"positions": [
+                [times[10], 1], [times[31], 0], [times[60], -1],
+            ]}})),
+        )
+        .unwrap();
+    let summary = &run["summary"];
+    let fills = lab
+        .dispatch("get_fills", &json!({"run_id": run["run_id"]}))
+        .unwrap();
+    let rows = fills["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{fills}");
+    let close = |value: &Value, expected: f64, what: &str| {
+        let value = value.as_f64().unwrap_or_else(|| panic!("{what}: {value}"));
+        assert!(
+            (value - expected).abs() < 1e-6,
+            "{what}: {value} against {expected}"
+        );
+    };
+
+    // The fills are where the list said: each at its bar's close, and worth 10% of 100,000.
+    for (row, (hour, price)) in rows.iter().zip([(10, 100.0), (31, 110.0), (60, 110.0)]) {
+        assert_eq!(row[0].as_u64().unwrap(), times[hour] + HOUR);
+        close(&row[3], price, "fill price");
+    }
+    // Sizes are rounded to the market's precision, so they're read rather than assumed.
+    let capital = 100_000.0;
+    let long = rows[0][4].as_f64().unwrap();
+    let short = rows[2][4].as_f64().unwrap();
+    assert!((long * 100.0 - 10_000.0).abs() < 50.0, "{long}");
+    assert!((short * 110.0 - 10_000.0).abs() < 50.0, "{short}");
+    let (long_fee, exit_fee, short_fee) = (
+        0.001 * long * 100.0,
+        0.001 * long * 110.0,
+        0.001 * short * 110.0,
+    );
+    close(&rows[0][5], long_fee, "first fee");
+    let win = long * 10.0 - long_fee - exit_fee;
+    let lose = short * (110.0 - 121.0) - short_fee;
+    let net = win + lose;
+    close(&summary["net_return"], net / capital, "net_return");
+    close(&summary["final_equity"], capital + net, "final_equity");
+    close(&summary["trades"], 2.0, "trades");
+    close(&summary["win_rate"], 0.5, "win_rate");
+    close(&summary["profit_factor"], win / -lose, "profit_factor");
+    close(&summary["average_trade"], net / 2.0, "average_trade");
+    close(&summary["buy_and_hold_return"], 0.21, "buy_and_hold_return");
+    // Held through hours 11 to 31 and 61 to 119.
+    close(&summary["exposure"], (21.0 + 59.0) / 120.0, "exposure");
+
+    // Each day's last equity: the short opens on day 3, and its loss comes on day 4.
+    let days = [
+        capital,
+        capital - long_fee,
+        capital + win,
+        capital + win - short_fee,
+        capital + win - short_fee - short * 11.0,
+        capital + win - short_fee - short * 11.0,
+    ];
+    let returns: Vec<f64> = days.windows(2).map(|day| day[1] / day[0] - 1.0).collect();
+    let mean = returns.iter().sum::<f64>() / 5.0;
+    let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / 4.0;
+    close(
+        &summary["sharpe"],
+        mean / variance.sqrt() * 365.0_f64.sqrt(),
+        "sharpe",
+    );
+
+    // A time that isn't a bar's says so, rather than quietly doing nothing.
+    let error = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({"strategy": {"positions": [[times[3] + 1, 1]]}})),
+        )
+        .unwrap_err();
+    assert!(error.contains("no bar opens at"), "{error}");
+    let refused = lab
+        .dispatch(
+            "save_result",
+            &json!({"name": "List", "strategy": {"positions": [[times[3], 1]]}}),
+        )
+        .unwrap_err();
+    assert!(refused.contains("only fits"), "{refused}");
+}
+
+#[test]
+fn a_tree_exits_on_its_own_entry_and_sees_whats_really_held() {
+    // 100, then 105 from hour 20, then falling a little each hour from hour 30.
+    let closes: Vec<f64> = (0..80)
+        .map(|hour| match hour {
+            0..=19 => 100.0,
+            20..=29 => 105.0,
+            _ => 105.0 - f64::from(hour - 29),
+        })
+        .collect();
+    let (lab, _times) = market_of(&closes);
+    let price = |run: &Value| -> Vec<(u64, f64)> {
+        let fills = lab
+            .dispatch("get_fills", &json!({"run_id": run["run_id"]}))
+            .unwrap();
+        fills["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| (row[1].as_u64().unwrap(), row[3].as_f64().unwrap()))
+            .collect()
+    };
+    // Stop 5% below its entry: 105 less 5.25 is 99.75, first closed under at hour 35.
+    let stop = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({"strategy": {"logic": {
+                "long": {"crosses_above": ["close", 102]},
+                "flat": {"lt": ["close", {"mul": ["entry_price", 0.95]}]},
+            }}})),
+        )
+        .unwrap();
+    assert_eq!(price(&stop), vec![(20, 105.0), (35, 99.0)]);
+
+    // Out after ten bars.
+    let timed = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({"strategy": {"logic": {
+                "long": {"crosses_above": ["close", 102]},
+                "flat": {"ge": ["bars_held", 10]},
+            }}})),
+        )
+        .unwrap();
+    assert_eq!(price(&timed)[1].0, 30);
+
+    // Asking while warming up isn't holding: "buy if not long" still buys on the first bar that
+    // can trade, and only that once.
+    let warmed = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({
+                "from": "2024-01-02",
+                "strategy": {"logic": {"long": {"lt": ["position", 1]}}},
+            })),
+        )
+        .unwrap();
+    let fills = price(&warmed);
+    assert_eq!(fills.len(), 1, "{fills:?}");
+    assert_eq!(fills[0].0, 24, "{fills:?}");
+}
+
+/// The time an hour after `time`, as a `from` or `to` takes it.
+fn next_hour(time: &str) -> String {
+    persephone_lab::time_text(persephone_lab::parse_time(&json!(time)).unwrap() + HOUR)
+}
+
+#[test]
+fn walk_forward_picks_only_on_what_came_before_what_it_tests() {
+    let (lab, _dir) = lab();
+    let strategy = json!({"builtin": "ema-cross", "params": {"Slow": 40}});
+    let variables = json!([{"name": "Fast", "min": 3, "max": 12, "step": 3}]);
+    let answer = lab
+        .dispatch(
+            "run_walk_forward",
+            &with(json!({
+                "strategy": strategy, "variables": variables, "windows": 3, "train_ratio": 2,
+                "from": "2024-01-02", "wait_seconds": 240,
+            })),
+        )
+        .unwrap();
+    let windows = answer["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 3);
+    let mut total = 0.0;
+    let mut last_to: Option<String> = None;
+    for window in windows {
+        let at = |name: &str| window[name].as_str().unwrap().to_owned();
+        assert!(at("train_from") < at("test_from") && at("test_from") < at("test_to"));
+        // Unseen stretches follow each other, so nothing's tested twice.
+        if let Some(previous) = &last_to {
+            assert!(previous < &at("test_from"), "{windows:?}");
+        }
+        last_to = Some(at("test_to"));
+
+        // Optimizing on the picking stretch alone picks the same: later bars played no part.
+        let alone = lab
+            .dispatch(
+                "run_optimize",
+                &with(json!({
+                    "strategy": strategy, "variables": variables,
+                    "from": at("train_from"), "to": at("test_from"), "wait_seconds": 240,
+                })),
+            )
+            .unwrap();
+        assert_eq!(window["values"], alone["top"][0]["values"], "{window}");
+
+        // And its unseen return is that backtest's, on those bars alone.
+        let mut chosen = strategy.clone();
+        chosen["params"]["Fast"] = window["values"]["Fast"].clone();
+        let run = lab
+            .dispatch(
+                "run_backtest",
+                &with(json!({
+                    "strategy": chosen, "from": at("test_from"), "to": next_hour(&at("test_to")),
+                    "wait_seconds": 240,
+                })),
+            )
+            .unwrap();
+        assert!(
+            (run["summary"]["net_return"].as_f64().unwrap()
+                - window["unseen_return"].as_f64().unwrap())
+            .abs()
+                < 1e-9,
+            "{window} against {run}"
+        );
+        total += window["unseen_return"].as_f64().unwrap();
+    }
+    assert!((answer["unseen_return"].as_f64().unwrap() - total).abs() < 1e-9);
+    assert!(answer["buy_and_hold_return"].is_number(), "{answer}");
+    assert!(windows[0]["buy_and_hold_return"].is_number(), "{answer}");
+
+    let error = lab
+        .dispatch(
+            "run_walk_forward",
+            &with(json!({
+                "strategy": strategy, "variables": variables, "windows": 3,
+                "from": "2024-01-01", "to": "2024-01-01 06:00", "wait_seconds": 60,
+            })),
+        )
+        .unwrap_err();
+    assert!(error.contains("too few"), "{error}");
+}
+
+#[test]
+fn runs_can_be_labelled_found_and_sorted() {
+    let (lab, _dir) = lab();
+    let run = |fast: u32, label: &str| {
+        lab.dispatch(
+            "run_backtest",
+            &with(json!({
+                "strategy": {"builtin": "ema-cross", "params": {"Fast": fast, "Slow": 40}},
+                "label": label, "wait_seconds": 120,
+            })),
+        )
+        .unwrap()
+    };
+    let runs = [run(3, "a"), run(6, "a"), run(9, "b")];
+    let found = lab.dispatch("list_runs", &json!({"label": "a"})).unwrap();
+    assert_eq!(found["total"], 2);
+    let sorted = lab
+        .dispatch("list_runs", &json!({"sort": "net_return"}))
+        .unwrap();
+    let returns: Vec<f64> = sorted["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["summary"]["net_return"].as_f64().unwrap())
+        .collect();
+    assert_eq!(returns.len(), runs.len());
+    assert!(
+        returns.windows(2).all(|pair| pair[0] >= pair[1]),
+        "{returns:?}"
+    );
+    let lowest = lab
+        .dispatch(
+            "list_runs",
+            &json!({"sort": "net_return", "ascending": true, "limit": 1}),
+        )
+        .unwrap();
+    assert_eq!(
+        lowest["rows"][0]["summary"]["net_return"],
+        json!(returns[2])
+    );
+    assert!(lowest["rows"][0].get("request").is_none());
+}
+
+/// A strategy over a socket: long on every bar.
+fn serve_external() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = format!("tcp://{}", listener.local_addr().unwrap());
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut out = stream.try_clone().unwrap();
+                for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                    let message: Value = serde_json::from_str(&line).unwrap();
+                    let answer = match message["type"].as_str().unwrap() {
+                        "describe" => {
+                            json!({"name": "Always long", "description": "Test", "params": []})
+                        }
+                        "bar" => json!({"target": 1}),
+                        _ => json!({}),
+                    };
+                    writeln!(out, "{answer}").unwrap();
+                }
+            });
+        }
+    });
+    address
+}
+
+#[test]
+fn a_program_over_a_socket_can_be_added_and_backtested() {
+    let (lab, _dir) = lab();
+    let address = serve_external();
+    let added = lab
+        .dispatch(
+            "install_plugin",
+            &json!({"name": "always-long", "address": address}),
+        )
+        .unwrap();
+    let id = added["id"].clone();
+    assert_eq!(added["kind"], "strategy");
+    let listed = lab.dispatch("list_strategies", &json!({})).unwrap();
+    assert!(listed.to_string().contains("Always long"), "{listed}");
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({"strategy": {"plugin": id}, "wait_seconds": 120})),
+        )
+        .unwrap();
+    assert_eq!(run["summary"]["fills"], 1, "{run}");
+
+    // Nothing's left behind if it isn't answering, and an existing one isn't replaced.
+    let closed = lab.dispatch(
+        "install_plugin",
+        &json!({"name": "not-there", "address": "tcp://127.0.0.1:1"}),
+    );
+    assert!(closed.is_err());
+    assert!(!lab.paths.plugins.join("not-there.external").exists());
+    let again = lab
+        .dispatch(
+            "install_plugin",
+            &json!({"name": "always-long", "address": address}),
+        )
+        .unwrap_err();
+    assert!(again.contains("already exists"), "{again}");
+    let empty = lab.dispatch("install_plugin", &json!({})).unwrap_err();
+    assert!(empty.contains("`path`"), "{empty}");
+}
+
+#[test]
+fn two_labs_sharing_a_folder_download_a_cold_market_once() {
+    let source = Arc::new(FakeBinance {
+        requests: AtomicUsize::new(0),
+    });
+    let dir = std::env::temp_dir().join(format!("persephone-lab-shared-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let labs: Vec<Arc<Lab>> = (0..2)
+        .map(|_| Lab::with_source(Paths::under(&dir), source.clone()).unwrap())
+        .collect();
+    let args = json!({"symbol": "BTCUSDT", "bars": "1h", "strategy": ema(), "wait_seconds": 120});
+    let answers: Vec<Value> = thread::scope(|scope| {
+        let running: Vec<_> = labs
+            .iter()
+            .map(|lab| scope.spawn(|| lab.dispatch("run_backtest", &args).unwrap()))
+            .collect();
+        running.into_iter().map(|one| one.join().unwrap()).collect()
+    });
+    assert_eq!(answers[0]["summary"], answers[1]["summary"]);
+    assert_eq!(
+        source.requests.load(Ordering::Relaxed),
+        5,
+        "one download's pages"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn many_kinds_of_call_at_once_all_finish() {
+    let (lab, _dir) = lab();
+    let stop_at = Instant::now() + Duration::from_secs(4);
+    let first = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({"strategy": ema(), "wait_seconds": 120})),
+        )
+        .unwrap();
+    let id = first["run_id"].clone();
+    let calls: Vec<(&str, Value)> = vec![
+        (
+            "run_backtest",
+            with(json!({"strategy": ema(), "wait_seconds": 120})),
+        ),
+        (
+            "run_backtests",
+            json!({
+                "defaults": market(), "runs": [{"strategy": ema()}, {"strategy": ema()}],
+                "wait_seconds": 120,
+            }),
+        ),
+        ("get_report", json!({"run_id": id})),
+        ("get_trades", json!({"run_id": id, "limit": 5})),
+        (
+            "run_monte_carlo",
+            json!({"run_id": id, "runs": 100, "wait_seconds": 120}),
+        ),
+        ("list_runs", json!({"limit": 3})),
+        ("list_runs", json!({"sort": "sharpe", "limit": 3})),
+        ("get_call_log", json!({"limit": 3})),
+        ("get_bars", with(json!({"from": "2024-01-02", "limit": 10}))),
+    ];
+    let done = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        for worker in 0..12 {
+            let (lab, calls, done) = (&lab, &calls, &done);
+            scope.spawn(move || {
+                let mut at = worker;
+                while Instant::now() < stop_at {
+                    let (tool, args) = &calls[at % calls.len()];
+                    lab.dispatch(tool, args)
+                        .unwrap_or_else(|e| panic!("{tool}: {e}"));
+                    done.fetch_add(1, Ordering::Relaxed);
+                    at += 1;
+                }
+                // Starting and cancelling mid-way leaves nothing stuck.
+                let job = lab
+                    .dispatch(
+                        "run_backtests",
+                        &json!({
+                            "defaults": market(), "runs": vec![json!({"strategy": ema()}); 200],
+                            "wait_seconds": 0,
+                        }),
+                    )
+                    .unwrap();
+                if let Some(id) = job["job_id"]
+                    .as_str()
+                    .filter(|_| job["status"] == "running")
+                {
+                    let _ = lab.dispatch("cancel_job", &json!({"job_id": id}));
+                    lab.dispatch("get_job", &json!({"job_id": id, "wait_seconds": 300}))
+                        .unwrap();
+                }
+            });
+        }
+    });
+    assert!(
+        done.load(Ordering::Relaxed) > 12,
+        "{}",
+        done.load(Ordering::Relaxed)
+    );
+}
+
+/// Against the real Binance, to prove the live format still matches. It needs the network, so it only
+/// runs when asked: `cargo test -p persephone-lab -- --ignored`.
+#[test]
+#[ignore = "needs the network"]
+fn real_binance_bars_parse_are_closed_and_cache_exactly() {
+    let dir = std::env::temp_dir().join(format!("persephone-lab-real-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let lab = Lab::new(Paths::under(&dir)).unwrap();
+    let args = json!({
+        "symbol": "BTCUSDT", "bars": "1h", "from": "2024-01-01", "to": "2024-03-15", "limit": 5_000,
+    });
+    let first = lab.dispatch("get_bars", &args).unwrap();
+    let rows = first["rows"].as_array().unwrap();
+    // Across more than one request, with none missing.
+    assert_eq!(rows.len(), 74 * 24);
+    for pair in rows.windows(2) {
+        assert_eq!(
+            pair[1][0].as_u64().unwrap() - pair[0][0].as_u64().unwrap(),
+            HOUR
+        );
+    }
+    assert!(
+        rows.iter().all(|row| row[2].as_f64().unwrap() > 1_000.0),
+        "prices look wrong"
+    );
+
+    // From a fresh start the cache gives what Binance did.
+    let again = Lab::new(Paths::under(&dir)).unwrap();
+    assert_eq!(
+        again.dispatch("get_bars", &args).unwrap()["rows"],
+        first["rows"]
+    );
+
+    // No bar still forming, with no `to`.
+    let latest = lab
+        .dispatch(
+            "get_bars",
+            &json!({"symbol": "BTCUSDT", "bars": "1h", "limit": 2}),
+        )
+        .unwrap();
+    let last = latest["rows"][1][0].as_u64().unwrap();
+    let now = persephone_lab::now_ms() * 1_000_000;
+    assert!(last + HOUR <= now, "{last} is still forming at {now}");
+
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &json!({
+                "symbol": "BTCUSDT", "bars": "1h", "from": "2024-01-01", "to": "2024-03-15",
+                "strategy": {"builtin": "ema-cross"}, "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    assert!(
+        run["summary"]["buy_and_hold_return"].as_f64().unwrap() > 0.0,
+        "{run}"
+    );
+    assert!(run["summary"]["sharpe"].is_number(), "{run}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn orders_on_their_way_arent_sent_twice() {
+    let closes: Vec<f64> = (0..60).map(|hour| 100.0 + f64::from(hour)).collect();
+    let (lab, times) = market_of(&closes);
+    // Latency on these bars delays a fill to the next bar, where a list still asks for the same.
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({
+                "strategy": {"positions": [[times[10], 1], [times[20], -1], [times[30], 0]]},
+                "settings": {"latency": {"on": true, "value": 100}},
+            })),
+        )
+        .unwrap();
+    let fills = lab
+        .dispatch("get_fills", &json!({"run_id": run["run_id"]}))
+        .unwrap();
+    let rows = fills["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{fills}");
+    assert_eq!(run["summary"]["trades"], 2, "{run}");
+    // One order for each change, a bar later than it would have been.
+    for (row, (hour, side)) in rows.iter().zip([(11, "buy"), (21, "sell"), (31, "buy")]) {
+        assert_eq!(row[1], hour, "{row}");
+        assert_eq!(row[2], side, "{row}");
+    }
+    assert!(run["summary"]["warnings"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn refused_orders_are_reported_and_standard_output_stays_json() {
+    // A short that tripled against it lost more than the account holds, so it can't open another.
+    let closes: Vec<f64> = (0..60)
+        .map(|hour| if hour < 10 { 100.0 } else { 300.0 })
+        .collect();
+    let (lab, times) = market_of(&closes);
+    let args = on_hand_market(json!({
+        "strategy": {
+            "positions": [[times[5], -1], [times[20], 0], [times[30], 1]],
+            "params": {"Size %": 100},
+        },
+    }));
+    let run = lab.dispatch("run_backtest", &args).unwrap();
+    let warnings = run["summary"]["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{run}");
+    assert!(warnings[0].as_str().unwrap().contains("refused"), "{run}");
+
+    // What reaches standard output is what a client parses.
+    let dir = lab.paths.lab().parent().unwrap().to_owned();
+    let output = Command::new(env!("CARGO_BIN_EXE_persephone-lab"))
+        .args(["--data"])
+        .arg(&dir)
+        .args(["call", "run_backtest"])
+        .arg(args.to_string())
+        .output()
+        .unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    let parsed: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("not JSON: {e}: {}", &text[..text.len().min(300)]));
+    assert_eq!(parsed["summary"]["warnings"], run["summary"]["warnings"]);
+
+    // A long list can come from a file.
+    let file = dir.join("args.json");
+    fs::write(&file, args.to_string()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_persephone-lab"))
+        .args(["--data"])
+        .arg(&dir)
+        .args(["call", "run_backtest"])
+        .arg(format!("@{}", file.display()))
+        .output()
+        .unwrap();
+    let parsed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        parsed["summary"]["net_return"],
+        run["summary"]["net_return"]
+    );
+}
+
+#[test]
+fn what_would_quietly_do_nothing_says_so() {
+    let (lab, _dir) = lab();
+    let tried = |more: Value| {
+        lab.dispatch(
+            "run_backtest",
+            &with(json!({"strategy": ema(), "settings": more, "wait_seconds": 60})),
+        )
+    };
+    let error = tried(json!({"slippagee": {"on": true, "value": 100}})).unwrap_err();
+    assert!(
+        error.contains("`slippagee`") && error.contains("slippage"),
+        "{error}"
+    );
+    let error = tried(json!({"slippage": {"value": 100}})).unwrap_err();
+    assert!(error.contains("\"on\""), "{error}");
+    assert!(tried(json!({"slippage": {"on": true, "value": 100}})).is_ok());
+
+    let error = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({"wait_seconds": 60, "strategy": {"logic": {
+                "params": {"Size %": 100}, "long": {"gt": ["close", 1]},
+            }}})),
+        )
+        .unwrap_err();
+    assert!(error.contains("beside `logic`"), "{error}");
+}
+
+#[test]
+fn a_list_of_positions_says_what_to_hold_wherever_a_run_starts() {
+    let closes: Vec<f64> = (0..600).map(|hour| 100.0 + f64::from(hour) * 0.1).collect();
+    let (lab, times) = market_of(&closes);
+    let hold = json!({"positions": [[times[0], 1]]});
+    // A span starting after its time takes it up on the first bar it can trade.
+    let later = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({"strategy": hold, "from": "2024-01-03"})),
+        )
+        .unwrap();
+    assert_eq!(later["summary"]["fills"], 1, "{later}");
+    assert!(
+        later["summary"]["net_return"].as_f64().unwrap() > 0.0,
+        "{later}"
+    );
+
+    // And so does each random block, which reports what the market did beside it.
+    let blocks = lab
+        .dispatch(
+            "run_random_blocks",
+            &on_hand_market(json!({
+                "strategy": hold, "blocks": 4, "length": "week", "seed": 1,
+            })),
+        )
+        .unwrap();
+    for block in blocks["blocks"].as_array().unwrap() {
+        assert_eq!(block["fills"], 1, "{block}");
+        assert!(
+            block["buy_and_hold_return"].as_f64().unwrap() > 0.0,
+            "{block}"
+        );
+        assert!(block["return"].as_f64().unwrap() > 0.0, "{block}");
+    }
+    assert!(blocks["median_buy_and_hold"].as_f64().unwrap() > 0.0);
+}
+
+#[test]
+fn a_trailing_stop_follows_the_high_since_entry() {
+    // Up from 100 to 130, then falling, with the bar's high 1 above its close.
+    let closes: Vec<f64> = (0..80)
+        .map(|hour| match hour {
+            0..=10 => 100.0,
+            11..=40 => 100.0 + f64::from(hour - 10),
+            _ => 130.0 - f64::from(hour - 40),
+        })
+        .collect();
+    let (lab, _times) = market_of(&closes);
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({"strategy": {"logic": {
+                "long": {"crosses_above": ["close", 100.5]},
+                "flat": {"lt": ["close", {"mul": ["high_since_entry", 0.9]}]},
+            }}})),
+        )
+        .unwrap();
+    let fills = lab
+        .dispatch("get_fills", &json!({"run_id": run["run_id"]}))
+        .unwrap();
+    // 10% under the high of 130 is 117, first closed under at 116.
+    assert_eq!(fills["rows"][0][3], 101.0, "{fills}");
+    assert_eq!(fills["rows"][1][3], 116.0, "{fills}");
+    assert_eq!(fills["rows"].as_array().unwrap().len(), 2, "{fills}");
 }
 
 #[test]

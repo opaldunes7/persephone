@@ -121,6 +121,11 @@ fn settings_schema() -> Value {
     })
 }
 
+const LABEL: Arg = opt(
+    "label",
+    "string",
+    "A name for grouping runs, saved with the run for finding it with list_runs.",
+);
 const WAIT: Arg = opt(
     "wait_seconds",
     "number",
@@ -157,7 +162,7 @@ const LIMIT: Arg = opt(
 const STRATEGY: Arg = arg(
     "strategy",
     "object",
-    "{\"builtin\": \"ema-cross\"}, {\"plugin\": \"id\"} or {\"logic\": {...tree...}}, each with optional \"params\": {\"name\": value}.",
+    "{\"builtin\": \"ema-cross\"}, {\"plugin\": \"id\"}, {\"logic\": {...tree...}} or {\"positions\": [[ts, 1], [ts, 0]]}, each with optional \"params\": {\"name\": value}.",
 );
 const SETTINGS: Arg = opt(
     "settings",
@@ -386,14 +391,26 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "install_plugin",
-            "Adds a compiled plugin to the plugins folder, where the app sees it too. Won't replace one of the same name.",
-            vec![arg("path", "string", "The plugin's .wasm file.")],
+            "Adds a plugin to the plugins folder, where the app sees it too: a compiled one by `path`, or a program answering over a socket by `name` and `address`. Won't replace one of the same name.",
+            vec![
+                opt("path", "string", "A compiled plugin's .wasm file."),
+                opt(
+                    "name",
+                    "string",
+                    "What to call a program answering over a socket.",
+                ),
+                opt(
+                    "address",
+                    "string",
+                    "Where it listens, as tcp://127.0.0.1:7878 or unix:///tmp/model.sock. It has to be running. The guide's `extending` topic has what it must answer.",
+                ),
+            ],
             &["id", "kind", "path"],
         ),
         job(
             "run_backtest",
             "Backtests any strategy on any span with any settings. The run is saved, so its details can be read by run_id. Returns and falls are fractions, so 0.05 is 5%.",
-            test_args(),
+            with(test_args(), &[LABEL]),
             &["run_id", "summary"],
         ),
         job(
@@ -478,6 +495,49 @@ pub fn tools() -> Vec<Tool> {
                 ],
             ),
             &["profitable", "median", "best", "worst", "blocks"],
+        ),
+        job(
+            "run_walk_forward",
+            "Picks the best values on one stretch, tests them on the next, unseen, and slides along, giving what they did where they hadn't been picked. Returns and falls are fractions.",
+            with(
+                test_args(),
+                &[
+                    arg(
+                        "variables",
+                        "array",
+                        "One or two of {\"name\", \"min\", \"max\", \"step\"}.",
+                    ),
+                    opt(
+                        "windows",
+                        "integer",
+                        "How many unseen stretches. Default 5.",
+                    ),
+                    opt(
+                        "train_ratio",
+                        "number",
+                        "How many times longer each picking stretch is than its unseen one. Default 3.",
+                    ),
+                    opt(
+                        "score",
+                        "string",
+                        "What to pick by: backtest (the default) or monte-carlo.",
+                    ),
+                    opt(
+                        "runs",
+                        "integer",
+                        "For monte-carlo: how many draws. Default 1,000.",
+                    ),
+                    opt("ruin_percent", "number", "For monte-carlo. Default 50."),
+                    opt("seed", "integer", "Default 0."),
+                ],
+            ),
+            &[
+                "windows",
+                "unseen_return",
+                "profitable_windows",
+                "deepest_fall",
+                "trades",
+            ],
         ),
         job(
             "run_optimize",
@@ -571,8 +631,18 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "list_runs",
-            "Saved runs, newest first.",
-            vec![CURSOR, LIMIT],
+            "Saved runs, newest first unless sorted. Searching reads every summary, so it takes longer with many runs.",
+            vec![
+                opt("label", "string", "Only runs saved with this label."),
+                opt(
+                    "sort",
+                    "string",
+                    "A summary figure to sort by, highest first, such as sharpe or net_return.",
+                ),
+                opt("ascending", "boolean", "Sort lowest first instead."),
+                CURSOR,
+                LIMIT,
+            ],
             &["columns", "rows", "next_cursor"],
         ),
         tool(
@@ -787,6 +857,7 @@ impl Lab {
                     "run_monte_carlo" => lab.run_monte_carlo(&owned, job),
                     "run_random_blocks" => lab.run_random_blocks(&owned, job),
                     "run_optimize" => lab.run_optimize(&owned, job),
+                    "run_walk_forward" => lab.run_walk_forward(&owned, job),
                     other => Err(format!("there's no tool `{other}`")),
                 })
             }

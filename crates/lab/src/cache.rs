@@ -317,7 +317,9 @@ impl BarCache {
     fn refresh(&self, market: &mut Market, path: &PathBuf) -> Result<(), String> {
         let stamp = fs::metadata(path).and_then(|meta| meta.modified()).ok();
         if stamp.is_some() && stamp != market.stamp {
-            let (bars, covered) = read_file(path)?;
+            // A damaged file holds nothing worth keeping: it's a copy of public data, so what it
+            // should hold gets fetched again and the file replaced.
+            let (bars, covered) = read_file(path).unwrap_or_default();
             market.bars = Arc::new(bars);
             market.covered = covered;
             market.stamp = stamp;
@@ -464,12 +466,7 @@ fn write_file(
 
 fn read_file(path: &PathBuf) -> Result<(Vec<Candle>, Vec<Range>), String> {
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
-    let corrupt = || {
-        format!(
-            "{} isn't a bar cache; delete it to start over",
-            path.display()
-        )
-    };
+    let corrupt = || format!("{} isn't a bar cache", path.display());
     if bytes.len() < 16 || &bytes[..4] != MAGIC {
         return Err(corrupt());
     }
@@ -742,6 +739,27 @@ mod tests {
     }
 
     #[test]
+    fn a_damaged_file_is_fetched_again_rather_than_failing_for_ever() {
+        let fake = Fake::new(1_000);
+        let dir = dir();
+        let cache = BarCache::new(dir.clone(), fake.clone());
+        let before = bars(&cache, 0, 100);
+        let file = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "bars"))
+            .unwrap();
+        fs::write(&file, b"not a cache").unwrap();
+        let cache = BarCache::new(dir, fake.clone());
+        assert_eq!(bars(&cache, 0, 100), before);
+        assert_eq!(fake.asked().len(), 2, "fetched once more");
+        // And it's right again on disk.
+        assert_eq!(bars(&cache, 0, 100), before);
+        assert_eq!(fake.asked().len(), 2);
+    }
+
+    #[test]
     fn a_long_download_doesnt_hold_up_bars_already_here_and_arrives_in_order() {
         let (release, carry_on) = std::sync::mpsc::channel();
         let held = Arc::new(Held {
@@ -834,21 +852,6 @@ mod tests {
             .bars("BTCUSDT", Timeframe::H1, 100 * HOUR, 110 * HOUR + half)
             .unwrap();
         assert_eq!(hours(&got), range(100, 111));
-    }
-
-    #[test]
-    fn a_damaged_file_says_so() {
-        let fake = Fake::new(1_000);
-        let dir = dir();
-        let cache = BarCache::new(dir.clone(), fake.clone());
-        bars(&cache, 100, 110);
-        let file = dir.join("BTCUSDT-1h.bars");
-        let bytes = fs::read(&file).unwrap();
-        fs::write(&file, &bytes[..bytes.len() - 3]).unwrap();
-        let error = BarCache::new(dir, fake)
-            .bars("BTCUSDT", Timeframe::H1, 100 * HOUR, 110 * HOUR)
-            .unwrap_err();
-        assert!(error.contains("delete it"), "{error}");
     }
 
     #[test]

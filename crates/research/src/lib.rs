@@ -5,6 +5,7 @@ pub mod calendar;
 pub mod logic;
 pub mod market;
 pub mod optimize;
+pub mod positions;
 pub mod results;
 pub mod robustness;
 pub mod settings;

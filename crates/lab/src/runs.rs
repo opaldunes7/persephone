@@ -22,7 +22,8 @@ use persephone_research::{
     WARM_UP_BARS,
     calendar::{Calendar, days_in_month, weeks},
     market::{MAX_FINE_BARS, MarketBars, fine_bars},
-    optimize::{Grid, OptimizeJob, Outcome, split_at},
+    optimize::{Grid, OptimizeJob, Outcome, rank, split_at},
+    positions::Positions,
     results::{StrategyRef, with_params},
     robustness::{
         BlockJob, MonteCarlo, RoundTrip, backtest, closed_trades, monte_carlo, pick_blocks, pool,
@@ -48,6 +49,27 @@ const LISTED_RUNS: usize = 20;
 const LISTED_VALUES: usize = 50;
 /// The most backtests `run_backtests` takes in one call.
 const MAX_BACKTESTS: usize = 5_000;
+const BATCH_COLUMNS: [&str; 15] = [
+    "index",
+    "run_id",
+    "net_return",
+    "max_drawdown",
+    "trades",
+    "win_rate",
+    "fees",
+    "final_equity",
+    "buy_and_hold_return",
+    "sharpe",
+    "profit_factor",
+    "exposure",
+    "average_trade",
+    "warnings",
+    "error",
+];
+/// How many windows `run_walk_forward` makes unless asked, and how many times longer each one's
+/// picking stretch is than its unseen one.
+const WALK_WINDOWS: u64 = 5;
+const WALK_RATIO: f64 = 3.0;
 const TRADE_COLUMNS: [&str; 14] = [
     "trade",
     "side",
@@ -95,11 +117,36 @@ pub fn build_request(
     })
 }
 
+/// Settings from JSON, refusing what would otherwise quietly do nothing: a misspelt cost flatters
+/// a result, and looks just like a setting that worked.
+///
+/// # Errors
+///
+/// Returns a message naming the setting.
+pub(crate) fn read_settings(value: &Value) -> Result<Settings, String> {
+    let defaults = serde_json::to_value(Settings::default()).map_err(|e| e.to_string())?;
+    if let (Some(given), Some(known)) = (value.as_object(), defaults.as_object()) {
+        for (name, setting) in given {
+            let Some(known_one) = known.get(name) else {
+                let names: Vec<&String> = known.keys().collect();
+                return Err(format!(
+                    "`settings`: there's no `{name}`; there are {names:?}"
+                ));
+            };
+            let is_switched = known_one.get("on").is_some() && known_one.get("value").is_some();
+            if is_switched && setting.get("on").is_none() {
+                return Err(format!(
+                    "`settings.{name}`: it needs {{\"on\": true, \"value\": ...}}, or it does nothing"
+                ));
+            }
+        }
+    }
+    serde_json::from_value(value.clone()).map_err(|e| format!("`settings`: {e}"))
+}
+
 fn settings_of(args: &Value) -> Result<Settings, String> {
-    args.get("settings").map_or_else(
-        || Ok(Settings::default()),
-        |value| serde_json::from_value(value.clone()).map_err(|e| format!("`settings`: {e}")),
-    )
+    args.get("settings")
+        .map_or_else(|| Ok(Settings::default()), read_settings)
 }
 
 fn parse_length(args: &Value) -> Result<BlockLength, String> {
@@ -143,8 +190,16 @@ fn trade_row(number: usize, trade: &RoundTrip, capital: f64) -> Value {
 }
 
 /// What a report comes to, in a few figures.
-fn summary_of(report: &BacktestReport, from_index: usize, name: &str) -> Value {
+fn summary_of(
+    report: &BacktestReport,
+    from_index: usize,
+    name: &str,
+    bars: &[(u64, f64)],
+) -> Value {
     let trades = round_trips(report);
+    let profit: f64 = trades.iter().map(|t| t.profit).sum();
+    let gains: f64 = trades.iter().map(|t| t.profit.max(0.0)).sum();
+    let losses: f64 = trades.iter().map(|t| (-t.profit).max(0.0)).sum();
     let winners = trades.iter().filter(|t| t.profit > 0.0).count();
     let last = report
         .equity
@@ -163,7 +218,80 @@ fn summary_of(report: &BacktestReport, from_index: usize, name: &str) -> Value {
         "winners": winners,
         "win_rate": winners as f64 / trades.len().max(1) as f64,
         "bars": report.equity.len().saturating_sub(from_index),
+        "buy_and_hold_return": buy_and_hold(bars, from_index),
+        "sharpe": sharpe(report, from_index, bars),
+        "profit_factor": (losses > 0.0).then(|| gains / losses),
+        "exposure": exposure(report, from_index),
+        "average_trade": (!trades.is_empty()).then(|| profit / trades.len() as f64),
+        "warnings": report.notes.iter()
+            .filter(|note| note.warning)
+            .map(|note| note.text.as_str())
+            .collect::<Vec<_>>(),
     })
+}
+
+/// What holding the market made: from the close of the first bar it could trade at, as a strategy's
+/// first order fills there, to the last close.
+fn buy_and_hold(bars: &[(u64, f64)], from_index: usize) -> Option<f64> {
+    let first = bars.get(from_index)?.1;
+    let last = bars.last()?.1;
+    (first > 0.0).then(|| last / first - 1.0)
+}
+
+/// The Sharpe ratio of daily returns, with no risk-free rate, over 365 days a year as crypto trades
+/// every day. A day's value is its last bar's equity. `None` if there are too few days to say, or
+/// nothing ever moved.
+fn sharpe(report: &BacktestReport, from_index: usize, bars: &[(u64, f64)]) -> Option<f64> {
+    const NANOS_PER_DAY: u64 = 86_400_000_000_000;
+    let mut days = vec![report.starting_balance];
+    let mut last_day = None;
+    for (&(ts, _), &equity) in bars.iter().zip(&report.equity).skip(from_index) {
+        let day = ts / NANOS_PER_DAY;
+        if last_day == Some(day) {
+            *days.last_mut()? = equity;
+        } else {
+            days.push(equity);
+            last_day = Some(day);
+        }
+    }
+    let returns: Vec<f64> = days
+        .windows(2)
+        .filter(|pair| pair[0] > 0.0)
+        .map(|pair| pair[1] / pair[0] - 1.0)
+        .collect();
+    if returns.len() < 2 {
+        return None;
+    }
+    let count = returns.len() as f64;
+    let mean = returns.iter().sum::<f64>() / count;
+    let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (count - 1.0);
+    (variance > 0.0).then(|| mean / variance.sqrt() * 365.0_f64.sqrt())
+}
+
+/// The share of the bars traded on that began with a position open. A position's first such bar is
+/// the one after the close it filled at.
+fn exposure(report: &BacktestReport, from_index: usize) -> f64 {
+    let bars = report.equity.len().saturating_sub(from_index);
+    if bars == 0 {
+        return 0.0;
+    }
+    let mut position = 0.0;
+    let mut fills = report.fills.iter().peekable();
+    let mut held = 0;
+    for bar in from_index..report.equity.len() {
+        while let Some(fill) = fills.next_if(|fill| fill.bar < bar) {
+            position += if fill.side == Side::Buy {
+                fill.qty
+            } else {
+                -fill.qty
+            };
+        }
+        // Rounding can leave dust where a position closed.
+        if f64::abs(position) > 1e-12 {
+            held += 1;
+        }
+    }
+    f64::from(held) / bars as f64
 }
 
 fn map_of(map: &BTreeMap<String, f64>) -> Value {
@@ -242,6 +370,70 @@ fn report_from(run: &Value) -> BacktestReport {
     }
 }
 
+/// What a call asks to optimize.
+fn optimize_choice(args: &Value, hold_out: bool) -> Result<OptimizeSettings, String> {
+    let variables = args
+        .get("variables")
+        .and_then(Value::as_array)
+        .filter(|v| (1..=2).contains(&v.len()))
+        .ok_or("`variables` should be a list of one or two")?;
+    let parse_variable = |value: &Value| -> Result<Variable, String> {
+        let figure = |name: &str| {
+            value[name]
+                .as_f64()
+                .ok_or_else(|| format!("`variables`: `{name}` is missing from {value}"))
+        };
+        Ok(Variable {
+            name: value["name"]
+                .as_str()
+                .ok_or_else(|| format!("`variables`: `name` is missing from {value}"))?
+                .to_owned(),
+            min: figure("min")?,
+            max: figure("max")?,
+            step: figure("step")?,
+        })
+    };
+    let score = match args.get("score").and_then(Value::as_str) {
+        None | Some("backtest") => ScoreBy::Backtest,
+        Some("monte-carlo") => ScoreBy::MonteCarlo,
+        Some("random-blocks") => ScoreBy::RandomBlocks,
+        Some(other) => {
+            return Err(format!(
+                "`score`: `{other}` isn't backtest, monte-carlo or random-blocks"
+            ));
+        }
+    };
+    Ok(OptimizeSettings {
+        variables: [
+            Some(parse_variable(&variables[0])?),
+            variables.get(1).map(parse_variable).transpose()?,
+        ],
+        score,
+        hold_out,
+    })
+}
+
+/// A combination's values by name.
+fn names_of(grid: &Grid, cell: usize) -> Value {
+    let mut names = Map::new();
+    let mut values = grid.values_of(cell).into_iter();
+    if let Some((_, value)) = values.next() {
+        names.insert(grid.first.name.clone(), json!(value));
+    }
+    if let (Some(second), Some((_, value))) = (&grid.second, values.next()) {
+        names.insert(second.name.clone(), json!(value));
+    }
+    Value::Object(names)
+}
+
+/// A summary with its request left out, to keep lists short.
+fn without_request(mut brief: Value) -> Value {
+    if let Some(brief) = brief.as_object_mut() {
+        brief.remove("request");
+    }
+    brief
+}
+
 /// A run's summary file, if it has one.
 fn read_summary(dir: &Path, id: &str) -> Option<Value> {
     serde_json::from_str(&fs::read_to_string(dir.join(format!("{id}.summary"))).ok()?).ok()
@@ -270,6 +462,11 @@ impl Lab {
                     value,
                 )?;
                 Ok((spec, Some(Arc::clone(plugin) as Arc<dyn SignalFactory>)))
+            }
+            StrategyRef::Positions(list) => {
+                let spec = with_params(list.spec().kind, Arc::new(list.info()), value)?;
+                let plugin: Arc<dyn SignalFactory> = Arc::new(list);
+                Ok((spec, Some(plugin)))
             }
             StrategyRef::Logic(logic) => {
                 let spec = with_params(logic.spec().kind, Arc::new(logic.info()), value)?;
@@ -301,9 +498,17 @@ impl Lab {
     fn prepare(&self, args: &Value) -> Result<(BacktestRequest, usize, String), String> {
         let market_args = MarketArgs::parse(args)?;
         let settings = settings_of(args)?;
-        let (spec, plugin) = self.resolve(args.get("strategy").unwrap_or(&Value::Null))?;
+        let strategy = args.get("strategy").unwrap_or(&Value::Null);
+        let (spec, mut plugin) = self.resolve(strategy)?;
         let name = spec.info.name.clone();
         let market = self.load_market(&market_args)?;
+        if let Some(list) = strategy.get("positions") {
+            // Given by when bars open, as an agent sees them, and heard by when they close.
+            let opens: Vec<u64> = market.candles.iter().map(|c| c.ts).collect();
+            let closes = market.bars.closes(&market.candles);
+            let list = Positions::parse(list)?.at_closes(&opens, &closes)?;
+            plugin = Some(Arc::new(list));
+        }
         let from = market_args.from.unwrap_or(0);
         let from_index = market.candles.partition_point(|c| c.ts < from);
         // High precision fills on ticks, or on 1-minute bars where there are none.
@@ -344,8 +549,12 @@ impl Lab {
     pub(crate) fn run_backtest(&self, args: &Value) -> Result<Value, String> {
         let (request, from_index, name) = self.prepare(args)?;
         let times: Vec<u64> = request.candles.iter().map(|c| c.ts).collect();
+        let bars: Vec<(u64, f64)> = request.candles.iter().map(|c| (c.ts, c.close)).collect();
         let report = backtest(request)?;
-        let mut summary = summary_of(&report, from_index, &name);
+        let mut summary = summary_of(&report, from_index, &name, &bars);
+        if let Some(label) = args.get("label") {
+            summary["label"] = label.clone();
+        }
         // Which bars these were, as a span with no end moves on as new bars close.
         summary["first_bar"] = json!(times.get(from_index).copied().map(time_text));
         summary["last_bar"] = json!(times.last().copied().map(time_text));
@@ -472,21 +681,25 @@ impl Lab {
                     summary["win_rate"],
                     summary["fees"],
                     summary["final_equity"],
+                    summary["buy_and_hold_return"],
+                    summary["sharpe"],
+                    summary["profit_factor"],
+                    summary["exposure"],
+                    summary["average_trade"],
+                    summary["warnings"].as_array().map_or(0, Vec::len),
                     null,
                 ])
             })
             .collect();
-        rows.extend(
-            failed.iter().map(|(index, error)| {
-                json!([index, null, null, null, null, null, null, null, error])
-            }),
-        );
+        rows.extend(failed.iter().map(|(index, error)| {
+            let mut row = vec![Value::Null; BATCH_COLUMNS.len()];
+            row[0] = json!(index);
+            row[BATCH_COLUMNS.len() - 1] = json!(error);
+            Value::Array(row)
+        }));
         rows.truncate(limit_of(args, DEFAULT_ROWS));
         Ok(json!({
-            "columns": [
-                "index", "run_id", "net_return", "max_drawdown", "trades", "win_rate", "fees",
-                "final_equity", "error",
-            ],
+            "columns": BATCH_COLUMNS,
             "rows": rows,
             "total": total,
             "succeeded": done,
@@ -724,6 +937,38 @@ impl Lab {
             })
             .collect();
         ids.sort_unstable_by(|a, b| b.cmp(a));
+        // Searching means reading them all, which only asking for it costs.
+        let label = args.get("label").and_then(Value::as_str);
+        let sort = args.get("sort").and_then(Value::as_str);
+        if label.is_some() || sort.is_some() {
+            let mut briefs: Vec<Value> = ids
+                .iter()
+                .filter_map(|(_, _, id)| read_summary(&dir, id))
+                .filter(|brief| label.is_none_or(|label| brief["summary"]["label"] == label))
+                .collect();
+            if let Some(sort) = sort {
+                let ascending = args
+                    .get("ascending")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let figure = |brief: &Value| brief["summary"][sort].as_f64();
+                // Those without the figure go last, whichever way it's sorted.
+                briefs.sort_by(|a, b| match (figure(a), figure(b)) {
+                    (Some(a), Some(b)) if ascending => a.total_cmp(&b),
+                    (Some(a), Some(b)) => b.total_cmp(&a),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                });
+            }
+            return Ok(page_of(
+                &["run_id", "created", "summary"],
+                briefs.len(),
+                args,
+                LISTED_RUNS,
+                |i| without_request(briefs[i].clone()),
+            ));
+        }
         Ok(page_of(
             &["run_id", "created", "summary"],
             ids.len(),
@@ -731,11 +976,7 @@ impl Lab {
             LISTED_RUNS,
             |i| {
                 let id = &ids[i].2;
-                let mut brief = read_summary(&dir, id).unwrap_or_else(|| json!({"run_id": id}));
-                if let Some(brief) = brief.as_object_mut() {
-                    brief.remove("request");
-                }
-                brief
+                without_request(read_summary(&dir, id).unwrap_or_else(|| json!({"run_id": id})))
             },
         ))
     }
@@ -792,6 +1033,7 @@ impl Lab {
         let (mut request, _, _) = self.prepare(args)?;
         let workers = self.workers_for(&request.strategy);
         let candles = std::mem::take(&mut request.candles);
+        let market: Vec<(u64, f64)> = candles.iter().map(|c| (c.ts, c.close)).collect();
         let from = request.trade_from;
         let from_index = candles.partition_point(|c| c.ts < from);
         let blocks = pick_blocks(
@@ -823,14 +1065,27 @@ impl Lab {
             .and_then(|settings| settings.get("capital"))
             .and_then(Value::as_f64)
             .unwrap_or_else(|| Settings::default().capital);
+        // What the market itself did over each block.
+        let held_over = |from: u64, to: u64| {
+            let first = market.partition_point(|bar| bar.0 < from);
+            let last = market.partition_point(|bar| bar.0 <= to).saturating_sub(1);
+            market[last].1 / market[first.min(last)].1 - 1.0
+        };
+        let mut held: Vec<f64> = summary
+            .blocks
+            .iter()
+            .map(|block| held_over(block.from, block.to))
+            .collect();
         let rows: Vec<Value> = summary
             .blocks
             .iter()
             .zip(&summary.trades)
-            .map(|(block, trades)| {
+            .zip(&held)
+            .map(|((block, trades), held)| {
                 let mut row = json!({
                     "from": time_text(block.from),
                     "to": time_text(block.to),
+                    "buy_and_hold_return": held,
                     "return": block.stats.return_,
                     "fell": block.stats.drawdown,
                     "fills": block.fills,
@@ -847,9 +1102,12 @@ impl Lab {
                 row
             })
             .collect();
+        held.sort_by(f64::total_cmp);
+        let median_held = held.get(held.len() / 2).copied();
         Ok(json!({
             "profitable": summary.profitable,
             "median": summary.median,
+            "median_buy_and_hold": median_held,
             "best": summary.best,
             "worst": summary.worst,
             "worst_dates": [time_text(summary.worst_dates.0), time_text(summary.worst_dates.1)],
@@ -857,52 +1115,131 @@ impl Lab {
         }))
     }
 
+    /// Picks values on one stretch, tests them on the next, and slides along. Every unseen stretch
+    /// starts from the same capital, as there's no compounding, so their returns add up.
+    pub(crate) fn run_walk_forward(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {
+        let (mut request, _, _) = self.prepare(args)?;
+        let workers = self.workers_for(&request.strategy);
+        let chosen = optimize_choice(args, false)?;
+        if chosen.score == ScoreBy::RandomBlocks {
+            return Err("`score`: walk-forward takes backtest or monte-carlo".into());
+        }
+        let grid = Grid::build(&chosen, &request.strategy.info.params)?;
+        let candles = std::mem::take(&mut request.candles);
+        request.ticks = None;
+        request.fill_bars = None;
+        let from = candles.partition_point(|c| c.ts < request.trade_from);
+        let windows = number(args, "windows", WALK_WINDOWS).max(1) as usize;
+        let ratio = args
+            .get("train_ratio")
+            .and_then(Value::as_f64)
+            .filter(|ratio| *ratio > 0.0)
+            .unwrap_or(WALK_RATIO);
+        let bars = candles.len().saturating_sub(from);
+        let test = (bars as f64 / (windows as f64 + ratio)) as usize;
+        let train = (test as f64 * ratio) as usize;
+        if test < 2 || train < 2 {
+            return Err(format!(
+                "{bars} bars is too few for {windows} windows; widen the span or ask for fewer"
+            ));
+        }
+        // The last unseen stretch ends on the last bar.
+        let first = candles.len() - windows * test - train;
+        job.total
+            .store(windows * (grid.cells() + 1), Ordering::Relaxed);
+        let warm_up = WARM_UP_BARS as usize;
+        let mut finished = 0;
+        let mut rows = Vec::with_capacity(windows);
+        let (mut unseen_total, mut held_total) = (0.0, 0.0);
+        let (mut trades, mut profitable, mut deepest) = (0, 0, 0.0_f64);
+        for window in 0..windows {
+            let train_start = first + window * test;
+            let train_end = train_start + train;
+            let test_end = train_end + test;
+            let warm_from = train_start.saturating_sub(warm_up);
+            let mut picking = request.clone();
+            picking.trade_from = candles[train_start].ts;
+            let batch = OptimizeJob {
+                request: picking,
+                candles: candles[warm_from..train_end].to_vec(),
+                grid: grid.clone(),
+                score: chosen.score,
+                split: None,
+                blocks: Vec::new(),
+                warm_up,
+                runs: number(args, "runs", 1_000) as u32,
+                ruin_at: args
+                    .get("ruin_percent")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(50.0)
+                    / 100.0,
+                seed: number(args, "seed", 0),
+                workers,
+                stop: Arc::clone(&job.stop),
+            };
+            let found = batch.run(&|done| job.done.store(finished + done, Ordering::Relaxed))?;
+            finished += grid.cells();
+            let scores: Vec<Option<f64>> = found.outcomes.iter().map(Outcome::score).collect();
+            let times = json!({
+                "train_from": time_text(candles[train_start].ts),
+                "test_from": time_text(candles[train_end].ts),
+                "test_to": time_text(candles[test_end - 1].ts),
+            });
+            let mut row = times;
+            let Some(&(cell, _)) = rank(&scores, grid.width()).first() else {
+                row["status"] = json!("nothing-to-pick");
+                rows.push(row);
+                continue;
+            };
+            let mut trying = request.clone();
+            for (index, value) in grid.values_of(cell) {
+                trying.strategy.set_param(index, value)?;
+            }
+            trying.candles = candles[train_end.saturating_sub(warm_up)..test_end].to_vec();
+            trying.trade_from = candles[train_end].ts;
+            let report = backtest(trying)?;
+            finished += 1;
+            job.done.store(finished, Ordering::Relaxed);
+            let capital = report.starting_balance;
+            let unseen = report.equity.last().copied().unwrap_or(capital) / capital - 1.0;
+            let made = round_trips(&report).len();
+            // From the close before the stretch's first order could fill, as a strategy's does.
+            let held = candles[test_end - 1].close / candles[train_end].close - 1.0;
+            held_total += held;
+            row["buy_and_hold_return"] = json!(held);
+            unseen_total += unseen;
+            trades += made;
+            profitable += usize::from(unseen > 0.0);
+            deepest = deepest.max(report.max_drawdown.abs());
+            row["values"] = names_of(&grid, cell);
+            row["picked_score"] = json!(scores[cell]);
+            row["unseen_return"] = json!(unseen);
+            row["fell"] = json!(report.max_drawdown.abs());
+            row["trades"] = json!(made);
+            row["status"] = json!("tested");
+            rows.push(row);
+        }
+        Ok(json!({
+            "windows": rows,
+            "unseen_return": unseen_total,
+            "buy_and_hold_return": held_total,
+            "profitable_windows": profitable,
+            "deepest_fall": deepest,
+            "trades": trades,
+            "train_bars": train,
+            "test_bars": test,
+        }))
+    }
+
     pub(crate) fn run_optimize(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {
         let (mut request, _, _) = self.prepare(args)?;
         let workers = self.workers_for(&request.strategy);
-        let variables = args
-            .get("variables")
-            .and_then(Value::as_array)
-            .filter(|v| (1..=2).contains(&v.len()))
-            .ok_or("`variables` should be a list of one or two")?;
-        let parse_variable = |value: &Value| -> Result<Variable, String> {
-            let figure = |name: &str| {
-                value[name]
-                    .as_f64()
-                    .ok_or_else(|| format!("`variables`: `{name}` is missing from {value}"))
-            };
-            Ok(Variable {
-                name: value["name"]
-                    .as_str()
-                    .ok_or_else(|| format!("`variables`: `name` is missing from {value}"))?
-                    .to_owned(),
-                min: figure("min")?,
-                max: figure("max")?,
-                step: figure("step")?,
-            })
-        };
-        let score = match args.get("score").and_then(Value::as_str) {
-            None | Some("backtest") => ScoreBy::Backtest,
-            Some("monte-carlo") => ScoreBy::MonteCarlo,
-            Some("random-blocks") => ScoreBy::RandomBlocks,
-            Some(other) => {
-                return Err(format!(
-                    "`score`: `{other}` isn't backtest, monte-carlo or random-blocks"
-                ));
-            }
-        };
         let hold_out = args
             .get("hold_out")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let chosen = OptimizeSettings {
-            variables: [
-                Some(parse_variable(&variables[0])?),
-                variables.get(1).map(parse_variable).transpose()?,
-            ],
-            score,
-            hold_out,
-        };
+        let chosen = optimize_choice(args, hold_out)?;
+        let score = chosen.score;
         let grid = Grid::build(&chosen, &request.strategy.info.params)?;
         let candles = std::mem::take(&mut request.candles);
         let from = candles.partition_point(|c| c.ts < request.trade_from);
@@ -942,17 +1279,7 @@ impl Lab {
         let total = batch.total();
         job.total.store(total, Ordering::Relaxed);
         let found = batch.run(&|done| job.done.store(done, Ordering::Relaxed))?;
-        let names_of = |cell: usize| -> Value {
-            let mut names = Map::new();
-            let mut values = found.grid.values_of(cell).into_iter();
-            if let Some((_, value)) = values.next() {
-                names.insert(found.grid.first.name.clone(), json!(value));
-            }
-            if let (Some(second), Some((_, value))) = (&found.grid.second, values.next()) {
-                names.insert(second.name.clone(), json!(value));
-            }
-            Value::Object(names)
-        };
+        let names_of = |cell: usize| names_of(&found.grid, cell);
         let mut rows: Vec<Value> = found
             .outcomes
             .iter()

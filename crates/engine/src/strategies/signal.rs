@@ -41,6 +41,15 @@ pub(crate) struct SignalStrategy {
     size_precision: u8,
     /// Signed position in base units, kept from fills.
     position: f64,
+    /// What the position now held was entered at.
+    entry_price: f64,
+    /// How much of the order sent is still to fill. With latency an order can still be on its way
+    /// at the next bar, and asking again then would double the position.
+    unfilled: f64,
+    /// What was asked for while an order was on its way, to do once it's filled.
+    deferred: Option<i8>,
+    /// Orders refused, and why the first was, for the report.
+    refused: Rc<RefCell<(usize, Option<String>)>>,
     /// Shared with the engine thread that runs this strategy; collected after the run.
     fills: Rc<RefCell<Vec<RawFill>>>,
     /// Set when the signal fails; the strategy stops trading and the run reports it.
@@ -69,6 +78,10 @@ impl SignalStrategy {
             notional,
             size_precision,
             position: 0.0,
+            entry_price: f64::NAN,
+            unfilled: 0.0,
+            deferred: None,
+            refused: Rc::default(),
             fills,
             failure,
             long_only: false,
@@ -80,6 +93,15 @@ impl SignalStrategy {
 
     /// Trades by `rules`, and only on bars closing after `trade_from`; earlier ones warm the
     /// signal up.
+    /// Counts refused orders in `refused`.
+    pub(crate) fn counting_refusals(
+        mut self,
+        refused: Rc<RefCell<(usize, Option<String>)>>,
+    ) -> Self {
+        self.refused = refused;
+        self
+    }
+
     pub(crate) fn ruled(mut self, rules: TradingRules, trade_from: UnixNanos) -> Self {
         self.rules = rules;
         self.trade_from = trade_from;
@@ -96,9 +118,30 @@ impl SignalStrategy {
         self
     }
 
+    /// An order won't fill: says so, and lets the next go.
+    fn refuse(&mut self, message: String) {
+        self.unfilled = 0.0;
+        let mut refused = self.refused.borrow_mut();
+        refused.0 += 1;
+        refused.1.get_or_insert_with(|| message.clone());
+        drop(refused);
+        self.report(message);
+    }
+
     fn report(&mut self, message: String) {
         if let Some(watcher) = &mut self.watcher {
             watcher.problem(message);
+        }
+    }
+
+    /// Which way the position is: `1`, `-1` or `0`.
+    fn held(&self) -> i8 {
+        if self.position > 0.0 {
+            1
+        } else if self.position < 0.0 {
+            -1
+        } else {
+            0
         }
     }
 
@@ -128,7 +171,14 @@ nautilus_strategy!(SignalStrategy, {
             OrderSide::Sell => Side::Sell,
             _ => Side::Buy,
         };
+        let before = self.position;
         self.position += if side == Side::Buy { qty } else { -qty };
+        self.unfilled = (self.unfilled - qty).max(0.0);
+        if self.position == 0.0 {
+            self.entry_price = f64::NAN;
+        } else if before == 0.0 || before.is_sign_positive() != self.position.is_sign_positive() {
+            self.entry_price = event.last_px.as_f64();
+        }
         let fill = RawFill {
             ts: event.ts_event.as_u64(),
             side,
@@ -143,11 +193,11 @@ nautilus_strategy!(SignalStrategy, {
     }
 
     fn on_order_rejected(&mut self, event: OrderRejected) {
-        self.report(format!("order rejected: {}", event.reason));
+        self.refuse(format!("order rejected: {}", event.reason));
     }
 
     fn on_order_denied(&mut self, event: OrderDenied) {
-        self.report(format!("order denied: {}", event.reason));
+        self.refuse(format!("order denied: {}", event.reason));
     }
 });
 
@@ -191,7 +241,11 @@ impl DataActor for SignalStrategy {
         if self.failure.borrow().is_some() {
             return Ok(());
         }
-        let wanted = self.signal.borrow_mut().on_bar(&candle);
+        let wanted = {
+            let mut signal = self.signal.borrow_mut();
+            signal.holding(self.held(), self.entry_price);
+            signal.on_bar(&candle)
+        };
         if let Some(watcher) = &mut self.watcher {
             watcher.bar(&candle);
         }
@@ -207,16 +261,14 @@ impl DataActor for SignalStrategy {
         if candle.ts <= self.trade_from {
             return Ok(());
         }
-        let held = if self.position > 0.0 {
-            1
-        } else if self.position < 0.0 {
-            -1
-        } else {
-            0
-        };
-        let Some(target) = self.rules.target(wanted, held, candle.ts) else {
+        let target = self.rules.target(wanted, self.held(), candle.ts);
+        let Some(target) = target.or(self.deferred.take()) else {
             return Ok(());
         };
+        if self.unfilled > 0.0 {
+            self.deferred = Some(target);
+            return Ok(());
+        }
         let target = if self.long_only {
             target.max(0)
         } else {
@@ -233,6 +285,7 @@ impl DataActor for SignalStrategy {
         if qty.is_zero() {
             return Ok(());
         }
+        self.unfilled = qty.as_f64();
         let side = if delta > 0.0 {
             OrderSide::Buy
         } else {

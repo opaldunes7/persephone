@@ -16,6 +16,11 @@ pub trait Signal {
     /// Returns a message if the rule failed (e.g. a plugin crashed); the backtest stops.
     fn on_bar(&mut self, bar: &Candle) -> Result<Option<i8>, String>;
 
+    /// What's really held, told before each bar: `1` long, `-1` short or `0` flat, and what it
+    /// entered at. A rule that cares needs this, as what it asks for isn't always what happens:
+    /// signals are dropped while warming up, and rules may invert or refuse them.
+    fn holding(&mut self, _position: i8, _entry_price: f64) {}
+
     /// What the report should say about this run once it's over (a plugin's AI use, say).
     fn notes(&mut self) -> Vec<Note> {
         Vec::new()

@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! persephone-lab tools [--markdown]        What there is
-//! persephone-lab call NAME [ARGS-AS-JSON]  Call one tool
+//! persephone-lab call NAME [ARGS-AS-JSON | @FILE]  Call one tool
 //! persephone-lab mcp                       Serve agents over MCP on stdio
 //! persephone-lab serve [--port N]          Serve over local HTTP (default port 8765)
 //! persephone-lab prune --older-than 30d    Remove Lab's old saved runs and job files
@@ -15,7 +15,7 @@ use std::{process::ExitCode, time::Duration};
 use persephone_lab::{Lab, Paths, http, mcp, tools};
 use serde_json::{Value, json};
 
-const USAGE: &str = "usage: persephone-lab [--data DIR] tools [--markdown] | call NAME [ARGS-AS-JSON] | mcp | serve [--port N] | prune --older-than 30d";
+const USAGE: &str = "usage: persephone-lab [--data DIR] tools [--markdown] | call NAME [ARGS-AS-JSON | @FILE] | mcp | serve [--port N] | prune --older-than 30d";
 /// The command line waits as long as a job takes.
 const WAIT_FOR_EVER: f64 = 86_400.0;
 
@@ -49,8 +49,16 @@ fn run() -> Result<(), String> {
         Some("call") => {
             let name = args.get(1).ok_or(USAGE)?;
             let mut call: Value = match args.get(2) {
-                Some(text) => serde_json::from_str(text)
-                    .map_err(|e| format!("the arguments aren't JSON: {e}"))?,
+                // From a file, as a long list can be more than a command line takes.
+                Some(text) => {
+                    let text = match text.strip_prefix('@') {
+                        Some(path) => std::fs::read_to_string(path)
+                            .map_err(|e| format!("couldn't read {path}: {e}"))?,
+                        None => text.clone(),
+                    };
+                    serde_json::from_str(&text)
+                        .map_err(|e| format!("the arguments aren't JSON: {e}"))?
+                }
                 None => json!({}),
             };
             let job = tools::tools()

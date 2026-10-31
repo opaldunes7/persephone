@@ -18,14 +18,16 @@ use persephone_plugin_host::Plugin;
 use persephone_research::{
     logic,
     results::{SavedResult, load_results, results_dir},
-    settings::Settings,
 };
 use serde_json::{Value, json};
 
 use crate::{
     Lab,
     data::MarketArgs,
-    new_id, now_ms, time_text,
+    jobs::check_id,
+    new_id, now_ms,
+    runs::read_settings,
+    time_text,
     tools::{DEFAULT_ROWS, limit_of, page, text},
 };
 
@@ -441,8 +443,51 @@ impl Lab {
         json!({"valid": args.get("logic").is_some() && error.is_none(), "error": error, "allowed": allowed})
     }
 
+    /// Adds a program answering over a socket: it has to answer before it goes anywhere the app
+    /// would pick it up.
+    fn install_external(&self, name: &str, address: &str) -> Result<Value, String> {
+        check_id(name)
+            .map_err(|_| format!("`name`: `{name}` should be letters, digits, - or _"))?;
+        let dest = self.paths.plugins.join(format!("{name}.external"));
+        if dest.exists() {
+            return Err(format!(
+                "{} already exists; Lab won't overwrite it",
+                dest.display()
+            ));
+        }
+        let trying = self.paths.lab().join(new_id("external"));
+        fs::create_dir_all(&trying).map_err(|e| e.to_string())?;
+        let source = trying.join(format!("{name}.external"));
+        let tried = fs::write(&source, format!("{address}\n"))
+            .map_err(|e| e.to_string())
+            .and_then(|()| self.host.load(&source));
+        let installed = tried.and_then(|plugin| {
+            let id = match plugin {
+                Plugin::Indicator(plugin) => plugin.id.clone(),
+                Plugin::Strategy(plugin) => plugin.id.clone(),
+            };
+            fs::create_dir_all(&self.paths.plugins).map_err(|e| e.to_string())?;
+            fs::copy(&source, &dest).map_err(|e| e.to_string())?;
+            Ok(id)
+        });
+        let _ = fs::remove_dir_all(&trying);
+        let id = installed?;
+        self.reload_plugins();
+        Ok(json!({"id": id, "kind": "strategy", "path": dest}))
+    }
+
     pub(crate) fn install_plugin(&self, args: &Value) -> Result<Value, String> {
-        let source = Path::new(text(args, "path")?);
+        if let (Some(name), Some(address)) = (
+            args.get("name").and_then(Value::as_str),
+            args.get("address").and_then(Value::as_str),
+        ) {
+            return self.install_external(name, address);
+        }
+        let source = Path::new(
+            args.get("path")
+                .and_then(Value::as_str)
+                .ok_or("it needs `path`, or `name` and `address`")?,
+        );
         let name = source
             .file_name()
             .filter(|_| source.extension().is_some_and(|ext| ext == "wasm"))
@@ -487,13 +532,12 @@ impl Lab {
     pub(crate) fn save_result(&self, args: &Value) -> Result<Value, String> {
         let strategy = args.get("strategy").cloned().unwrap_or(Value::Null);
         self.resolve(&strategy)?;
-        let settings = args
-            .get("settings")
-            .map(|value| {
-                serde_json::from_value::<Settings>(value.clone())
-                    .map_err(|e| format!("`settings`: {e}"))
-            })
-            .transpose()?;
+        if strategy.get("positions").is_some() {
+            return Err(
+                "`strategy`: a list of positions only fits the bars it was made for, so it can't be saved for the app's charts".into(),
+            );
+        }
+        let settings = args.get("settings").map(read_settings).transpose()?;
         let summary = match args.get("run_id").and_then(Value::as_str) {
             Some(id) => self.load_run(id)?["summary"].clone(),
             None => Value::Null,

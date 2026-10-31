@@ -38,9 +38,12 @@ It answers with a `run_id` and a `summary`. Read the rest by that id:
 
 How a backtest works, which decides what its numbers mean.
 
-- **Decisions come at a bar's close.** A strategy sees one closed bar at a time and can't look ahead.
-- **Fills:** a market order, at that bar's close, plus any slippage and spread. With `precision: "high"`,
-  orders fill on what happened next inside the bars instead: ticks, or 1-minute bars.
+- **Decisions come at a bar's close.** A strategy sees one closed bar at a time and can't look ahead, except
+  a list of `positions`, which holds whatever you put in it.
+- **Fills:** a market order, at that bar's close, plus any slippage and spread. With `latency`, it arrives after
+  that close, so on bars it fills at the next bar's close, which is a whole bar's delay however small the latency.
+  With `precision: "high"`, it fills on what's next inside the bars instead: ticks, or 1-minute bars. So `high` only
+  changes results alongside `latency`, or on ticks, and otherwise just takes longer.
 - **A strategy says what position it wants:** long, short or flat. One position at a time, in one
   direction; reversing is one order, twice the size. There are no stops or limit orders.
 - **Size:** each position is worth capital × `Size %` × leverage, worked out from the **starting**
@@ -52,7 +55,22 @@ How a backtest works, which decides what its numbers mean.
   trade, and they aren't in the results.
 - **At the end:** a position still open counts at the last close, with no closing fee.
 
-A strategy is `{"builtin": id}`, `{"plugin": id}` or `{"logic": tree}`, each with optional `"params"`.
+**What backtests leave out,** so they flatter a strategy:
+
+- A decision and its fill share one close. Real orders go after it, so set `slippage` or `latency`. Slippage is in
+  ticks, so the same number means different things on different markets: a tick is `10^-price_precision`, from
+  `get_instrument`.
+- Stops are checked at closes too, so one fills at the close that broke it, which may be well past its level.
+- Shorts are allowed on spot markets, with no borrowing or funding costs. Paper and live spot accounts can't short.
+- No margin calls or financing costs, and any size fills in full, while the account can pay. If it can't, as with
+  `Size %` near 100 or high leverage, the order's refused, the position stays as it was, and the summary's `warnings`
+  says so. Such a result doesn't follow the strategy: don't trust it.
+- Sizes don't compound, so a strategy trading in and out falls behind `buy_and_hold_return` as profits build. Compare
+  at `Size %` 100, or work out compounded returns from `get_trades`.
+- One market at a time: there are no portfolios or limit orders.
+
+A strategy is `{"builtin": id}`, `{"plugin": id}`, `{"logic": tree}` or `{"positions": list}`, each with optional
+`"params"`.
 `list_strategies` lists them, and `describe_strategy` gives one's parameters and limits.
 
 ## logic
@@ -85,6 +103,32 @@ Strategies as JSON, tested straight away with nothing to compile. `validate_logi
 - **Limits:** 500 nodes, and look-backs up to 10,000 bars.
 - **Parameters** can be changed per call with `"params"` beside `"logic"`, and optimized by name.
 
+**Now:** `position` is what's really held (1, -1 or 0), `entry_price` what it filled at (not ready while flat),
+and `bars_held` the bars since (1 on the bar after its fill, 0 while flat). `high_since_entry` and `low_since_entry`
+are the furthest it's gone since, for trailing stops, also not ready while flat. `hour` and `weekday` (Monday is 0) are
+UTC, at the bar's close. So exits work like this:
+
+```json
+{"tool": "run_backtest", "args": {
+  "symbol": "BTCUSDT", "bars": "1h", "from": "2024-01-01", "to": "2024-03-01",
+  "strategy": {"logic": {
+    "name": "Breakout with a stop, out after two days, weekdays only",
+    "params": {"stop": 0.97, "most_bars": 48},
+    "long": {"and": [
+      {"crosses_above": ["close", {"ago": {"of": {"highest": {"length": 50}}, "bars": 1}}]},
+      {"lt": ["weekday", 5]}
+    ]},
+    "flat": {"or": [
+      {"lt": ["close", {"mul": ["entry_price", "$stop"]}]},
+      {"ge": ["bars_held", "$most_bars"]}
+    ]}
+  }}
+}}
+```
+
+`flat` only counts on a bar where `long` and `short` are both true or both false, so write an entry that fires once,
+like a cross. An entry that stays true would keep the position open past its stop.
+
 ## settings
 
 Costs and rules go in `settings` on `run_backtest`, `run_random_blocks` and `run_optimize`. Give only what
@@ -112,14 +156,15 @@ differs from the defaults, which `get_settings` returns as exact JSON.
 }}
 ```
 
-Most are `{"on": bool, "value": ...}`, and do nothing while off.
+Most are `{"on": bool, "value": ...}`, and do nothing while off. A setting that doesn't exist, or one with no `on`, is
+an error.
 
 | Setting | Value |
 |---|---|
 | `stock` | `false` turns all of the below off at once, except `capital` and `precision` |
 | `capital` | Starting cash, in the quote currency |
 | `commission` | `{"percent": 0.1}` of each fill, or `{"per-order": 1.5}` flat, instead of the market's fee |
-| `slippage` | Ticks every market order fills worse |
+| `slippage` | Ticks every market order fills worse. See `backtests` on what a tick is |
 | `spread` | Ticks of spread assumed for bars and trades |
 | `latency` | Milliseconds before orders reach the venue |
 | `leverage` | A multiple of position size, 1 or more. Margin calls aren't simulated |
@@ -138,6 +183,13 @@ What every number means, the same everywhere.
 - **Returns and falls are fractions,** so `0.05` is 5%, unless the name ends in `_percent`.
 - **Falls are positive:** `max_drawdown`, `fell` and `drawdown` of `0.1` mean 10% down from a peak.
 - **Money** (`profit`, `fees`, `final_equity`) is in the market's quote currency.
+- **`buy_and_hold_return`** is what the market did, from the first bar's close that could trade to the last.
+- **`sharpe`** is the Sharpe ratio of daily equity returns, with no risk-free rate, over 365 days a year. It's null
+  under two days, or if nothing moved. Equity includes capital not in the position, so it falls with `Size %`:
+  compare runs of the same size.
+- **`profit_factor`** is winning trades' profit over losing trades' loss, null if there were no losses.
+- **`exposure`** is the fraction of bars that began with a position open.
+- **`average_trade`** is net profit per trade, in the quote currency, after fees.
 - **Times:** `ts` is nanoseconds since 1970, and `time` is `YYYY-MM-DD HH:MM`. All are UTC.
 - **A bar's `ts` is when it opens.** Its order fills at its close.
 - **`from` and `to`** take `2024-01-31`, `2024-01-31 09:30` or nanoseconds. `to` isn't included.
@@ -199,6 +251,10 @@ Monte Carlo draws a finished run's trades at random. It needs at least 10 trades
 `median`, `low` and `high` are returns (5th to 95th percentile), `drawdown` is the 95th percentile fall,
 and `actual` shows where the real order of trades ranks. `show_run` lists what one run drew.
 
+`actual.fell` works from closed trades, so it can be less than the run's `max_drawdown`, which falls bar by bar. This
+shows the range of luck in those trades. It doesn't show whether the entries beat chance: for that, see
+below.
+
 Random blocks backtests random stretches of a span, and needs a span longer than one block. Orders fill on
 the chart's bars whatever the `precision`.
 
@@ -227,6 +283,38 @@ Optimize tries a range of one or two parameters, by the names `describe_strategy
 - **`hold_out`** scores on the span's first 70% and gives the top 5's `unseen_return` on the last 30%. It's
   off unless asked for.
 - **Values with no score:** `status` says `too-few-trades` or `failed`, and the rest carry on.
+
+Walk-forward picks the best values on a stretch, tests them on the next, unseen, and slides along.
+
+```json
+{"tool": "run_walk_forward", "args": {
+  "symbol": "BTCUSDT", "bars": "1h", "from": "2024-01-01", "to": "2024-07-01",
+  "strategy": {"builtin": "ema-cross", "params": {"Slow": 40}},
+  "variables": [{"name": "Fast", "min": 5, "max": 15, "step": 5}],
+  "windows": 4, "train_ratio": 3
+}}
+```
+
+Each of `windows` says what it picked, its `unseen_return`, and the market's `buy_and_hold_return` over it. The
+top-level figures add them up, as each stretch starts from the same capital. It fills on the chart's bars whatever the `precision`.
+
+**Against chance:** backtest random positions at about your strategy's trade count, many times, and see how often
+they match it. Make the lists yourself from bars' `ts`, as Lab has no such tool, a different random one per run:
+
+```json
+{"tool": "run_backtests", "args": {
+  "defaults": {"symbol": "BTCUSDT", "bars": "1h", "label": "random-entries"},
+  "runs": [
+    {"from": "2024-01-01", "to": "2024-02-01",
+     "strategy": {"positions": [[1704153600000000000, 1], [1704240000000000000, 0]]}},
+    {"from": "2024-01-01", "to": "2024-02-01",
+     "strategy": {"positions": [[1704326400000000000, -1], [1704412800000000000, 0]]}}
+  ]
+}}
+```
+
+`list_runs` then finds and sorts them, with `{"label": "random-entries", "sort": "net_return"}`. Give any backtest a
+`label` to keep experiments apart, and sort by any summary figure.
 
 ## jobs
 
@@ -267,11 +355,32 @@ every call made to Lab, newest first.
 
 ## extending
 
-Adding markets, compiled strategies and models.
+Adding markets, strategies and models.
 
-`import_data` and `fetch_archive` add markets, `install_plugin` adds compiled strategies
-and indicators, `list_indicators` lists both kinds, and `run_model` runs an ONNX model from `list_models`,
-for models trained elsewhere.
+`import_data` and `fetch_archive` add markets. `list_indicators` lists built-in and plugin indicators, and `run_model`
+runs an ONNX model from `list_models`.
+
+**Using a model you trained, three ways, simplest first:**
+
+1. **A list of positions.** Export bars with `export_data`, make predictions, and backtest them as
+   `{"positions": [[ts, 1], [ts, -1], [ts, 0]]}`. Each `ts` is a bar's, from `get_bars` or the export: when it opens.
+   It fills at that bar's close and holds until the next entry, so a span or random block starting later takes up
+   what's wanted by then. It runs in parallel, but nothing checks the list only used what was known by then:
+   train and predict on separate stretches. It can't go in `save_result`, as it only fits the bars it was made for.
+2. **A program over a socket,** for a full Python stack. It's told one bar at a time, so it can't see ahead, but
+   backtests run one at a time. Listen on a local socket, with a thread per connection, answering one JSON line per
+   request:
+
+   | It's sent | It answers |
+   |---|---|
+   | `{"type":"describe"}` | `{"name":"…","description":"…","params":[{"name":"Fast","default":10,"min":1,"max":100}]}` |
+   | `{"type":"start","params":[10.0]}` | `{}` |
+   | `{"type":"bar","ts":…,"open":…,"high":…,"low":…,"close":…,"volume":…}` | `{"target":1}`, `-1` or `0` |
+   | `{"type":"end"}` | `{}` |
+
+   Any answer may be `{"error":"…"}`, which stops the run. Here `ts` is the bar's close. Add it while it's running
+   with `install_plugin` and a `name` and `address`, then use it as `{"plugin": id}`.
+3. **A compiled plugin,** by `install_plugin` and a `.wasm` file's `path`.
 
 ## limits
 

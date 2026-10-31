@@ -38,7 +38,7 @@ use nautilus_model::{
 };
 use persephone_core::{
     BarSpec, Candle, InstrumentSpec, Timeframe, UnixNanos,
-    signal::{Signal, SignalFactory},
+    signal::{Note, Signal, SignalFactory},
     strategy::{StrategyKind, StrategySpec},
     tick::{TickFeed, Ticks},
     time::NANOS_PER_DAY,
@@ -179,6 +179,7 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
 
     let fills = Rc::new(RefCell::new(Vec::new()));
     let failure = Rc::new(RefCell::new(None));
+    let refused = Rc::new(RefCell::new((0, None)));
     let signal = Rc::new(RefCell::new(signal));
     engine.add_strategy(
         SignalStrategy::new(
@@ -189,7 +190,8 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
             Rc::clone(&fills),
             Rc::clone(&failure),
         )
-        .ruled(request.rules.clone(), request.trade_from),
+        .ruled(request.rules.clone(), request.trade_from)
+        .counting_refusals(Rc::clone(&refused)),
     )?;
 
     match &request.ticks {
@@ -226,6 +228,14 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
     );
     engine.dispose();
     report.notes = signal.borrow_mut().notes();
+    if let (count @ 1.., Some(first)) = (refused.borrow().0, refused.borrow().1.clone()) {
+        report.notes.push(Note {
+            text: format!(
+                "{count} orders were refused, so the position stayed as it was and these results don't follow the strategy. The first: {first}"
+            ),
+            warning: true,
+        });
+    }
     Ok(report)
 }
 
@@ -319,7 +329,9 @@ fn run_on_ticks(
 fn engine_config() -> BacktestEngineConfig {
     BacktestEngineConfig {
         logging: LoggerConfig {
-            stdout_level: log::LevelFilter::Warn,
+            // Standard output may be someone's protocol, as it is for Lab over MCP, and what
+            // Nautilus warns of that matters reaches the report.
+            stdout_level: log::LevelFilter::Off,
             ..LoggerConfig::default()
         },
         ..BacktestEngineConfig::default()

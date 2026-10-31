@@ -9,8 +9,9 @@
 //! }
 //! ```
 //!
-//! A value is a number, a bar's field (`open`, `high`, `low`, `close`, `volume`), a parameter
-//! (`$name`), or an object: an indicator (`sma`, `ema`, `rsi`, `atr`, `highest`, `lowest`, `roc`,
+//! A value is a number, a bar's field (`open`, `high`, `low`, `close`, `volume`), something about
+//! now (`position`, `entry_price`, `bars_held`, `hour`, `weekday`), a parameter (`$name`), or an
+//! object: an indicator (`sma`, `ema`, `rsi`, `atr`, `highest`, `lowest`, `roc`,
 //! `zscore`), an earlier value (`ago`), or arithmetic (`add`, `sub`, `mul`, `div`). A rule compares
 //! values (`gt`, `lt`, `ge`, `le`, `crosses_above`, `crosses_below`) or combines rules (`and`, `or`,
 //! `not`).
@@ -37,10 +38,24 @@ use sha2::{Digest, Sha256};
 
 /// The most nodes a tree may have, and the longest look-back it may ask for.
 pub const MAX_NODES: usize = 500;
+const NANOS_PER_HOUR: u64 = 3_600_000_000_000;
 pub const MAX_LENGTH: f64 = 10_000.0;
 
 /// What [`Logic::parse`] accepts, for telling an agent what it can write.
-pub const FIELDS: [&str; 5] = ["open", "high", "low", "close", "volume"];
+pub const FIELDS: [&str; 12] = [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "position",
+    "entry_price",
+    "bars_held",
+    "high_since_entry",
+    "low_since_entry",
+    "hour",
+    "weekday",
+];
 pub const INDICATORS: [&str; 8] = [
     "sma", "ema", "rsi", "atr", "highest", "lowest", "roc", "zscore",
 ];
@@ -79,6 +94,29 @@ enum Field {
     Low,
     Close,
     Volume,
+    /// What's really held: `1`, `-1` or `0`.
+    Position,
+    /// What the position was entered at; not ready while flat.
+    EntryPrice,
+    /// Bars since the position was entered: 1 on the bar after its fill, 0 while flat.
+    BarsHeld,
+    /// The furthest it's gone since entry, this bar included, for trailing stops; not ready while
+    /// flat.
+    HighSinceEntry,
+    LowSinceEntry,
+    /// The UTC hour and weekday (Monday is 0) of the bar's close, when the decision is made.
+    Hour,
+    Weekday,
+}
+
+/// What a value can see at a bar.
+struct Now<'a> {
+    bar: &'a Candle,
+    position: i8,
+    entry_price: f64,
+    bars_held: u32,
+    high_since_entry: f64,
+    low_since_entry: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -184,6 +222,13 @@ impl Parser<'_> {
                     "low" => Field::Low,
                     "close" => Field::Close,
                     "volume" => Field::Volume,
+                    "position" => Field::Position,
+                    "entry_price" => Field::EntryPrice,
+                    "bars_held" => Field::BarsHeld,
+                    "high_since_entry" => Field::HighSinceEntry,
+                    "low_since_entry" => Field::LowSinceEntry,
+                    "hour" => Field::Hour,
+                    "weekday" => Field::Weekday,
                     other => {
                         return Err(format!(
                             "{at}: `{other}` isn't a value. Use one of {FIELDS:?}, a parameter as `$name`, a number or an object"
@@ -394,6 +439,12 @@ impl Logic {
                 .as_object()
                 .ok_or_else(|| format!("params: expected an object, not {given}"))?;
             for (name, value) in given {
+                if name == "Size %" {
+                    return Err(
+                        "params.Size %: position size goes in `params` beside `logic`, not inside it"
+                            .into(),
+                    );
+                }
                 let value = value
                     .as_f64()
                     .filter(|v| v.is_finite())
@@ -509,6 +560,11 @@ impl SignalFactory for Logic {
             long: build(&self.long)?,
             short: build(&self.short)?,
             flat: build(&self.flat)?,
+            position: 0,
+            entry_price: f64::NAN,
+            bars_held: 0,
+            high_since_entry: f64::NAN,
+            low_since_entry: f64::NAN,
         }))
     }
 }
@@ -589,22 +645,30 @@ impl LiveExpr {
     }
 
     /// The value at this bar, `NaN` if it isn't ready yet.
-    fn next(&mut self, bar: &Candle) -> f64 {
+    fn next(&mut self, now: &Now<'_>) -> f64 {
         match self {
             Self::Number(value) => *value,
             Self::Field(field) => match field {
-                Field::Open => bar.open,
-                Field::High => bar.high,
-                Field::Low => bar.low,
-                Field::Close => bar.close,
-                Field::Volume => bar.volume,
+                Field::Open => now.bar.open,
+                Field::High => now.bar.high,
+                Field::Low => now.bar.low,
+                Field::Close => now.bar.close,
+                Field::Volume => now.bar.volume,
+                Field::Position => f64::from(now.position),
+                Field::EntryPrice => now.entry_price,
+                Field::BarsHeld => f64::from(now.bars_held),
+                Field::HighSinceEntry => now.high_since_entry,
+                Field::LowSinceEntry => now.low_since_entry,
+                Field::Hour => ((now.bar.ts / NANOS_PER_HOUR) % 24) as f64,
+                // 1970-01-01 was a Thursday.
+                Field::Weekday => ((now.bar.ts / (24 * NANOS_PER_HOUR) + 3) % 7) as f64,
             },
             Self::Engine(indicator, of) => {
-                let value = of.next(bar);
+                let value = of.next(now);
                 if value.is_nan() {
                     return f64::NAN;
                 }
-                indicator.update(value, bar).unwrap_or(f64::NAN)
+                indicator.update(value, now.bar).unwrap_or(f64::NAN)
             }
             Self::Window {
                 kind,
@@ -612,7 +676,7 @@ impl LiveExpr {
                 window,
                 size,
             } => {
-                let value = of.next(bar);
+                let value = of.next(now);
                 if value.is_nan() {
                     return f64::NAN;
                 }
@@ -626,7 +690,7 @@ impl LiveExpr {
                 windowed(*kind, window)
             }
             Self::Ago { of, window, bars } => {
-                window.push_back(of.next(bar));
+                window.push_back(of.next(now));
                 if window.len() > *bars + 1 {
                     window.pop_front();
                 }
@@ -637,7 +701,7 @@ impl LiveExpr {
                 }
             }
             Self::Arithmetic(arithmetic, a, b) => {
-                let (a, b) = (a.next(bar), b.next(bar));
+                let (a, b) = (a.next(now), b.next(now));
                 match arithmetic {
                     Arithmetic::Add => a + b,
                     Arithmetic::Sub => a - b,
@@ -714,7 +778,7 @@ impl LiveRule {
     }
 
     /// Whether it holds at this bar. Every part always runs, as each keeps its own history.
-    fn next(&mut self, bar: &Candle) -> bool {
+    fn next(&mut self, now: &Now<'_>) -> bool {
         match self {
             Self::Compare {
                 how,
@@ -722,7 +786,7 @@ impl LiveRule {
                 b,
                 was_above,
             } => {
-                let (a, b) = (a.next(bar), b.next(bar));
+                let (a, b) = (a.next(now), b.next(now));
                 if a.is_nan() || b.is_nan() {
                     return false;
                 }
@@ -741,18 +805,18 @@ impl LiveRule {
             Self::And(rules) => {
                 let mut holds = true;
                 for rule in rules {
-                    holds &= rule.next(bar);
+                    holds &= rule.next(now);
                 }
                 holds
             }
             Self::Or(rules) => {
                 let mut holds = false;
                 for rule in rules {
-                    holds |= rule.next(bar);
+                    holds |= rule.next(now);
                 }
                 holds
             }
-            Self::Not(rule) => !rule.next(bar),
+            Self::Not(rule) => !rule.next(now),
         }
     }
 }
@@ -761,11 +825,42 @@ struct Running {
     long: Option<LiveRule>,
     short: Option<LiveRule>,
     flat: Option<LiveRule>,
+    position: i8,
+    entry_price: f64,
+    bars_held: u32,
+    high_since_entry: f64,
+    low_since_entry: f64,
 }
 
 impl Signal for Running {
+    fn holding(&mut self, position: i8, entry_price: f64) {
+        self.bars_held = match position {
+            0 => 0,
+            _ if position == self.position => self.bars_held + 1,
+            _ => 1,
+        };
+        if position != self.position {
+            self.high_since_entry = entry_price;
+            self.low_since_entry = entry_price;
+        }
+        self.position = position;
+        self.entry_price = entry_price;
+    }
+
     fn on_bar(&mut self, bar: &Candle) -> Result<Option<i8>, String> {
-        let holds = |rule: &mut Option<LiveRule>| rule.as_mut().is_some_and(|r| r.next(bar));
+        if self.position != 0 {
+            self.high_since_entry = self.high_since_entry.max(bar.high);
+            self.low_since_entry = self.low_since_entry.min(bar.low);
+        }
+        let now = Now {
+            bar,
+            position: self.position,
+            entry_price: self.entry_price,
+            bars_held: self.bars_held,
+            high_since_entry: self.high_since_entry,
+            low_since_entry: self.low_since_entry,
+        };
+        let holds = |rule: &mut Option<LiveRule>| rule.as_mut().is_some_and(|r| r.next(&now));
         let (long, short, flat) = (
             holds(&mut self.long),
             holds(&mut self.short),
@@ -815,7 +910,64 @@ mod tests {
         };
         let parsed = parser.expr(expr, "test").unwrap();
         let mut live = LiveExpr::new(&parsed, &BTreeMap::new()).unwrap();
-        bars.iter().map(|bar| live.next(bar)).collect()
+        bars.iter()
+            .map(|bar| {
+                live.next(&Now {
+                    bar,
+                    position: 0,
+                    entry_price: f64::NAN,
+                    bars_held: 0,
+                    high_since_entry: f64::NAN,
+                    low_since_entry: f64::NAN,
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_time_is_the_bars_close_in_utc() {
+        const HOUR: u64 = 3_600_000_000_000;
+        // 2024-01-01 was a Monday.
+        let monday = 19_723 * 24 * HOUR;
+        let at = |ts| Candle {
+            ts,
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 1.0,
+        };
+        let bars = [at(monday + 9 * HOUR), at(monday + 24 * HOUR + 23 * HOUR)];
+        same(&values(&json!("hour"), &bars), &[9.0, 23.0]);
+        same(&values(&json!("weekday"), &bars), &[0.0, 1.0]);
+    }
+
+    #[test]
+    fn what_it_holds_is_what_its_told_and_not_what_it_asked_for() {
+        let bar = Candle {
+            ts: 0,
+            open: 1.0,
+            high: 1.0,
+            low: 1.0,
+            close: 1.0,
+            volume: 1.0,
+        };
+        let logic = Logic::parse(&json!({
+            "long": {"lt": ["position", 1]},
+            "flat": {"ge": ["bars_held", 2]},
+        }))
+        .unwrap();
+        let mut running = logic.create(&[]).unwrap();
+        // Told it's flat, it keeps asking.
+        running.holding(0, f64::NAN);
+        assert_eq!(running.on_bar(&bar).unwrap(), Some(1));
+        running.holding(0, f64::NAN);
+        assert_eq!(running.on_bar(&bar).unwrap(), Some(1));
+        // Told it's long, it counts bars from there, and asks to leave at two.
+        running.holding(1, 100.0);
+        assert_eq!(running.on_bar(&bar).unwrap(), None);
+        running.holding(1, 100.0);
+        assert_eq!(running.on_bar(&bar).unwrap(), Some(0));
     }
 
     fn same(a: &[f64], b: &[f64]) {

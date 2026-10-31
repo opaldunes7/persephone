@@ -11,17 +11,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
-use crate::{logic::Logic, settings::Settings};
+use crate::{logic::Logic, positions::Positions, settings::Settings};
 
 /// A strategy named in JSON, one of:
 /// - `{"builtin": "ema-cross", "params": {"Fast": 5}}`
 /// - `{"plugin": "my_strategy", "params": {...}}`
 /// - `{"logic": {...a logic tree...}, "params": {...}}`
+/// - `{"positions": [[ts, 1], [ts, -1], [ts, 0]], "params": {...}}`
 #[derive(Clone, Debug, PartialEq)]
 pub enum StrategyRef {
     BuiltIn(BuiltInStrategy),
     Plugin(String),
     Logic(Box<Logic>),
+    Positions(Positions),
 }
 
 impl StrategyRef {
@@ -32,14 +34,15 @@ impl StrategyRef {
     /// Returns a message saying what's wrong with it.
     pub fn parse(value: &Value) -> Result<Self, String> {
         let object = value.as_object().ok_or_else(|| {
-            format!("strategy: expected an object with `builtin`, `plugin` or `logic`, not {value}")
+            format!(
+                "strategy: expected an object with `builtin`, `plugin`, `logic` or `positions`, not {value}"
+            )
         })?;
-        if let Some(unknown) = object
-            .keys()
-            .find(|key| !["builtin", "plugin", "logic", "params"].contains(&key.as_str()))
-        {
+        if let Some(unknown) = object.keys().find(|key| {
+            !["builtin", "plugin", "logic", "positions", "params"].contains(&key.as_str())
+        }) {
             return Err(format!(
-                "strategy: `{unknown}` isn't one of builtin, plugin, logic or params"
+                "strategy: `{unknown}` isn't one of builtin, plugin, logic, positions or params"
             ));
         }
         if let Some(id) = object.get("builtin").and_then(Value::as_str) {
@@ -56,7 +59,10 @@ impl StrategyRef {
         if let Some(tree) = object.get("logic") {
             return Logic::parse(tree).map(|logic| Self::Logic(Box::new(logic)));
         }
-        Err("strategy: it needs `builtin`, `plugin` or `logic`".into())
+        if let Some(list) = object.get("positions") {
+            return Positions::parse(list).map(Self::Positions);
+        }
+        Err("strategy: it needs `builtin`, `plugin`, `logic` or `positions`".into())
     }
 }
 
