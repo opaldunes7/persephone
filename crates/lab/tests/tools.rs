@@ -3054,6 +3054,132 @@ fn filling_at_the_next_open_does_as_worked_by_hand() {
 }
 
 #[test]
+fn what_the_app_draws_an_agent_can_read() {
+    let (lab, _source) = binance_lab();
+    let at = |hour: u64| START + hour * HOUR;
+    let span = json!({"symbol": "BTCUSDT", "bars": "1h", "from": at(0), "to": at(2_500), "wait_seconds": 120});
+    let with_span = |more: Value| {
+        let mut args = span.clone();
+        for (key, value) in more.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        args
+    };
+    let ema = json!({"builtin": "ema-cross", "params": {"Size %": 25}});
+
+    // The line beside the equity: a quarter of the capital held in the market, worked by hand.
+    let run = lab
+        .dispatch("run_backtest", &with_span(json!({"strategy": ema})))
+        .unwrap();
+    let bars = lab
+        .dispatch(
+            "get_bars",
+            &json!({"symbol": "BTCUSDT", "bars": "1h", "from": at(0), "to": at(2_500), "limit": 3_000}),
+        )
+        .unwrap();
+    let close_at = bars["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|c| c == "close")
+        .unwrap();
+    let closes: Vec<f64> = bars["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row[close_at].as_f64().unwrap())
+        .collect();
+    let equity = lab
+        .dispatch(
+            "get_equity",
+            &json!({"run_id": run["run_id"], "limit": 3_000}),
+        )
+        .unwrap();
+    let rows = equity["rows"].as_array().unwrap();
+    assert_eq!(equity["columns"][3], "market", "{equity}");
+    assert_eq!(rows.len(), closes.len());
+    for (row, close) in rows.iter().zip(&closes) {
+        let expected = 100_000.0 * (1.0 + 0.25 * (close / closes[0] - 1.0));
+        assert!((row[3].as_f64().unwrap() - expected).abs() < 1e-6, "{row}");
+    }
+
+    // Random entries' charts: everything counted, and the backtest's figure within range.
+    let drawn = lab
+        .dispatch(
+            "run_random_entries",
+            &json!({"run_id": run["run_id"], "runs": 12, "wait_seconds": 120}),
+        )
+        .unwrap();
+    for (chart, actual) in [
+        ("return_chart", "actual_return"),
+        ("fall_chart", "actual_fell"),
+    ] {
+        let chart = &drawn[chart];
+        let counted: u64 = chart["counts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_u64().unwrap())
+            .sum();
+        assert_eq!(counted, 12, "{chart}");
+        assert_eq!(chart["actual"], drawn[actual], "{chart}");
+        let (from, to) = (
+            chart["from"].as_f64().unwrap(),
+            chart["to"].as_f64().unwrap(),
+        );
+        assert!(
+            (from..=to).contains(&chart["actual"].as_f64().unwrap()),
+            "{chart}"
+        );
+    }
+
+    // Walk-forward's chart ends where its figures say, a start for each window tested.
+    let walked = lab
+        .dispatch(
+            "run_walk_forward",
+            &with_span(json!({
+                "strategy": ema,
+                "windows": 3,
+                "variables": [{"name": "Fast", "min": 5, "max": 8, "step": 3}],
+            })),
+        )
+        .unwrap();
+    let chart = &walked["chart"];
+    let last = |line: &str| {
+        chart[line]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .as_f64()
+            .unwrap()
+    };
+    let near = |a: f64, b: f64| assert!((a - b).abs() < 1e-3, "{a} against {b}: {walked}");
+    near(
+        last("unseen_percent"),
+        walked["unseen_return"].as_f64().unwrap() * 100.0,
+    );
+    near(
+        last("market_percent"),
+        walked["buy_and_hold_return"].as_f64().unwrap() * 100.0,
+    );
+    assert_eq!(
+        chart["window_starts"].as_array().unwrap().len(),
+        3,
+        "{chart}"
+    );
+    // Thin enough not to cost an agent much of its context.
+    assert!(
+        chart["unseen_percent"].as_array().unwrap().len() <= 202,
+        "{chart}"
+    );
+    assert_eq!(
+        chart["unseen_percent"].as_array().unwrap().len(),
+        chart["market_percent"].as_array().unwrap().len(),
+    );
+}
+
+#[test]
 fn a_look_back_longer_than_the_warm_up_says_so_even_when_it_trades() {
     let (lab, _source) = binance_lab();
     let at = |hour: u64| START + hour * HOUR;

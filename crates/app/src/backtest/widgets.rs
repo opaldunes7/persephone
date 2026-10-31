@@ -15,11 +15,13 @@ use persephone_chart::{PRICE_AXIS_WIDTH, Projection, theme, ticks};
 use persephone_core::{BarSpec, Candle, UnixNanos, time::DateTime};
 
 use super::{
-    History, PanelMessage, RunColumn, SPEED_LABELS,
+    History, PanelMessage, RunColumn, SPEED_LABELS, figures,
+    figures::Histogram,
     optimize::{OptimizeResult, Outcome},
     position_of,
     robustness::{LineStats, RunRow},
     speed_at,
+    walk_forward::WalkForward,
 };
 
 const HANDLE: Color = Color::from_rgb8(0xd1, 0xd4, 0xdc);
@@ -32,6 +34,8 @@ const TIME_STRIP: f32 = 20.0;
 const LEGEND_ROOM: f32 = 44.0;
 /// The equity line, the same color as a chart's equity pane.
 const EQUITY: Color = Color::from_rgb8(0x42, 0xa5, 0xf5);
+/// The market beside it: quieter, as it's only there to compare with.
+const MARKET: Color = Color::from_rgb8(0x8a, 0x8f, 0x9c);
 
 /// Equity over the span, drawn like a chart pane as far as the playhead: grid, price axis and
 /// time labels, a dashed line at the starting capital, and falls from the running peak shaded.
@@ -46,6 +50,8 @@ pub struct Equity<'a> {
     /// How many have happened; all of them without a playback.
     pub shown: usize,
     pub start: f64,
+    /// The share of the capital a position is worth, to show the market at the same size.
+    pub market_share: f64,
 }
 
 /// The grid stays drawn between frames, as finding its labels means going through every bar.
@@ -61,10 +67,23 @@ impl Equity<'_> {
     fn projection(&self, size: Size) -> Projection {
         let count = self.values.len().min(self.candles.len());
         pane_for(
-            self.values[..count].iter().copied(),
+            self.values[..count]
+                .iter()
+                .copied()
+                .chain((0..count).map(|i| self.market_at(i))),
             self.start,
             count,
             size,
+        )
+    }
+
+    /// What holding the market with a position of the same size would be worth at bar `i`.
+    fn market_at(&self, i: usize) -> f64 {
+        figures::market_equity(
+            self.start,
+            self.market_share,
+            self.candles[0].close,
+            self.candles[i].close,
         )
     }
 
@@ -89,6 +108,17 @@ impl Equity<'_> {
 /// A pane's projection for `values` over `count` points: the scale covers them and `start`, with
 /// room above for the legend.
 fn pane_for(values: impl Iterator<Item = f64>, start: f64, count: usize, size: Size) -> Projection {
+    pane_with_room(values, start, count, size, LEGEND_ROOM)
+}
+
+/// [`pane_for`] with `room` kept clear above the lines.
+fn pane_with_room(
+    values: impl Iterator<Item = f64>,
+    start: f64,
+    count: usize,
+    size: Size,
+    room: f32,
+) -> Projection {
     let (lo, hi) = values
         .chain(std::iter::once(start))
         .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
@@ -96,7 +126,7 @@ fn pane_for(values: impl Iterator<Item = f64>, start: f64, count: usize, size: S
     let width = (size.width - PRICE_AXIS_WIDTH).max(1.0);
     let height = (size.height - TIME_STRIP).max(1.0);
     // Room above the curve, so the legend stays readable.
-    let room = LEGEND_ROOM.min(height * 0.4);
+    let room = room.min(height * 0.4);
     let headroom = (hi - lo + 2.0 * pad) * f64::from(room / (height - room));
     Projection {
         left: 0.0,
@@ -280,8 +310,32 @@ impl canvas::Program<PanelMessage> for Equity<'_> {
                 b.line_to(point(i, v));
             }
         });
+        // The market underneath, for what the strategy did against just holding.
+        let market = Path::new(|b| {
+            b.move_to(point(path[0].0, self.market_at(path[0].0)));
+            for &(i, _) in &path[1..] {
+                b.line_to(point(i, self.market_at(i)));
+            }
+        });
+        frame.stroke(
+            &market,
+            Stroke::default().with_color(MARKET).with_width(1.0),
+        );
         frame.stroke(&line, Stroke::default().with_color(EQUITY).with_width(1.5));
         axis_tag(&mut frame, &pane, last, EQUITY);
+        frame.fill_text(Text {
+            content: if self.market_share == 1.0 {
+                "Market held".to_owned()
+            } else {
+                format!("Market held at {:.0}% size", self.market_share * 100.0)
+            },
+            position: Point::new(pane.width - 8.0, 34.0),
+            color: MARKET,
+            size: theme::TEXT_SIZE.into(),
+            align_x: text::Alignment::Right,
+            align_y: alignment::Vertical::Center,
+            ..Text::default()
+        });
 
         let hovered = cursor
             .position_in(bounds)
@@ -313,6 +367,300 @@ impl canvas::Program<PanelMessage> for Equity<'_> {
             });
         }
         vec![grid, frame.into_geometry()]
+    }
+}
+
+// --- Random entries' spread -------------------------------------------------------------------
+
+/// How values are spread, as bars, with where the backtest's own lies: what Random entries found.
+pub struct Distribution<'a> {
+    pub title: &'static str,
+    pub values: &'a [f64],
+    /// The backtest's own figure, marked.
+    pub actual: f64,
+    /// The range to shade: 19 in 20 of them.
+    pub band: Option<(f64, f64)>,
+    pub median: f64,
+}
+
+/// Room kept above a chart for the heading over it.
+const CHART_TOP: f32 = 76.0;
+
+impl canvas::Program<PanelMessage> for Distribution<'_> {
+    type State = ();
+
+    fn update(
+        &self,
+        _state: &mut (),
+        event: &Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<canvas::Action<PanelMessage>> {
+        matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }))
+            .then(|| cursor.position_in(bounds))
+            .flatten()
+            .map(|_| canvas::Action::request_redraw())
+    }
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let size = bounds.size();
+        let mut frame = Frame::new(renderer, size);
+        frame.fill_rectangle(Point::ORIGIN, size, theme::BACKGROUND);
+        let found = Histogram::of(self.values, figures::HISTOGRAM_BINS, self.actual);
+        let (left, right) = (12.0, (size.width - 12.0).max(13.0));
+        let top = CHART_TOP.min(size.height * 0.5);
+        let bottom = (size.height - TIME_STRIP).max(top + 1.0);
+        let width = right - left;
+        let height = bottom - top;
+        let x = |value: f64| left + found.share_of(value) as f32 * width;
+
+        frame.fill_text(Text {
+            content: self.title.to_owned(),
+            position: Point::new(left, top - 10.0),
+            color: theme::TEXT,
+            size: theme::TEXT_SIZE.into(),
+            align_y: alignment::Vertical::Center,
+            ..Text::default()
+        });
+        if let Some((low, high)) = self.band {
+            frame.fill_rectangle(
+                Point::new(x(low), top),
+                Size::new(x(high) - x(low), height),
+                Color { a: 0.08, ..EQUITY },
+            );
+        }
+        let most = found.counts.iter().copied().max().unwrap_or(1).max(1);
+        let step = width / found.counts.len() as f32;
+        for (i, &count) in found.counts.iter().enumerate() {
+            if count > 0 {
+                let tall = (count as f32 / most as f32 * height).max(1.0);
+                frame.fill_rectangle(
+                    Point::new(left + i as f32 * step + 0.5, bottom - tall),
+                    Size::new((step - 1.0).max(1.0), tall),
+                    Color { a: 0.65, ..EQUITY },
+                );
+            }
+        }
+        frame.fill_rectangle(
+            Point::new(left, bottom),
+            Size::new(width, 1.0),
+            theme::AXIS_LINE,
+        );
+        for share in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let value = found.lo + (found.hi - found.lo) * share;
+            let align = match share {
+                0.0 => text::Alignment::Left,
+                1.0 => text::Alignment::Right,
+                _ => text::Alignment::Center,
+            };
+            grid_label(
+                &mut frame,
+                format!("{:.1}%", value * 100.0),
+                left + share as f32 * width,
+                bottom + TIME_STRIP / 2.0,
+                align,
+            );
+        }
+        let median = x(self.median).round();
+        frame.stroke(
+            &Path::line(Point::new(median, top), Point::new(median, bottom)),
+            dashed(theme::CROSSHAIR),
+        );
+        let actual = x(self.actual).round();
+        frame.stroke(
+            &Path::line(Point::new(actual, top), Point::new(actual, bottom)),
+            Stroke::default().with_color(PICKED).with_width(2.0),
+        );
+        let label = format!("Backtest {:.1}%", self.actual * 100.0);
+        let on_left = actual > left + width * 0.7;
+        frame.fill_text(Text {
+            content: label,
+            position: Point::new(if on_left { actual - 6.0 } else { actual + 6.0 }, top + 8.0),
+            color: PICKED,
+            size: theme::TEXT_SIZE.into(),
+            align_x: if on_left {
+                text::Alignment::Right
+            } else {
+                text::Alignment::Left
+            },
+            align_y: alignment::Vertical::Center,
+            ..Text::default()
+        });
+        if let Some(at) = cursor
+            .position_in(bounds)
+            .filter(|p| p.x >= left && p.x < right && p.y >= top && p.y <= bottom)
+        {
+            let bin = (((at.x - left) / step) as usize).min(found.counts.len() - 1);
+            let each = (found.hi - found.lo) / found.counts.len() as f64;
+            let from = found.lo + each * bin as f64;
+            hover_label(
+                &mut frame,
+                format!(
+                    "{:.1}% to {:.1}%: {} runs",
+                    from * 100.0,
+                    (from + each) * 100.0,
+                    found.counts[bin]
+                ),
+                at.x,
+                at.y.max(top + 30.0),
+                size.width,
+            );
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+// --- Walk-forward's unseen stretches ----------------------------------------------------------
+
+/// The unseen stretches joined end to end beside the market's, each window marked and those that
+/// lost shaded: what a walk-forward comes to, and when.
+pub struct WalkChart<'a> {
+    pub found: &'a WalkForward,
+}
+
+impl canvas::Program<PanelMessage> for WalkChart<'_> {
+    type State = ();
+
+    fn update(
+        &self,
+        _state: &mut (),
+        event: &Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<canvas::Action<PanelMessage>> {
+        matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }))
+            .then(|| cursor.position_in(bounds))
+            .flatten()
+            .map(|_| canvas::Action::request_redraw())
+    }
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let size = bounds.size();
+        let mut frame = Frame::new(renderer, size);
+        let found = self.found;
+        let unseen = &found.unseen_line;
+        let market = &found.market_line;
+        let count = unseen.len();
+        // The legend's above this chart, not over it. Just enough room for this one's own.
+        let pane = pane_with_room(
+            unseen.iter().chain(market.iter()).copied(),
+            0.0,
+            count,
+            size,
+            16.0,
+        );
+        price_grid(&mut frame, &pane);
+        let point = |i: usize, v: f64| Point::new(pane.x(i as f64), pane.y(v));
+        // Each tested window's stretch of the line, up to where the next starts.
+        let spans: Vec<(usize, usize, usize)> = found
+            .starts
+            .iter()
+            .enumerate()
+            .map(|(i, &(window, start))| {
+                let end = found
+                    .starts
+                    .get(i + 1)
+                    .map_or(count.saturating_sub(1), |next| next.1);
+                (window, start, end)
+            })
+            .collect();
+        for &(window, start, end) in &spans {
+            let (a, b) = (pane.x(start as f64), pane.x(end as f64));
+            let lost = found.windows[window]
+                .picked
+                .as_ref()
+                .is_some_and(|picked| picked.unseen_return < 0.0);
+            if lost {
+                frame.fill_rectangle(
+                    Point::new(a, 0.0),
+                    Size::new(b - a, pane.height),
+                    Color {
+                        a: 0.1,
+                        ..theme::DOWN
+                    },
+                );
+            }
+            frame.fill_rectangle(
+                Point::new(a.round(), 0.0),
+                Size::new(1.0, pane.height),
+                theme::GRID_MAJOR,
+            );
+            let day = DateTime::from_nanos(found.windows[window].test_from).date();
+            if b - a > 76.0 {
+                grid_label(
+                    &mut frame,
+                    day,
+                    a + 3.0,
+                    pane.height + TIME_STRIP / 2.0,
+                    text::Alignment::Left,
+                );
+            }
+        }
+        axes_and_start(&mut frame, &pane, 0.0);
+        for (line, color, width) in [(market, MARKET, 1.0), (unseen, EQUITY, 1.5)] {
+            if line.len() > 1 {
+                let path = Path::new(|b| {
+                    b.move_to(point(0, line[0]));
+                    for (i, &value) in line.iter().enumerate().skip(1) {
+                        b.line_to(point(i, value));
+                    }
+                });
+                frame.stroke(&path, Stroke::default().with_color(color).with_width(width));
+            }
+        }
+        for (content, color, x) in [
+            ("% made unseen", EQUITY, 12.0),
+            ("Market, held in full", MARKET, 116.0),
+        ] {
+            frame.fill_text(Text {
+                content: content.to_owned(),
+                position: Point::new(x, 8.0),
+                color,
+                size: theme::TEXT_SIZE.into(),
+                align_y: alignment::Vertical::Center,
+                ..Text::default()
+            });
+        }
+        if let Some(at) = cursor
+            .position_in(bounds)
+            .filter(|p| p.x < pane.width && p.y < pane.height)
+        {
+            let index = pane.bar_at(at.x, count).unwrap_or(0);
+            let hovered = spans
+                .iter()
+                .find(|(_, start, end)| index >= *start && index <= *end);
+            if let Some(picked) =
+                hovered.and_then(|&(window, _, _)| found.windows[window].picked.as_ref())
+            {
+                hover_label(
+                    &mut frame,
+                    format!(
+                        "Picked {}: {} against the market's {}",
+                        picked.label,
+                        percent(picked.unseen_return),
+                        percent(picked.buy_and_hold_return)
+                    ),
+                    at.x,
+                    at.y,
+                    pane.width,
+                );
+            }
+        }
+        vec![frame.into_geometry()]
     }
 }
 

@@ -279,9 +279,9 @@ the strategy has never seen.
 
 ## Optimizing a strategy
 
-**Walk-forward**, under **Test**, is Optimize done fairly. It picks the best values on a stretch, tests them on the unseen stretch after it, slides along and repeats, for as many **Windows** as you set. The heading's **Unseen** is what those stretches returned added up, beside what the **Market** did. It's the figure to trust, as none of it was used to pick anything. Its table shows what each window picked and how that did.
+**Walk-forward**, under **Test**, is Optimize done fairly. It picks the best values on a stretch, tests them on the unseen stretch after it, slides along and repeats, for as many **Windows** as you set. The heading's **Unseen** is what those stretches returned added up, beside what the **Market** did. It's the figure to trust, as none of it was used to pick anything. The chart joins those stretches end to end beside the market's held in full, marks each window and shades those that lost. The table beside it shows what each window picked and how that did; hover the chart for the same.
 
-**Random entries**, under **Test**, compares a backtest with chance. It places the same trades at random times, holding each as long, as many **Runs** as you set. **As good** is the share of placings that returned at least as much: near 50% means the entries add nothing.
+**Random entries**, under **Test**, compares a backtest with chance. It places the same trades at random times, holding each as long, as many **Runs** as you set. **As good** is the share of placings that returned at least as much: near 50% means the entries add nothing. The charts show how the placings' returns and worst falls were spread, with the backtest's own marked in yellow, the median dashed and the middle 19 in 20 shaded.
 
 **Optimize**, under **Test** in the backtest panel, tries a range of one of the strategy's variables
 or two together (including Size %). Pick each variable's **Min**, **Max** and **Step**, what to

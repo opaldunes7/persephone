@@ -4348,6 +4348,9 @@ impl Persephone {
             Some(grid.describe(chosen.score, tile.backtest.blocks))
         });
         backtest::PanelInfo {
+            market_share: tile.strategy.as_ref().map_or(1.0, |s| {
+                s.spec.size_fraction() * tile.backtest.sim().leverage
+            }),
             summary: tile
                 .strategy
                 .as_ref()

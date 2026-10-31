@@ -31,7 +31,7 @@ use persephone_research::{
         monte_carlo_compounding, pick_blocks, pnl_by_trade, pool, round_trips,
     },
     settings::{BlockLength, FillTiming, OptimizeSettings, Precision, ScoreBy, Settings, Variable},
-    walk_forward::{RATIO, WINDOWS, WalkForwardJob, stretches},
+    walk_forward::{RATIO, WINDOWS, WalkForward, WalkForwardJob, stretches},
 };
 use serde_json::{Map, Value, json};
 
@@ -249,6 +249,33 @@ fn warnings_of(report: &BacktestReport) -> Vec<String> {
         ));
     }
     warnings
+}
+
+/// Walk-forward's chart as the app's panel draws it, thinned as a full one would cost an agent about
+/// 10,000 tokens each call to tell it no more.
+fn walk_chart(found: &WalkForward) -> Value {
+    const POINTS: usize = 200;
+    let count = found.unseen_line.len();
+    let stride = count.div_ceil(POINTS).max(1);
+    let thin = |line: &[f64]| -> Vec<f64> {
+        (0..count)
+            .step_by(stride)
+            .chain((!(count - 1).is_multiple_of(stride)).then_some(count - 1))
+            .map(|at| (line[at] * 1e4).round() / 1e4)
+            .collect()
+    };
+    json!({
+        "unseen_percent": thin(&found.unseen_line),
+        "market_percent": thin(&found.market_line),
+        "window_starts": found.starts.iter().map(|&(_, at)| at / stride).collect::<Vec<_>>(),
+    })
+}
+
+/// A spread as the app's panel draws it: the range, how many lie in each equal step across it, and
+/// where the backtest's own figure lies.
+fn histogram_json(values: &[f64], actual: f64) -> Value {
+    let found = figures::Histogram::of(values, figures::HISTOGRAM_BINS, actual);
+    json!({"from": found.lo, "to": found.hi, "counts": found.counts, "actual": actual})
 }
 
 /// A page whose rows are objects, so has no columns to name.
@@ -531,6 +558,7 @@ impl Lab {
         let times: Vec<u64> = request.candles.iter().map(|c| c.ts).collect();
         let bars: Vec<(u64, f64)> = request.candles.iter().map(|c| (c.ts, c.close)).collect();
         let look_back = look_back_of(args, request.strategy.own_params());
+        let market_share = request.strategy.size_fraction() * request.sim.leverage;
         let sim = request.sim;
         let price_precision = request.instrument.price_precision;
         let wanted = args
@@ -577,6 +605,8 @@ impl Lab {
             "from_index": from_index,
             "times": times,
             "equity": report.equity,
+            "closes": bars.iter().map(|(_, close)| close).collect::<Vec<_>>(),
+            "market_share": market_share,
             "fills": report.fills.iter().map(|f| json!([
                 f.ts, f.bar, if f.side == Side::Buy { "buy" } else { "sell" }, f.price, f.qty, f.fee,
             ])).collect::<Vec<_>>(),
@@ -641,6 +671,8 @@ impl Lab {
             "median": found.median,
             "low": found.low,
             "high": found.high,
+            "return_chart": histogram_json(&found.returns, found.actual_return),
+            "fall_chart": histogram_json(&found.falls, found.actual_fell),
         }))
     }
 
@@ -888,14 +920,25 @@ impl Lab {
         let times = run["times"].as_array().unwrap_or(&empty);
         let equity = run["equity"].as_array().unwrap_or(&empty);
         let total = times.len().min(equity.len()).saturating_sub(from);
+        let closes = run["closes"].as_array().unwrap_or(&empty);
+        let share = run["market_share"].as_f64();
+        let first = closes.get(from).and_then(Value::as_f64);
+        let capital = run["starting_balance"].as_f64().unwrap_or(0.0);
         Ok(page_of(
-            &["ts", "time", "equity"],
+            &["ts", "time", "equity", "market"],
             total,
             args,
             DEFAULT_ROWS,
             |i| {
                 let at = times[from + i].as_u64().unwrap_or(0);
-                json!([at, time_text(at), equity[from + i]])
+                // Runs saved before this have no closes to work it out from.
+                let market = share
+                    .zip(first)
+                    .zip(closes.get(from + i).and_then(Value::as_f64));
+                let market = market.map(|((share, first), close)| {
+                    figures::market_equity(capital, share, first, close)
+                });
+                json!([at, time_text(at), equity[from + i], market])
             },
         ))
     }
@@ -1287,6 +1330,7 @@ impl Lab {
             "trades": found.trades,
             "train_bars": found.train_bars,
             "test_bars": found.test_bars,
+            "chart": walk_chart(&found),
         }))
     }
 

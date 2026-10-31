@@ -20,6 +20,7 @@ use super::{
     positions::ONE_TRADE,
     progress,
     robustness::Problem,
+    robustness::percentile,
     robustness::{
         BlockStats, BlockSummary, LineStats, MonteCarlo, RoundTrip, RunRow, RunSummary,
         round_trips, sort_rows, summarize_run,
@@ -28,7 +29,8 @@ use super::{
     walk_forward::WalkForward,
     widgets::heat,
     widgets::{
-        Edge, Equity, Fan, Glyph, HeatScale, Icon, Landscape, RunsTable, Span, Speed, percent,
+        Distribution, Edge, Equity, Fan, Glyph, HeatScale, Icon, Landscape, RunsTable, Span, Speed,
+        WalkChart, percent,
     },
 };
 
@@ -53,6 +55,10 @@ const FIGURES_WIDTH: f32 = 180.0;
 /// The Optimize test's list of the best.
 const RESULTS_WIDTH: f32 = 250.0;
 const RESULT_FIGURE: f32 = 56.0;
+/// Walk-forward's table of windows, beside its chart.
+const WALK_TABLE_WIDTH: f32 = 430.0;
+/// How far down the legend over the pane reaches.
+const WALK_TOP: f32 = 48.0;
 /// A value that made money where it was picked and lost it on bars it hadn't seen.
 const FELL_APART: Color = Color::from_rgb8(0xff, 0xa7, 0x26);
 /// The legend's figures, the size of a chart's O/H/L/C.
@@ -97,6 +103,8 @@ pub struct PanelInfo<'a> {
     pub fills: Option<String>,
     /// How the finished run compares: with no costs, and with the market.
     pub summary: Option<String>,
+    /// The share of the capital a position is worth, for showing the market at the same size.
+    pub market_share: f64,
     /// The strategies to pick from, and the chart's own.
     pub strategies: Vec<StrategyChoice>,
     pub strategy: Option<StrategyChoice>,
@@ -259,6 +267,7 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                     bar_nanos: info.bar_nanos,
                     shown: bars.saturating_sub(info.from_index),
                     start: report.starting_balance,
+                    market_share: info.market_share,
                 })
                 .width(Fill)
                 .height(Fill)
@@ -388,7 +397,17 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                         "Each window picks on {} bars, then is tested on the next {}. Each starts from the same capital.",
                         found.train_bars, found.test_bars,
                     )));
-                    walk_forward_table(found)
+                    row![
+                        container(canvas(WalkChart { found }).width(Fill).height(Fill))
+                            .padding(Padding {
+                                top: WALK_TOP,
+                                ..Padding::ZERO
+                            })
+                            .width(Fill)
+                            .height(Fill),
+                        walk_forward_table(found),
+                    ]
+                    .into()
                 }
                 TestRun::Running { done, total, .. } => {
                     note = Some(muted(format!("Running backtest {done} of {total}…")));
@@ -450,7 +469,28 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                         percent(found.high),
                     ))
                 });
-                Space::new().width(Fill).height(Fill).into()
+                let (returns, falls) = (&found.returns, &found.falls);
+                row![
+                    canvas(Distribution {
+                        title: "What random placings returned",
+                        values: returns,
+                        actual: found.actual_return,
+                        band: Some((found.low, found.high)),
+                        median: found.median,
+                    })
+                    .width(FillPortion(3))
+                    .height(Fill),
+                    canvas(Distribution {
+                        title: "How far each fell at worst",
+                        values: falls,
+                        actual: found.actual_fell,
+                        band: None,
+                        median: percentile(falls, 0.5),
+                    })
+                    .width(FillPortion(2))
+                    .height(Fill),
+                ]
+                .into()
             }
             TestRun::Running { done, total, .. } => {
                 note = Some(muted(format!("Running backtest {done} of {total}…")));
@@ -837,7 +877,17 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
     let side = container(settings)
         .width(FillPortion(SETTINGS_PORTION))
         .height(Fill);
+    let tabs = container(settings::test_tabs(test))
+        .padding([0, 10])
+        .height(super::TABS_HEIGHT)
+        .align_y(Alignment::Center);
+    let under_tabs = container(Space::new())
+        .width(Fill)
+        .height(1)
+        .style(|_| container::background(theme::AXIS_LINE));
     container(column![
+        tabs,
+        under_tabs,
         row![side, divider, main].height(Fill),
         canvas(Edge).width(Fill).height(super::EDGE_HEIGHT)
     ])
@@ -859,16 +909,16 @@ fn walk_forward_table(found: &WalkForward) -> Element<'_, PanelMessage> {
             .font(iced::Font::MONOSPACE)
     };
     let mut rows = column![row![
-        cell("Unseen stretch".into(), 190.0, theme::TEXT_MUTED),
-        cell("Picked".into(), 170.0, theme::TEXT_MUTED),
-        cell("Return".into(), 80.0, theme::TEXT_MUTED),
-        cell("Market".into(), 80.0, theme::TEXT_MUTED),
-        cell("Fell".into(), 70.0, theme::TEXT_MUTED),
-        cell("Trades".into(), 60.0, theme::TEXT_MUTED),
+        cell("From".into(), 84.0, theme::TEXT_MUTED),
+        cell("Picked".into(), 92.0, theme::TEXT_MUTED),
+        cell("Return".into(), 66.0, theme::TEXT_MUTED),
+        cell("Market".into(), 66.0, theme::TEXT_MUTED),
+        cell("Fell".into(), 50.0, theme::TEXT_MUTED),
+        cell("Trades".into(), 46.0, theme::TEXT_MUTED),
     ]]
     .spacing(3);
     for window in &found.windows {
-        let stretch = format!("{} to {}", day(window.test_from), day(window.test_to));
+        let stretch = day(window.test_from);
         rows = rows.push(match &window.picked {
             Some(picked) => {
                 let color = if picked.unseen_return >= 0.0 {
@@ -877,28 +927,28 @@ fn walk_forward_table(found: &WalkForward) -> Element<'_, PanelMessage> {
                     theme::DOWN
                 };
                 row![
-                    cell(stretch, 190.0, theme::TEXT),
-                    cell(picked.label.clone(), 170.0, theme::TEXT),
-                    cell(percent(picked.unseen_return), 80.0, color),
-                    cell(percent(picked.buy_and_hold_return), 80.0, theme::TEXT),
-                    cell(format!("{:.1}%", picked.fell * 100.0), 70.0, theme::TEXT),
-                    cell(picked.trades.to_string(), 60.0, theme::TEXT),
+                    cell(stretch, 84.0, theme::TEXT),
+                    cell(picked.label.clone(), 92.0, theme::TEXT),
+                    cell(percent(picked.unseen_return), 66.0, color),
+                    cell(percent(picked.buy_and_hold_return), 66.0, theme::TEXT),
+                    cell(format!("{:.1}%", picked.fell * 100.0), 50.0, theme::TEXT),
+                    cell(picked.trades.to_string(), 46.0, theme::TEXT),
                 ]
             }
             None => row![
-                cell(stretch, 190.0, theme::TEXT),
-                cell("nothing traded".into(), 170.0, theme::TEXT_MUTED),
+                cell(stretch, 84.0, theme::TEXT),
+                cell("nothing traded".into(), 200.0, theme::TEXT_MUTED),
             ],
         });
     }
     // Below the legend, which sits over the top of the pane.
     iced::widget::scrollable(rows.padding(Padding {
-        top: 84.0,
+        top: WALK_TOP,
         right: 12.0,
         bottom: 8.0,
         left: 12.0,
     }))
-    .width(Fill)
+    .width(WALK_TABLE_WIDTH)
     .height(Fill)
     .into()
 }

@@ -6,6 +6,60 @@ use super::*;
 
 /// The panel's left side: the strategy, every stock setting and the plugin slots, packed into
 /// as many columns as fit. What each one does is in the tooltips of its name and controls.
+/// Which test to run, all on one line across the top of the panel.
+pub(super) fn test_tabs<'a>(current: TestKind) -> Element<'a, PanelMessage> {
+    let tab = |label: &'a str, test: TestKind, what: &'a str| {
+        tip(
+            button(text(label).size(SMALL).center())
+                .padding([3, 8])
+                .on_press(PanelMessage::Test(test))
+                .style(move |_, status| chip(current == test, status)),
+            what,
+            None,
+        )
+    };
+    row![
+        tip(
+            text("Test").size(SMALL).color(theme::TEXT_BRIGHT),
+            "How to test the strategy. One backtest can't tell skill from luck; the others show how far its result could have gone either way, and whether it beats chance.",
+            None,
+        ),
+        tab(
+            "Backtest",
+            TestKind::Backtest,
+            "One run through the span, which can be played back bar by bar.",
+        ),
+        tab(
+            "Monte Carlo",
+            TestKind::MonteCarlo,
+            "Draws the backtest's trades at random many times, showing the range of results and drawdowns those trades could have given.",
+        ),
+        tab(
+            "Random blocks",
+            TestKind::RandomBlocks,
+            "Backtests random stretches of the span, showing whether the strategy works throughout or only in one period.",
+        ),
+        tab(
+            "Optimize",
+            TestKind::Optimize,
+            "Tries a range of one or two of the strategy's variables and shows which values do best and how steady they are.",
+        ),
+        tab(
+            "Walk-forward",
+            TestKind::WalkForward,
+            "Optimizes on a stretch, tries the best values on the unseen stretch after it, and slides along. The fairest test of whether optimizing helps.",
+        ),
+        tab(
+            "Random entries",
+            TestKind::RandomEntries,
+            "Places the backtest's trades at random times many times over, keeping how long each was held. If that does as well, the entries are worth nothing.",
+        ),
+    ]
+    .spacing(3)
+    .align_y(Alignment::Center)
+    .into()
+}
+
 pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMessage> {
     let (panel, settings) = (info.panel, info.settings);
     let stock = settings.stock;
@@ -126,62 +180,7 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
         .align_right(Fill),
     );
 
-    // Which test, and its own settings.
-    let tests = row![
-        name(
-            "Test",
-            "How to test the strategy. One backtest can't tell skill from luck; the others show how far its result could have gone either way, and whether it beats chance.",
-        ),
-        container(column![
-            row![
-                chip_button(
-                    "Backtest",
-                    settings.test == TestKind::Backtest,
-                    PanelMessage::Test(TestKind::Backtest),
-                    "One run through the span, which can be played back bar by bar.",
-                ),
-                chip_button(
-                    "Monte Carlo",
-                    settings.test == TestKind::MonteCarlo,
-                    PanelMessage::Test(TestKind::MonteCarlo),
-                    "Draws the backtest's trades at random many times, showing the range of results and drawdowns those trades could have given.",
-                ),
-                chip_button(
-                    "Random blocks",
-                    settings.test == TestKind::RandomBlocks,
-                    PanelMessage::Test(TestKind::RandomBlocks),
-                    "Backtests random stretches of the span, showing whether the strategy works throughout or only in one period.",
-                ),
-                chip_button(
-                    "Optimize",
-                    settings.test == TestKind::Optimize,
-                    PanelMessage::Test(TestKind::Optimize),
-                    "Tries a range of one or two of the strategy's variables and shows which values do best and how steady they are.",
-                ),
-            ]
-            .spacing(2),
-            row![
-                chip_button(
-                    "Walk-forward",
-                    settings.test == TestKind::WalkForward,
-                    PanelMessage::Test(TestKind::WalkForward),
-                    "Optimizes on a stretch, tries the best values on the unseen stretch after it, and slides along. The fairest test of whether optimizing helps.",
-                ),
-                chip_button(
-                    "Random entries",
-                    settings.test == TestKind::RandomEntries,
-                    PanelMessage::Test(TestKind::RandomEntries),
-                    "Places the backtest's trades at random times many times over, keeping how long each was held. If that does as well, the entries are worth nothing.",
-                ),
-            ]
-            .spacing(2),
-        ]
-        .spacing(2)
-        .align_x(Alignment::End))
-        .align_right(Fill),
-    ]
-    .spacing(7)
-    .align_y(Alignment::Center);
+    // Which test is in the bar over the panel; these are its own settings.
     let boxed = |label: &'a str,
                  field: Field,
                  suffix: &'a str,
@@ -769,7 +768,7 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
     // As many columns as fit in the panel's left side.
     let side_width = info.width * f32::from(SETTINGS_PORTION) / 10.0;
     let columns = ((side_width / 200.0) as usize).clamp(1, 3);
-    let mut body = column![top, tests].spacing(7);
+    let mut body = column![top].spacing(7);
     if let Some(test_settings) = test_settings {
         body = body.push(test_settings);
     }

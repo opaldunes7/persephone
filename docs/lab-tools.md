@@ -321,7 +321,7 @@ Returns: `columns`, `rows`, `next_cursor`
 
 ## `get_equity`
 
-A run's equity at each bar's close, in pages.
+A run's equity at each bar's close, in pages, beside what holding the market with a position of the same size would be worth: the line the app draws.
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.

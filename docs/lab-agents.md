@@ -224,6 +224,11 @@ What every number means, the same everywhere.
   batches. A plugin that doesn't repeat itself may differ between the two runs.
 - **`benchmark`** has `return`, `sharpe` and `max_drawdown` for buying at the first close that could trade and holding to
   the end, with no costs. `return` is the same as `buy_and_hold_return`.
+- **`get_equity`'s `market`** is the app's market line: what holding the market with a position the run's size would be
+  worth, from the first close that could trade. It's null on runs saved before it was added.
+- **Charts:** what the app's panel draws comes with the answers too. `run_walk_forward`'s `chart` has the unseen stretches
+  and the market held in full joined end to end, as percentages, at about 200 points, with where each window starts. `run_random_entries`' `return_chart`
+  and `fall_chart` each have the range from `from` to `to`, `counts` in equal steps across it, and the backtest's `actual`.
 - **`by_year`** is what each UTC year added, as a fraction of the starting capital, so the years add up to `net_return`.
 - **`return_percent`** on a trade is a percentage of the starting capital, even with `compound`, so add them up rather
   than compounding them.

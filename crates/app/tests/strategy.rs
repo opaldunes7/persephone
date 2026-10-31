@@ -1510,7 +1510,7 @@ mod panel {
         assert_eq!(found.windows.len(), 2);
         assert!(found.windows.iter().all(|window| window.picked.is_some()));
         assert!(shows(&app, "Unseen"));
-        assert!(shows(&app, "Unseen stretch"));
+        assert!(shows(&app, "Picked"));
     }
 
     #[test]
@@ -1567,6 +1567,35 @@ mod panel {
             panic!("{:?}", run_state(&app));
         };
         assert!(error.contains("no bar opens at"), "{error}");
+    }
+
+    #[test]
+    fn the_new_charts_draw_even_with_almost_nothing_to_show() {
+        // A single window and few placings: the charts still have to draw.
+        let mut walk = ready_panel(TestKind::WalkForward);
+        panel(&mut walk, PanelMessage::Input(Field::Windows, "1".into()));
+        panel(&mut walk, PanelMessage::Submit(Field::Windows));
+        set_range(&mut walk, 0, "5", "8", "3");
+        run_task(&mut walk, PanelMessage::RunWalkForward);
+        assert!(shows(&walk, "Unseen"));
+        let mut entries = ready_panel(TestKind::RandomEntries);
+        panel(
+            &mut entries,
+            PanelMessage::Input(Field::Entries, "2".into()),
+        );
+        panel(&mut entries, PanelMessage::Submit(Field::Entries));
+        run_task(&mut entries, PanelMessage::RunRandomEntries);
+        assert!(shows(&entries, "As good"));
+        for label in [
+            "Backtest",
+            "Monte Carlo",
+            "Random blocks",
+            "Optimize",
+            "Walk-forward",
+            "Random entries",
+        ] {
+            assert!(shows(&entries, label), "{label}");
+        }
     }
 
     #[test]

@@ -261,6 +261,9 @@ pub struct RandomEntries {
     pub median: f64,
     pub low: f64,
     pub high: f64,
+    /// What every placing returned and how far it fell, each sorted, to draw.
+    pub returns: Vec<f64>,
+    pub falls: Vec<f64>,
 }
 
 /// What's said when there's too little for the test to mean anything.
@@ -354,6 +357,8 @@ impl RandomEntriesJob {
             median: percentile(&returns, 0.5),
             low: percentile(&returns, 0.05),
             high: percentile(&returns, 0.95),
+            returns,
+            falls,
         })
     }
 }

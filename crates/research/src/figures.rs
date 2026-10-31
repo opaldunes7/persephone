@@ -235,6 +235,54 @@ fn break_even_bp(free: &BacktestReport) -> Option<f64> {
     (traded > 0.0).then(|| free.net_pnl() / traded * 10_000.0)
 }
 
+/// What the account would be worth holding the market with `share` of the capital since `first`: the
+/// same size of position a strategy takes, so the two can be compared on one scale.
+#[must_use]
+pub fn market_equity(capital: f64, share: f64, first: f64, close: f64) -> f64 {
+    capital * (1.0 + share * (close / first - 1.0))
+}
+
+/// How many bars a chart of a spread has, in the app and from Lab alike.
+pub const HISTOGRAM_BINS: usize = 40;
+
+/// How values are spread: `counts[i]` of them lie in the `i`th of equal steps from `lo` to `hi`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Histogram {
+    pub lo: f64,
+    pub hi: f64,
+    pub counts: Vec<usize>,
+}
+
+impl Histogram {
+    /// Over `bins` steps, wide enough to reach `also`, so a mark there is always on the chart.
+    #[must_use]
+    pub fn of(values: &[f64], bins: usize, also: f64) -> Self {
+        let bins = bins.max(1);
+        let (lo, hi) = values
+            .iter()
+            .chain(std::iter::once(&also))
+            .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+        // All the same still needs some width to draw.
+        let (lo, hi) = if hi > lo {
+            (lo, hi)
+        } else {
+            (lo - 0.005, hi + 0.005)
+        };
+        let mut counts = vec![0; bins];
+        for value in values {
+            let at = ((value - lo) / (hi - lo) * bins as f64) as usize;
+            counts[at.min(bins - 1)] += 1;
+        }
+        Self { lo, hi, counts }
+    }
+
+    /// Where `value` lies across it, from 0 to 1.
+    #[must_use]
+    pub fn share_of(&self, value: f64) -> f64 {
+        ((value - self.lo) / (self.hi - self.lo)).clamp(0.0, 1.0)
+    }
+}
+
 /// A finished run's figures, to show beside it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RunFigures {
@@ -262,5 +310,41 @@ impl RunFigures {
             by_year: by_year(report, from_index, bars),
             benchmark: benchmark(report.starting_balance, bars, from_index),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_histogram_counts_everything_even_at_its_top_edge() {
+        let values = [-0.1, 0.0, 0.0, 0.05, 0.1];
+        let found = Histogram::of(&values, 4, 0.0);
+        assert_eq!(found.counts.iter().sum::<usize>(), values.len());
+        assert_eq!(
+            *found.counts.last().unwrap(),
+            2,
+            "the top one is in the last"
+        );
+        assert_eq!((found.lo, found.hi), (-0.1, 0.1));
+        assert!((found.share_of(0.0) - 0.5).abs() < 1e-12);
+
+        // A mark beyond every value widens it.
+        let found = Histogram::of(&values, 4, 0.3);
+        assert_eq!(found.hi, 0.3);
+        assert_eq!(found.share_of(0.3), 1.0);
+
+        // All the same doesn't divide by nothing.
+        let found = Histogram::of(&[0.2, 0.2], 4, 0.2);
+        assert_eq!(found.counts.iter().sum::<usize>(), 2);
+        assert!(found.hi > found.lo);
+    }
+
+    #[test]
+    fn the_market_line_holds_the_same_size_as_the_strategy() {
+        // A tenth of 1,000 in a market up from 100 to 150 makes 50.
+        assert!((market_equity(1_000.0, 0.1, 100.0, 150.0) - 1_050.0).abs() < 1e-9);
+        assert!((market_equity(1_000.0, 1.0, 100.0, 50.0) - 500.0).abs() < 1e-9);
     }
 }

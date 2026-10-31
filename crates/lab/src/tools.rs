@@ -642,7 +642,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "get_equity",
-            "A run's equity at each bar's close, in pages.",
+            "A run's equity at each bar's close, in pages, beside what holding the market with a position of the same size would be worth: the line the app draws.",
             vec![RUN_ID, CURSOR, LIMIT],
             &["columns", "rows", "next_cursor"],
         ),

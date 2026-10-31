@@ -52,6 +52,23 @@ pub struct WalkForward {
     pub trades: usize,
     pub train_bars: usize,
     pub test_bars: usize,
+    /// The unseen stretches joined end to end, as percentages of the capital made so far, to draw,
+    /// with the market's alongside. They add up to the figures above.
+    pub unseen_line: Vec<f64>,
+    pub market_line: Vec<f64>,
+    /// Where each tested window starts in those lines, in `windows`' order.
+    pub starts: Vec<(usize, usize)>,
+}
+
+/// The most points a stretch keeps for drawing.
+const LINE_POINTS: usize = 300;
+
+/// A stretch's `count` points, thinned to what a chart can use, always with the last.
+fn thinned(count: usize) -> impl Iterator<Item = usize> {
+    let stride = (count / LINE_POINTS).max(1);
+    (0..count)
+        .step_by(stride)
+        .chain(std::iter::once(count.saturating_sub(1)))
 }
 
 /// A walk-forward, ready to go to worker threads.
@@ -108,6 +125,8 @@ impl WalkForwardJob {
         let finished = AtomicUsize::new(0);
         let mut rows = Vec::with_capacity(self.windows);
         let (mut unseen_total, mut held_total) = (0.0, 0.0);
+        let (mut unseen_line, mut market_line) = (vec![0.0], vec![0.0]);
+        let mut starts = Vec::with_capacity(self.windows);
         let (mut trades, mut profitable, mut deepest) = (0, 0, 0.0_f64);
         for window in 0..self.windows {
             let train_start = first + window * test;
@@ -157,6 +176,14 @@ impl WalkForwardJob {
             let made = round_trips(&report).len();
             // From the close before the stretch's first order could fill, as a strategy's does.
             let held = candles[test_end - 1].close / candles[train_end].close - 1.0;
+            let warmed = train_end - train_end.saturating_sub(self.warm_up);
+            let stretch = report.equity.get(warmed..).unwrap_or_default();
+            starts.push((window, unseen_line.len() - 1));
+            for at in thinned(stretch.len().min(test)) {
+                unseen_line.push((unseen_total + (stretch[at] / capital - 1.0)) * 100.0);
+                let close = candles[train_end + at].close;
+                market_line.push((held_total + (close / candles[train_end].close - 1.0)) * 100.0);
+            }
             held_total += held;
             unseen_total += unseen;
             trades += made;
@@ -195,6 +222,9 @@ impl WalkForwardJob {
             trades,
             train_bars: train,
             test_bars: test,
+            unseen_line,
+            market_line,
+            starts,
         })
     }
 }
