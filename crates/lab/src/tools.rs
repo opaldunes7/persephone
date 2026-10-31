@@ -131,6 +131,11 @@ const LABEL: Arg = opt(
     "string",
     "A name for grouping runs, saved with the run for finding it with list_runs.",
 );
+const INCLUDE_LINES: Arg = opt(
+    "include_lines",
+    "boolean",
+    "Add every line the app's fan draws to `chart`, not just the few that sum it up. Costs more to read.",
+);
 const FRICTION: Arg = opt(
     "friction",
     "boolean",
@@ -461,6 +466,7 @@ pub fn tools() -> Vec<Tool> {
                     "integer",
                     "The same seed gives the same draws. Default 0.",
                 ),
+                INCLUDE_LINES,
                 opt(
                     "show_run",
                     "integer",
@@ -482,6 +488,7 @@ pub fn tools() -> Vec<Tool> {
                 "ruin",
                 "actual",
                 "best_runs",
+                "chart",
             ],
         ),
         job(
@@ -502,10 +509,19 @@ pub fn tools() -> Vec<Tool> {
                         "The same seed gives the same stretches. Default 0.",
                     ),
                     opt("include_trades", "boolean", "Include each block's trades."),
+                    INCLUDE_LINES,
                     opt("limit", "integer", "How many blocks to list. Default 50."),
                 ],
             ),
-            &["profitable", "median", "best", "worst", "blocks", "total"],
+            &[
+                "profitable",
+                "median",
+                "best",
+                "worst",
+                "blocks",
+                "total",
+                "chart",
+            ],
         ),
         job(
             "run_random_entries",
@@ -618,7 +634,15 @@ pub fn tools() -> Vec<Tool> {
                     ),
                 ],
             ),
-            &["values", "total", "top", "on_edge", "held_out", "backtests"],
+            &[
+                "values",
+                "total",
+                "top",
+                "on_edge",
+                "held_out",
+                "backtests",
+                "chart",
+            ],
         ),
         tool(
             "get_report",

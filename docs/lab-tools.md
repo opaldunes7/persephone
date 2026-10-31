@@ -213,10 +213,11 @@ Draws a run's trades at random many times, to see the range of results they coul
 - `runs` (integer): How many draws. Default 1,000.
 - `ruin_percent` (number): The fall from a peak that counts as ruin. Default 50.
 - `seed` (integer): The same seed gives the same draws. Default 0.
+- `include_lines` (boolean): Add every line the app's fan draws to `chart`, not just the few that sum it up. Costs more to read.
 - `show_run` (integer): A run's number, to list what it drew; one past the last is the backtest.
 - `limit` (integer): How many runs to list, best first. Default 20.
 
-Returns: `trades`, `runs`, `median`, `low`, `high`, `drawdown`, `ruin`, `actual`, `best_runs`
+Returns: `trades`, `runs`, `median`, `low`, `high`, `drawdown`, `ruin`, `actual`, `best_runs`, `chart`
 
 ## `run_random_blocks` *job*
 
@@ -233,9 +234,10 @@ Backtests random stretches of a span, to see whether a strategy works throughout
 - `length` (string): week, month (30 days, the default) or quarter (91 days).
 - `seed` (integer): The same seed gives the same stretches. Default 0.
 - `include_trades` (boolean): Include each block's trades.
+- `include_lines` (boolean): Add every line the app's fan draws to `chart`, not just the few that sum it up. Costs more to read.
 - `limit` (integer): How many blocks to list. Default 50.
 
-Returns: `profitable`, `median`, `best`, `worst`, `blocks`, `total`
+Returns: `profitable`, `median`, `best`, `worst`, `blocks`, `total`, `chart`
 
 ## `run_random_entries` *job*
 
@@ -289,7 +291,7 @@ Backtests a range of one or two parameters, scored by return, Monte Carlo or ran
 - `seed` (integer): Default 0.
 - `limit` (integer): How many values to list, best first. Default 50.
 
-Returns: `values`, `total`, `top`, `on_edge`, `held_out`, `backtests`
+Returns: `values`, `total`, `top`, `on_edge`, `held_out`, `backtests`, `chart`
 
 ## `get_report`
 

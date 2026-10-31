@@ -251,6 +251,28 @@ fn warnings_of(report: &BacktestReport) -> Vec<String> {
     warnings
 }
 
+/// Whether a call asks for every line a fan draws, rather than the few that sum it up.
+fn wants_lines(args: &Value) -> bool {
+    args.get("include_lines")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// An equity line from a fan, thinned to about 100 points to the cent: a fan's lines are a lot for an
+/// agent to read, and this tells it what the shape needs.
+fn thin_line(line: &[f64]) -> Vec<f64> {
+    const POINTS: usize = 100;
+    let Some(last) = line.len().checked_sub(1) else {
+        return Vec::new();
+    };
+    let stride = line.len().div_ceil(POINTS).max(1);
+    (0..line.len())
+        .step_by(stride)
+        .chain((!last.is_multiple_of(stride)).then_some(last))
+        .map(|at| (line[at] * 100.0).round() / 100.0)
+        .collect()
+}
+
 /// Walk-forward's chart as the app's panel draws it, thinned as a full one would cost an agent about
 /// 10,000 tokens each call to tell it no more.
 fn walk_chart(found: &WalkForward) -> Value {
@@ -559,6 +581,15 @@ impl Lab {
         let bars: Vec<(u64, f64)> = request.candles.iter().map(|c| (c.ts, c.close)).collect();
         let look_back = look_back_of(args, request.strategy.own_params());
         let market_share = request.strategy.size_fraction() * request.sim.leverage;
+        let fills_on = if request.sim.next_open {
+            "next_open"
+        } else if request.ticks.is_some() {
+            "ticks"
+        } else if request.fill_bars.is_some() {
+            "minute_bars"
+        } else {
+            "bars"
+        };
         let sim = request.sim;
         let price_precision = request.instrument.price_precision;
         let wanted = args
@@ -594,6 +625,7 @@ impl Lab {
             summary["label"] = label.clone();
         }
         // Which bars these were, as a span with no end moves on as new bars close.
+        summary["fills_on"] = json!(fills_on);
         summary["first_bar"] = json!(times.get(from_index).copied().map(time_text));
         summary["last_bar"] = json!(times.last().copied().map(time_text));
         let run_id = new_id("run");
@@ -1239,7 +1271,23 @@ impl Lab {
             )
         });
         rows.truncate(limit_of(args, LISTED_VALUES));
+        let mut chart = json!({
+            "bars_between_points": summary.stride,
+            "median_line": thin_line(&summary.median_path),
+            "best_line": summary.paths.get(summary.best_line).map(|line| thin_line(line)),
+            "worst_line": summary.paths.get(summary.worst_line).map(|line| thin_line(line)),
+        });
+        if wants_lines(args) {
+            chart["lines"] = json!(
+                summary
+                    .paths
+                    .iter()
+                    .map(|line| thin_line(line))
+                    .collect::<Vec<_>>()
+            );
+        }
         Ok(json!({
+            "chart": chart,
             "profitable": summary.profitable,
             "median": summary.median,
             "median_buy_and_hold": median_held,
@@ -1420,7 +1468,18 @@ impl Lab {
                 })
             })
             .collect();
+        let scores: Vec<Option<f64>> = found
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.score().map(|score| (score * 1e6).round() / 1e6))
+            .collect();
+        let axis = |axis: &persephone_research::optimize::Axis| json!({"name": axis.name, "values": axis.values});
         Ok(json!({
+            "chart": {
+                "across": axis(&found.grid.first),
+                "down": found.grid.second.as_ref().map(axis),
+                "scores": scores,
+            },
             "values": rows,
             "total": values,
             "top": top,
@@ -1458,6 +1517,23 @@ fn monte_carlo_json(
     };
     let limit = number(args, "limit", 20) as usize;
     let actual = ranked.iter().find(|r| r.backtest).map(row);
+    let mut chart = json!({
+        "trades_between_points": found.stride,
+        "median_line": thin_line(&found.median_path),
+        "backtest_line": thin_line(&found.actual),
+        "best_line": found.paths.get(found.best).map(|line| thin_line(line)),
+        "worst_line": found.paths.get(found.worst).map(|line| thin_line(line)),
+        "middle_line": found.paths.get(found.middle).map(|line| thin_line(line)),
+    });
+    if wants_lines(args) {
+        chart["lines"] = json!(
+            found
+                .paths
+                .iter()
+                .map(|line| thin_line(line))
+                .collect::<Vec<_>>()
+        );
+    }
     let mut answer = json!({
         "trades": found.trades,
         "runs": found.runs,
@@ -1468,6 +1544,7 @@ fn monte_carlo_json(
         "ruin": found.ruin,
         "actual": actual,
         "best_runs": ranked.iter().take(limit).map(row).collect::<Vec<_>>(),
+        "chart": chart,
     });
     if let Some(run) = args.get("show_run").and_then(Value::as_u64) {
         let draws = found

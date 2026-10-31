@@ -501,7 +501,8 @@ new.
 
 Agents and scripts can read every data point and run every test through
 [Persephone Lab](lab.md), without the app open. Strategies they save appear in the backtest panel's
-strategy list, marked **Lab**, ready to backtest and replay.
+strategy list, marked **Lab**, ready to backtest and replay. Everything the backtest panel shows,
+including the data behind its charts, is available to them as well.
 
 ## Where files live
 

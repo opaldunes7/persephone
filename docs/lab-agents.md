@@ -224,11 +224,14 @@ What every number means, the same everywhere.
   batches. A plugin that doesn't repeat itself may differ between the two runs.
 - **`benchmark`** has `return`, `sharpe` and `max_drawdown` for buying at the first close that could trade and holding to
   the end, with no costs. `return` is the same as `buy_and_hold_return`.
+- **`fills_on`** in a summary says how orders filled: `bars`, `ticks`, `minute_bars` or `next_open`.
 - **`get_equity`'s `market`** is the app's market line: what holding the market with a position the run's size would be
   worth, from the first close that could trade. It's null on runs saved before it was added.
 - **Charts:** what the app's panel draws comes with the answers too. `run_walk_forward`'s `chart` has the unseen stretches
   and the market held in full joined end to end, as percentages, at about 200 points, with where each window starts. `run_random_entries`' `return_chart`
   and `fall_chart` each have the range from `from` to `to`, `counts` in equal steps across it, and the backtest's `actual`.
+  `run_optimize`'s `chart` has every score in the grid, row by row, `across` one variable's values and `down` the other's.
+  The `results` topic lists every screen in the app and where its data comes from.
 - **`by_year`** is what each UTC year added, as a fraction of the starting capital, so the years add up to `net_return`.
 - **`return_percent`** on a trade is a percentage of the starting capital, even with `compound`, so add them up rather
   than compounding them.
@@ -296,6 +299,10 @@ Monte Carlo draws a finished run's trades at random. It needs at least 10 trades
 ```json
 {"tool": "run_monte_carlo", "args": {"run_id": "$RUN", "runs": 1000, "ruin_percent": 50, "seed": 1, "limit": 5}}
 ```
+
+Its `chart` has the lines the app's fan draws, as equity: `median_line`, `backtest_line`, `best_line`, `worst_line` and
+`middle_line`, thinned to about 100 points. `include_lines: true` adds every line as `lines`, and `run_random_blocks` has
+the same for its blocks.
 
 `median`, `low` and `high` are returns (5th to 95th percentile), `drawdown` is the 95th percentile fall,
 and `actual` shows where the real order of trades ranks. `show_run` lists what one run drew.
@@ -421,7 +428,37 @@ Showing a strategy to the person using the app, and seeing what's on their chart
 It appears in the app's backtest panel straight away, marked Lab, to chart and replay.
 
 `get_layout`, `get_chart_settings` and `get_drawings` show what's on their charts, and `get_call_log` shows
-every call made to Lab, newest first.
+every call made to Lab, newest first. Lists of positions can be saved too: they're written out in full, and work on
+markets and timeframes whose bars they name.
+
+**Everything the app's panel shows, and where to get it:**
+
+| In the app | From Lab |
+|---|---|
+| A chart's bars and studies | `get_bars`, `compute_indicator`, `get_chart_settings`, `get_drawings` |
+| The span slider's history | `get_history_range`, then `get_bars` with `1M` |
+| The strategy's list and its settings | `list_strategies`, `describe_strategy`, `list_results`, `get_settings` |
+| Backtest: return, fall, fills, equity line | `summary`; `get_equity` |
+| Backtest: the market line | `get_equity`'s `market` |
+| Backtest: trade marks and replay | `get_fills`, `get_trades` |
+| Backtest: how orders fill | `summary.fills_on` |
+| Calendar: months, days and a day's trades | `get_calendar` with `year`, `month` and `day` |
+| Statistics: Sharpe, win rate, profit factor, exposure | `summary` |
+| Statistics: before costs, costs, break-even | `summary.gross_return`, `total_costs_paid`, `break_even_cost_per_fill` |
+| Statistics: the market, and each year | `summary.benchmark`, `by_year` |
+| Statistics: Sortino, and notes | `get_report`'s `returns` and `notes`; `warnings` in `summary` |
+| Monte Carlo: its figures and fan | `run_monte_carlo`, with `chart` for the lines |
+| Monte Carlo: table of runs and a run's trades | `best_runs` with `limit`, and `show_run` |
+| Random blocks: its figures and fan | `run_random_blocks`, with `chart` for the lines |
+| Random blocks: table of blocks and their trades | `blocks`, with `include_trades` |
+| Optimize: the heatmap or bars | `run_optimize`'s `chart`, with `scores` across `across` and down `down` |
+| Optimize: the best, and what they did unseen | `top`, `on_edge`, `held_out_buy_and_hold` |
+| Walk-forward: chart and table | `run_walk_forward`'s `chart` and `windows` |
+| Random entries: both charts | `run_random_entries`' `return_chart` and `fall_chart` |
+| A parameter sweep | `run_optimize`, or `run_backtests` across the values |
+
+Every line and chart is the same data the panel draws. Lab gives numbers rather than images. Only paper and live sessions
+have no equivalent, as Lab can't trade.
 
 ## extending
 

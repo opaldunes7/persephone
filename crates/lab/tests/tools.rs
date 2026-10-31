@@ -3180,6 +3180,146 @@ fn what_the_app_draws_an_agent_can_read() {
 }
 
 #[test]
+fn every_fan_and_heatmap_the_app_draws_an_agent_can_read() {
+    let (lab, _source) = binance_lab();
+    let at = |hour: u64| START + hour * HOUR;
+    let span = |more: Value| {
+        let mut args = json!({
+            "symbol": "BTCUSDT", "bars": "1h", "from": at(0), "to": at(2_500), "wait_seconds": 120,
+            "strategy": {"builtin": "ema-cross"},
+        });
+        for (key, value) in more.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        args
+    };
+    let run = lab.dispatch("run_backtest", &span(json!({}))).unwrap();
+    assert_eq!(run["summary"]["fills_on"], "bars", "{run}");
+    let next = lab
+        .dispatch(
+            "run_backtest",
+            &span(json!({"settings": {"fill_timing": "next_open"}})),
+        )
+        .unwrap();
+    assert_eq!(next["summary"]["fills_on"], "next_open", "{next}");
+
+    let drawn = lab
+        .dispatch(
+            "run_monte_carlo",
+            &json!({"run_id": run["run_id"], "runs": 30, "seed": 1, "wait_seconds": 120}),
+        )
+        .unwrap();
+    let chart = &drawn["chart"];
+    for line in [
+        "median_line",
+        "backtest_line",
+        "best_line",
+        "worst_line",
+        "middle_line",
+    ] {
+        let points = chart[line].as_array().unwrap();
+        assert!(points.len() > 1 && points.len() <= 102, "{line}: {chart}");
+    }
+    // The real line ends where the run did, and the extremes where the table says.
+    let last = |line: &str| {
+        chart[line]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .as_f64()
+            .unwrap()
+    };
+    let capital = run["summary"]["final_equity"].as_f64().unwrap();
+    assert!((last("backtest_line") - capital).abs() < 0.01, "{chart}");
+    assert!(last("best_line") >= last("worst_line"), "{chart}");
+    assert!(chart.get("lines").is_none(), "only when asked: {chart}");
+    let every = lab
+        .dispatch(
+            "run_monte_carlo",
+            &json!({"run_id": run["run_id"], "runs": 30, "seed": 1, "include_lines": true, "wait_seconds": 120}),
+        )
+        .unwrap();
+    assert!(
+        every["chart"]["lines"]
+            .as_array()
+            .is_some_and(|l| !l.is_empty()),
+        "{every}"
+    );
+
+    let blocks = lab
+        .dispatch(
+            "run_random_blocks",
+            &span(json!({"blocks": 6, "length": "week", "include_lines": true})),
+        )
+        .unwrap();
+    assert!(
+        blocks["chart"]["median_line"]
+            .as_array()
+            .is_some_and(|l| l.len() > 1),
+        "{blocks}"
+    );
+    assert!(
+        blocks["chart"]["lines"]
+            .as_array()
+            .is_some_and(|l| !l.is_empty()),
+        "{blocks}"
+    );
+
+    // The whole grid, however few are listed: what the heatmap is drawn from.
+    let found = lab
+        .dispatch(
+            "run_optimize",
+            &span(json!({
+                "limit": 1,
+                "variables": [
+                    {"name": "Fast", "min": 5, "max": 9, "step": 2},
+                    {"name": "Slow", "min": 20, "max": 30, "step": 10},
+                ],
+            })),
+        )
+        .unwrap();
+    let chart = &found["chart"];
+    assert_eq!(found["values"].as_array().unwrap().len(), 1);
+    assert_eq!(chart["across"]["name"], "Fast");
+    assert_eq!(chart["across"]["values"], json!([5.0, 7.0, 9.0]));
+    assert_eq!(chart["down"]["name"], "Slow");
+    assert_eq!(chart["scores"].as_array().unwrap().len(), 6, "{chart}");
+}
+
+#[test]
+fn the_docs_name_every_tool_and_what_each_screen_comes_from() {
+    let docs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+    let overview = fs::read_to_string(docs.join("lab.md")).unwrap();
+    for tool in tools() {
+        assert!(
+            overview.contains(&format!("`{}`", tool.name)),
+            "`{}` isn't in docs/lab.md",
+            tool.name
+        );
+    }
+    // Every test the app's panel has is in the table of what's where, with every chart's field.
+    let guide = fs::read_to_string(docs.join("lab-agents.md")).unwrap();
+    for named in [
+        "Monte Carlo",
+        "Random blocks",
+        "Optimize",
+        "Walk-forward",
+        "Random entries",
+        "Calendar",
+        "`get_equity`'s `market`",
+        "`return_chart`",
+        "`fall_chart`",
+        "`fills_on`",
+        "include_lines",
+        "`gross_return`",
+        "`benchmark`",
+    ] {
+        assert!(guide.contains(named), "{named} isn't in the agents' guide");
+    }
+}
+
+#[test]
 fn a_look_back_longer_than_the_warm_up_says_so_even_when_it_trades() {
     let (lab, _source) = binance_lab();
     let at = |hour: u64| START + hour * HOUR;

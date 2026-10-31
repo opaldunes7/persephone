@@ -80,12 +80,14 @@ persephone-lab call run_backtest '{"symbol": "BTCUSDT", "bars": "1h", "from": "2
 | Markets and data | `list_markets`, `get_instrument`, `get_history_range`, `get_bars`, `get_ticks`, `export_data`, `import_data`, `fetch_archive` |
 | Indicators and models | `list_indicators`, `compute_indicator`, `list_models`, `run_model` |
 | Strategies | `list_strategies`, `describe_strategy`, `validate_logic`, `install_plugin` (compiled, or a program over a socket) |
-| Running tests | `run_backtest`, `run_monte_carlo`, `run_random_blocks`, `run_optimize` |
+| Running tests | `run_backtest`, `run_backtests`, `run_monte_carlo`, `run_random_blocks`, `run_optimize`, `run_walk_forward`, `run_random_entries` |
 | Reading a run | `get_report`, `get_trades`, `get_fills`, `get_equity`, `get_returns`, `get_calendar`, `list_runs`, `compare_runs` |
 | Long jobs | `get_job`, `cancel_job` |
 | The app | `get_layout`, `get_chart_settings`, `get_drawings`, `save_result`, `list_results` |
 | What's happened | `get_call_log` |
 
+- **Everything the app's panel shows is here too.** Figures, tables and the data behind each chart come back as numbers.
+  [The agents' guide](lab-agents.md) has a table of every screen and where its data comes from, under `results`.
 - **Big answers come in pages.** Pass a page's `next_cursor` as `cursor` to carry on. `export_data`
   writes any amount to a CSV or Parquet file, including for training models elsewhere.
 - **Slow work becomes a job.** A call waits `wait_seconds` (30 by default), then answers with a
@@ -126,18 +128,20 @@ A strategy can be written as JSON and tested straight away, with nothing to comp
 Pass it as `{"logic": {...}, "params": {...}}` wherever a strategy goes. `validate_logic` with no
 arguments lists everything a tree can be made of, and with one says where it's wrong.
 
-- **Values:** a number, a bar's `open`, `high`, `low`, `close` or `volume`, a parameter as `$name`, an
-  indicator (`sma`, `ema`, `rsi`, `atr`, `highest`, `lowest`, `roc`, `zscore`), an earlier value
+- **Values:** a number, a bar's `open`, `high`, `low`, `close` or `volume`, what's held (`position`,
+  `entry_price`, `bars_held`, `high_since_entry`, `low_since_entry`), the time (`hour`, `weekday`), a parameter as
+  `$name`, an indicator (`sma`, `ema`, `rsi`, `atr`, `highest`, `lowest`, `roc`, `zscore`), an earlier value
   (`{"ago": {"of": "close", "bars": 1}}`), or arithmetic (`add`, `sub`, `mul`, `div`). Indicators read
   the close unless given `of`, and can read another indicator.
 - **Rules:** `gt`, `lt`, `ge`, `le`, `crosses_above`, `crosses_below`, `and`, `or`, `not`.
-- **What they do:** `long` and `short` ask for that position. On a bar with both or neither, `flat`
-  asks to close, and otherwise the position stays as it is.
+- **What they do:** `long` and `short` ask for that position. `flat` asks to close on a bar with both or
+  neither, or when the one that's true is what's already held, so an exit beats an entry. Otherwise the position
+  stays as it is.
 - **No looking ahead:** a tree only ever gets one closed bar at a time, so it can't. `sma`, `ema`, `rsi`
   and `atr` are the same ones charts and built-in strategies use.
 
 ## Seeing results in the app
 
-`save_result` saves a strategy, with its settings and how it did. It appears in the backtest panel's
+`save_result` saves a strategy or a list of positions, with its settings and how it did. It appears in the backtest panel's
 strategy list straight away, marked **Lab**. Pick it to put it on the chart, then use Backtest, the
 calendar and trade replay as usual. If the app isn't open, it's there next time.
