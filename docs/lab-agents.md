@@ -431,6 +431,12 @@ It appears in the app's backtest panel straight away, marked Lab, to chart and r
 every call made to Lab, newest first. Lists of positions can be saved too: they're written out in full, and work on
 markets and timeframes whose bars they name.
 
+**Moving a setup:** `export_state` writes saved results, the layout, drawings and which plugins are in use to one JSON file,
+with `include_runs` for every run in full (gigabytes after long research), or one chart's setup if given a `strategy` or `settings`. It won't replace a
+file. `import_state` adds a file's results and runs, keeping what's already here under the same id. It answers with any
+`chart` to use in calls, `plugins_missing` to install, and `not_applied` for a layout or drawings, which only the app
+imports. API keys, what AI models a plugin may use, plugins' code and market data never go in a file.
+
 **Everything the app's panel shows, and where to get it:**
 
 | In the app | From Lab |
@@ -456,6 +462,7 @@ markets and timeframes whose bars they name.
 | Walk-forward: chart and table | `run_walk_forward`'s `chart` and `windows` |
 | Random entries: both charts | `run_random_entries`' `return_chart` and `fall_chart` |
 | A parameter sweep | `run_optimize`, or `run_backtests` across the values |
+| Export and Import buttons | `export_state`, `import_state` |
 
 Every line and chart is the same data the panel draws. Lab gives numbers rather than images. Only paper and live sessions
 have no equivalent, as Lab can't trade.

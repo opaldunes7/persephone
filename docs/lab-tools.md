@@ -425,6 +425,26 @@ Saved strategies, newest first.
 
 Returns: `results`
 
+## `export_state`
+
+Writes saved results, the layout, drawings and which plugins are in use to one JSON file, or just one chart's setup if given a strategy or settings. Never API keys, plugins' code or market data. Won't replace a file.
+
+- `path` (string): Where to write it. Default: a new file in Lab's exports folder.
+- `include_runs` (boolean): Add every saved run in full, which can be large. Default false.
+- `strategy` (object): A strategy, for one chart's setup.
+- `settings` (object): Settings, for one chart's setup.
+- `name` (string): A name for one chart's setup.
+
+Returns: `path`, `results`, `runs`, `plugins`, `bytes`
+
+## `import_state`
+
+Adds an exported file's results and runs, keeping anything already here under the same id. A chart's setup comes back to use in calls. A layout and drawings aren't applied, as Lab doesn't change those: the app imports them and asks first.
+
+- `path` (string, required): The exported JSON file.
+
+Returns: `results_added`, `results_skipped`, `runs_added`, `runs_skipped`, `plugins_missing`, `chart`, `not_applied`
+
 ## `get_call_log`
 
 Every call made to Lab: tool, arguments and how it went, newest first. Lab enforces nothing with it.

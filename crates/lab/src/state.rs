@@ -4,7 +4,7 @@
 use std::{
     fs::{self, File},
     io::{Read as _, Seek as _, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -16,6 +16,7 @@ use persephone_engine::indicators::compute;
 use persephone_ml::models::Tensor;
 use persephone_plugin_host::Plugin;
 use persephone_research::{
+    bundle::{Bundle, ChartSetup, Places},
     logic,
     positions::Positions,
     results::{SavedResult, load_results, results_dir},
@@ -528,6 +529,87 @@ impl Lab {
 
     pub(crate) fn get_drawings(&self) -> Result<Value, String> {
         Ok(json!({"drawings": read_ron(&self.paths.data.join("drawings.ron"))?}))
+    }
+
+    /// Where everything is, as a bundle reads and writes it.
+    fn places(&self) -> Places {
+        Places {
+            plugins: self.paths.plugins.clone(),
+            ..Places::under(&self.paths.data)
+        }
+    }
+
+    /// Writes everything to one JSON file, or one chart's setup if given one. Never API keys.
+    pub(crate) fn export_state(&self, args: &Value) -> Result<Value, String> {
+        let path = args.get("path").and_then(Value::as_str).map_or_else(
+            || {
+                self.paths
+                    .lab()
+                    .join("exports")
+                    .join(format!("{}.json", new_id("bundle")))
+            },
+            PathBuf::from,
+        );
+        let chart = args.get("strategy").is_some() || args.get("settings").is_some();
+        let bundle = if chart {
+            let mut strategy = args.get("strategy").cloned();
+            if let Some(strategy) = &mut strategy {
+                self.resolve(strategy)?;
+                if let Some(list) = strategy.get("positions") {
+                    strategy["positions"] = Positions::parse(list)?.to_json();
+                }
+            }
+            let setup = ChartSetup {
+                name: args
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Exported from Lab")
+                    .to_owned(),
+                strategy,
+                settings: args.get("settings").map(read_settings).transpose()?,
+            };
+            Bundle::of_chart(setup, now_ms())
+        } else {
+            let runs = args
+                .get("include_runs")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Bundle::gather(&self.places(), runs, now_ms())?
+        };
+        bundle.write(&path, false)?;
+        Ok(json!({
+            "path": path,
+            "chart": bundle.chart.is_some(),
+            "results": bundle.results.len(),
+            "runs": bundle.runs.len(),
+            "plugins": bundle.plugins,
+            "layout": bundle.layout_ron.is_some(),
+            "drawings": bundle.drawings_ron.is_some(),
+            "bytes": fs::metadata(&path).map_or(0, |file| file.len()),
+        }))
+    }
+
+    /// Adds a file's results and runs. It changes nothing else you have: a chart's setup comes back
+    /// to use in calls, and a layout and drawings are left for the app, which asks first.
+    pub(crate) fn import_state(&self, args: &Value) -> Result<Value, String> {
+        let bundle = Bundle::read(Path::new(text(args, "path")?))?;
+        let done = bundle.add_to(&self.places())?;
+        let not_applied: Vec<&str> = [
+            bundle.layout_ron.is_some().then_some("layout"),
+            bundle.drawings_ron.is_some().then_some("drawings"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        Ok(json!({
+            "results_added": done.results_added,
+            "results_skipped": done.results_skipped,
+            "runs_added": done.runs_added,
+            "runs_skipped": done.runs_skipped,
+            "plugins_missing": done.plugins_missing,
+            "chart": bundle.chart,
+            "not_applied": not_applied,
+        }))
     }
 
     pub(crate) fn save_result(&self, args: &Value) -> Result<Value, String> {

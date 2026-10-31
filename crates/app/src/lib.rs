@@ -66,6 +66,7 @@ use persephone_engine::{
 };
 use persephone_plugin_host::{Host, Plugins, StrategyPlugin};
 use persephone_research::{
+    bundle::{Bundle, ChartSetup, Imported, Places},
     figures::{self, Friction, RunFigures},
     logic::Logic,
     positions::Positions,
@@ -172,6 +173,17 @@ pub enum Run {
     Running,
     Done(Arc<BacktestReport>),
     Failed(String),
+}
+
+/// What to write to a file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Export {
+    /// One chart's setup.
+    Chart,
+    /// Everything but keys, plugins' code and market data.
+    All,
+    /// That and full runs.
+    AllWithRuns,
 }
 
 /// What costs did to a finished run. It takes a second backtest with costs off, so that only runs
@@ -385,6 +397,14 @@ pub enum Message {
     ),
     RandomEntriesProgress(u64, usize),
     RandomEntriesDone(u64, Result<Arc<backtest::positions::RandomEntries>, String>),
+    /// Where to export to, if anywhere was picked.
+    ExportTo(Export, Option<PathBuf>),
+    Exported(Result<String, String>),
+    /// Which file to import, if one was picked.
+    ImportFrom(Option<PathBuf>),
+    BundleImported(Result<(Arc<Bundle>, Imported), String>),
+    /// Whether to replace the layout with the imported one.
+    ReplaceLayout(Arc<Bundle>, bool),
     /// What costs did to a run: tile, the run it's about, and the outcome.
     CostsDone(TileId, u64, Result<Friction, String>),
     /// 1-minute bars for a market's span, for High precision.
@@ -1110,6 +1130,19 @@ impl Persephone {
                     };
                 }
             }
+            Message::ExportTo(what, Some(path)) => return self.export_to(what, path),
+            Message::ExportTo(_, None) | Message::ImportFrom(None) => {}
+            Message::Exported(result) => match result {
+                Ok(said) => self.notify(said, false),
+                Err(error) => self.notify(format!("Couldn't export: {error}"), true),
+            },
+            Message::ImportFrom(Some(path)) => return self.import_from(path),
+            Message::BundleImported(Ok((bundle, done))) => return self.imported(bundle, &done),
+            Message::BundleImported(Err(error)) => {
+                self.notify(format!("Couldn't import: {error}"), true);
+            }
+            Message::ReplaceLayout(bundle, true) => return self.replace_layout(&bundle),
+            Message::ReplaceLayout(_, false) => {}
             Message::CostsDone(id, generation, result) => {
                 let tile = match self.tiles.get_mut(&id) {
                     Some(tile) => Some(tile),
@@ -2514,6 +2547,11 @@ impl Persephone {
         let Some(saved) = self.lab_results.iter().find(|r| r.id == result).cloned() else {
             return Task::none();
         };
+        self.apply_saved(id, saved)
+    }
+
+    /// Puts a strategy on tile `id`, with the costs and rules that came with it, if any.
+    fn apply_saved(&mut self, id: TileId, saved: SavedResult) -> Task<Message> {
         let kind = StrategyKind::Plugin(format!("{LAB_PREFIX}{}", saved.id));
         let spec = match StrategyRef::parse(&saved.strategy) {
             Ok(StrategyRef::BuiltIn(builtin)) => with_params(
@@ -3076,6 +3114,336 @@ impl Persephone {
             stop: backtest::StopOnDrop(stop),
         };
         Some((run, job))
+    }
+
+    // --- Export and import ------------------------------------------------------------------------
+
+    /// Where everything is, if this app keeps anything anywhere.
+    fn places(&self) -> Option<Places> {
+        let data = match (&self.save_path, &self.results_dir) {
+            (Some(layout), _) => layout.parent()?.to_owned(),
+            // Its results folder is `<data>/lab/results`.
+            (None, Some(results)) => results.parent()?.parent()?.to_owned(),
+            (None, None) => return None,
+        };
+        let mut places = Places::under(&data);
+        if let Some(layout) = &self.save_path {
+            places.layout.clone_from(layout);
+        }
+        if let Some(drawings) = &self.drawings_path {
+            places.drawings.clone_from(drawings);
+        }
+        if let Some(results) = &self.results_dir {
+            places.results.clone_from(results);
+            if let Some(lab) = results.parent() {
+                places.runs = lab.join("runs");
+            }
+        }
+        if let Some(plugins) = &self.plugin_dir {
+            places.plugins.clone_from(plugins);
+        }
+        Some(places)
+    }
+
+    fn notify(&mut self, said: String, failed: bool) {
+        if let Some(panel) = self.panel.as_mut() {
+            panel.notice = Some((said, failed));
+        }
+    }
+
+    /// The tile the panel's on, or the focused one.
+    fn current_tile(&self) -> TileId {
+        self.panel
+            .as_ref()
+            .map_or_else(|| self.layout.focused(), |panel| panel.tile)
+    }
+
+    /// A chart's settings and strategy, with its values, written as a strategy is anywhere else.
+    fn chart_setup(&self, id: TileId) -> Option<ChartSetup> {
+        let tile = self.tiles.get(&id)?;
+        let Some(strategy) = &tile.strategy else {
+            return Some(ChartSetup {
+                name: tile.market.symbol.clone(),
+                strategy: None,
+                settings: Some(tile.backtest.clone()),
+            });
+        };
+        let spec = &strategy.spec;
+        let mut written = match &spec.kind {
+            StrategyKind::BuiltIn(kind) => serde_json::json!({"builtin": kind.id()}),
+            StrategyKind::Plugin(plugin) => match plugin.strip_prefix(LAB_PREFIX) {
+                Some(result) => self
+                    .lab_results
+                    .iter()
+                    .find(|saved| saved.id == result)?
+                    .strategy
+                    .clone(),
+                None => serde_json::json!({"plugin": plugin}),
+            },
+        };
+        let values: serde_json::Map<String, serde_json::Value> = spec
+            .info
+            .params
+            .iter()
+            .zip(&spec.params)
+            .map(|(param, value)| (param.name.to_string(), serde_json::json!(value)))
+            .collect();
+        written["params"] = serde_json::Value::Object(values);
+        Some(ChartSetup {
+            name: spec.info.name.clone(),
+            strategy: Some(written),
+            settings: Some(tile.backtest.clone()),
+        })
+    }
+
+    /// Writes `what` to `path` on a worker thread. The system's panel has asked before replacing.
+    fn export_to(&mut self, what: Export, path: PathBuf) -> Task<Message> {
+        let now = now_ms();
+        let bundle = if what == Export::Chart {
+            let Some(chart) = self.chart_setup(self.current_tile()) else {
+                self.notify("There's no chart to export.".into(), true);
+                return Task::none();
+            };
+            Ok(Bundle::of_chart(chart, now))
+        } else {
+            // So the file has the layout as it is now.
+            self.save();
+            let Some(places) = self.places() else {
+                self.notify("Nothing's saved here to export.".into(), true);
+                return Task::none();
+            };
+            Err(places)
+        };
+        let runs = what == Export::AllWithRuns;
+        Task::perform(
+            on_thread(move || {
+                let bundle = match bundle {
+                    Ok(bundle) => bundle,
+                    Err(places) => Bundle::gather(&places, runs, now)?,
+                };
+                bundle.write(&path, true)?;
+                Ok(format!("Exported to {}", path.display()))
+            }),
+            Message::Exported,
+        )
+    }
+
+    /// Reads `path` and adds its results and runs, on a worker thread.
+    fn import_from(&mut self, path: PathBuf) -> Task<Message> {
+        let Some(places) = self.places() else {
+            self.notify("Nothing's saved here to import into.".into(), true);
+            return Task::none();
+        };
+        Task::perform(
+            on_thread(move || {
+                let bundle = Bundle::read(&path)?;
+                let done = bundle.add_to(&places)?;
+                Ok((Arc::new(bundle), done))
+            }),
+            Message::BundleImported,
+        )
+    }
+
+    /// Applies what can be applied now: drawings are merged in and a chart's setup goes on the
+    /// current chart. A layout replaces what you have, so that asks first.
+    fn imported(&mut self, bundle: Arc<Bundle>, done: &Imported) -> Task<Message> {
+        let results = self.load_lab_results();
+        let mut said = done.describe();
+        if let Some(text) = &bundle.drawings_ron {
+            match ron::from_str::<persist::Drawings>(text) {
+                Ok(drawings) => {
+                    let added = self.merge_drawings(drawings);
+                    said += &format!("; {added} drawings added");
+                }
+                Err(error) => said += &format!("; the drawings couldn't be read: {error}"),
+            }
+        }
+        let chart = bundle
+            .chart
+            .clone()
+            .map_or_else(Task::none, |chart| self.apply_chart(chart));
+        self.notify(said, false);
+        let ask = match &bundle.layout_ron {
+            Some(text) if self.layout_from(text).is_ok() => ask_replace_layout(Arc::clone(&bundle)),
+            Some(_) => {
+                self.notify(
+                    "Imported, but the layout in that file isn't usable.".into(),
+                    true,
+                );
+                Task::none()
+            }
+            None => Task::none(),
+        };
+        Task::batch([results, chart, ask])
+    }
+
+    fn layout_from(&self, text: &str) -> Result<Saved, String> {
+        ron::from_str::<Saved>(text)
+            .map_err(|e| e.to_string())
+            .and_then(|saved| {
+                if saved.is_valid() {
+                    Ok(saved)
+                } else {
+                    Err("it doesn't hold together".to_owned())
+                }
+            })
+    }
+
+    /// Adds drawings that aren't already here, and shows them. How many that came to.
+    fn merge_drawings(&mut self, drawings: persist::Drawings) -> usize {
+        let mut added = 0;
+        for (market, list) in drawings {
+            let mine = self.drawings.entry(market).or_default();
+            for drawing in list {
+                if !mine.contains(&drawing) {
+                    mine.push(drawing);
+                    added += 1;
+                }
+            }
+        }
+        if added > 0 {
+            if let Some(path) = &self.drawings_path
+                && let Err(e) = persist::save_drawings(path, &self.drawings)
+            {
+                eprintln!("persephone: couldn't save the drawings: {e}");
+            }
+            for tile in self.tiles.values_mut() {
+                let list = self
+                    .drawings
+                    .get(&drawing_key(&tile.market))
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(chart) = tile.chart.as_mut() {
+                    chart.set_drawings(if tile.hidden.drawings {
+                        Vec::new()
+                    } else {
+                        list
+                    });
+                }
+            }
+        }
+        added
+    }
+
+    /// Puts a chart's setup on the current chart. A logic tree or a list of positions has nowhere
+    /// else to live, so joins the saved results, unless it's one of them already.
+    fn apply_chart(&mut self, chart: ChartSetup) -> Task<Message> {
+        let id = self.current_tile();
+        let Some(strategy) = chart.strategy else {
+            if let (Some(settings), Some(tile)) = (chart.settings, self.tiles.get_mut(&id)) {
+                tile.backtest = backtest::Settings {
+                    test: tile.backtest.test,
+                    stock_open: tile.backtest.stock_open,
+                    ..settings
+                };
+                self.save();
+                return self.run_backtest(id);
+            }
+            return Task::none();
+        };
+        let has_own_home = matches!(
+            StrategyRef::parse(&strategy),
+            Ok(StrategyRef::Logic(_) | StrategyRef::Positions(_))
+        );
+        let mut saved = SavedResult {
+            id: format!("imported-{}-{}", now_ms(), backtest::next_run()),
+            name: chart.name,
+            note: "Imported".to_owned(),
+            strategy,
+            settings: chart.settings,
+            summary: serde_json::Value::Null,
+            saved_at: now_ms(),
+        };
+        if has_own_home {
+            let same = self.lab_results.iter().find(|known| {
+                known.strategy.get("logic") == saved.strategy.get("logic")
+                    && known.strategy.get("positions") == saved.strategy.get("positions")
+            });
+            if let Some(same) = same {
+                saved.id.clone_from(&same.id);
+            } else if let Some(places) = self.places() {
+                let bundle = Bundle {
+                    results: vec![saved.clone()],
+                    ..Bundle::of_chart(
+                        ChartSetup {
+                            name: String::new(),
+                            strategy: None,
+                            settings: None,
+                        },
+                        0,
+                    )
+                };
+                if let Err(error) = bundle.add_to(&places) {
+                    self.notify(format!("Couldn't save its strategy: {error}"), true);
+                    return Task::none();
+                }
+                let _ = self.load_lab_results();
+            }
+        }
+        self.apply_saved(id, saved)
+    }
+
+    /// Replaces the whole layout with an imported one, keeping the old one beside it.
+    fn replace_layout(&mut self, bundle: &Bundle) -> Task<Message> {
+        let Some(text) = &bundle.layout_ron else {
+            return Task::none();
+        };
+        let saved = match self.layout_from(text) {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.notify(format!("That layout isn't usable: {error}"), true);
+                return Task::none();
+            }
+        };
+        let live = self.tiles.values().any(|tile| tile.live.is_some())
+            || self
+                .stash
+                .values()
+                .any(|workspace| workspace.tiles.values().any(|tile| tile.live.is_some()));
+        if live {
+            self.notify(
+                "Stop paper or live trading before replacing the layout.".into(),
+                true,
+            );
+            return Task::none();
+        }
+        if let Some(path) = &self.save_path
+            && path.exists()
+            && let Err(e) = std::fs::copy(path, path.with_file_name("layout.before-import.ron"))
+        {
+            self.notify(
+                format!("Couldn't keep the old layout, so left it: {e}"),
+                true,
+            );
+            return Task::none();
+        }
+        self.close_panel();
+        self.popup = None;
+        self.sweeps.clear();
+        self.tiles.clear();
+        self.stash.clear();
+        self.layout = saved.layout;
+        self.workspace = saved.workspace;
+        let mut loads: Vec<Task<Message>> = saved
+            .tiles
+            .iter()
+            .map(|tile| self.restore(tile.id, restore_tile(tile)))
+            .collect();
+        for other in saved.others {
+            let mut workspace = Workspace {
+                layout: other.layout,
+                tiles: BTreeMap::new(),
+            };
+            self.swap_workspace(&mut workspace);
+            for tile in &other.tiles {
+                loads.push(self.restore(tile.id, restore_tile(tile)));
+            }
+            self.swap_workspace(&mut workspace);
+            self.stash.insert(other.number, workspace);
+        }
+        self.relayout(false);
+        self.save();
+        Task::batch(loads)
     }
 
     /// Sets a walk-forward going on the panel, unless there's a reason not to.
@@ -3799,6 +4167,17 @@ impl Persephone {
                 panel.tests.optimize = backtest::OptimizeRun::Idle;
                 return Task::none();
             }
+            P::ExportRuns(on) => panel.export_runs = on,
+            P::ExportChart => return pick_export(Export::Chart),
+            P::ExportAll => {
+                let what = if panel.export_runs {
+                    Export::AllWithRuns
+                } else {
+                    Export::All
+                };
+                return pick_export(what);
+            }
+            P::Import => return pick_import(),
             P::RunWalkForward => {
                 if !self.apply_typed(id) {
                     return Task::none();
@@ -5101,6 +5480,51 @@ fn batch_task<R: Send + Sync + 'static>(
 /// The first bar of a chart's span.
 fn span_start(candles: &[Candle], span: Option<(UnixNanos, UnixNanos)>) -> usize {
     span.map_or(0, |(from, _)| candles.partition_point(|c| c.ts < from))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
+/// Asks where to export to with the system's save panel, which asks before replacing a file.
+fn pick_export(what: Export) -> Task<Message> {
+    let name = if what == Export::Chart {
+        "persephone-chart.json"
+    } else {
+        "persephone-export.json"
+    };
+    let dialog = rfd::AsyncFileDialog::new()
+        .set_title("Export")
+        .set_file_name(name)
+        .add_filter("JSON", &["json"]);
+    Task::perform(dialog.save_file(), move |picked| {
+        Message::ExportTo(what, picked.map(|file| file.path().to_owned()))
+    })
+}
+
+/// Asks which file to import with the system's open panel.
+fn pick_import() -> Task<Message> {
+    let dialog = rfd::AsyncFileDialog::new()
+        .set_title("Import")
+        .add_filter("JSON", &["json"]);
+    Task::perform(dialog.pick_file(), |picked| {
+        Message::ImportFrom(picked.map(|file| file.path().to_owned()))
+    })
+}
+
+/// Asks before an imported layout replaces yours.
+fn ask_replace_layout(bundle: Arc<Bundle>) -> Task<Message> {
+    let dialog = rfd::AsyncMessageDialog::new()
+        .set_title("Replace your layout?")
+        .set_description(
+            "This file has a layout. Replacing yours closes your charts and opens its. Yours is kept as layout.before-import.ron beside it.",
+        )
+        .set_buttons(rfd::MessageButtons::YesNo);
+    Task::perform(dialog.show(), move |answer| {
+        Message::ReplaceLayout(Arc::clone(&bundle), answer == rfd::MessageDialogResult::Yes)
+    })
 }
 
 /// A strategy that couldn't be set up, which says why when it's run.

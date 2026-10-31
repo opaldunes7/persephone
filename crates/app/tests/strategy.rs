@@ -1598,6 +1598,135 @@ mod panel {
         }
     }
 
+    fn export(app: &mut Persephone, what: persephone::Export, file: &std::path::Path) {
+        let task = app.update(Message::ExportTo(what, Some(file.to_owned())));
+        deliver(app, task);
+        let (said, failed) = app.panel().unwrap().notice.clone().unwrap();
+        assert!(!failed, "{said}");
+    }
+
+    #[test]
+    fn a_charts_setup_goes_out_and_comes_back_with_its_values() {
+        let mut app = ready_panel(TestKind::Backtest);
+        panel(&mut app, PanelMessage::Edit(Edit::Compound(true)));
+        let dir = results_dir();
+        let _ = app.use_results_dir(dir.clone());
+        let file = dir
+            .parent()
+            .unwrap()
+            .join(format!("chart-{}.json", std::process::id()));
+        export(&mut app, persephone::Export::Chart, &file);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("persephone-bundle"), "{text}");
+        assert!(text.contains("\"builtin\": \"ema-cross\""), "{text}");
+        assert!(text.contains("\"Fast\""), "{text}");
+
+        // On a chart with none of that, it's all back.
+        let mut other = ready_panel(TestKind::Backtest);
+        assert!(!other.backtest_request(0).unwrap().1.sim.compound);
+        let bundle = persephone_research::bundle::Bundle::read(&file).unwrap();
+        let task = other.update(Message::BundleImported(Ok((
+            Arc::new(bundle),
+            persephone_research::bundle::Imported::default(),
+        ))));
+        drop(task);
+        assert!(other.backtest_request(0).unwrap().1.sim.compound);
+        assert_eq!(
+            other.tile_strategy(0).unwrap().0.params,
+            app.tile_strategy(0).unwrap().0.params
+        );
+    }
+
+    #[test]
+    fn exporting_everything_keeps_the_layout_and_a_new_one_replaces_it_after_asking() {
+        use persephone::persist;
+        use persephone_research::bundle::{Bundle, Imported};
+        let data =
+            std::env::temp_dir().join(format!("persephone-everything-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&data);
+        std::fs::create_dir_all(data.join("lab").join("results")).unwrap();
+        let layout = data.join("layout.ron");
+        let (mut mine, _) = Persephone::start(&["BTCUSDT".to_owned()], Some(layout.clone()));
+        let _ = mine.use_results_dir(data.join("lab").join("results"));
+        let task = mine.update(Message::Key(Action::Backtest));
+        drop(task);
+        std::fs::write(
+            data.join("ai.json"),
+            r#"{"anthropic_api_key": "SECRET-KEY"}"#,
+        )
+        .unwrap();
+
+        let file = data.join("export.json");
+        export(&mut mine, persephone::Export::All, &file);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(!text.contains("SECRET-KEY"), "keys never go out");
+        let bundle = Bundle::read(&file).unwrap();
+        let carried: persist::Saved = ron::from_str(bundle.layout_ron.as_ref().unwrap()).unwrap();
+        assert_eq!(carried, persist::load(&layout).unwrap());
+
+        // Saying no leaves it alone; saying yes keeps the old one beside the new.
+        let mut changed = carried.clone();
+        changed.tiles[0].symbol = "ETHUSDT".into();
+        let replacing = Bundle {
+            layout_ron: Some(ron::to_string(&changed).unwrap()),
+            ..bundle
+        };
+        let _ = mine.update(Message::ReplaceLayout(Arc::new(replacing.clone()), false));
+        assert_eq!(persist::load(&layout).unwrap().tiles[0].symbol, "BTCUSDT");
+        let _ = mine.update(Message::ReplaceLayout(Arc::new(replacing), true));
+        assert_eq!(persist::load(&layout).unwrap().tiles[0].symbol, "ETHUSDT");
+        let kept = persist::load(&data.join("layout.before-import.ron")).unwrap();
+        assert_eq!(kept.tiles[0].symbol, "BTCUSDT");
+
+        // A broken one doesn't get as far as asking, and says so.
+        let broken = Bundle {
+            layout_ron: Some("not a layout".into()),
+            ..Bundle::read(&file).unwrap()
+        };
+        let task = mine.update(Message::Key(Action::Backtest));
+        drop(task);
+        let task = mine.update(Message::BundleImported(Ok((
+            Arc::new(broken),
+            Imported::default(),
+        ))));
+        drop(task);
+        let (said, failed) = mine.panel().unwrap().notice.clone().unwrap();
+        assert!(failed && said.contains("isn't usable"), "{said}");
+    }
+
+    #[test]
+    fn a_logic_tree_from_a_file_joins_the_saved_results_and_goes_on_the_chart() {
+        use persephone_research::bundle::{Bundle, ChartSetup, Imported};
+        let mut app = ready_panel(TestKind::Backtest);
+        let dir = results_dir().join("lab").join("results");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = app.use_results_dir(dir);
+        let chart = ChartSetup {
+            name: "From a file".into(),
+            strategy: Some(serde_json::json!({"logic": {
+                "name": "Over its average",
+                "params": {"n": 5},
+                "long": {"gt": ["close", {"sma": {"length": "$n"}}]},
+            }, "params": {"n": 9}})),
+            settings: None,
+        };
+        for _ in 0..2 {
+            let bundle = Bundle::of_chart(chart.clone(), 1);
+            let _ = app.update(Message::BundleImported(Ok((
+                Arc::new(bundle),
+                Imported::default(),
+            ))));
+        }
+        let (spec, _) = app.tile_strategy(0).unwrap();
+        assert_eq!(spec.info.name, "Over its average");
+        assert_eq!(spec.params[0], 9.0);
+        assert_eq!(
+            app.lab_results().len(),
+            1,
+            "the same tree isn't saved twice"
+        );
+    }
+
     #[test]
     fn filling_at_the_next_open_reaches_the_backtest() {
         use persephone::backtest::FillTiming;

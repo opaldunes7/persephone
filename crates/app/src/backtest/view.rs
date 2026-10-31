@@ -877,7 +877,7 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
     let side = container(settings)
         .width(FillPortion(SETTINGS_PORTION))
         .height(Fill);
-    let tabs = container(settings::test_tabs(test))
+    let tabs = container(settings::test_tabs(test, panel))
         .padding([0, 10])
         .height(super::TABS_HEIGHT)
         .align_y(Alignment::Center);

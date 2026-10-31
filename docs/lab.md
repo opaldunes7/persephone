@@ -84,6 +84,7 @@ persephone-lab call run_backtest '{"symbol": "BTCUSDT", "bars": "1h", "from": "2
 | Reading a run | `get_report`, `get_trades`, `get_fills`, `get_equity`, `get_returns`, `get_calendar`, `list_runs`, `compare_runs` |
 | Long jobs | `get_job`, `cancel_job` |
 | The app | `get_layout`, `get_chart_settings`, `get_drawings`, `save_result`, `list_results` |
+| Moving your setup | `export_state`, `import_state` |
 | What's happened | `get_call_log` |
 
 - **Everything the app's panel shows is here too.** Figures, tables and the data behind each chart come back as numbers.
@@ -139,6 +140,15 @@ arguments lists everything a tree can be made of, and with one says where it's w
   stays as it is.
 - **No looking ahead:** a tree only ever gets one closed bar at a time, so it can't. `sma`, `ema`, `rsi`
   and `atr` are the same ones charts and built-in strategies use.
+
+## Moving your setup
+
+`export_state` writes saved results, the layout, drawings and which plugins are in use to one JSON file, with
+`include_runs` for full runs, or one chart's setup if given a `strategy` or `settings`. `import_state` adds a file's
+results and runs beside what's there. The app has the same in its backtest panel, and they read each other's files.
+
+Lab doesn't change a layout or drawings, so it leaves those for the app, which asks before replacing a layout. API keys,
+what AI models a plugin may use, plugins' code and market data never go in a file.
 
 ## Seeing results in the app
 

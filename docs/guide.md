@@ -16,6 +16,7 @@ chart, in the strategy report, and in `persephone-cli`. This guide walks through
 - [Your own data](#your-own-data)
 - [Paper and live trading](#paper-and-live-trading)
 - [Plugins, models and AI](#plugins-models-and-ai)
+- [Exporting and importing](#exporting-and-importing)
 - [Persephone Lab](#persephone-lab)
 - [Where files live](#where-files-live)
 
@@ -496,6 +497,19 @@ When a strategy plugin wants to ask language models, the app asks you first. The
 explains what's at stake (prompts leave your machine, and new calls can cost money) and has
 **Allow it to ask AI models**. Replies are recorded, so rerunning a backtest asks nothing
 new.
+
+## Exporting and importing
+
+The backtest panel's bar has **Export chart**, **Export all** and **Import**, all as JSON files.
+
+- **Export chart** saves this chart's settings, strategy and values. Importing it puts them on the chart you're on.
+- **Export all** saves your saved results, layout, workspaces, drawings and which plugins are in use. Turn on **Runs** to add
+  every full run, which can be large: gigabytes, after an agent has been researching for a while.
+- **Import** adds results and drawings beside yours. If the file has a layout it asks first, and keeps yours as
+  `layout.before-import.ron` beside it. It says if the file names a plugin you don't have.
+
+A file can't carry your API keys, what AI models a plugin may use, plugins' code or market data. Lab reads and writes the
+same files.
 
 ## Persephone Lab
 

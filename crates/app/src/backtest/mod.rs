@@ -76,6 +76,10 @@ pub struct Panel {
     pub error: Option<String>,
     /// How tall the settings measure, for keeping the panel at least that tall.
     pub settings_height: f32,
+    /// Whether exporting everything includes full runs, which can be large.
+    pub export_runs: bool,
+    /// How the last export or import went, and whether it failed.
+    pub notice: Option<(String, bool)>,
     /// The search for plugins to add: every kind not already on.
     pub plugin_search: combo_box::State<&'static str>,
     /// How far the Monte Carlo and Random blocks tests have got.
@@ -279,6 +283,8 @@ impl Panel {
     pub fn new(tile: TileId, window_height: f32, settings: &Settings) -> Self {
         Self {
             settings_height: 0.0,
+            export_runs: false,
+            notice: None,
             plugin_search: plugin_search(settings),
             tests: Tests::default(),
             calendar: calendar::CalendarView::default(),
@@ -391,6 +397,14 @@ pub enum PanelMessage {
     StopWalkForward,
     RunRandomEntries,
     StopRandomEntries,
+    /// Write this chart's setup to a file.
+    ExportChart,
+    /// Write everything to a file.
+    ExportAll,
+    /// Whether exporting everything includes full runs.
+    ExportRuns(bool),
+    /// Read an exported file.
+    Import,
     /// Put this result of the optimization on the strategy, by its place in the results.
     Apply(usize),
     /// Back to the strategy's parameters from before any result was applied.

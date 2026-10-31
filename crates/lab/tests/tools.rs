@@ -233,6 +233,8 @@ fn calls(lab: &Arc<Lab>, dir: &std::path::Path) -> Vec<(&'static str, Value)> {
         ("get_layout", json!({})),
         ("get_chart_settings", json!({})),
         ("get_drawings", json!({})),
+        ("export_state", json!({"path": dir.join("state.json")})),
+        ("import_state", json!({"path": dir.join("state.json")})),
         (
             "save_result",
             json!({"name": "A try", "strategy": tree(), "run_id": run_id, "note": "worth a look"}),
@@ -3314,9 +3316,89 @@ fn the_docs_name_every_tool_and_what_each_screen_comes_from() {
         "include_lines",
         "`gross_return`",
         "`benchmark`",
+        "`export_state`",
+        "`import_state`",
     ] {
         assert!(guide.contains(named), "{named} isn't in the agents' guide");
     }
+}
+
+#[test]
+fn everything_moves_to_another_lab_in_one_file_and_no_keys_go_with_it() {
+    // `lab()` puts an API key beside everything else.
+    let (lab, dir) = lab();
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({"strategy": ema(), "label": "moved"})),
+        )
+        .unwrap();
+    lab.dispatch(
+        "save_result",
+        &json!({"name": "To move", "strategy": ema(), "run_id": run["run_id"], "settings": {"compound": true}}),
+    )
+    .unwrap();
+    fs::write(dir.join("layout.ron"), "(layout)").unwrap();
+
+    let file = dir.join("moved.json");
+    let out = lab
+        .dispatch("export_state", &json!({"path": file, "include_runs": true}))
+        .unwrap();
+    assert_eq!(out["results"], 1, "{out}");
+    assert_eq!(out["runs"], 1, "{out}");
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(!text.contains(SECRET), "a key went out");
+    // It won't write over a file, as with every other export here.
+    let again = lab
+        .dispatch("export_state", &json!({"path": file}))
+        .unwrap_err();
+    assert!(again.contains("already exists"), "{again}");
+
+    let (other, _other_dir) = self::lab();
+    let done = other
+        .dispatch("import_state", &json!({"path": file}))
+        .unwrap();
+    assert_eq!(done["results_added"], 1, "{done}");
+    assert_eq!(done["runs_added"], 1, "{done}");
+    assert_eq!(done["not_applied"], json!(["layout"]), "{done}");
+    // The run reads back the same, the result's listed, and its settings came too.
+    let back = other
+        .dispatch("get_report", &json!({"run_id": run["run_id"]}))
+        .unwrap();
+    assert_eq!(back["summary"], run["summary"]);
+    let results = other.dispatch("list_results", &json!({})).unwrap();
+    assert_eq!(results["results"][0]["name"], "To move");
+    assert_eq!(results["results"][0]["settings"]["compound"], true);
+    let listed = other
+        .dispatch("list_runs", &json!({"label": "moved"}))
+        .unwrap();
+    assert_eq!(listed["total"], 1, "{listed}");
+    // Twice changes nothing.
+    let twice = other
+        .dispatch("import_state", &json!({"path": file}))
+        .unwrap();
+    assert_eq!(twice["results_added"], 0, "{twice}");
+    assert_eq!(twice["results_skipped"], 1, "{twice}");
+
+    // One chart's setup, for the app or another Lab.
+    let chart = dir.join("chart.json");
+    lab.dispatch(
+        "export_state",
+        &json!({"path": chart, "strategy": ema(), "settings": {"compound": true}, "name": "Mine"}),
+    )
+    .unwrap();
+    let setup = other
+        .dispatch("import_state", &json!({"path": chart}))
+        .unwrap();
+    assert_eq!(setup["chart"]["name"], "Mine", "{setup}");
+    assert_eq!(setup["chart"]["strategy"], ema(), "{setup}");
+
+    // Something else entirely says so.
+    fs::write(dir.join("other.json"), "{}").unwrap();
+    let error = other
+        .dispatch("import_state", &json!({"path": dir.join("other.json")}))
+        .unwrap_err();
+    assert!(error.contains("isn't a Persephone"), "{error}");
 }
 
 #[test]

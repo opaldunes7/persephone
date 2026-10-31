@@ -7,7 +7,7 @@ use super::*;
 /// The panel's left side: the strategy, every stock setting and the plugin slots, packed into
 /// as many columns as fit. What each one does is in the tooltips of its name and controls.
 /// Which test to run, all on one line across the top of the panel.
-pub(super) fn test_tabs<'a>(current: TestKind) -> Element<'a, PanelMessage> {
+pub(super) fn test_tabs<'a>(current: TestKind, panel: &'a Panel) -> Element<'a, PanelMessage> {
     let tab = |label: &'a str, test: TestKind, what: &'a str| {
         tip(
             button(text(label).size(SMALL).center())
@@ -18,7 +18,7 @@ pub(super) fn test_tabs<'a>(current: TestKind) -> Element<'a, PanelMessage> {
             None,
         )
     };
-    row![
+    let tabs = row![
         tip(
             text("Test").size(SMALL).color(theme::TEXT_BRIGHT),
             "How to test the strategy. One backtest can't tell skill from luck; the others show how far its result could have gone either way, and whether it beats chance.",
@@ -56,6 +56,57 @@ pub(super) fn test_tabs<'a>(current: TestKind) -> Element<'a, PanelMessage> {
         ),
     ]
     .spacing(3)
+    .align_y(Alignment::Center);
+    let action = |label: &'a str, message: PanelMessage, what: &'a str| {
+        tip(
+            button(text(label).size(SMALL).center())
+                .padding([3, 8])
+                .on_press(message)
+                .style(|_, status| chip(false, status)),
+            what,
+            None,
+        )
+    };
+    let notice = panel.notice.as_ref().map(|(said, failed)| {
+        text(said.as_str()).size(HINT).color(if *failed {
+            theme::DOWN
+        } else {
+            theme::TEXT_MUTED
+        })
+    });
+    row![
+        tabs,
+        container(notice).width(Fill).padding([0, 12]),
+        action(
+            "Export chart",
+            PanelMessage::ExportChart,
+            "Save this chart's settings, strategy and values to a JSON file.",
+        ),
+        action(
+            "Export all",
+            PanelMessage::ExportAll,
+            "Save your saved results, layout, drawings and which plugins are in use to one JSON file. Never API keys, plugins' code or market data.",
+        ),
+        tip(
+            row![
+                toggler(panel.export_runs)
+                    .size(15)
+                    .on_toggle(PanelMessage::ExportRuns)
+                    .style(switch_style),
+                text("Runs").size(SMALL).color(theme::TEXT),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+            "Include every saved run in full when exporting all. They can be large.",
+            None,
+        ),
+        action(
+            "Import",
+            PanelMessage::Import,
+            "Read an exported file. Results are added beside yours, and it asks before replacing your layout.",
+        ),
+    ]
+    .spacing(6)
     .align_y(Alignment::Center)
     .into()
 }

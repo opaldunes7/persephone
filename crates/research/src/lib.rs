@@ -1,6 +1,7 @@
 //! What the Persephone app and Lab share, with no interface of its own: a chart's backtest
 //! settings, loading markets, and the tests beyond a backtest.
 
+pub mod bundle;
 pub mod calendar;
 pub mod figures;
 pub mod logic;

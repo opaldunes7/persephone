@@ -4893,6 +4893,7 @@ name = "persephone-research"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "flate2",
  "persephone-core",
  "persephone-data",
  "persephone-engine",
