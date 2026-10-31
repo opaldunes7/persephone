@@ -1412,4 +1412,26 @@ mod panel {
         panel(&mut app, PanelMessage::SelectLine(None));
         assert_eq!(tests(&app), (None, false));
     }
+
+    #[test]
+    fn the_invert_switch_reruns_the_backtest_on_the_other_side() {
+        let mut app = ready_panel(TestKind::Backtest);
+        let before = trades(&app);
+        assert!(!before.is_empty());
+
+        panel(&mut app, PanelMessage::Edit(Edit::Invert(true)));
+        assert!(app.backtest_request(0).unwrap().1.rules.invert);
+        finish_backtest(&mut app);
+        let after = trades(&app);
+        assert_eq!(before.len(), after.len());
+        for (a, b) in before.iter().zip(&after) {
+            assert_eq!(a.entry_bar, b.entry_bar);
+            assert_ne!(a.long, b.long);
+        }
+        measure(&mut app);
+
+        // The master switch turns it off with the rest.
+        panel(&mut app, PanelMessage::Edit(Edit::Stock(false)));
+        assert!(!app.backtest_request(0).unwrap().1.rules.invert);
+    }
 }

@@ -844,7 +844,7 @@ fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMessage> {
     if !open {
         stock_title = stock_title.push(
             text(format!(
-                "{} of 7 on, capital {}",
+                "{} of 8 on, capital {}",
                 settings.stock_sections_on(),
                 settings.text(Field::Capital)
             ))
@@ -1168,6 +1168,7 @@ fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMessage> {
     const LEVERAGE: &str =
         "A position is worth capital × Size % × leverage. Margin calls aren't simulated.";
     const DIRECTION: &str = "Trade one way only; the other side's signals close positions instead. Paper trading follows it too.";
+    const INVERT: &str = "Trade the opposite of what the strategy says: sell when it buys and buy when it sells, at the same moments. Paper trading follows it too.";
     const SESSION: &str = "Outside these days and times, signals can close positions but not open them. Paper trading follows it too.";
     let ticks_box = |field: Field, suffix: &'a str, what: &'a str| -> Element<'a, PanelMessage> {
         tip(
@@ -1274,6 +1275,11 @@ fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMessage> {
             ]
             .spacing(2)
             .into(),
+        ),
+        line(
+            switch(settings.invert, Edit::Invert, INVERT),
+            name("Invert", INVERT),
+            no_switch(),
         ),
     ];
 

@@ -39,7 +39,7 @@ use anyhow::{Context, bail};
 use iced::{Point, Settings, Size, Theme};
 use persephone::{
     Message, Persephone, Run,
-    backtest::{BlockLength, PanelMessage, TestKind},
+    backtest::{BlockLength, Edit, PanelMessage, TestKind},
     keymap::Action,
     menu::{Active, ImportState, MenuMessage, Page, Popup},
 };
@@ -155,6 +155,16 @@ fn main() -> anyhow::Result<()> {
             '%' => {
                 // Zoomed into the fan's first half.
                 let _ = app.update(Message::Backtest(PanelMessage::ZoomFan(Some((0.0, 0.5)))));
+            }
+            '&' => {
+                // The strategy's trades inverted, once the backtest has rerun.
+                let _ = app.update(Message::Backtest(PanelMessage::Edit(Edit::Invert(true))));
+                if let Some((generation, request)) = app.backtest_request(focused) {
+                    let result = persephone_engine::run_backtest(&request)
+                        .map(std::sync::Arc::new)
+                        .map_err(|e| e.to_string());
+                    let _ = app.update(Message::BacktestDone(focused, generation, result));
+                }
             }
             '~' => {
                 // The stock settings folded away.

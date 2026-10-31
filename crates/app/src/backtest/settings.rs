@@ -33,6 +33,8 @@ pub struct Settings {
     pub latency: Section<u32>,
     pub leverage: Section<f64>,
     pub direction: Section<OneWay>,
+    /// Trade the opposite of what the strategy says.
+    pub invert: bool,
     pub session: Section<SessionRule>,
     pub precision: Precision,
     /// Plugins added to the backtest, by name. They're only listed for now: no kind of
@@ -62,6 +64,7 @@ impl Default for Settings {
             latency: Section::off(100),
             leverage: Section::off(2.0),
             direction: Section::off(OneWay::LongOnly),
+            invert: false,
             session: Section::off(SessionRule::default()),
             precision: Precision::Standard,
             plugins: Vec::new(),
@@ -311,6 +314,7 @@ pub enum Edit {
     Latency(bool),
     Leverage(bool),
     Direction(bool),
+    Invert(bool),
     OneWay(OneWay),
     Session(bool),
     /// Monday is 0.
@@ -337,6 +341,7 @@ impl Settings {
             Edit::Leverage(on) => self.leverage.on = on,
             Edit::Direction(on) => self.direction.on = on,
             Edit::OneWay(way) => self.direction.value = way,
+            Edit::Invert(on) => self.invert = on,
             Edit::Session(on) => self.session.on = on,
             Edit::Day(day) => {
                 if let Some(on) = self.session.value.days.get_mut(day) {
@@ -445,6 +450,7 @@ impl Settings {
             + self.latency.on as usize
             + self.leverage.on as usize
             + self.direction.on as usize
+            + self.invert as usize
             + self.session.on as usize
     }
 
@@ -478,7 +484,7 @@ impl Settings {
         }
     }
 
-    /// The direction and session rules, for backtests and live trading alike.
+    /// The inverting, direction and session rules, for backtests and live trading alike.
     ///
     /// # Errors
     ///
@@ -501,7 +507,11 @@ impl Settings {
             }
             None => None,
         };
-        Ok(TradingRules { direction, session })
+        Ok(TradingRules {
+            invert: self.stock && self.invert,
+            direction,
+            session,
+        })
     }
 
     /// The commission as said in the panel: `0.1%` or `2.5 per order`, or the market's.
@@ -597,6 +607,11 @@ mod tests {
         settings.stock = false;
         assert_eq!(settings.sim(), SimSettings::default(), "all off at once");
         assert_eq!(settings.rules().unwrap().direction, Direction::Both);
+
+        settings.invert = true;
+        assert!(!settings.rules().unwrap().invert, "off with the rest");
+        settings.stock = true;
+        assert!(settings.rules().unwrap().invert);
 
         settings.stock = true;
         settings.commission.value = Commission::Percent(0.05);

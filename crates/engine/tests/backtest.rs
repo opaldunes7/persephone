@@ -280,6 +280,28 @@ fn long_only_and_short_only_never_cross_zero() {
 }
 
 #[test]
+fn inverting_takes_the_opposite_side_of_every_trade_at_the_same_time() {
+    let normal = run(request(sine_candles(800), ema(5.0, 20.0))).unwrap();
+    let mut req = request(sine_candles(800), ema(5.0, 20.0));
+    req.rules.invert = true;
+    let inverted = run(req).unwrap();
+
+    assert!(normal.fills.len() >= 4, "it trades");
+    assert_eq!(normal.fills.len(), inverted.fills.len());
+    for (a, b) in normal.fills.iter().zip(&inverted.fills) {
+        assert_eq!(a.bar, b.bar);
+        assert_ne!(a.side, b.side, "bar {}", a.bar);
+    }
+    assert!(
+        positions(&normal)
+            .iter()
+            .zip(positions(&inverted))
+            .all(|(a, b)| (a + b).abs() < 1e-9),
+        "every position is its opposite"
+    );
+}
+
+#[test]
 fn sessions_stop_entries_and_can_close_positions() {
     let candles = sine_candles(800);
     let cut = candles[400].ts;

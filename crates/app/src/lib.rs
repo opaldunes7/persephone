@@ -3776,7 +3776,17 @@ impl Persephone {
             width: self.window.width,
             panel,
             settings: &tile.backtest,
-            title: format!("{} · {} · {strategy}", tile.market.symbol, tile.market.bars),
+            // Worth saying wherever results show: they're not the strategy's own.
+            title: format!(
+                "{} · {} · {strategy}{}",
+                tile.market.symbol,
+                tile.market.bars,
+                if tile.backtest.stock && tile.backtest.invert {
+                    " · inverted"
+                } else {
+                    ""
+                }
+            ),
             status,
             quote: ready.map_or("", |m| m.instrument.quote.as_str()),
             span: tile.market.span,

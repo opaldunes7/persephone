@@ -37,6 +37,9 @@ impl Default for SimSettings {
 /// Rules on what a strategy may do, whatever its signal says.
 #[derive(Clone, Debug, Default)]
 pub struct TradingRules {
+    /// Do the opposite of what the strategy says: long for short, short for long. Going flat is
+    /// still going flat.
+    pub invert: bool,
     pub direction: Direction,
     /// When positions may be opened; any time without one.
     pub session: Option<Session>,
@@ -87,7 +90,9 @@ impl TradingRules {
     /// and what it holds (1, -1 or 0); `None` changes nothing.
     #[must_use]
     pub fn target(&self, wanted: Option<i8>, held: i8, ts: UnixNanos) -> Option<i8> {
-        let wanted = wanted.map(|target| self.direction.allow(target));
+        let wanted = wanted
+            .map(|target| if self.invert { -target } else { target })
+            .map(|target| self.direction.allow(target));
         let Some(session) = self.session.as_ref().filter(|s| !(s.contains)(ts)) else {
             return wanted;
         };
@@ -113,6 +118,7 @@ mod tests {
         close_after: bool,
     ) -> TradingRules {
         TradingRules {
+            invert: false,
             direction,
             session: open_until.map(|until| Session {
                 contains: Arc::new(move |ts| ts < until),
@@ -129,6 +135,44 @@ mod tests {
         let short_only = rules(Direction::ShortOnly, None, false);
         assert_eq!(short_only.target(Some(1), -1, 0), Some(0));
         assert_eq!(rules(Direction::Both, None, false).target(None, 1, 0), None);
+    }
+
+    #[test]
+    fn inverting_swaps_long_and_short_but_flat_stays_flat() {
+        let mut inverted = rules(Direction::Both, None, false);
+        inverted.invert = true;
+        assert_eq!(inverted.target(Some(1), 0, 0), Some(-1));
+        assert_eq!(inverted.target(Some(-1), 0, 0), Some(1));
+        assert_eq!(inverted.target(Some(0), 1, 0), Some(0));
+        assert_eq!(
+            inverted.target(None, 1, 0),
+            None,
+            "no signal keeps what it has"
+        );
+    }
+
+    #[test]
+    fn inverting_comes_before_the_other_rules() {
+        // Long only still means only long positions: what were short signals now open them.
+        let mut long_only = rules(Direction::LongOnly, None, false);
+        long_only.invert = true;
+        assert_eq!(long_only.target(Some(-1), 0, 0), Some(1));
+        assert_eq!(long_only.target(Some(1), 1, 0), Some(0));
+
+        // Outside a session, it can close but not open, the inverted way round too.
+        let mut session = rules(Direction::Both, Some(100), false);
+        session.invert = true;
+        assert_eq!(session.target(Some(-1), 0, 150), None, "no entry");
+        assert_eq!(
+            session.target(Some(-1), 1, 150),
+            None,
+            "already where it's told to be"
+        );
+        assert_eq!(
+            session.target(Some(1), 1, 150),
+            Some(0),
+            "a reversal only closes"
+        );
     }
 
     #[test]

@@ -179,9 +179,10 @@ ideal run to compare against. They're saved with each chart.
 | Leverage | A position is worth capital × Size % × leverage. Margin calls aren't simulated. |
 | Intra-bar precision | **Standard** fills at the bars, and playback shows each bar as it closes: fast and light, best for long spans. **High** fills on ticks or 1-minute bars, and at slow speeds playback builds each bar as it formed, from the ticks (imported tick data), 1-minute bars (Binance, and 1-minute imports; they load in the background) or, with nothing finer, a simulated path from open through low and high to close. |
 | Direction | Long only, or short only; the other side's signals close positions instead. |
+| Invert | Trade the opposite of what the strategy says: short for long and long for short, at the same moments. It comes before Direction, so Long only still means only long positions. Going flat stays flat, and the panel's title says **inverted**. |
 | Trading session | Weekdays, a time window and a time zone (e.g. America/New_York, daylight saving included). Outside it, signals can close positions but not open them; optionally, positions close when it ends. |
 
-Direction and the trading session apply to paper trading too. Position sizing models, dynamic
+Direction, Invert and the trading session apply to paper trading too. Position sizing models, dynamic
 slippage, order-book fills, news-driven spreads and latency, holding costs, commission
 schedules and exchange calendars are found through the plugin search. Those kinds aren't built
 yet, so a tag has no effect on results for now; see
