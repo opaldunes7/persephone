@@ -321,7 +321,8 @@ anything: pandas, scikit-learn, PyTorch, a call to an agent.
 The backtest panel's settings fix what's the same everywhere: capital, a commission, a constant
 slippage and spread, latency, leverage, direction and trading sessions. What depends on the
 market, the broker or your own theory will be plugins. None of these kinds exist yet; the
-settings sheet lists them so you can see where they'll go.
+backtest panel's plugin search lists them, and adding one makes a tag, but a tag has no effect
+on results until that kind exists.
 
 | Kind | Would see | Would decide | For example |
 |---|---|---|---|

@@ -1,9 +1,12 @@
 //! A chart's backtest settings, saved with the layout: the stock ones every market shares, and
 //! what the engine makes of them.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
-use persephone_core::{UnixNanos, time::NANOS_PER_MINUTE};
+use persephone_core::{
+    UnixNanos,
+    time::{NANOS_PER_DAY, NANOS_PER_MINUTE},
+};
 use persephone_data::import::Zone;
 use persephone_engine::{Direction, FeeRates, Session, SimSettings, TradingRules};
 use serde::{Deserialize, Serialize};
@@ -30,6 +33,19 @@ pub struct Settings {
     pub direction: Section<OneWay>,
     pub session: Section<SessionRule>,
     pub precision: Precision,
+    /// Plugins added to the backtest, by name. They're only listed for now: no kind of
+    /// backtest plugin exists yet.
+    pub plugins: Vec<String>,
+    /// Which test the panel shows, and what the two beyond the backtest itself are set to.
+    pub test: TestKind,
+    /// How many times Monte Carlo draws the trades.
+    pub runs: u32,
+    /// The fall from a peak Monte Carlo counts as ruin, in percent.
+    pub ruin: f64,
+    /// How many stretches of the market Random blocks backtests.
+    pub blocks: u32,
+    pub block_length: BlockLength,
+    pub optimize: OptimizeSettings,
 }
 
 impl Default for Settings {
@@ -45,7 +61,118 @@ impl Default for Settings {
             direction: Section::off(OneWay::LongOnly),
             session: Section::off(SessionRule::default()),
             precision: Precision::Standard,
+            plugins: Vec::new(),
+            test: TestKind::Backtest,
+            runs: 1_000,
+            ruin: 50.0,
+            blocks: 50,
+            block_length: BlockLength::Month,
+            optimize: OptimizeSettings::default(),
         }
+    }
+}
+
+/// What the panel tests a strategy with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TestKind {
+    /// One run through the span, which can be played back.
+    #[default]
+    Backtest,
+    /// The backtest's trades, drawn at random many times.
+    MonteCarlo,
+    /// Backtests of random stretches of the span.
+    RandomBlocks,
+    /// Backtests across a range of a strategy's parameters.
+    Optimize,
+}
+
+/// What the Optimize test varies and how it scores the results.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OptimizeSettings {
+    /// The variable to change, and optionally a second one with it.
+    pub variables: [Option<Variable>; 2],
+    pub score: ScoreBy,
+    /// Pick values on the span's first 70%, and check the best on the rest.
+    pub hold_out: bool,
+}
+
+impl Default for OptimizeSettings {
+    fn default() -> Self {
+        Self {
+            variables: [None, None],
+            score: ScoreBy::Backtest,
+            hold_out: true,
+        }
+    }
+}
+
+/// A strategy parameter, by name, and the values to try it at.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Variable {
+    pub name: String,
+    pub min: f64,
+    pub max: f64,
+    pub step: f64,
+}
+
+/// What makes one value better than another.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScoreBy {
+    /// The return of one backtest.
+    #[default]
+    Backtest,
+    /// The low end of the returns its trades could have given.
+    MonteCarlo,
+    /// The median return across random stretches of the span.
+    RandomBlocks,
+}
+
+impl ScoreBy {
+    pub const ALL: [Self; 3] = [Self::Backtest, Self::MonteCarlo, Self::RandomBlocks];
+}
+
+impl fmt::Display for ScoreBy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Backtest => "Backtest return",
+            Self::MonteCarlo => "Monte Carlo",
+            Self::RandomBlocks => "Random blocks",
+        })
+    }
+}
+
+/// How long each of Random blocks' stretches is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlockLength {
+    Week,
+    #[default]
+    Month,
+    Quarter,
+}
+
+impl BlockLength {
+    /// As in "1-month blocks".
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Week => "1-week",
+            Self::Month => "1-month",
+            Self::Quarter => "3-month",
+        }
+    }
+
+    #[must_use]
+    pub const fn nanos(self) -> UnixNanos {
+        let days = match self {
+            Self::Week => 7,
+            Self::Month => 30,
+            Self::Quarter => 91,
+        };
+        days * NANOS_PER_DAY
     }
 }
 
@@ -169,7 +296,7 @@ pub fn time_text(minutes: u32) -> String {
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
-/// A switch or choice in the settings sheet, applied as soon as it's made.
+/// A switch or choice in the settings section, applied as soon as it's made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Edit {
     Stock(bool),
@@ -233,6 +360,19 @@ impl Settings {
             Field::SessionFrom => time_text(self.session.value.from),
             Field::SessionTo => time_text(self.session.value.to),
             Field::SessionZone => self.session.value.zone.clone(),
+            Field::Runs => self.runs.to_string(),
+            Field::Ruin => trim(self.ruin),
+            Field::Blocks => self.blocks.to_string(),
+            Field::Min(slot) | Field::Max(slot) | Field::Step(slot) => {
+                let Some(variable) = &self.optimize.variables[slot] else {
+                    return String::new();
+                };
+                trim(match field {
+                    Field::Min(_) => variable.min,
+                    Field::Max(_) => variable.max,
+                    _ => variable.step,
+                })
+            }
         }
     }
 
@@ -275,6 +415,19 @@ impl Settings {
             Field::SessionZone => {
                 let zone: Zone = text.parse().map_err(|e| format!("{e:#}"))?;
                 self.session.value.zone = zone.to_string();
+            }
+            Field::Runs => self.runs = number(10.0, 10_000.0, "Runs")?.round() as u32,
+            Field::Ruin => self.ruin = number(1.0, 100.0, "Ruin")?,
+            Field::Blocks => self.blocks = number(2.0, 1_000.0, "Blocks")?.round() as u32,
+            Field::Min(slot) | Field::Max(slot) | Field::Step(slot) => {
+                let value = number(-1e12, 1e12, "Min, Max and Step each")?;
+                if let Some(variable) = &mut self.optimize.variables[slot] {
+                    match field {
+                        Field::Min(_) => variable.min = value,
+                        Field::Max(_) => variable.max = value,
+                        _ => variable.step = value,
+                    }
+                }
             }
         }
         Ok(())
@@ -445,6 +598,7 @@ mod tests {
                 on: true,
                 value: 250,
             },
+            plugins: vec!["Fill model".into()],
             ..Settings::default()
         };
         let text = ron::to_string(&settings).unwrap();
@@ -475,6 +629,39 @@ mod tests {
         assert_eq!(settings.commission.value, Commission::PerOrder(2.5));
         settings.apply(Edit::Day(6));
         assert!(settings.session.value.days[6], "Sunday on");
+    }
+
+    #[test]
+    fn test_settings_are_checked_and_old_layouts_get_the_defaults() {
+        let mut settings = Settings::default();
+        settings.set(Field::Runs, "2,500").unwrap();
+        assert_eq!(settings.runs, 2_500);
+        assert!(settings.set(Field::Runs, "5").is_err());
+        assert!(settings.set(Field::Ruin, "0").is_err());
+        assert!(settings.set(Field::Blocks, "1").is_err());
+        assert_eq!(settings.text(Field::Blocks), "50");
+
+        let old: Settings = ron::from_str("(stock: false)").unwrap();
+        assert_eq!(old.test, TestKind::Backtest);
+        assert_eq!(old.runs, 1_000);
+        assert_eq!(old.block_length, BlockLength::Month);
+        assert!(
+            old.optimize.hold_out,
+            "keeping some bars unseen is the default"
+        );
+
+        settings.test = TestKind::Optimize;
+        settings.block_length = BlockLength::Quarter;
+        settings.optimize.score = ScoreBy::MonteCarlo;
+        settings.optimize.hold_out = false;
+        settings.optimize.variables[1] = Some(Variable {
+            name: "Slow".into(),
+            min: 10.0,
+            max: 50.0,
+            step: 5.0,
+        });
+        let text = ron::to_string(&settings).unwrap();
+        assert_eq!(ron::from_str::<Settings>(&text).unwrap(), settings);
     }
 
     #[test]

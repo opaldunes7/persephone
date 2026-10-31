@@ -7,7 +7,7 @@
 //!
 //! Menu pages:
 //! - root: what's active on the chart, each with a checkbox to show or hide it, then
-//!   Indicators ›, Strategy ›, Draw ›, Symbol ›, and a row of timeframe chips;
+//!   Indicators ›, Strategy ›, Draw ›, Backtest, Symbol ›, and a row of timeframe chips;
 //! - indicators: every built-in, grouped by where it's drawn, then loaded plugins;
 //! - strategies: every built-in strategy and plugin, with a one-line description;
 //! - symbol: a search box over markets in the local store and popular Binance pairs, with an
@@ -275,7 +275,7 @@ impl Popup {
         match self {
             Self::Menu {
                 page: Page::Root, ..
-            } => 195.0 + extra,
+            } => 217.0 + extra,
             Self::SymbolSearch { .. } => 60.0 + extra,
             Self::Timeframes { .. } => 180.0 + extra,
             Self::Menu {
@@ -717,6 +717,7 @@ fn root<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
         item("Indicators", "›", MenuMessage::Open(Page::Indicators)),
         item("Strategy", strategy, MenuMessage::Open(Page::Strategies)),
         item("Draw", "›", MenuMessage::Open(Page::Draw)),
+        item("Backtest", backtest_shortcut(), MenuMessage::OpenBacktest),
         item(
             "Symbol",
             tile.symbol,
@@ -1550,10 +1551,7 @@ fn report<'a>(
     }
     body = body
         .push(separator())
-        .push(wide_button(
-            "Backtest: span, playback and settings",
-            MenuMessage::OpenBacktest,
-        ))
+        .push(backtest_button())
         .extend(live_section(&tile.live, quote, tile.base));
     body = match tile.ai_allowed {
         Some(false) => body
@@ -1663,6 +1661,47 @@ fn amount(value: f64) -> String {
         "+" | "-" | "+0" | "-0" => "0".into(),
         other => other.to_owned(),
     }
+}
+
+const fn backtest_shortcut() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌃B"
+    } else {
+        "Ctrl+B"
+    }
+}
+
+/// Opens the backtest panel, saying its shortcut.
+fn backtest_button<'a>() -> Element<'a, MenuMessage> {
+    button(
+        row![
+            text("Backtest").size(12),
+            space::horizontal(),
+            text(backtest_shortcut())
+                .size(11)
+                .font(iced::Font::MONOSPACE),
+        ]
+        .align_y(iced::Center),
+    )
+    .width(Fill)
+    .padding([3, 8])
+    .on_press(MenuMessage::OpenBacktest)
+    .style(|_, status| button::Style {
+        background: Some(Background::Color(
+            if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                PANEL_BORDER
+            } else {
+                HOVER
+            },
+        )),
+        text_color: theme::TEXT_BRIGHT,
+        border: Border {
+            radius: 4.0.into(),
+            ..Border::default()
+        },
+        ..button::Style::default()
+    })
+    .into()
 }
 
 fn wide_button(label: &str, on_press: MenuMessage) -> Element<'_, MenuMessage> {

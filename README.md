@@ -15,7 +15,10 @@ strategies can paper trade on live Binance bars.
 - **Backtests** on Nautilus, with trade markers, an equity pane, a full report, and parameter
   sweeps compared side by side. A backtest panel picks the span from the market's whole
   history, plays the run back bar by bar at any speed from real time up, and sets costs,
-  slippage, latency, leverage, direction, trading sessions and intra-bar precision.
+  slippage, latency, leverage, direction, trading sessions and intra-bar precision. Monte Carlo
+  and random-block tests show how much of a result was luck, and an optimizer tries one or two
+  variables by return, survival or consistency, checking the best on bars it kept unseen. A calendar shows what each month and day made, down
+  to a day's trades, any of which can be replayed on the chart.
 - **Your own indicators and strategies** as sandboxed WebAssembly plugins (Rust SDK), which
   can run ONNX models and ask language models, or as any process (Python, …) reached over a
   socket.
@@ -61,6 +64,7 @@ on any keyboard layout.
 | Ctrl+Alt+H/J/K/L (Option on a Mac) | move the divider |
 | Ctrl+T | toggle split direction |
 | Ctrl+F | fullscreen |
+| Ctrl+B | open or close the backtest panel on the focused chart |
 | Ctrl+1…9 | switch workspace |
 | Ctrl+Shift+1…9 | move chart to workspace |
 | Esc | close a menu, stop drawing |

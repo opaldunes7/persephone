@@ -20,8 +20,8 @@
 //! bar on it so the other charts show the synced crosshair.
 //!
 //! `B` opens the focused chart's backtest panel, `p` moves its playback halfway through the bars
-//! (at speed `SNAPSHOT_SPEED`, 0 to 1, when set), `V` switches it to High precision (loading its
-//! 1-minute bars) and `g` opens its settings sheet.
+//! (at speed `SNAPSHOT_SPEED`, 0 to 1, when set), `d` adds two plugin tags, `o` adds them all and drags the panel short, and `V` switches it to High precision (loading
+//! its 1-minute bars).
 //!
 //! With `SNAPSHOT_STORE` naming a local store, `L` / `M` open its first / second market
 //! (menu open), `Z` asks to delete its first market (symbol search open), `D` drops the file
@@ -39,7 +39,7 @@ use anyhow::{Context, bail};
 use iced::{Point, Settings, Size, Theme};
 use persephone::{
     Message, Persephone, Run,
-    backtest::PanelMessage,
+    backtest::{BlockLength, PanelMessage, TestKind},
     keymap::Action,
     menu::{Active, ImportState, MenuMessage, Page, Popup},
 };
@@ -102,6 +102,58 @@ fn main() -> anyhow::Result<()> {
                 let _ = app.update(Message::Menu(MenuMessage::OpenBacktest));
                 app.load_history_now();
             }
+            'C' => {
+                // Monte Carlo on the chart's backtest.
+                let _ = app.update(Message::Backtest(PanelMessage::Test(TestKind::MonteCarlo)));
+                app.monte_carlo_now();
+            }
+            'W' => {
+                // Random blocks, of a week each, over the chart's bars.
+                let _ = app.update(Message::Backtest(PanelMessage::Test(
+                    TestKind::RandomBlocks,
+                )));
+                let _ = app.update(Message::Backtest(PanelMessage::BlockLength(
+                    BlockLength::Week,
+                )));
+                app.blocks_now();
+            }
+            'Q' => {
+                // Optimize, on the strategy's first variable.
+                let _ = app.update(Message::Backtest(PanelMessage::Test(TestKind::Optimize)));
+                app.optimize_now();
+            }
+            'F' => {
+                // Optimize, with a second variable.
+                let _ = app.update(Message::Backtest(PanelMessage::Test(TestKind::Optimize)));
+                let _ = app.update(Message::Backtest(PanelMessage::Variable(1, "Slow".into())));
+                app.optimize_now();
+            }
+            'N' => {
+                // A chart of too few bars to test: the panel says why.
+                let _ = app.update(Message::Backtest(PanelMessage::Test(
+                    TestKind::RandomBlocks,
+                )));
+                let _ = app.update(Message::Backtest(PanelMessage::BlockLength(
+                    BlockLength::Quarter,
+                )));
+            }
+            'g' | '#' => {
+                // The backtest's calendar: its years, or the busiest day and its first trade.
+                let _ = app.update(Message::Backtest(PanelMessage::ShowCalendar(true)));
+                if c == '#' {
+                    let (_, run) = app.tile_strategy(focused).context("no strategy")?;
+                    let persephone::Run::Done(report) = run else {
+                        anyhow::bail!("the backtest hasn't finished");
+                    };
+                    let trades = persephone::backtest::robustness::round_trips(report);
+                    let index = trades.len() / 2;
+                    let at = persephone_core::time::DateTime::from_nanos(trades[index].exit_ts);
+                    let _ = app.update(Message::Backtest(PanelMessage::CalendarLevel(
+                        persephone::backtest::calendar::Level::Day(at.year, at.month, at.day),
+                    )));
+                    let _ = app.update(Message::Backtest(PanelMessage::ReplayTrade(index)));
+                }
+            }
             'p' => {
                 // Halfway through the chart's bars, at the speed SNAPSHOT_SPEED (0 to 1).
                 let candles = &app
@@ -120,14 +172,23 @@ fn main() -> anyhow::Result<()> {
                 }
                 let _ = app.update(Message::Backtest(PanelMessage::Seek(middle)));
             }
+            'd' => {
+                for plugin in ["Slippage model", "Holding costs"] {
+                    let _ = app.update(Message::Backtest(PanelMessage::AddPlugin(plugin.into())));
+                }
+            }
+            'o' => {
+                // Every plugin tag, with the panel dragged as short as it goes.
+                for (plugin, _) in persephone::backtest::PLUGIN_SLOTS {
+                    let _ = app.update(Message::Backtest(PanelMessage::AddPlugin(plugin.into())));
+                }
+                let _ = app.update(Message::Backtest(PanelMessage::Resize(0.0)));
+            }
             'V' => {
                 let _ = app.update(Message::Backtest(PanelMessage::Edit(
                     persephone::backtest::Edit::Precision(persephone::backtest::Precision::High),
                 )));
                 app.load_fine_now(focused);
-            }
-            'g' => {
-                let _ = app.update(Message::Backtest(PanelMessage::ToggleSettings));
             }
             'Z' => {
                 let markets = store.as_ref().context("set SNAPSHOT_STORE")?.markets();
@@ -155,6 +216,21 @@ fn main() -> anyhow::Result<()> {
         finish_backtests(&mut app);
     }
     let frozen = Instant::now() + at.map_or(Duration::from_secs(5), Duration::from_millis);
+    let _ = app.update(Message::Tick(frozen));
+
+    // A first frame, for the backtest panel to measure its settings.
+    let measured: Vec<Message> = {
+        let mut ui = iced_test::Simulator::with_size(Settings::default(), WINDOW, app.view());
+        ui.simulate([iced::Event::Window(iced::window::Event::RedrawRequested(
+            Instant::now(),
+        ))]);
+        ui.into_messages().collect()
+    };
+    for message in measured {
+        if matches!(message, Message::Backtest(_)) {
+            let _ = app.update(message);
+        }
+    }
     let _ = app.update(Message::Tick(frozen));
 
     let mut ui = iced_test::Simulator::with_size(Settings::default(), WINDOW, app.view());

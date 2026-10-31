@@ -4728,6 +4728,7 @@ dependencies = [
  "persephone-ml",
  "persephone-plugin-host",
  "persephone-tiling",
+ "rand 0.10.3",
  "rfd",
  "ron",
  "serde",

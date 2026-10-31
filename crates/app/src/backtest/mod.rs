@@ -5,19 +5,30 @@
 //! Playback never reruns anything. The backtest runs once over the span (strategies only see
 //! closed bars, so running ahead changes nothing); playing moves a playhead through market time,
 //! and the chart, trades, equity and statistics show what had happened by then.
+//!
+//! Two more tests sit beside it, in [`robustness`]: they say how much of a result was luck.
 
+pub mod calendar;
+pub mod optimize;
+pub mod robustness;
 mod settings;
 mod view;
 mod widgets;
 
 use std::{
-    sync::Arc,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
+use iced::widget::combo_box;
 use persephone_chart::ChartData;
 use persephone_core::{
     Candle, Timeframe, UnixNanos,
+    strategy::StrategyKind,
     tick::{TickFeed, Ticks},
 };
 use persephone_engine::BacktestReport;
@@ -25,16 +36,21 @@ use persephone_tiling::TileId;
 
 pub use self::{
     settings::{
-        Commission, Edit, OneWay, Precision, Section, SessionRule, Settings, parse_time, time_text,
+        BlockLength, Commission, Edit, OneWay, OptimizeSettings, Precision, ScoreBy, Section,
+        SessionRule, Settings, TestKind, Variable, parse_time, time_text,
     },
-    view::{PanelInfo, SETTINGS_WIDTH, Status, panel, settings_sheet},
+    view::{PLUGIN_SLOTS, PanelInfo, Status, panel},
 };
 
 /// Bars loaded before a span's start for the strategy to warm up on, without trading.
 pub const WARM_UP_BARS: u64 = 500;
 /// The panel's share of the window when it opens, and the least it's ever given.
-pub const DEFAULT_SHARE: f32 = 0.25;
-pub const MIN_HEIGHT: f32 = 170.0;
+pub const DEFAULT_SHARE: f32 = 0.3;
+pub const MIN_HEIGHT: f32 = 190.0;
+/// The panel's draggable bottom edge.
+const EDGE_HEIGHT: f32 = 5.0;
+/// What the panel leaves the charts, however much it wants.
+const CHARTS_ROOM: f32 = 160.0;
 /// At Max speed, a whole span plays in this long.
 const MAX_SPEED_SECONDS: f64 = 2.0;
 /// Where on the speed slider Max begins.
@@ -47,7 +63,6 @@ pub struct Panel {
     /// How tall it is, in logical pixels.
     pub height: f32,
     pub playback: Playback,
-    pub settings_open: bool,
     /// The market's whole history, once known; the error if it couldn't be found.
     pub history: Option<Result<History, String>>,
     /// The span's handles while they're dragged, as times.
@@ -60,16 +75,104 @@ pub struct Panel {
     pub inputs: Vec<(Field, String)>,
     /// Why the last edit couldn't be applied.
     pub error: Option<String>,
+    /// How tall the settings measure, for keeping the panel at least that tall.
+    pub settings_height: f32,
+    /// The search for plugins to add: every kind not already on.
+    pub plugin_search: combo_box::State<&'static str>,
+    /// How far the Monte Carlo and Random blocks tests have got.
+    pub tests: Tests,
+    /// Whether the backtest's calendar is showing, and how far into it.
+    pub calendar: calendar::CalendarView,
+}
+
+/// The results of the tests beyond the backtest itself. They aren't saved: they follow from the
+/// chart's backtest, and go when it changes.
+#[derive(Debug, Default)]
+pub struct Tests {
+    /// Starts the same every time, so the same inputs give the same results until asked for
+    /// another draw.
+    pub seed: u64,
+    /// The Monte Carlo draws under way, if any.
+    pub monte_carlo_run: Option<u64>,
+    pub monte_carlo: Option<Result<Arc<robustness::MonteCarlo>, String>>,
+    pub blocks: BlockRun,
+    pub optimize: OptimizeRun,
+    /// The strategy's parameters before a result was applied, to go back to.
+    pub original: Option<Vec<f64>>,
+}
+
+/// Where an optimization has got.
+#[derive(Debug, Default)]
+pub enum OptimizeRun {
+    #[default]
+    Idle,
+    Running {
+        run: u64,
+        done: usize,
+        total: usize,
+        stop: StopOnDrop,
+    },
+    Done(Arc<optimize::OptimizeResult>),
+    Failed(String),
+}
+
+/// Where a batch of Random blocks has got.
+#[derive(Debug, Default)]
+pub enum BlockRun {
+    #[default]
+    Idle,
+    Running {
+        run: u64,
+        done: usize,
+        total: usize,
+        stop: StopOnDrop,
+    },
+    Done(Arc<robustness::BlockSummary>),
+    Failed(String),
+}
+
+impl Tests {
+    /// Forgets the results and stops what's running, as what they were about has changed.
+    pub fn clear(&mut self) {
+        self.clear_monte_carlo();
+        self.blocks = BlockRun::Idle;
+        self.optimize = OptimizeRun::Idle;
+        self.original = None;
+    }
+
+    pub fn clear_monte_carlo(&mut self) {
+        self.monte_carlo_run = None;
+        self.monte_carlo = None;
+    }
+}
+
+/// Stops a batch's workers when it goes, however it goes: replaced, or with the panel.
+#[derive(Debug)]
+pub struct StopOnDrop(pub Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A number no earlier test run had, so a late result can't be taken for the current one's.
+pub fn next_run() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Panel {
     #[must_use]
-    pub fn new(tile: TileId, window_height: f32) -> Self {
+    pub fn new(tile: TileId, window_height: f32, settings: &Settings) -> Self {
         Self {
+            settings_height: 0.0,
+            plugin_search: plugin_search(settings),
+            tests: Tests::default(),
+            calendar: calendar::CalendarView::default(),
             tile,
             height: (window_height * DEFAULT_SHARE).max(MIN_HEIGHT),
             playback: Playback::default(),
-            settings_open: false,
             history: None,
             dragging: None,
             timeline: None,
@@ -79,13 +182,20 @@ impl Panel {
         }
     }
 
-    /// The height it gets in a window this tall: what it was given, within limits that leave
-    /// the charts room.
+    /// The height it gets in a window this tall: what it was given, but never less than it
+    /// takes to show all the settings, unless the window is too short to leave the charts room.
     #[must_use]
     pub fn height_in(&self, window_height: f32) -> f32 {
+        let least = MIN_HEIGHT.max(self.settings_height + EDGE_HEIGHT);
         self.height
             .min(window_height * 0.6)
-            .max(MIN_HEIGHT.min(window_height * 0.5))
+            .max(least)
+            .min((window_height - CHARTS_ROOM).max(MIN_HEIGHT.min(window_height * 0.5)))
+    }
+
+    /// Starts the plugin search over, offering what `settings` doesn't have on.
+    pub fn refresh_plugins(&mut self, settings: &Settings) {
+        self.plugin_search = plugin_search(settings);
     }
 
     /// What's typed in `field`'s box, if anything since it was last applied.
@@ -102,6 +212,21 @@ impl Panel {
         self.inputs.push((field, text));
     }
 }
+
+fn plugin_search(settings: &Settings) -> combo_box::State<&'static str> {
+    combo_box::State::new(
+        PLUGIN_SLOTS
+            .iter()
+            .map(|(slot, _)| *slot)
+            .filter(|slot| !settings.plugins.iter().any(|on| on == slot))
+            .collect(),
+    )
+}
+
+/// The second variable's choice for not having one.
+pub const NO_VARIABLE: &str = "None";
+/// How many bars a replayed trade starts before it opens, to see what led up to it.
+pub const REPLAY_LEAD_BARS: usize = 10;
 
 /// What the panel's controls ask for.
 #[derive(Clone, Debug)]
@@ -123,13 +248,58 @@ pub enum PanelMessage {
     Seek(UnixNanos),
     /// The bottom edge was dragged this far down the window.
     Resize(f32),
-    ToggleSettings,
+    /// The settings measured this tall.
+    SettingsHeight(f32),
+    /// Backtest this chart with another strategy.
+    Strategy(StrategyChoice),
+    /// Put a plugin on this chart's backtests, or take it off.
+    AddPlugin(String),
+    RemovePlugin(String),
     Input(Field, String),
     Submit(Field),
     Edit(Edit),
+    /// Show another test.
+    Test(TestKind),
+    BlockLength(BlockLength),
+    /// Run Random blocks, with the same draws as before.
+    RunBlocks,
+    /// Stop Random blocks.
+    StopBlocks,
+    /// Run the current test again with new random draws.
+    RunAgain,
+    /// Move the span back far enough for the test to run.
+    WidenSpan,
+    /// Change which variable Optimize varies (the first or second), by name; "None" for no second.
+    Variable(usize, String),
+    ScoreBy(ScoreBy),
+    HoldOut(bool),
+    RunOptimize,
+    StopOptimize,
+    /// Put this result of the optimization on the strategy, by its place in the results.
+    Apply(usize),
+    /// Back to the strategy's parameters from before any result was applied.
+    Revert,
+    /// Show the backtest's calendar, or its equity curve.
+    ShowCalendar(bool),
+    CalendarLevel(calendar::Level),
+    /// Move the playhead to just before this trade opened, by its place in the backtest's trades.
+    ReplayTrade(usize),
 }
 
-/// A box in the settings sheet.
+/// A strategy in the panel's dropdown.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrategyChoice {
+    pub kind: StrategyKind,
+    pub name: String,
+}
+
+impl fmt::Display for StrategyChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
+/// A box in the settings section.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Field {
     Capital,
@@ -141,6 +311,24 @@ pub enum Field {
     SessionFrom,
     SessionTo,
     SessionZone,
+    Runs,
+    Ruin,
+    Blocks,
+    /// An Optimize variable's range: the first variable or the second.
+    Min(usize),
+    Max(usize),
+    Step(usize),
+}
+
+impl Field {
+    /// Whether it's one of the tests' own settings, which don't change the backtest itself.
+    #[must_use]
+    pub const fn belongs_to_tests(self) -> bool {
+        matches!(
+            self,
+            Self::Runs | Self::Ruin | Self::Blocks | Self::Min(_) | Self::Max(_) | Self::Step(_)
+        )
+    }
 }
 
 /// A market's whole history, for the span slider.

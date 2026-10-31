@@ -6,14 +6,15 @@ use std::{path::PathBuf, sync::Arc};
 use iced::{Point, Size};
 use persephone::{
     Message, Persephone, Run,
-    backtest::{Edit, Field, PanelMessage},
+    backtest::{Edit, Field, PanelMessage, StrategyChoice},
+    keymap::Action,
     menu::{MenuMessage, Page, Popup},
 };
 use persephone_chart::{ChartData, ChartMessage};
 use persephone_core::{
     Candle, Timeframe,
     indicator::BuiltIn,
-    strategy::{BuiltInStrategy, StrategySpec},
+    strategy::{BuiltInStrategy, StrategyKind, StrategySpec},
 };
 
 fn app() -> Persephone {
@@ -453,6 +454,12 @@ mod live {
 mod panel {
     use std::time::{Duration, Instant};
 
+    use persephone::backtest::{
+        BlockLength, BlockRun, History, OptimizeRun, ScoreBy, TestKind,
+        calendar::{Calendar, Level},
+        optimize::{OptimizeResult, Outcome},
+        robustness::round_trips,
+    };
     use persephone_engine::Direction;
 
     use super::*;
@@ -507,6 +514,110 @@ mod panel {
     }
 
     #[test]
+    fn ctrl_b_opens_and_closes_the_panel() {
+        let mut app = app();
+        // It opens without a strategy too, and says what's missing.
+        let _ = app.update(Message::Key(Action::Backtest));
+        assert_eq!(app.panel().map(|p| p.tile), Some(0));
+        let _ = app.view();
+        assert!(app.tile_strategy(0).is_none());
+
+        // Its dropdown picks the strategy, without going through the chart's menu.
+        panel(
+            &mut app,
+            PanelMessage::Strategy(StrategyChoice {
+                kind: StrategyKind::BuiltIn(BuiltInStrategy::EmaCross),
+                name: "EMA Cross".into(),
+            }),
+        );
+        assert!(app.tile_strategy(0).is_some());
+        assert_eq!(app.panel().map(|p| p.tile), Some(0), "the panel stays open");
+        finish_backtest(&mut app);
+        panel(&mut app, PanelMessage::Speed(1.0));
+        panel(&mut app, PanelMessage::Play);
+        assert_eq!(shown(&app), Some(0));
+
+        let _ = app.update(Message::Key(Action::Backtest));
+        assert!(app.panel().is_none());
+        assert_eq!(shown(&app), None, "closing it shows the whole chart again");
+    }
+
+    #[test]
+    fn the_right_click_menu_opens_the_panel() {
+        let mut app = app();
+        let _ = app.update(Message::Chart(
+            0,
+            ChartMessage::RightClicked {
+                at: Point::new(200.0, 200.0),
+            },
+        ));
+        menu(&mut app, MenuMessage::OpenBacktest);
+        assert!(app.popup().is_none());
+        assert_eq!(app.panel().map(|p| p.tile), Some(0));
+    }
+
+    #[test]
+    fn plugins_are_added_from_the_search_and_taken_off_as_tags() {
+        let mut app = app();
+        let _ = app.update(Message::Key(Action::Backtest));
+        let offered = |app: &Persephone| app.panel().unwrap().plugin_search.options().len();
+        assert_eq!(offered(&app), 7);
+
+        panel(&mut app, PanelMessage::AddPlugin("Fill model".into()));
+        panel(&mut app, PanelMessage::AddPlugin("Fill model".into()));
+        panel(&mut app, PanelMessage::AddPlugin("Holding costs".into()));
+        assert_eq!(offered(&app), 5, "what's on is no longer offered");
+        let _ = app.view();
+
+        panel(&mut app, PanelMessage::RemovePlugin("Fill model".into()));
+        assert_eq!(offered(&app), 6);
+    }
+
+    /// Draws a frame and delivers what the panel measured; returns the settings' height.
+    fn measure(app: &mut Persephone) -> f32 {
+        let messages: Vec<Message> = {
+            let mut ui = iced_test::Simulator::with_size(
+                iced::Settings::default(),
+                Size::new(1400.0, 900.0),
+                app.view(),
+            );
+            ui.simulate([iced::Event::Window(iced::window::Event::RedrawRequested(
+                Instant::now(),
+            ))]);
+            ui.into_messages().collect()
+        };
+        for message in messages {
+            if matches!(message, Message::Backtest(_)) {
+                let _ = app.update(message);
+            }
+        }
+        app.panel().unwrap().settings_height
+    }
+
+    #[test]
+    fn the_panel_is_always_tall_enough_for_its_settings() {
+        let mut app = app();
+        let _ = app.update(Message::Key(Action::Backtest));
+        // Dragged as short as it goes.
+        panel(&mut app, PanelMessage::Resize(0.0));
+        let settings = measure(&mut app);
+        assert!(settings > 100.0, "measured {settings}");
+        let height = app.panel().unwrap().height_in(900.0);
+        assert!(height >= settings, "{height} for {settings} of settings");
+
+        // Tags can take more lines, and the panel grows with them.
+        for (name, _) in persephone::backtest::PLUGIN_SLOTS {
+            panel(&mut app, PanelMessage::AddPlugin(name.into()));
+        }
+        let taller = measure(&mut app);
+        assert!(taller > settings, "{taller} with every tag");
+        assert!(app.panel().unwrap().height_in(900.0) >= taller);
+
+        // The charts keep some room in a window too short for it all.
+        assert!(app.panel().unwrap().height_in(300.0) <= 150.0);
+    }
+
+    #[test]
     fn settings_edits_rerun_the_backtest() {
         let mut app = app();
         set_strategy(&mut app, BuiltInStrategy::EmaCross);
@@ -546,5 +657,557 @@ mod panel {
         assert_eq!(request.rules.direction, Direction::Both);
         finish_backtest(&mut app);
         assert!(matches!(run_state(&app), Run::Done(_)));
+    }
+
+    fn test_settings(app: &Persephone) -> &persephone::backtest::Settings {
+        app.tile_backtest(0).unwrap()
+    }
+
+    #[test]
+    fn monte_carlo_draws_the_backtests_trades_and_starts_over_when_it_changes() {
+        let mut app = app();
+        set_strategy(&mut app, BuiltInStrategy::EmaCross);
+        finish_backtest(&mut app);
+        let _ = app.update(Message::Key(Action::Backtest));
+
+        panel(&mut app, PanelMessage::Test(TestKind::MonteCarlo));
+        assert_eq!(test_settings(&app).test, TestKind::MonteCarlo);
+        app.monte_carlo_now();
+        let first = app
+            .panel()
+            .unwrap()
+            .tests
+            .monte_carlo
+            .clone()
+            .expect("the draws")
+            .expect("enough trades");
+        assert_eq!(first.runs, 1_000);
+        assert!(first.low <= first.median && first.median <= first.high);
+
+        // Only the backtest plays back.
+        panel(&mut app, PanelMessage::Play);
+        assert!(!app.panel().unwrap().playback.playing);
+
+        // The same inputs give the same results; asking again gives others.
+        panel(&mut app, PanelMessage::Input(Field::Ruin, "40".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Ruin));
+        assert!(app.panel().unwrap().tests.monte_carlo.is_none());
+        app.monte_carlo_now();
+        let same = app.panel().unwrap().tests.monte_carlo.clone().unwrap();
+        assert_eq!(same.unwrap().paths, first.paths);
+        panel(&mut app, PanelMessage::RunAgain);
+        app.monte_carlo_now();
+        let other = app.panel().unwrap().tests.monte_carlo.clone().unwrap();
+        assert_ne!(other.unwrap().paths, first.paths);
+
+        // A changed backtest clears them, and its result draws them anew.
+        panel(&mut app, PanelMessage::Edit(Edit::Slippage(true)));
+        assert!(app.panel().unwrap().tests.monte_carlo.is_none());
+        finish_backtest(&mut app);
+        assert!(app.panel().unwrap().tests.monte_carlo_run.is_some());
+        app.monte_carlo_now();
+        assert!(app.panel().unwrap().tests.monte_carlo.is_some());
+    }
+
+    #[test]
+    fn random_blocks_backtest_stretches_of_the_chart_and_clear_when_it_changes() {
+        let mut app = app();
+        set_strategy(&mut app, BuiltInStrategy::EmaCross);
+        finish_backtest(&mut app);
+        let _ = app.update(Message::Key(Action::Backtest));
+
+        panel(&mut app, PanelMessage::Test(TestKind::RandomBlocks));
+        panel(&mut app, PanelMessage::BlockLength(BlockLength::Week));
+        panel(&mut app, PanelMessage::Input(Field::Blocks, "6".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Blocks));
+        assert_eq!(test_settings(&app).blocks, 6);
+        assert!(matches!(run_state(&app), Run::Done(_)), "no rerun for that");
+
+        app.blocks_now();
+        let BlockRun::Done(summary) = &app.panel().unwrap().tests.blocks else {
+            panic!("{:?}", app.panel().unwrap().tests.blocks);
+        };
+        assert_eq!(summary.paths.len(), 6);
+        // A week of hours, from the same capital.
+        assert_eq!(summary.paths[0].len(), 7 * 24);
+        assert!((summary.paths[0][0] - 100_000.0).abs() < 1_000.0);
+        assert!(summary.worst <= summary.median && summary.median <= summary.best);
+
+        // Changing a setting takes them away.
+        panel(&mut app, PanelMessage::Edit(Edit::Slippage(true)));
+        assert!(matches!(app.panel().unwrap().tests.blocks, BlockRun::Idle));
+
+        // A block too long for the bars says so.
+        finish_backtest(&mut app);
+        panel(&mut app, PanelMessage::BlockLength(BlockLength::Quarter));
+        panel(&mut app, PanelMessage::RunBlocks);
+        let BlockRun::Failed(error) = &app.panel().unwrap().tests.blocks else {
+            panic!("a refusal");
+        };
+        assert!(error.contains("3-month blocks need 91"), "{error}");
+
+        // A batch that's stopped is told to, and its late result goes nowhere.
+        panel(&mut app, PanelMessage::BlockLength(BlockLength::Week));
+        panel(&mut app, PanelMessage::RunBlocks);
+        let BlockRun::Running {
+            run, total, stop, ..
+        } = &app.panel().unwrap().tests.blocks
+        else {
+            panic!("a batch running");
+        };
+        let (run, stopping) = (*run, std::sync::Arc::clone(&stop.0));
+        assert_eq!(*total, 6);
+        let _ = app.update(Message::BlocksProgress(run, 2));
+        assert!(matches!(
+            app.panel().unwrap().tests.blocks,
+            BlockRun::Running { done: 2, .. }
+        ));
+        panel(&mut app, PanelMessage::StopBlocks);
+        assert!(stopping.load(std::sync::atomic::Ordering::Relaxed));
+        let _ = app.update(Message::BlocksDone(run, Err("Stopped.".into())));
+        assert!(matches!(app.panel().unwrap().tests.blocks, BlockRun::Idle));
+    }
+
+    #[test]
+    fn the_tests_settings_fit_in_the_panel_too() {
+        let mut app = app();
+        set_strategy(&mut app, BuiltInStrategy::EmaCross);
+        let _ = app.update(Message::Key(Action::Backtest));
+        panel(&mut app, PanelMessage::Resize(0.0));
+        let backtest = measure(&mut app);
+        panel(&mut app, PanelMessage::Test(TestKind::RandomBlocks));
+        let blocks = measure(&mut app);
+        assert!(blocks > backtest, "{blocks} against {backtest}");
+        assert!(app.panel().unwrap().height_in(900.0) >= blocks);
+    }
+
+    fn ready_panel(test: TestKind) -> Persephone {
+        let mut app = app();
+        set_strategy(&mut app, BuiltInStrategy::EmaCross);
+        finish_backtest(&mut app);
+        let _ = app.update(Message::Key(Action::Backtest));
+        panel(&mut app, PanelMessage::Test(test));
+        app
+    }
+
+    fn found(app: &Persephone) -> Arc<OptimizeResult> {
+        match &app.panel().unwrap().tests.optimize {
+            OptimizeRun::Done(found) => Arc::clone(found),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn set_range(app: &mut Persephone, slot: usize, min: &str, max: &str, step: &str) {
+        panel(app, PanelMessage::Input(Field::Min(slot), min.into()));
+        panel(app, PanelMessage::Submit(Field::Min(slot)));
+        panel(app, PanelMessage::Input(Field::Max(slot), max.into()));
+        panel(app, PanelMessage::Submit(Field::Max(slot)));
+        panel(app, PanelMessage::Input(Field::Step(slot), step.into()));
+        panel(app, PanelMessage::Submit(Field::Step(slot)));
+    }
+
+    #[test]
+    fn the_panel_says_why_random_blocks_cant_run() {
+        let mut app = app();
+        set_strategy(&mut app, BuiltInStrategy::EmaCross);
+        finish_backtest(&mut app);
+        let _ = app.update(Message::Key(Action::Backtest));
+        assert_eq!(app.test_problem(0), None, "nothing to say about a backtest");
+        panel(&mut app, PanelMessage::Test(TestKind::RandomBlocks));
+        assert_eq!(app.test_problem(0), None, "62 days fit 1-month blocks");
+
+        // Too long for the bars: it says by how much, and offers to widen.
+        panel(&mut app, PanelMessage::BlockLength(BlockLength::Quarter));
+        let problem = app.test_problem(0).expect("a problem");
+        assert!(problem.message.contains("covers 62 days"), "{problem:?}");
+        assert!(
+            problem.message.contains("3-month blocks need 91"),
+            "{problem:?}"
+        );
+        assert!(problem.widen);
+
+        // Without a strategy, pressing Run isn't silent either.
+        let _ = app.update(Message::Chart(
+            0,
+            ChartMessage::RightClicked {
+                at: Point::new(200.0, 200.0),
+            },
+        ));
+        menu(&mut app, MenuMessage::RemoveStrategy);
+        let problem = app.test_problem(0).expect("a problem");
+        assert_eq!(problem.message, "Pick a strategy first.");
+        panel(&mut app, PanelMessage::RunBlocks);
+        assert!(matches!(
+            &app.panel().unwrap().tests.blocks,
+            BlockRun::Failed(error) if error == "Pick a strategy first."
+        ));
+    }
+
+    #[test]
+    fn widen_span_reaches_back_far_enough_for_the_blocks() {
+        let mut app = ready_panel(TestKind::RandomBlocks);
+        panel(&mut app, PanelMessage::BlockLength(BlockLength::Quarter));
+        let hour = Timeframe::H1.nanos();
+        let _ = app.update(Message::History(
+            0,
+            (None, "BTCUSDT".into()),
+            Ok(Arc::new(History {
+                first: 0,
+                last: 20_000 * hour,
+                closes: Vec::new(),
+            })),
+        ));
+        panel(&mut app, PanelMessage::WidenSpan);
+        let (from, to) = app.tile_span(0).expect("a span now");
+        assert!(to - from >= 91 * 24 * hour, "{from} to {to}");
+    }
+
+    #[test]
+    fn typed_values_count_when_run_is_pressed() {
+        let mut app = ready_panel(TestKind::RandomBlocks);
+        panel(&mut app, PanelMessage::BlockLength(BlockLength::Week));
+        panel(&mut app, PanelMessage::Input(Field::Blocks, "7".into()));
+        panel(&mut app, PanelMessage::RunBlocks);
+        assert_eq!(app.tile_backtest(0).unwrap().blocks, 7);
+        assert!(matches!(
+            app.panel().unwrap().tests.blocks,
+            BlockRun::Running { total: 7, .. }
+        ));
+
+        // And one that's no good says so, without starting anything.
+        panel(&mut app, PanelMessage::StopBlocks);
+        panel(&mut app, PanelMessage::Input(Field::Blocks, "1".into()));
+        panel(&mut app, PanelMessage::RunBlocks);
+        assert!(
+            app.panel()
+                .unwrap()
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("Blocks"))
+        );
+        assert!(matches!(app.panel().unwrap().tests.blocks, BlockRun::Idle));
+    }
+
+    #[test]
+    fn bad_ranges_and_too_many_backtests_are_refused_before_running() {
+        let mut app = ready_panel(TestKind::Optimize);
+        set_range(&mut app, 0, "20", "10", "1");
+        assert!(
+            app.test_problem(0)
+                .unwrap()
+                .message
+                .contains("Max must be above Min")
+        );
+        set_range(&mut app, 0, "10", "20", "0");
+        assert!(
+            app.test_problem(0)
+                .unwrap()
+                .message
+                .contains("Step must be above zero")
+        );
+        panel(&mut app, PanelMessage::RunOptimize);
+        assert!(matches!(
+            app.panel().unwrap().tests.optimize,
+            OptimizeRun::Failed(_)
+        ));
+
+        set_range(&mut app, 0, "1", "100", "1");
+        panel(&mut app, PanelMessage::Variable(1, "Slow".into()));
+        set_range(&mut app, 1, "1", "100", "1");
+        let problem = app.test_problem(0).unwrap();
+        assert!(problem.message.contains("10000 backtests"), "{problem:?}");
+        panel(&mut app, PanelMessage::Variable(1, "None".into()));
+        assert_eq!(app.test_problem(0), None);
+    }
+
+    #[test]
+    fn optimizing_one_variable_ranks_its_values_and_keeps_some_bars_unseen() {
+        let mut app = ready_panel(TestKind::Optimize);
+        // The strategy's first variable is ready to go.
+        panel(&mut app, PanelMessage::Variable(0, "Fast".into()));
+        set_range(&mut app, 0, "6", "14", "2");
+        app.optimize_now();
+        let result = found(&app);
+        assert_eq!(result.grid.first.values, vec![6.0, 8.0, 10.0, 12.0, 14.0]);
+        assert!(result.grid.second.is_none());
+        assert_eq!(result.outcomes.len(), 5);
+        assert_eq!(result.top.len(), 5);
+        assert!(result.held_out);
+        assert!(
+            result.top.iter().all(|r| r.unseen.is_some()),
+            "{:?}",
+            result.top
+        );
+    }
+
+    #[test]
+    fn the_unseen_part_warms_up_without_trading_and_starts_from_the_same_capital() {
+        let mut app = ready_panel(TestKind::Optimize);
+        panel(&mut app, PanelMessage::Variable(0, "Fast".into()));
+        let job = app.optimize_job().expect("a job");
+        let split = job.split.expect("some bars kept back");
+        assert_eq!(split, 1_050, "70% of 1,500");
+        let request = job.unseen_request(0, split).unwrap();
+        assert_eq!(
+            request.candles.len(),
+            500 + 450,
+            "warm-up bars from the 70% part"
+        );
+        assert_eq!(request.candles[500].ts, job.candles[split].ts);
+        assert_eq!(request.trade_from, job.candles[split].ts);
+        assert_eq!(request.starting_balance, job.request.starting_balance);
+        let report = persephone_engine::run_backtest(&request).unwrap();
+        assert!(
+            report.fills.iter().all(|f| f.bar >= 500),
+            "no trades warming up"
+        );
+        assert_eq!(report.equity[499], request.starting_balance);
+    }
+
+    #[test]
+    fn a_value_that_fails_shows_as_grey_without_ending_the_batch() {
+        let mut app = ready_panel(TestKind::Optimize);
+        panel(&mut app, PanelMessage::Variable(0, "Fast".into()));
+        set_range(&mut app, 0, "10", "20", "5");
+        panel(&mut app, PanelMessage::Variable(1, "Slow".into()));
+        set_range(&mut app, 1, "15", "25", "5");
+        app.optimize_now();
+        let result = found(&app);
+        assert_eq!(result.outcomes.len(), 9);
+        // Fast must be below Slow, so 15/15 and 20/15 and 20/20 can't run.
+        let cell = result.grid.cell_of(&[20.0, 15.0]).unwrap();
+        assert!(
+            matches!(result.outcomes[cell], Outcome::Failed(_)),
+            "{:?}",
+            result.outcomes[cell]
+        );
+        let good = result.grid.cell_of(&[10.0, 25.0]).unwrap();
+        assert!(result.outcomes[good].score().is_some());
+        assert!(
+            result
+                .top
+                .iter()
+                .all(|r| result.outcomes[r.cell].score().is_some())
+        );
+    }
+
+    #[test]
+    fn every_score_gives_results() {
+        for score in [
+            ScoreBy::Backtest,
+            ScoreBy::MonteCarlo,
+            ScoreBy::RandomBlocks,
+        ] {
+            let mut app = ready_panel(TestKind::Optimize);
+            panel(&mut app, PanelMessage::Variable(0, "Fast".into()));
+            set_range(&mut app, 0, "8", "12", "2");
+            panel(&mut app, PanelMessage::ScoreBy(score));
+            // This market's slow cycle makes few trades, so Monte Carlo needs all its bars.
+            panel(
+                &mut app,
+                PanelMessage::HoldOut(score != ScoreBy::MonteCarlo),
+            );
+            panel(&mut app, PanelMessage::BlockLength(BlockLength::Week));
+            panel(&mut app, PanelMessage::Input(Field::Blocks, "3".into()));
+            panel(&mut app, PanelMessage::Submit(Field::Blocks));
+            app.optimize_now();
+            let result = found(&app);
+            assert_eq!(result.score, score);
+            assert_eq!(result.outcomes.len(), 3);
+            assert!(!result.top.is_empty(), "{score:?}: {:?}", result.outcomes);
+        }
+    }
+
+    #[test]
+    fn every_value_gets_the_same_blocks() {
+        let mut app = ready_panel(TestKind::Optimize);
+        panel(&mut app, PanelMessage::ScoreBy(ScoreBy::RandomBlocks));
+        panel(&mut app, PanelMessage::BlockLength(BlockLength::Week));
+        let job = app.optimize_job().expect("a job");
+        assert_eq!(job.blocks.len(), 50);
+        let split = job.split.unwrap();
+        assert!(
+            job.blocks.iter().all(|b| b.end <= split),
+            "none in the unseen bars"
+        );
+        assert_eq!(job.total(), job.grid.cells() * 50 + 5);
+    }
+
+    #[test]
+    fn applying_a_result_keeps_the_results_and_can_be_undone() {
+        let mut app = ready_panel(TestKind::Optimize);
+        panel(&mut app, PanelMessage::Variable(0, "Fast".into()));
+        set_range(&mut app, 0, "6", "14", "2");
+        app.optimize_now();
+        let fast = |app: &Persephone| app.tile_strategy(0).unwrap().0.params[0];
+        assert_eq!(fast(&app), 10.0);
+
+        panel(&mut app, PanelMessage::Apply(4));
+        assert_eq!(fast(&app), 14.0);
+        finish_backtest(&mut app);
+        assert!(matches!(
+            app.panel().unwrap().tests.optimize,
+            OptimizeRun::Done(_)
+        ));
+        assert!(matches!(run_state(&app), Run::Done(_)), "the chart reran");
+
+        // Trying another still goes back to the first original.
+        panel(&mut app, PanelMessage::Apply(0));
+        assert_eq!(fast(&app), 6.0);
+        panel(&mut app, PanelMessage::Revert);
+        assert_eq!(fast(&app), 10.0);
+        assert!(matches!(
+            app.panel().unwrap().tests.optimize,
+            OptimizeRun::Done(_)
+        ));
+        assert_eq!(app.panel().unwrap().tests.original, None);
+
+        // Any other change takes the results away.
+        panel(&mut app, PanelMessage::Edit(Edit::Slippage(true)));
+        assert!(matches!(
+            app.panel().unwrap().tests.optimize,
+            OptimizeRun::Idle
+        ));
+    }
+
+    #[test]
+    fn cancelling_stops_the_workers_and_drops_the_late_result() {
+        let mut app = ready_panel(TestKind::Optimize);
+        panel(&mut app, PanelMessage::RunOptimize);
+        let OptimizeRun::Running { run, stop, .. } = &app.panel().unwrap().tests.optimize else {
+            panic!("running");
+        };
+        let (run, stopping) = (*run, Arc::clone(&stop.0));
+        let _ = app.update(Message::OptimizeProgress(run, 3));
+        assert!(matches!(
+            app.panel().unwrap().tests.optimize,
+            OptimizeRun::Running { done: 3, .. }
+        ));
+        panel(&mut app, PanelMessage::StopOptimize);
+        assert!(stopping.load(std::sync::atomic::Ordering::Relaxed));
+        let _ = app.update(Message::OptimizeDone(run, Err("Stopped.".into())));
+        assert!(matches!(
+            app.panel().unwrap().tests.optimize,
+            OptimizeRun::Idle
+        ));
+    }
+
+    #[test]
+    fn a_variable_the_strategy_no_longer_has_is_replaced() {
+        let mut app = ready_panel(TestKind::Optimize);
+        panel(&mut app, PanelMessage::Variable(1, "Slow".into()));
+        set_strategy(&mut app, BuiltInStrategy::DonchianBreakout);
+        finish_backtest(&mut app);
+        let chosen = &app.tile_backtest(0).unwrap().optimize.variables;
+        assert_eq!(chosen[0].as_ref().unwrap().name, "Length");
+        assert!(chosen[1].is_none());
+    }
+
+    fn trades(app: &Persephone) -> Vec<persephone::backtest::robustness::RoundTrip> {
+        let Run::Done(report) = run_state(app) else {
+            panic!("the backtest hasn't finished");
+        };
+        round_trips(report)
+    }
+
+    #[test]
+    fn the_calendar_adds_up_to_the_backtest() {
+        let app = ready_panel(TestKind::Backtest);
+        let Run::Done(report) = run_state(&app) else {
+            panic!("the backtest hasn't finished");
+        };
+        let last = app.tile_chart(0).unwrap().data().candles.last().unwrap().ts;
+        let calendar = Calendar::new(round_trips(report), last);
+        let total: f64 = calendar
+            .years()
+            .iter()
+            .map(|y| calendar.year(*y).profit)
+            .sum();
+        let made = report.equity.last().unwrap() - report.starting_balance;
+        assert!((total - made).abs() < 1e-6, "{total} against {made}");
+        let count: usize = calendar
+            .years()
+            .iter()
+            .map(|y| calendar.year(*y).trades)
+            .sum();
+        assert_eq!(count, calendar.trades.len());
+    }
+
+    #[test]
+    fn the_calendar_opens_level_by_level_and_draws() {
+        let mut app = ready_panel(TestKind::Backtest);
+        panel(&mut app, PanelMessage::ShowCalendar(true));
+        assert!(app.panel().unwrap().calendar.shown);
+        measure(&mut app);
+        panel(&mut app, PanelMessage::CalendarLevel(Level::Month(1970, 1)));
+        measure(&mut app);
+        panel(
+            &mut app,
+            PanelMessage::CalendarLevel(Level::Day(1970, 1, 5)),
+        );
+        measure(&mut app);
+        assert_eq!(app.panel().unwrap().calendar.level, Level::Day(1970, 1, 5));
+
+        // A changed backtest has other trades, so it starts over at the top.
+        panel(&mut app, PanelMessage::Edit(Edit::Slippage(true)));
+        assert_eq!(app.panel().unwrap().calendar.level, Level::Years);
+        assert!(app.panel().unwrap().calendar.shown);
+    }
+
+    #[test]
+    fn replaying_a_trade_stops_just_before_it_and_plays_on_from_there() {
+        let mut app = ready_panel(TestKind::Backtest);
+        let trades = trades(&app);
+        let index = trades.len() / 2;
+        let entry = trades[index].entry_bar;
+        assert!(entry > 20, "{entry}");
+
+        panel(&mut app, PanelMessage::Speed(1.0));
+        panel(&mut app, PanelMessage::Play);
+        assert!(app.panel().unwrap().playback.playing);
+        panel(&mut app, PanelMessage::ReplayTrade(index));
+
+        let shown_now = shown(&app).expect("a playhead");
+        assert_eq!(
+            shown_now,
+            entry - 10 + 1,
+            "ten bars before it, that one closed"
+        );
+        assert!(!app.panel().unwrap().playback.playing, "paused, for Play");
+        assert_eq!(app.panel().unwrap().calendar.replaying, Some(index));
+        // The chart has come to it, however far away it was.
+        let right = app.tile_chart(0).unwrap().viewport().right;
+        assert!(
+            (right - shown_now as f64).abs() < 20.0,
+            "{right} for {shown_now}"
+        );
+
+        // Stepping on goes on from there, and reaches the trade.
+        for _ in 0..11 {
+            panel(&mut app, PanelMessage::Step);
+        }
+        assert!(
+            shown(&app).unwrap() > entry,
+            "{:?} for {entry}",
+            shown(&app)
+        );
+    }
+
+    #[test]
+    fn replaying_an_early_trade_stays_inside_the_span() {
+        let mut app = ready_panel(TestKind::Backtest);
+        panel(&mut app, PanelMessage::ReplayTrade(0));
+        assert!(shown(&app).is_some());
+        // A trade that doesn't exist does nothing.
+        let before = shown(&app);
+        panel(&mut app, PanelMessage::ReplayTrade(1_000_000));
+        assert_eq!(shown(&app), before);
+    }
+
+    #[test]
+    fn only_the_backtest_replays_trades() {
+        let mut app = ready_panel(TestKind::MonteCarlo);
+        panel(&mut app, PanelMessage::ReplayTrade(0));
+        assert_eq!(shown(&app), None);
     }
 }

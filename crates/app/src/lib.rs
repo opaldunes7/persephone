@@ -28,7 +28,7 @@ mod sweep;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex, atomic::AtomicBool},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -64,7 +64,7 @@ use persephone_engine::{
     BacktestReport, BacktestRequest, FeeRates,
     live::{LiveEvent, LiveFeed, LiveMode, LiveRequest, start_live},
 };
-use persephone_plugin_host::{Host, Plugins};
+use persephone_plugin_host::{Host, Plugins, StrategyPlugin};
 use persephone_tiling::{Layout, Rect, TileId};
 
 use crate::{
@@ -324,6 +324,14 @@ pub enum Message {
     /// One of a chart's corner buttons: the same as its shortcut, on that chart.
     TileButton(TileId, Action),
     Backtest(backtest::PanelMessage),
+    /// Monte Carlo's draws are done: run, result.
+    MonteCarloDone(u64, Result<Arc<backtest::robustness::MonteCarlo>, String>),
+    /// This many of a Random blocks run's blocks are done: run, count.
+    BlocksProgress(u64, usize),
+    BlocksDone(u64, Result<Arc<backtest::robustness::BlockSummary>, String>),
+    /// This many of an optimization's backtests are done: run, count.
+    OptimizeProgress(u64, usize),
+    OptimizeDone(u64, Result<Arc<backtest::optimize::OptimizeResult>, String>),
     /// 1-minute bars for a market's span, for High precision.
     FineLoaded(Market, Result<Arc<Vec<Candle>>, String>),
     /// A market's whole history, for the backtest panel's span: tile, (venue, symbol), result.
@@ -566,6 +574,40 @@ impl Persephone {
         let _ = self.update(Message::FineLoaded(tile.market.clone(), result));
     }
 
+    /// Draws Monte Carlo here and now, instead of handing back a task. For tests and snapshots.
+    #[doc(hidden)]
+    pub fn monte_carlo_now(&mut self) {
+        if let Some((run, job)) = self.monte_carlo_job() {
+            let result = job.run().map(Arc::new);
+            let _ = self.update(Message::MonteCarloDone(run, result));
+        }
+    }
+
+    /// Runs a batch of Random blocks here and now, instead of handing back a task. For tests and
+    /// snapshots.
+    #[doc(hidden)]
+    pub fn blocks_now(&mut self) {
+        if let Some((run, job)) = self.start_blocks() {
+            let result = job.run(&|_| {}).map(Arc::new);
+            let _ = self.update(Message::BlocksDone(run, result));
+        }
+    }
+
+    /// Runs an optimization here and now, instead of handing back a task. For tests and snapshots.
+    #[doc(hidden)]
+    pub fn optimize_now(&mut self) {
+        if let Some((run, job)) = self.start_optimize() {
+            let result = job.run(&|_| {}).map(Arc::new);
+            let _ = self.update(Message::OptimizeDone(run, result));
+        }
+    }
+
+    /// The optimization the app would run now, for tests to look at.
+    #[doc(hidden)]
+    pub fn optimize_job(&mut self) -> Option<backtest::optimize::OptimizeJob> {
+        self.start_optimize().map(|(_, job)| job)
+    }
+
     /// The backtest panel, while it's open.
     #[must_use]
     pub fn panel(&self) -> Option<&backtest::Panel> {
@@ -654,6 +696,11 @@ impl Persephone {
     }
 
     /// Tile `id`'s strategy and the state of its latest backtest.
+    #[must_use]
+    pub fn tile_backtest(&self, id: TileId) -> Option<&backtest::Settings> {
+        self.tiles.get(&id).map(|tile| &tile.backtest)
+    }
+
     #[must_use]
     pub fn tile_strategy(&self, id: TileId) -> Option<(&StrategySpec, &Run)> {
         self.tiles
@@ -873,9 +920,6 @@ impl Persephone {
             Message::Menu(message) => return self.on_menu(message),
             Message::Escape => {
                 self.popup = None;
-                if let Some(panel) = &mut self.panel {
-                    panel.settings_open = false;
-                }
                 for chart in self.tiles.values_mut().filter_map(|t| t.chart.as_mut()) {
                     chart.cancel_drawing();
                 }
@@ -934,6 +978,65 @@ impl Persephone {
                     if on_screen {
                         self.restudy(id);
                     }
+                    if let Some(panel) = self.panel.as_mut().filter(|p| p.tile == id) {
+                        panel.tests.clear_monte_carlo();
+                        self.refresh_variables(id);
+                        return self.draw_monte_carlo();
+                    }
+                }
+            }
+            Message::MonteCarloDone(run, result) => {
+                if let Some(panel) = self.panel.as_mut()
+                    && panel.tests.monte_carlo_run == Some(run)
+                {
+                    panel.tests.monte_carlo_run = None;
+                    panel.tests.monte_carlo = Some(result);
+                }
+            }
+            Message::BlocksProgress(run, count) => {
+                if let Some(panel) = self.panel.as_mut()
+                    && let backtest::BlockRun::Running {
+                        run: running, done, ..
+                    } = &mut panel.tests.blocks
+                    && *running == run
+                {
+                    *done = (*done).max(count);
+                }
+            }
+            Message::BlocksDone(run, result) => {
+                if let Some(panel) = self.panel.as_mut()
+                    && matches!(
+                        panel.tests.blocks,
+                        backtest::BlockRun::Running { run: running, .. } if running == run
+                    )
+                {
+                    panel.tests.blocks = match result {
+                        Ok(summary) => backtest::BlockRun::Done(summary),
+                        Err(error) => backtest::BlockRun::Failed(error),
+                    };
+                }
+            }
+            Message::OptimizeProgress(run, count) => {
+                if let Some(panel) = self.panel.as_mut()
+                    && let backtest::OptimizeRun::Running {
+                        run: running, done, ..
+                    } = &mut panel.tests.optimize
+                    && *running == run
+                {
+                    *done = (*done).max(count);
+                }
+            }
+            Message::OptimizeDone(run, result) => {
+                if let Some(panel) = self.panel.as_mut()
+                    && matches!(
+                        panel.tests.optimize,
+                        backtest::OptimizeRun::Running { run: running, .. } if running == run
+                    )
+                {
+                    panel.tests.optimize = match result {
+                        Ok(found) => backtest::OptimizeRun::Done(found),
+                        Err(error) => backtest::OptimizeRun::Failed(error),
+                    };
                 }
             }
             Message::Key(action) => return self.act(action),
@@ -1276,6 +1379,7 @@ impl Persephone {
                 self.layout.toggle_fullscreen();
                 true
             }
+            Action::Backtest => return self.toggle_panel(self.layout.focused()),
             Action::Workspace(number) => return self.switch_workspace(number),
             Action::MoveToWorkspace(number) => return self.move_to_workspace(number),
         };
@@ -2109,6 +2213,7 @@ impl Persephone {
                     tile.strategy = None;
                     tile.live = None;
                 }
+                self.clear_tests(id);
                 self.restudy(id);
                 self.save();
             }
@@ -2340,6 +2445,7 @@ impl Persephone {
 
     /// Backtests tile `id`'s strategy on its bars, on a worker thread.
     fn run_backtest(&mut self, id: TileId) -> Task<Message> {
+        self.clear_tests(id);
         let Some(strategy) = self.tiles.get_mut(&id).and_then(|t| t.strategy.as_mut()) else {
             return Task::none();
         };
@@ -2365,9 +2471,410 @@ impl Persephone {
             return Task::none();
         }
         self.close_panel();
-        self.panel = Some(backtest::Panel::new(id, self.window.height));
+        let settings = self
+            .tiles
+            .get(&id)
+            .map(|t| t.backtest.clone())
+            .unwrap_or_default();
+        self.panel = Some(backtest::Panel::new(id, self.window.height, &settings));
         self.relayout(true);
-        self.load_history(id)
+        self.refresh_variables(id);
+        Task::batch([self.load_history(id), self.draw_monte_carlo()])
+    }
+
+    /// Forgets what the panel's tests found about tile `id`, as its backtest is changing.
+    fn clear_tests(&mut self, id: TileId) {
+        if let Some(panel) = self.panel.as_mut().filter(|p| p.tile == id) {
+            panel.tests.clear();
+            // The trades it pointed at are about to change.
+            panel.calendar.replaying = None;
+            panel.calendar.level = backtest::calendar::Level::Years;
+        }
+    }
+
+    /// What Monte Carlo should draw now, if the panel shows it and it has nothing to show yet.
+    fn monte_carlo_job(&mut self) -> Option<(u64, backtest::robustness::MonteCarloJob)> {
+        let panel = self.panel.as_mut()?;
+        let tile = self.tiles.get(&panel.tile)?;
+        let settings = &tile.backtest;
+        if settings.test != backtest::TestKind::MonteCarlo || panel.tests.monte_carlo.is_some() {
+            return None;
+        }
+        let Run::Done(report) = &tile.strategy.as_ref()?.run else {
+            return None;
+        };
+        let run = backtest::next_run();
+        panel.tests.monte_carlo_run = Some(run);
+        Some((
+            run,
+            backtest::robustness::MonteCarloJob {
+                report: Arc::clone(report),
+                runs: settings.runs,
+                ruin_at: settings.ruin / 100.0,
+                seed: panel.tests.seed,
+            },
+        ))
+    }
+
+    fn draw_monte_carlo(&mut self) -> Task<Message> {
+        let Some((run, job)) = self.monte_carlo_job() else {
+            return Task::none();
+        };
+        Task::perform(on_thread(move || job.run().map(Arc::new)), move |result| {
+            Message::MonteCarloDone(run, result)
+        })
+    }
+
+    /// Why tile `id`'s chosen test can't run right now, and how to fix that.
+    #[must_use]
+    pub fn test_problem(&self, id: TileId) -> Option<backtest::robustness::Problem> {
+        use backtest::{ScoreBy, TestKind, optimize, robustness};
+        let tile = self.tiles.get(&id)?;
+        let settings = &tile.backtest;
+        if settings.test == TestKind::Backtest {
+            return None;
+        }
+        let Some(strategy) = &tile.strategy else {
+            return Some(robustness::Problem::new("Pick a strategy first."));
+        };
+        let Some(Bars::Ready(market)) = self.bars.get(&tile.market) else {
+            return Some(robustness::Problem::new("Waiting for the chart's bars."));
+        };
+        if settings.test == TestKind::MonteCarlo {
+            return None;
+        }
+        if self
+            .strategy_plugin(&strategy.spec)
+            .is_some_and(|p| p.uses_ai)
+        {
+            return Some(robustness::Problem::new(
+                "This strategy asks AI models, and that many backtests could cost real money.",
+            ));
+        }
+        let candles = &market.data.candles;
+        let from = span_start(candles, tile.market.span);
+        let mut end = candles.len();
+        let mut blocks = settings.test == TestKind::RandomBlocks;
+        let mut share = 1.0;
+        if settings.test == TestKind::Optimize {
+            let chosen = &settings.optimize;
+            let grid = match optimize::Grid::build(chosen, &strategy.spec.info.params) {
+                Ok(grid) => grid,
+                Err(error) => return Some(robustness::Problem::new(error)),
+            };
+            let total = grid.backtests(chosen.score, settings.blocks);
+            if total > optimize::MAX_BACKTESTS {
+                return Some(robustness::Problem::new(format!(
+                    "That's {total} backtests, more than the {} allowed. Use a larger Step, fewer \
+                     blocks, or one variable.",
+                    optimize::MAX_BACKTESTS
+                )));
+            }
+            if chosen.hold_out {
+                end = optimize::split_at(from, end);
+                share = optimize::PICKED_ON;
+                if end < from + 2 || end >= candles.len() {
+                    return Some(robustness::Problem {
+                        message: "The span has too few bars to keep some unseen. Widen it, or \
+                                  turn off Keep unseen."
+                            .into(),
+                        widen: false,
+                    });
+                }
+            }
+            blocks = chosen.score == ScoreBy::RandomBlocks;
+        }
+        if !blocks {
+            return None;
+        }
+        let length = settings.block_length;
+        let mut problem = robustness::blocks_problem(&candles[..end], from, length)?;
+        if problem.widen
+            && let Err(error) = self.widen_target(id, needed_span(length, share))
+        {
+            problem = robustness::Problem::new(error);
+        }
+        Some(problem)
+    }
+
+    fn strategy_plugin(&self, spec: &StrategySpec) -> Option<&Arc<StrategyPlugin>> {
+        match &spec.kind {
+            StrategyKind::Plugin(plugin) => self.plugins.strategies.get(plugin),
+            StrategyKind::BuiltIn(_) => None,
+        }
+    }
+
+    /// The span to widen tile `id` to for blocks needing `needed`; while the market's history is
+    /// unknown it's still worth offering, and comes to nothing until it's found.
+    fn widen_target(
+        &self,
+        id: TileId,
+        needed: UnixNanos,
+    ) -> Result<Option<(UnixNanos, UnixNanos)>, String> {
+        let Some(Ok(history)) = self.panel.as_ref().and_then(|p| p.history.as_ref()) else {
+            return Ok(None);
+        };
+        let bar_nanos = self
+            .tiles
+            .get(&id)
+            .and_then(|t| t.chart.as_ref())
+            .map_or(1, |chart| chart.data().typical_nanos);
+        backtest::robustness::widened_span(history.first, history.last, needed, bar_nanos).map(Some)
+    }
+
+    /// Applies what's been typed in the tests' own boxes, so a value without Enter still counts.
+    /// Says so and returns false if one is no good.
+    fn apply_typed(&mut self, id: TileId) -> bool {
+        let (Some(panel), Some(tile)) = (self.panel.as_mut(), self.tiles.get_mut(&id)) else {
+            return false;
+        };
+        let typed: Vec<_> = panel
+            .inputs
+            .iter()
+            .filter(|(field, _)| field.belongs_to_tests())
+            .cloned()
+            .collect();
+        for (field, text) in typed {
+            if let Err(error) = tile.backtest.set(field, &text) {
+                panel.error = Some(error);
+                return false;
+            }
+            panel.inputs.retain(|(f, _)| *f != field);
+        }
+        self.save();
+        true
+    }
+
+    /// Sets a batch of Random blocks going on the panel, unless there's a reason not to: the
+    /// panel then says why.
+    fn start_blocks(&mut self) -> Option<(u64, backtest::robustness::BlockJob)> {
+        let id = self.panel.as_ref()?.tile;
+        // The checks below are the chosen test's, so only that test may start.
+        if self.tiles.get(&id)?.backtest.test != backtest::TestKind::RandomBlocks {
+            return None;
+        }
+        if let Some(problem) = self.test_problem(id) {
+            self.panel.as_mut()?.tests.blocks = backtest::BlockRun::Failed(problem.message);
+            return None;
+        }
+        let (_, mut request) = self.backtest_request(id)?;
+        let workers = self.test_workers(&request.strategy);
+        let tile = self.tiles.get(&id)?;
+        let panel = self.panel.as_mut()?;
+        let candles = std::mem::take(&mut request.candles);
+        let from = span_start(&candles, tile.market.span);
+        let settings = &tile.backtest;
+        let blocks = match backtest::robustness::pick_blocks(
+            &candles,
+            from,
+            settings.block_length,
+            settings.blocks,
+            panel.tests.seed,
+        ) {
+            Ok(blocks) => blocks,
+            Err(error) => {
+                panel.tests.blocks = backtest::BlockRun::Failed(error);
+                return None;
+            }
+        };
+        // On the chart's bars whatever the precision, to keep a batch quick.
+        request.ticks = None;
+        request.fill_bars = None;
+        let run = backtest::next_run();
+        let stop = Arc::new(AtomicBool::new(false));
+        panel.tests.blocks = backtest::BlockRun::Running {
+            run,
+            done: 0,
+            total: blocks.len(),
+            stop: backtest::StopOnDrop(Arc::clone(&stop)),
+        };
+        Some((
+            run,
+            backtest::robustness::BlockJob {
+                request,
+                candles,
+                blocks,
+                warm_up: backtest::WARM_UP_BARS as usize,
+                workers,
+                stop,
+            },
+        ))
+    }
+
+    /// How many backtests a batch may run at once: one for a strategy in a process of its own,
+    /// which may not take more.
+    fn test_workers(&self, spec: &StrategySpec) -> usize {
+        if self
+            .strategy_plugin(spec)
+            .is_some_and(|p| p.address().is_some())
+        {
+            return 1;
+        }
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .saturating_sub(1)
+            .max(1)
+    }
+
+    /// Sets an optimization going on the panel, unless there's a reason not to: the panel then
+    /// says why.
+    fn start_optimize(&mut self) -> Option<(u64, backtest::optimize::OptimizeJob)> {
+        use backtest::{ScoreBy, optimize};
+        let id = self.panel.as_ref()?.tile;
+        if self.tiles.get(&id)?.backtest.test != backtest::TestKind::Optimize {
+            return None;
+        }
+        if let Some(problem) = self.test_problem(id) {
+            self.panel.as_mut()?.tests.optimize = backtest::OptimizeRun::Failed(problem.message);
+            return None;
+        }
+        let (_, mut request) = self.backtest_request(id)?;
+        let workers = self.test_workers(&request.strategy);
+        let tile = self.tiles.get(&id)?;
+        let panel = self.panel.as_mut()?;
+        let settings = &tile.backtest;
+        let chosen = &settings.optimize;
+        let grid = optimize::Grid::build(chosen, &request.strategy.info.params).ok()?;
+        let candles = std::mem::take(&mut request.candles);
+        let from = span_start(&candles, tile.market.span);
+        let split = chosen
+            .hold_out
+            .then(|| optimize::split_at(from, candles.len()));
+        let blocks = if chosen.score == ScoreBy::RandomBlocks {
+            match backtest::robustness::pick_blocks(
+                &candles[..split.unwrap_or(candles.len())],
+                from,
+                settings.block_length,
+                settings.blocks,
+                panel.tests.seed,
+            ) {
+                Ok(blocks) => blocks,
+                Err(error) => {
+                    panel.tests.optimize = backtest::OptimizeRun::Failed(error);
+                    return None;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        // On the chart's bars whatever the precision, to keep a batch quick.
+        request.ticks = None;
+        request.fill_bars = None;
+        let run = backtest::next_run();
+        let stop = Arc::new(AtomicBool::new(false));
+        let job = optimize::OptimizeJob {
+            request,
+            candles,
+            grid,
+            score: chosen.score,
+            split,
+            blocks,
+            warm_up: backtest::WARM_UP_BARS as usize,
+            runs: settings.runs,
+            ruin_at: settings.ruin / 100.0,
+            seed: panel.tests.seed,
+            workers,
+            stop: Arc::clone(&stop),
+        };
+        panel.tests.original = None;
+        panel.tests.optimize = backtest::OptimizeRun::Running {
+            run,
+            done: 0,
+            total: job.total(),
+            stop: backtest::StopOnDrop(stop),
+        };
+        Some((run, job))
+    }
+
+    /// Makes sure Optimize's variables are ones tile `id`'s strategy has, with the first always
+    /// picked.
+    fn refresh_variables(&mut self, id: TileId) {
+        let Some(tile) = self.tiles.get_mut(&id) else {
+            return;
+        };
+        let Some(strategy) = &tile.strategy else {
+            return;
+        };
+        let spec = &strategy.spec;
+        let variables = &mut tile.backtest.optimize.variables;
+        for variable in variables.iter_mut() {
+            if variable
+                .as_ref()
+                .is_some_and(|v| !spec.info.params.iter().any(|p| p.name == v.name.as_str()))
+            {
+                *variable = None;
+            }
+        }
+        if variables[0].is_none() {
+            variables[0] = spec
+                .info
+                .params
+                .first()
+                .map(|param| default_variable(spec, param.name.as_ref()));
+            variables[1] = None;
+        }
+    }
+
+    /// Puts `params` on tile `id`'s strategy and reruns its backtest, keeping the optimization's
+    /// results on screen. A live session runs the old settings, so it stops.
+    fn apply_params(
+        &mut self,
+        id: TileId,
+        params: Vec<(usize, f64)>,
+        original: Option<Vec<f64>>,
+    ) -> Task<Message> {
+        let Some(panel) = self.panel.as_mut() else {
+            return Task::none();
+        };
+        let kept = std::mem::take(&mut panel.tests.optimize);
+        if let Some(tile) = self.tiles.get_mut(&id) {
+            if let Some(strategy) = tile.strategy.as_mut() {
+                for (index, value) in params {
+                    let _ = strategy.spec.set_param(index, value);
+                }
+            }
+            tile.live = None;
+        }
+        self.save();
+        let task = self.run_backtest(id);
+        if let Some(panel) = self.panel.as_mut() {
+            panel.tests.optimize = kept;
+            panel.tests.original = original;
+        }
+        task
+    }
+
+    fn run_blocks(&mut self) -> Task<Message> {
+        let Some((run, job)) = self.start_blocks() else {
+            return Task::none();
+        };
+        batch_task(
+            run,
+            move |progress| job.run(&|count| progress(count)),
+            Message::BlocksProgress,
+            Message::BlocksDone,
+        )
+    }
+
+    fn run_optimize(&mut self) -> Task<Message> {
+        let Some((run, job)) = self.start_optimize() else {
+            return Task::none();
+        };
+        batch_task(
+            run,
+            move |progress| job.run(&|count| progress(count)),
+            Message::OptimizeProgress,
+            Message::OptimizeDone,
+        )
+    }
+
+    /// Closes the backtest panel if it's open for tile `id`, else opens it for it.
+    fn toggle_panel(&mut self, id: TileId) -> Task<Message> {
+        if self.panel.as_ref().is_some_and(|p| p.tile == id) {
+            self.close_panel();
+            return Task::none();
+        }
+        self.open_panel(id)
     }
 
     fn close_panel(&mut self) {
@@ -2574,10 +3081,176 @@ impl Persephone {
             return Task::none();
         };
         let span = self.playback_span();
+        // Only the backtest itself plays back.
+        let plays = self
+            .tiles
+            .get(&id)
+            .is_some_and(|t| t.backtest.test == backtest::TestKind::Backtest);
+        if !plays
+            && matches!(
+                message,
+                P::Play | P::Step | P::Restart | P::Seek(_) | P::ReplayTrade(_)
+            )
+        {
+            return Task::none();
+        }
         let Some(panel) = self.panel.as_mut() else {
             return Task::none();
         };
         match message {
+            P::ShowCalendar(shown) => panel.calendar.shown = shown,
+            P::CalendarLevel(level) => panel.calendar.level = level,
+            P::ReplayTrade(index) => {
+                let Some(Run::Done(report)) = self
+                    .tiles
+                    .get(&id)
+                    .and_then(|t| t.strategy.as_ref())
+                    .map(|s| &s.run)
+                else {
+                    return Task::none();
+                };
+                let trades = backtest::robustness::round_trips(report);
+                let (Some(trade), Some((start, end)), Some(timeline)) =
+                    (trades.get(index), span, &panel.timeline)
+                else {
+                    return Task::none();
+                };
+                let lead_in = trade.entry_bar.saturating_sub(backtest::REPLAY_LEAD_BARS);
+                let at = timeline.closes.get(lead_in).copied().unwrap_or(start);
+                panel.playback.pause();
+                panel.playback.at = Some(at.clamp(start, end));
+                panel.calendar.replaying = Some(index);
+                self.sync_playhead();
+                if let Some(chart) = self.tiles.get_mut(&id).and_then(|t| t.chart.as_mut()) {
+                    chart.show_playhead();
+                }
+                return Task::none();
+            }
+            P::Test(test) => {
+                if let Some(tile) = self.tiles.get_mut(&id) {
+                    tile.backtest.test = test;
+                }
+                panel.playback.reset();
+                self.sync_playhead();
+                self.refresh_variables(id);
+                self.save();
+                return self.draw_monte_carlo();
+            }
+            P::BlockLength(length) => {
+                if let Some(tile) = self.tiles.get_mut(&id) {
+                    tile.backtest.block_length = length;
+                }
+                panel.tests.blocks = backtest::BlockRun::Idle;
+                panel.tests.optimize = backtest::OptimizeRun::Idle;
+                self.save();
+                return Task::none();
+            }
+            P::RunBlocks => {
+                if !self.apply_typed(id) {
+                    return Task::none();
+                }
+                return self.run_blocks();
+            }
+            P::StopBlocks => {
+                panel.tests.blocks = backtest::BlockRun::Idle;
+                return Task::none();
+            }
+            P::RunAgain => {
+                panel.tests.seed = panel.tests.seed.wrapping_add(1);
+                panel.tests.clear_monte_carlo();
+                if !self.apply_typed(id) {
+                    return Task::none();
+                }
+                return match self.tiles.get(&id).map(|t| t.backtest.test) {
+                    Some(backtest::TestKind::RandomBlocks) => self.run_blocks(),
+                    Some(backtest::TestKind::Optimize) => self.run_optimize(),
+                    _ => self.draw_monte_carlo(),
+                };
+            }
+            P::RunOptimize => {
+                if !self.apply_typed(id) {
+                    return Task::none();
+                }
+                return self.run_optimize();
+            }
+            P::StopOptimize => {
+                panel.tests.optimize = backtest::OptimizeRun::Idle;
+                return Task::none();
+            }
+            P::WidenSpan => {
+                let Some(tile) = self.tiles.get(&id) else {
+                    return Task::none();
+                };
+                let settings = &tile.backtest;
+                let share = if settings.test == backtest::TestKind::Optimize
+                    && settings.optimize.hold_out
+                {
+                    backtest::optimize::PICKED_ON
+                } else {
+                    1.0
+                };
+                let needed = needed_span(settings.block_length, share);
+                return match self.widen_target(id, needed) {
+                    Ok(Some(span)) => self.set_span(id, Some(span)),
+                    _ => Task::none(),
+                };
+            }
+            P::Variable(slot, name) => {
+                let Some(tile) = self.tiles.get_mut(&id) else {
+                    return Task::none();
+                };
+                let spec = tile.strategy.as_ref().map(|s| &s.spec);
+                if let (Some(spec), Some(variable)) =
+                    (spec, tile.backtest.optimize.variables.get_mut(slot))
+                {
+                    *variable =
+                        (name != backtest::NO_VARIABLE).then(|| default_variable(spec, &name));
+                }
+                panel.inputs.retain(|(field, _)| {
+                    !matches!(
+                        field,
+                        backtest::Field::Min(s) | backtest::Field::Max(s) | backtest::Field::Step(s)
+                            if *s == slot
+                    )
+                });
+                panel.tests.optimize = backtest::OptimizeRun::Idle;
+                self.save();
+                return Task::none();
+            }
+            P::ScoreBy(score) => {
+                if let Some(tile) = self.tiles.get_mut(&id) {
+                    tile.backtest.optimize.score = score;
+                }
+                panel.tests.optimize = backtest::OptimizeRun::Idle;
+                self.save();
+                return Task::none();
+            }
+            P::HoldOut(on) => {
+                if let Some(tile) = self.tiles.get_mut(&id) {
+                    tile.backtest.optimize.hold_out = on;
+                }
+                panel.tests.optimize = backtest::OptimizeRun::Idle;
+                self.save();
+                return Task::none();
+            }
+            P::Apply(cell) => {
+                let backtest::OptimizeRun::Done(found) = &panel.tests.optimize else {
+                    return Task::none();
+                };
+                let params = found.grid.values_of(cell);
+                let original = panel.tests.original.clone().or_else(|| {
+                    let strategy = self.tiles.get(&id)?.strategy.as_ref()?;
+                    Some(strategy.spec.params.clone())
+                });
+                return self.apply_params(id, params, original);
+            }
+            P::Revert => {
+                let Some(original) = panel.tests.original.clone() else {
+                    return Task::none();
+                };
+                let params = original.into_iter().enumerate().collect();
+                return self.apply_params(id, params, None);
+            }
             P::Play => {
                 if let Some((start, end)) = span {
                     panel.playback.play(start, end);
@@ -2622,7 +3295,46 @@ impl Persephone {
                 panel.height = y.max(backtest::MIN_HEIGHT);
                 self.relayout(false);
             }
-            P::ToggleSettings => panel.settings_open = !panel.settings_open,
+            P::SettingsHeight(height) => {
+                if panel.settings_height != height {
+                    panel.settings_height = height;
+                    self.relayout(false);
+                }
+                return Task::none();
+            }
+            P::Strategy(choice) => {
+                let spec = match choice.kind {
+                    StrategyKind::BuiltIn(kind) => Some(StrategySpec::new(kind)),
+                    StrategyKind::Plugin(plugin) => {
+                        self.plugins.strategies.get(&plugin).map(|loaded| {
+                            StrategySpec::from_info(
+                                StrategyKind::Plugin(plugin.clone()),
+                                Arc::clone(&loaded.info),
+                                &[],
+                            )
+                        })
+                    }
+                };
+                panel.playback.reset();
+                self.sync_playhead();
+                return spec.map_or_else(Task::none, |spec| self.set_strategy(id, spec));
+            }
+            P::AddPlugin(plugin) => {
+                if let Some(tile) = self.tiles.get_mut(&id) {
+                    if !tile.backtest.plugins.contains(&plugin) {
+                        tile.backtest.plugins.push(plugin);
+                    }
+                    panel.refresh_plugins(&tile.backtest);
+                    self.save();
+                }
+            }
+            P::RemovePlugin(plugin) => {
+                if let Some(tile) = self.tiles.get_mut(&id) {
+                    tile.backtest.plugins.retain(|on| *on != plugin);
+                    panel.refresh_plugins(&tile.backtest);
+                    self.save();
+                }
+            }
             P::Input(field, text) => {
                 panel.set_input(field, text);
                 panel.error = None;
@@ -2637,6 +3349,25 @@ impl Persephone {
                 match tile.backtest.set(field, &text) {
                     Ok(()) => {
                         panel.inputs.retain(|(f, _)| *f != field);
+                        // The tests' own settings don't change the backtest they start from.
+                        match field {
+                            backtest::Field::Runs | backtest::Field::Ruin => {
+                                panel.tests.clear_monte_carlo();
+                                panel.tests.optimize = backtest::OptimizeRun::Idle;
+                                self.save();
+                                return self.draw_monte_carlo();
+                            }
+                            backtest::Field::Blocks
+                            | backtest::Field::Min(_)
+                            | backtest::Field::Max(_)
+                            | backtest::Field::Step(_) => {
+                                panel.tests.blocks = backtest::BlockRun::Idle;
+                                panel.tests.optimize = backtest::OptimizeRun::Idle;
+                                self.save();
+                                return Task::none();
+                            }
+                            _ => {}
+                        }
                         self.save();
                         return self.run_backtest_keeping(id);
                     }
@@ -2676,6 +3407,7 @@ impl Persephone {
     /// Reruns tile `id`'s backtest after its bars changed, showing the last result until the
     /// new one is in.
     fn run_backtest_keeping(&mut self, id: TileId) -> Task<Message> {
+        self.clear_tests(id);
         let Some(strategy) = self.tiles.get_mut(&id).and_then(|t| t.strategy.as_mut()) else {
             return Task::none();
         };
@@ -2895,7 +3627,7 @@ impl Persephone {
             Some(Run::Running) => backtest::Status::Running,
             Some(Run::Failed(message)) => backtest::Status::Failed(message),
             Some(Run::Waiting) => backtest::Status::Waiting,
-            None => backtest::Status::Failed("Add a strategy to this chart to backtest it."),
+            None => backtest::Status::NoStrategy,
         };
         let data = tile.chart.as_ref().map(ChartState::data);
         let from_index = match (data, tile.market.span) {
@@ -2911,7 +3643,50 @@ impl Persephone {
             .strategy
             .as_ref()
             .map_or("no strategy", |s| s.spec.info.name.as_str());
+        let built_in = persephone_core::strategy::BuiltInStrategy::ALL
+            .into_iter()
+            .map(|kind| backtest::StrategyChoice {
+                kind: StrategyKind::BuiltIn(kind),
+                name: kind.name().to_owned(),
+            });
+        // Worth knowing before picking it: it sends prompts out.
+        let from_plugins = self
+            .plugins
+            .strategies
+            .values()
+            .map(|p| backtest::StrategyChoice {
+                kind: StrategyKind::Plugin(p.id.clone()),
+                name: if p.uses_ai {
+                    format!("{} (asks AI models)", p.info.name)
+                } else {
+                    p.info.name.clone()
+                },
+            });
+        let strategies: Vec<_> = built_in.chain(from_plugins).collect();
+        let current = tile
+            .strategy
+            .as_ref()
+            .and_then(|s| strategies.iter().find(|c| c.kind == s.spec.kind).cloned());
+        let params = tile.strategy.as_ref().map(|s| &s.spec);
+        let plan = params.and_then(|spec| {
+            let chosen = &tile.backtest.optimize;
+            let grid = backtest::optimize::Grid::build(chosen, &spec.info.params).ok()?;
+            Some(grid.describe(chosen.score, tile.backtest.blocks))
+        });
         backtest::PanelInfo {
+            problem: self.test_problem(panel.tile),
+            plan,
+            params: params.map_or(&[], |spec| spec.params.as_slice()),
+            variables: params.map_or_else(Vec::new, |spec| {
+                spec.info
+                    .params
+                    .iter()
+                    .map(|p| p.name.to_string())
+                    .collect()
+            }),
+            strategies,
+            strategy: current,
+            width: self.window.width,
             panel,
             settings: &tile.backtest,
             title: format!("{} · {} · {strategy}", tile.market.symbol, tile.market.bars),
@@ -2920,6 +3695,8 @@ impl Persephone {
             span: tile.market.span,
             traded,
             from_index,
+            candles: data.map_or(&[], |d| d.candles.get(from_index..).unwrap_or_default()),
+            bars: tile.market.bars,
             shown: tile
                 .chart
                 .as_ref()
@@ -2955,18 +3732,6 @@ impl Persephone {
                 .height(height))
                 .into(),
             );
-            if panel.settings_open {
-                let x = (self.window.width - backtest::SETTINGS_WIDTH - 10.0).max(0.0);
-                layers.push(
-                    pin(container(
-                        backtest::settings_sheet(panel, &tile.backtest).map(Message::Backtest),
-                    )
-                    .max_height((self.window.height - height - 14.0).max(120.0)))
-                    .x(x)
-                    .y(height + 4.0)
-                    .into(),
-                );
-            }
         }
 
         // The popup goes above every tile, so neighbouring charts can't cover it.
@@ -3614,6 +4379,67 @@ async fn on_thread<T: Send + 'static>(
     });
     rx.await
         .map_err(|_| "the worker thread stopped".to_string())?
+}
+
+/// Runs a batch on a thread of its own, reporting progress as it goes.
+fn batch_task<R: Send + Sync + 'static>(
+    run: u64,
+    job: impl FnOnce(&(dyn Fn(usize) + Sync)) -> Result<R, String> + Send + 'static,
+    progress: fn(u64, usize) -> Message,
+    finished: fn(u64, Result<Arc<R>, String>) -> Message,
+) -> Task<Message> {
+    Task::stream(iced::stream::channel(
+        16,
+        async move |mut output: iced::futures::channel::mpsc::Sender<Message>| {
+            let (done, result) = oneshot::channel();
+            let updates = Mutex::new(output.clone());
+            std::thread::spawn(move || {
+                let report = |count: usize| {
+                    if let Ok(mut updates) = updates.lock() {
+                        let _ = updates.try_send(progress(run, count));
+                    }
+                };
+                let _ = done.send(job(&report).map(Arc::new));
+            });
+            let result = result
+                .await
+                .unwrap_or_else(|_| Err("The batch stopped unexpectedly.".into()));
+            let _ = iced::futures::SinkExt::send(&mut output, finished(run, result)).await;
+        },
+    ))
+}
+
+/// The first bar of a chart's span.
+fn span_start(candles: &[Candle], span: Option<(UnixNanos, UnixNanos)>) -> usize {
+    span.map_or(0, |(from, _)| candles.partition_point(|c| c.ts < from))
+}
+
+/// How long a span must be for blocks of `length` when only `share` of it can be sampled.
+fn needed_span(length: backtest::BlockLength, share: f64) -> UnixNanos {
+    (length.nanos() as f64 / share).ceil() as UnixNanos
+}
+
+/// A parameter to optimize, by name, over a starting range around its value: about ten steps.
+fn default_variable(spec: &StrategySpec, name: &str) -> backtest::Variable {
+    let index = spec
+        .info
+        .params
+        .iter()
+        .position(|p| p.name == name)
+        .unwrap_or(0);
+    let param = &spec.info.params[index];
+    let (min, max) = sweep::default_range(param, spec.params[index]);
+    let step = (max - min) / 10.0;
+    backtest::Variable {
+        name: name.to_owned(),
+        min,
+        max,
+        step: if param.integer {
+            step.ceil().max(1.0)
+        } else {
+            ((step * 10_000.0).round() / 10_000.0).max(0.0001)
+        },
+    }
 }
 
 async fn backtest_on_thread(request: BacktestRequest) -> Result<Arc<BacktestReport>, String> {

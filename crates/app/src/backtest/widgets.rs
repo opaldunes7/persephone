@@ -1,32 +1,880 @@
-//! The panel's drawn controls: the equity curve, the span slider and the speed slider, plus the
-//! handle that resizes the panel.
+//! The panel's drawn controls: the equity curve and the tests' fan of lines, the span slider and
+//! the speed slider, plus the handle that resizes the panel.
+
+use std::cell::Cell;
 
 use iced::{
-    Color, Point, Rectangle, Renderer, Size, Theme, alignment,
+    Color, Point, Radians, Rectangle, Renderer, Size, Theme, alignment,
     mouse::{self, ScrollDelta},
-    widget::canvas::{self, Event, Frame, Path, Stroke, Text},
+    widget::{
+        canvas::{self, Event, Frame, LineDash, Path, Stroke, Text},
+        text,
+    },
 };
-use persephone_chart::theme;
-use persephone_core::{UnixNanos, time::DateTime};
+use persephone_chart::{PRICE_AXIS_WIDTH, Projection, theme, ticks};
+use persephone_core::{BarSpec, Candle, UnixNanos, time::DateTime};
 
-use super::{History, PanelMessage, SPEED_LABELS, position_of, speed_at};
+use super::{
+    History, PanelMessage, SPEED_LABELS,
+    optimize::{OptimizeResult, Outcome},
+    position_of, speed_at,
+};
 
-const TRACK: Color = Color::from_rgb8(0x2a, 0x2e, 0x39);
 const HANDLE: Color = Color::from_rgb8(0xd1, 0xd4, 0xdc);
 
 // --- Equity ----------------------------------------------------------------------------------
 
-/// Equity over the span, drawn as far as the playhead: a line over the starting capital, with
-/// falls from the running peak shaded.
+/// Room along the bottom of the equity pane for its time labels.
+const TIME_STRIP: f32 = 20.0;
+/// Room kept above the curve for the legend's two lines.
+const LEGEND_ROOM: f32 = 44.0;
+/// The equity line, the same color as a chart's equity pane.
+const EQUITY: Color = Color::from_rgb8(0x42, 0xa5, 0xf5);
+
+/// Equity over the span, drawn like a chart pane as far as the playhead: grid, price axis and
+/// time labels, a dashed line at the starting capital, and falls from the running peak shaded.
 pub struct Equity<'a> {
     /// One value per bar of the span.
     pub values: &'a [f64],
+    /// The span's bars, for the time labels.
+    pub candles: &'a [Candle],
+    pub bars: BarSpec,
+    /// A bar's usual length.
+    pub bar_nanos: UnixNanos,
     /// How many have happened; all of them without a playback.
     pub shown: usize,
     pub start: f64,
 }
 
+/// The grid stays drawn between frames, as finding its labels means going through every bar.
+#[derive(Default)]
+pub struct EquityGrid {
+    cache: canvas::Cache,
+    drawn_for: Cell<(usize, u32, u32, u64)>,
+}
+
+impl Equity<'_> {
+    /// The pane's projection: the scale covers the whole run, so it doesn't jump as the
+    /// playhead moves.
+    fn projection(&self, size: Size) -> Projection {
+        let count = self.values.len().min(self.candles.len());
+        pane_for(
+            self.values[..count].iter().copied(),
+            self.start,
+            count,
+            size,
+        )
+    }
+
+    fn draw_grid(&self, frame: &mut Frame, pane: &Projection) {
+        price_grid(frame, pane);
+        let count = pane.visible.end;
+        for tick in ticks::time_ticks(&self.candles[..count], pane, self.bar_nanos) {
+            let x = pane.x(tick.index as f64).round();
+            let color = if tick.major {
+                theme::GRID_MAJOR
+            } else {
+                theme::GRID
+            };
+            frame.fill_rectangle(Point::new(x, 0.0), Size::new(1.0, pane.height), color);
+            let y = pane.height + TIME_STRIP / 2.0;
+            grid_label(frame, tick.label, x, y, text::Alignment::Center);
+        }
+        axes_and_start(frame, pane, self.start);
+    }
+}
+
+/// A pane's projection for `values` over `count` points: the scale covers them and `start`, with
+/// room above for the legend.
+fn pane_for(values: impl Iterator<Item = f64>, start: f64, count: usize, size: Size) -> Projection {
+    let (lo, hi) = values
+        .chain(std::iter::once(start))
+        .fold((f64::MAX, f64::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+    let pad = ((hi - lo) * 0.08).max(hi.abs() * 1e-6).max(1e-9);
+    let width = (size.width - PRICE_AXIS_WIDTH).max(1.0);
+    let height = (size.height - TIME_STRIP).max(1.0);
+    // Room above the curve, so the legend stays readable.
+    let room = LEGEND_ROOM.min(height * 0.4);
+    let headroom = (hi - lo + 2.0 * pad) * f64::from(room / (height - room));
+    Projection {
+        left: 0.0,
+        spacing: f64::from(width) / (count.max(2) - 1) as f64,
+        top: hi + pad + headroom,
+        bottom: lo - pad,
+        width,
+        height,
+        offset: 0.0,
+        visible: 0..count,
+        max_volume: 0.0,
+    }
+}
+
+fn grid_label(frame: &mut Frame, content: String, x: f32, y: f32, align: text::Alignment) {
+    frame.fill_text(Text {
+        content,
+        position: Point::new(x, y),
+        color: theme::TEXT,
+        size: theme::TEXT_SIZE.into(),
+        align_x: align,
+        align_y: alignment::Vertical::Center,
+        ..Text::default()
+    });
+}
+
+/// The pane's background, and its price lines with their labels on the axis.
+fn price_grid(frame: &mut Frame, pane: &Projection) {
+    frame.fill_rectangle(Point::ORIGIN, frame.size(), theme::BACKGROUND);
+    let ticks = ticks::price_ticks(pane);
+    let decimals = match ticks.as_slice() {
+        [a, b, ..] => ticks::step_decimals(b - a),
+        _ => 2,
+    };
+    for value in ticks {
+        let y = pane.y(value).round();
+        if pane.contains_y(y) {
+            frame.fill_rectangle(Point::new(0.0, y), Size::new(pane.width, 1.0), theme::GRID);
+            let text = format!("{value:.decimals$}");
+            grid_label(frame, text, pane.width + 8.0, y, text::Alignment::Left);
+        }
+    }
+}
+
+/// The axes, as on a chart, and a dashed line at the starting capital.
+fn axes_and_start(frame: &mut Frame, pane: &Projection, start: f64) {
+    let size = frame.size();
+    frame.fill_rectangle(
+        Point::new(pane.width, 0.0),
+        Size::new(1.0, size.height),
+        theme::AXIS_LINE,
+    );
+    frame.fill_rectangle(
+        Point::new(0.0, pane.height),
+        Size::new(size.width, 1.0),
+        theme::AXIS_LINE,
+    );
+    let base = pane.y(start).round() + 0.5;
+    frame.stroke(
+        &Path::line(Point::new(0.0, base), Point::new(pane.width, base)),
+        dashed(theme::LEVEL),
+    );
+}
+
+fn dashed(color: Color) -> Stroke<'static> {
+    Stroke {
+        line_dash: LineDash {
+            segments: &[4.0, 4.0],
+            offset: 0,
+        },
+        ..Stroke::default().with_color(color).with_width(1.0)
+    }
+}
+
+/// A value's tag on the price axis, as on a chart.
+fn axis_tag(frame: &mut Frame, pane: &Projection, value: f64, background: Color) {
+    let y = pane.y(value);
+    if !pane.contains_y(y) {
+        return;
+    }
+    frame.fill_rectangle(
+        Point::new(pane.width + 1.0, y - 9.0),
+        Size::new(PRICE_AXIS_WIDTH - 1.0, 18.0),
+        background,
+    );
+    frame.fill_text(Text {
+        content: format!("{value:.2}"),
+        position: Point::new(pane.width + 8.0, y),
+        color: theme::LABEL_TEXT,
+        size: theme::TEXT_SIZE.into(),
+        align_y: alignment::Vertical::Center,
+        ..Text::default()
+    });
+}
+
 impl canvas::Program<PanelMessage> for Equity<'_> {
+    type State = EquityGrid;
+
+    fn draw(
+        &self,
+        state: &EquityGrid,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let size = bounds.size();
+        let pane = self.projection(size);
+        let key = (
+            pane.visible.end,
+            size.width.to_bits(),
+            size.height.to_bits(),
+            pane.top.to_bits() ^ pane.bottom.to_bits().rotate_left(1),
+        );
+        if state.drawn_for.replace(key) != key {
+            state.cache.clear();
+        }
+        let grid = state
+            .cache
+            .draw(renderer, size, |frame| self.draw_grid(frame, &pane));
+
+        let mut frame = Frame::new(renderer, size);
+        let count = pane.visible.end;
+        let shown = &self.values[..self.shown.min(count)];
+        let Some(&last) = shown.last() else {
+            return vec![grid, frame.into_geometry()];
+        };
+        let point = |i: usize, v: f64| Point::new(pane.x(i as f64), pane.y(v));
+        // No need for more than a couple of points a pixel.
+        let stride = (shown.len() / (2 * pane.width as usize).max(1)).max(1);
+        let path: Vec<(usize, f64)> = shown
+            .iter()
+            .copied()
+            .enumerate()
+            .step_by(stride)
+            .chain(std::iter::once((shown.len() - 1, last)))
+            .collect();
+
+        // Drawdown: from the running peak down to the curve.
+        let mut peak = f64::MIN;
+        let peaks: Vec<f64> = path
+            .iter()
+            .map(|&(_, v)| {
+                peak = peak.max(v);
+                peak
+            })
+            .collect();
+        let shade = Path::new(|b| {
+            b.move_to(point(path[0].0, peaks[0]));
+            for (&(i, _), &p) in path.iter().zip(&peaks) {
+                b.line_to(point(i, p));
+            }
+            for &(i, v) in path.iter().rev() {
+                b.line_to(point(i, v));
+            }
+            b.close();
+        });
+        frame.fill(
+            &shade,
+            Color {
+                a: 0.1,
+                ..theme::DOWN
+            },
+        );
+        let line = Path::new(|b| {
+            b.move_to(point(path[0].0, path[0].1));
+            for &(i, v) in &path[1..] {
+                b.line_to(point(i, v));
+            }
+        });
+        frame.stroke(&line, Stroke::default().with_color(EQUITY).with_width(1.5));
+        axis_tag(&mut frame, &pane, last, EQUITY);
+
+        let hovered = cursor
+            .position_in(bounds)
+            .filter(|p| p.x < pane.width && p.y < pane.height)
+            .and_then(|p| pane.bar_at(p.x, shown.len()));
+        if let Some(i) = hovered {
+            let x = pane.x(i as f64).round();
+            frame.stroke(
+                &Path::line(Point::new(x, 0.0), Point::new(x, pane.height)),
+                dashed(theme::CROSSHAIR),
+            );
+            axis_tag(&mut frame, &pane, shown[i], theme::LABEL_BACKGROUND);
+            let label = ticks::crosshair_label(self.candles[i].ts, self.bars);
+            let half = label.chars().count() as f32 * 3.4 + 7.0;
+            let center = x.clamp(half, (pane.width - half).max(half));
+            frame.fill_rectangle(
+                Point::new(center - half, pane.height + 1.0),
+                Size::new(half * 2.0, TIME_STRIP - 2.0),
+                theme::LABEL_BACKGROUND,
+            );
+            frame.fill_text(Text {
+                content: label,
+                position: Point::new(center, pane.height + TIME_STRIP / 2.0),
+                color: theme::LABEL_TEXT,
+                size: theme::TEXT_SIZE.into(),
+                align_x: text::Alignment::Center,
+                align_y: alignment::Vertical::Center,
+                ..Text::default()
+            });
+        }
+        vec![grid, frame.into_geometry()]
+    }
+}
+
+// --- The tests' fan of equity lines ----------------------------------------------------------
+
+/// Many equity lines from the same capital, drawn faintly over each other with their median
+/// bright on top: how Monte Carlo's runs and Random blocks' blocks spread out.
+pub struct Fan<'a> {
+    pub paths: &'a [Vec<f64>],
+    pub median: &'a [f64],
+    pub start: f64,
+    /// What's between a line's points, and how many of them.
+    pub unit: &'static str,
+    pub stride: usize,
+}
+
+/// The lines stay drawn between frames, as there can be many.
+#[derive(Default)]
+pub struct FanLines {
+    cache: canvas::Cache,
+    drawn_for: Cell<(u32, u32, usize)>,
+}
+
+impl Fan<'_> {
+    fn projection(&self, size: Size) -> Projection {
+        let count = self.paths.iter().map(Vec::len).max().unwrap_or(0);
+        let values = self.paths.iter().flatten().copied();
+        pane_for(values, self.start, count, size)
+    }
+
+    fn draw_lines(&self, frame: &mut Frame, pane: &Projection) {
+        price_grid(frame, pane);
+        let count = pane.visible.end;
+        let every = nice_step((count * self.stride / 6).max(1));
+        let mut at = every;
+        while at < count * self.stride {
+            let x = pane.x((at / self.stride) as f64).round();
+            frame.fill_rectangle(Point::new(x, 0.0), Size::new(1.0, pane.height), theme::GRID);
+            let y = pane.height + TIME_STRIP / 2.0;
+            grid_label(frame, at.to_string(), x, y, text::Alignment::Center);
+            at += every;
+        }
+        axes_and_start(frame, pane, self.start);
+
+        let line = |values: &[f64]| {
+            Path::new(|b| {
+                for (i, &value) in values.iter().enumerate() {
+                    let point = Point::new(pane.x(i as f64), pane.y(value));
+                    if i == 0 {
+                        b.move_to(point);
+                    } else {
+                        b.line_to(point);
+                    }
+                }
+            })
+        };
+        let faint = Color { a: 0.14, ..EQUITY };
+        for path in self.paths {
+            frame.stroke(
+                &line(path),
+                Stroke::default().with_color(faint).with_width(1.0),
+            );
+        }
+        frame.stroke(
+            &line(self.median),
+            Stroke::default().with_color(HANDLE).with_width(1.5),
+        );
+    }
+}
+
+/// A round number near `rough`: 1, 2 or 5 times a power of ten.
+fn nice_step(rough: usize) -> usize {
+    let power = 10_usize.pow(rough.max(1).ilog10());
+    let lead = rough / power;
+    power
+        * match lead {
+            0 | 1 => 1,
+            2..=4 => 2,
+            5..=9 => 5,
+            _ => 10,
+        }
+}
+
+impl canvas::Program<PanelMessage> for Fan<'_> {
+    type State = FanLines;
+
+    fn draw(
+        &self,
+        state: &FanLines,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let size = bounds.size();
+        let pane = self.projection(size);
+        let key = (
+            size.width.to_bits(),
+            size.height.to_bits(),
+            self.paths.as_ptr() as usize,
+        );
+        if state.drawn_for.replace(key) != key {
+            state.cache.clear();
+        }
+        let lines = state
+            .cache
+            .draw(renderer, size, |frame| self.draw_lines(frame, &pane));
+
+        let mut frame = Frame::new(renderer, size);
+        if let Some(&last) = self.median.last() {
+            axis_tag(&mut frame, &pane, last, EQUITY);
+        }
+        let hovered = cursor
+            .position_in(bounds)
+            .filter(|p| p.x < pane.width && p.y < pane.height)
+            .and_then(|p| pane.bar_at(p.x, self.median.len()));
+        if let Some(i) = hovered {
+            let x = pane.x(i as f64).round();
+            frame.stroke(
+                &Path::line(Point::new(x, 0.0), Point::new(x, pane.height)),
+                dashed(theme::CROSSHAIR),
+            );
+            axis_tag(&mut frame, &pane, self.median[i], theme::LABEL_BACKGROUND);
+            let label = format!("{} {}", self.unit, i * self.stride);
+            let half = label.chars().count() as f32 * 3.4 + 7.0;
+            let center = x.clamp(half, (pane.width - half).max(half));
+            frame.fill_rectangle(
+                Point::new(center - half, pane.height + 1.0),
+                Size::new(half * 2.0, TIME_STRIP - 2.0),
+                theme::LABEL_BACKGROUND,
+            );
+            frame.fill_text(Text {
+                content: label,
+                position: Point::new(center, pane.height + TIME_STRIP / 2.0),
+                color: theme::LABEL_TEXT,
+                size: theme::TEXT_SIZE.into(),
+                align_x: text::Alignment::Center,
+                align_y: alignment::Vertical::Center,
+                ..Text::default()
+            });
+        }
+        vec![lines, frame.into_geometry()]
+    }
+}
+
+// --- What an optimization found --------------------------------------------------------------
+
+/// A combination without a score: it made no trades, or failed.
+const NO_SCORE: Color = Color::from_rgb8(0x3a, 0x3e, 0x48);
+/// A score of zero on the heatmap.
+const HEAT_ZERO: Color = Color::from_rgb8(0x1e, 0x22, 0x2d);
+
+/// The score at each value: bars for one variable, a heatmap for two. Clicking a combination
+/// applies it.
+pub struct Landscape<'a> {
+    pub found: &'a OptimizeResult,
+    /// The combination the strategy is on, if it's one of these.
+    pub current: Option<usize>,
+}
+
+/// Where the heatmap's cells go: the first variable's values across, the second's up.
+struct HeatArea {
+    x: f32,
+    y: f32,
+    cell_width: f32,
+    cell_height: f32,
+    rows: usize,
+}
+
+impl HeatArea {
+    fn top_left(&self, column: usize, row: usize) -> Point {
+        Point::new(
+            self.x + column as f32 * self.cell_width,
+            self.y + (self.rows - 1 - row) as f32 * self.cell_height,
+        )
+    }
+}
+
+fn mix(a: Color, b: Color, share: f32) -> Color {
+    let share = share.clamp(0.0, 1.0);
+    Color::from_rgb(
+        a.r + (b.r - a.r) * share,
+        a.g + (b.g - a.g) * share,
+        a.b + (b.b - a.b) * share,
+    )
+}
+
+/// `score`'s color on a scale reaching `reach` either side of zero.
+pub(super) fn heat(score: f64, reach: f64) -> Color {
+    let share = (score.abs() / reach.max(1e-12)) as f32;
+    mix(
+        HEAT_ZERO,
+        if score >= 0.0 { theme::UP } else { theme::DOWN },
+        share,
+    )
+}
+
+fn percent(score: f64) -> String {
+    format!("{:+.2}%", score * 100.0)
+}
+
+impl Landscape<'_> {
+    fn scores(&self) -> impl Iterator<Item = f64> + '_ {
+        self.found.outcomes.iter().filter_map(Outcome::score)
+    }
+
+    fn is_heatmap(&self) -> bool {
+        self.found.grid.second.is_some()
+    }
+
+    fn bars_pane(&self, size: Size) -> Projection {
+        let values = self.scores().map(|score| score * 100.0);
+        pane_for(values, 0.0, self.found.outcomes.len(), size)
+    }
+
+    fn heat_area(&self, size: Size) -> HeatArea {
+        let grid = &self.found.grid;
+        let room = LEGEND_ROOM.min(size.height * 0.3);
+        HeatArea {
+            x: 0.0,
+            y: room,
+            cell_width: (size.width - PRICE_AXIS_WIDTH).max(1.0) / grid.width() as f32,
+            cell_height: (size.height - room - TIME_STRIP).max(1.0) / grid.height() as f32,
+            rows: grid.height(),
+        }
+    }
+
+    /// The combination under the mouse.
+    fn cell_at(&self, point: Point, size: Size) -> Option<usize> {
+        let width = self.found.grid.width();
+        if point.x >= size.width - PRICE_AXIS_WIDTH || point.y >= size.height - TIME_STRIP {
+            return None;
+        }
+        if self.is_heatmap() {
+            let area = self.heat_area(size);
+            if point.y < area.y {
+                return None;
+            }
+            let column = (point.x / area.cell_width) as usize;
+            let down = ((point.y - area.y) / area.cell_height) as usize;
+            let row = area.rows.checked_sub(down + 1)?;
+            Some(row * width + column.min(width - 1))
+        } else {
+            let pane = self.bars_pane(size);
+            Some(((point.x / (pane.width / width as f32)) as usize).min(width - 1))
+        }
+    }
+
+    /// What the bottom strip says about a combination.
+    fn describe(&self, cell: usize) -> String {
+        let grid = &self.found.grid;
+        let mut names = vec![format!(
+            "{} {}",
+            grid.first.name,
+            crate::sweep::label(grid.first.values[cell % grid.width()])
+        )];
+        if let Some(second) = &grid.second {
+            names.push(format!(
+                "{} {}",
+                second.name,
+                crate::sweep::label(second.values[cell / grid.width()])
+            ));
+        }
+        let outcome = match &self.found.outcomes[cell] {
+            Outcome::Scored { score, .. } => percent(*score),
+            Outcome::TooFewTrades => "too few trades".to_owned(),
+            Outcome::Failed(error) => format!("failed: {error}"),
+        };
+        format!("{}: {outcome}", names.join(" · "))
+    }
+
+    fn draw_bars(&self, frame: &mut Frame, hovered: Option<usize>) {
+        let size = frame.size();
+        let pane = self.bars_pane(size);
+        price_grid(frame, &pane);
+        let count = self.found.outcomes.len();
+        let slot = pane.width / count as f32;
+        let every = ((44.0 / slot).ceil() as usize).max(1);
+        for (i, outcome) in self.found.outcomes.iter().enumerate() {
+            let x = slot * i as f32;
+            let bar_x = x + slot * 0.15;
+            let width = (slot * 0.7).max(1.0);
+            match outcome.score() {
+                Some(score) => {
+                    let (zero, y) = (pane.y(0.0), pane.y(score * 100.0));
+                    let color = if score >= 0.0 { theme::UP } else { theme::DOWN };
+                    frame.fill_rectangle(
+                        Point::new(bar_x, y.min(zero)),
+                        Size::new(width, (y - zero).abs().max(1.0)),
+                        color,
+                    );
+                }
+                None => frame.fill_rectangle(
+                    Point::new(bar_x, 0.0),
+                    Size::new(width, pane.height),
+                    Color {
+                        a: 0.35,
+                        ..NO_SCORE
+                    },
+                ),
+            }
+            if self.current == Some(i) || hovered == Some(i) {
+                let color = if self.current == Some(i) {
+                    HANDLE
+                } else {
+                    theme::CROSSHAIR
+                };
+                frame.stroke(
+                    &Path::rectangle(Point::new(bar_x, 0.5), Size::new(width, pane.height - 1.0)),
+                    Stroke::default().with_color(color).with_width(1.0),
+                );
+            }
+            if i % every == 0 {
+                grid_label(
+                    frame,
+                    crate::sweep::label(self.found.grid.first.values[i]),
+                    x + slot / 2.0,
+                    pane.height + TIME_STRIP / 2.0,
+                    text::Alignment::Center,
+                );
+            }
+        }
+        axes_and_start(frame, &pane, 0.0);
+        if let Some(score) = hovered.and_then(|i| self.found.outcomes[i].score()) {
+            axis_tag(frame, &pane, score * 100.0, theme::LABEL_BACKGROUND);
+        }
+    }
+
+    fn draw_heat(&self, frame: &mut Frame, hovered: Option<usize>) {
+        let size = frame.size();
+        frame.fill_rectangle(Point::ORIGIN, size, theme::BACKGROUND);
+        let grid = &self.found.grid;
+        let area = self.heat_area(size);
+        let reach = self.scores().fold(0.0, |most: f64, s| most.max(s.abs()));
+        let cell_size = Size::new(area.cell_width, area.cell_height);
+        for (cell, outcome) in self.found.outcomes.iter().enumerate() {
+            let (column, row) = (cell % grid.width(), cell / grid.width());
+            let at = area.top_left(column, row);
+            let color = outcome.score().map_or(NO_SCORE, |score| heat(score, reach));
+            frame.fill_rectangle(at, cell_size, color);
+            if let Some(score) = outcome.score()
+                && area.cell_width > 52.0
+                && area.cell_height > 16.0
+            {
+                frame.fill_text(Text {
+                    content: percent(score),
+                    position: Point::new(
+                        at.x + area.cell_width / 2.0,
+                        at.y + area.cell_height / 2.0,
+                    ),
+                    color: theme::TEXT_BRIGHT,
+                    size: 11.0.into(),
+                    align_x: text::Alignment::Center,
+                    align_y: alignment::Vertical::Center,
+                    ..Text::default()
+                });
+            }
+        }
+        // The current combination stands out from one that's only under the mouse.
+        for (cell, color, width) in [
+            (hovered, theme::CROSSHAIR, 1.0),
+            (self.current, HANDLE, 1.5),
+        ] {
+            if let Some(cell) = cell {
+                let at = area.top_left(cell % grid.width(), cell / grid.width());
+                frame.stroke(
+                    &Path::rectangle(
+                        Point::new(at.x + 0.75, at.y + 0.75),
+                        Size::new(area.cell_width - 1.5, area.cell_height - 1.5),
+                    ),
+                    Stroke::default().with_color(color).with_width(width),
+                );
+            }
+        }
+
+        let plot_width = area.cell_width * grid.width() as f32;
+        let bottom = area.y + area.cell_height * area.rows as f32;
+        let every = ((44.0 / area.cell_width).ceil() as usize).max(1);
+        for (i, value) in grid.first.values.iter().enumerate().step_by(every) {
+            grid_label(
+                frame,
+                crate::sweep::label(*value),
+                area.cell_width * (i as f32 + 0.5),
+                bottom + TIME_STRIP / 2.0,
+                text::Alignment::Center,
+            );
+        }
+        if let Some(second) = &grid.second {
+            let every = ((16.0 / area.cell_height).ceil() as usize).max(1);
+            for (row, value) in second.values.iter().enumerate().step_by(every) {
+                grid_label(
+                    frame,
+                    crate::sweep::label(*value),
+                    plot_width + 8.0,
+                    area.top_left(0, row).y + area.cell_height / 2.0,
+                    text::Alignment::Left,
+                );
+            }
+        }
+        frame.fill_rectangle(
+            Point::new(plot_width, 0.0),
+            Size::new(1.0, size.height),
+            theme::AXIS_LINE,
+        );
+        frame.fill_rectangle(
+            Point::new(0.0, bottom),
+            Size::new(size.width, 1.0),
+            theme::AXIS_LINE,
+        );
+    }
+}
+
+impl canvas::Program<PanelMessage> for Landscape<'_> {
+    type State = ();
+
+    fn update(
+        &self,
+        _state: &mut (),
+        event: &Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<canvas::Action<PanelMessage>> {
+        let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event else {
+            return None;
+        };
+        let cell = self.cell_at(cursor.position_in(bounds)?, bounds.size())?;
+        self.found.outcomes[cell].score()?;
+        Some(canvas::Action::publish(PanelMessage::Apply(cell)).and_capture())
+    }
+
+    fn mouse_interaction(
+        &self,
+        _state: &(),
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        let scored = cursor
+            .position_in(bounds)
+            .and_then(|point| self.cell_at(point, bounds.size()))
+            .is_some_and(|cell| self.found.outcomes[cell].score().is_some());
+        if scored {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::default()
+        }
+    }
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let size = bounds.size();
+        let mut frame = Frame::new(renderer, size);
+        let hovered = cursor
+            .position_in(bounds)
+            .and_then(|point| self.cell_at(point, size));
+        if self.is_heatmap() {
+            self.draw_heat(&mut frame, hovered);
+        } else {
+            self.draw_bars(&mut frame, hovered);
+        }
+        if let Some(cell) = hovered {
+            let label = self.describe(cell);
+            let half = label.chars().count() as f32 * 3.4 + 7.0;
+            let plot = (size.width - PRICE_AXIS_WIDTH).max(1.0);
+            let center = cursor
+                .position_in(bounds)
+                .map_or(0.0, |p| p.x)
+                .clamp(half, (plot - half).max(half));
+            let y = size.height - TIME_STRIP;
+            frame.fill_rectangle(
+                Point::new(center - half, y + 1.0),
+                Size::new(half * 2.0, TIME_STRIP - 2.0),
+                theme::LABEL_BACKGROUND,
+            );
+            frame.fill_text(Text {
+                content: label,
+                position: Point::new(center, y + TIME_STRIP / 2.0),
+                color: theme::LABEL_TEXT,
+                size: theme::TEXT_SIZE.into(),
+                align_x: text::Alignment::Center,
+                align_y: alignment::Vertical::Center,
+                ..Text::default()
+            });
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+/// The heatmap's colors, with its lowest and highest scores and where zero is.
+pub struct HeatScale {
+    pub low: f64,
+    pub high: f64,
+}
+
+impl canvas::Program<PanelMessage> for HeatScale {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let reach = self.low.abs().max(self.high.abs());
+        // Zero is always at the middle, with the same color for the same distance either side.
+        let width = bounds.width;
+        let steps = 48;
+        let step = width / steps as f32;
+        for i in 0..steps {
+            let share = (f64::from(i) + 0.5) / f64::from(steps) * 2.0 - 1.0;
+            frame.fill_rectangle(
+                Point::new(step * i as f32, 0.0),
+                Size::new(step + 0.5, 8.0),
+                heat(share * reach, reach),
+            );
+        }
+        let label = |frame: &mut Frame, content: String, x: f32, align| {
+            frame.fill_text(Text {
+                content,
+                position: Point::new(x, 11.0),
+                color: theme::TEXT,
+                size: 11.0.into(),
+                align_x: align,
+                ..Text::default()
+            });
+        };
+        label(
+            &mut frame,
+            format!("Min {}", percent(self.low)),
+            0.0,
+            text::Alignment::Left,
+        );
+        label(
+            &mut frame,
+            "0".to_owned(),
+            width / 2.0,
+            text::Alignment::Center,
+        );
+        label(
+            &mut frame,
+            format!("Max {}", percent(self.high)),
+            width,
+            text::Alignment::Right,
+        );
+        vec![frame.into_geometry()]
+    }
+}
+
+// --- Icons -----------------------------------------------------------------------------------
+
+/// A control's picture. Drawn rather than taken from a font, so they're all one weight, and
+/// never turn into emoji.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Glyph {
+    Play,
+    Pause,
+    Restart,
+    Step,
+}
+
+/// Goes inside a button: muted, brighter under the mouse, like a chart's corner buttons.
+pub struct Icon {
+    pub glyph: Glyph,
+    pub enabled: bool,
+    /// Lit, for what's switched on or the main control.
+    pub lit: bool,
+}
+
+impl canvas::Program<PanelMessage> for Icon {
     type State = ();
 
     fn draw(
@@ -38,90 +886,58 @@ impl canvas::Program<PanelMessage> for Equity<'_> {
         cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
-        let (w, h) = (bounds.width, bounds.height);
-        frame.fill_rectangle(Point::ORIGIN, bounds.size(), theme::BACKGROUND);
-        let shown = &self.values[..self.shown.min(self.values.len())];
-        if self.values.len() < 2 || w < 4.0 || h < 4.0 {
-            return vec![frame.into_geometry()];
-        }
-
-        // The scale covers the whole run, so it doesn't jump as the playhead moves.
-        let (lo, hi) = self
-            .values
-            .iter()
-            .chain(std::iter::once(&self.start))
-            .fold((f64::MAX, f64::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));
-        let pad = ((hi - lo) * 0.08).max(hi.abs() * 1e-6).max(1e-9);
-        let (lo, hi) = (lo - pad, hi + pad);
-        let x = |i: usize| i as f32 / (self.values.len() - 1) as f32 * w;
-        let y = |v: f64| ((hi - v) / (hi - lo)) as f32 * h;
-
-        let base = y(self.start).round() + 0.5;
-        frame.stroke(
-            &Path::line(Point::new(0.0, base), Point::new(w, base)),
-            Stroke::default()
-                .with_color(theme::AXIS_LINE)
-                .with_width(1.0),
-        );
-        if shown.len() >= 2 {
-            // Drawdown: from the running peak down to the curve.
-            let mut peak = f64::MIN;
-            let peaks: Vec<f64> = shown
-                .iter()
-                .map(|&v| {
-                    peak = peak.max(v);
-                    peak
-                })
-                .collect();
-            let shade = Path::new(|b| {
-                b.move_to(Point::new(x(0), y(peaks[0])));
-                for (i, &p) in peaks.iter().enumerate() {
-                    b.line_to(Point::new(x(i), y(p)));
-                }
-                for (i, &v) in shown.iter().enumerate().rev() {
-                    b.line_to(Point::new(x(i), y(v)));
-                }
-                b.close();
-            });
-            frame.fill(
-                &shade,
-                Color {
-                    a: 0.12,
-                    ..theme::DOWN
-                },
-            );
-
-            let last = *shown.last().unwrap_or(&self.start);
-            let color = if last >= self.start {
-                theme::UP
-            } else {
-                theme::DOWN
-            };
-            let line = Path::new(|b| {
-                b.move_to(Point::new(x(0), y(shown[0])));
-                for (i, &v) in shown.iter().enumerate().skip(1) {
-                    b.line_to(Point::new(x(i), y(v)));
-                }
-            });
-            frame.stroke(&line, Stroke::default().with_color(color).with_width(1.5));
-        }
-
-        if let Some(p) = cursor.position_in(bounds) {
-            let i = ((p.x / w) * (self.values.len() - 1) as f32).round() as usize;
-            if let Some(&v) = shown.get(i) {
-                frame.fill_rectangle(
-                    Point::new(x(i).round(), 0.0),
-                    Size::new(1.0, h),
-                    theme::CROSSHAIR,
-                );
-                let change = (v / self.start - 1.0) * 100.0;
-                frame.fill_text(Text {
-                    content: format!("{v:.2}  ({change:+.2}%)"),
-                    position: Point::new((x(i) + 6.0).min(w - 120.0), 6.0),
-                    color: theme::TEXT_BRIGHT,
-                    size: 11.0.into(),
-                    ..Text::default()
+        let hot = self.enabled && cursor.position_in(bounds).is_some();
+        let color = match (self.enabled, self.lit, hot) {
+            (false, _, _) => theme::LABEL_BACKGROUND,
+            (true, _, true) => theme::TEXT_BRIGHT,
+            (true, true, false) => theme::ACCENT,
+            (true, false, false) => theme::TEXT_MUTED,
+        };
+        let c = frame.center();
+        let at = |x: f32, y: f32| Point::new(c.x + x, c.y + y);
+        let stroke = Stroke::default().with_color(color).with_width(1.4);
+        match self.glyph {
+            Glyph::Play => {
+                let shape = Path::new(|b| {
+                    b.move_to(at(-4.0, -6.0));
+                    b.line_to(at(6.0, 0.0));
+                    b.line_to(at(-4.0, 6.0));
+                    b.close();
                 });
+                frame.fill(&shape, color);
+            }
+            Glyph::Pause => {
+                frame.fill_rectangle(at(-5.0, -6.0), Size::new(3.5, 12.0), color);
+                frame.fill_rectangle(at(1.5, -6.0), Size::new(3.5, 12.0), color);
+            }
+            Glyph::Step => {
+                let shape = Path::new(|b| {
+                    b.move_to(at(-5.0, -5.5));
+                    b.line_to(at(3.0, 0.0));
+                    b.line_to(at(-5.0, 5.5));
+                    b.close();
+                });
+                frame.fill(&shape, color);
+                frame.fill_rectangle(at(3.5, -5.5), Size::new(1.8, 11.0), color);
+            }
+            Glyph::Restart => {
+                // Most of a circle, with an arrowhead where it starts.
+                let arc = Path::new(|b| {
+                    b.arc(canvas::path::Arc {
+                        center: c,
+                        radius: 5.5,
+                        start_angle: Radians(-1.2),
+                        end_angle: Radians(-1.2 + 5.2),
+                    });
+                });
+                frame.stroke(&arc, stroke);
+                let head = Path::new(|b| {
+                    b.move_to(at(-4.2, -8.0));
+                    b.line_to(at(-3.2, -3.0));
+                    b.line_to(at(1.6, -5.0));
+                    b.close();
+                });
+                frame.fill(&head, color);
             }
         }
         vec![frame.into_geometry()]
@@ -237,8 +1053,7 @@ impl canvas::Program<PanelMessage> for Span<'_> {
         let (w, h) = (bounds.width, bounds.height);
         let (fx, tx) = (self.x(self.from, w), self.x(self.to, w));
 
-        frame.fill_rectangle(Point::ORIGIN, bounds.size(), TRACK);
-        // Prices across the whole history, faint outside the span.
+        // Prices across the whole history.
         let closes = &self.history.closes;
         if closes.len() >= 2 {
             let (lo, hi) = closes
@@ -272,25 +1087,27 @@ impl canvas::Program<PanelMessage> for Span<'_> {
             Point::new(fx, 0.0),
             Size::new((tx - fx).max(1.0), h),
             Color {
-                a: 0.2,
+                a: 0.14,
                 ..theme::ACCENT
             },
         );
         if let Some(at) = self.playhead {
             let px = self.x(at, w);
             frame.fill_rectangle(
-                Point::new(fx, h - 3.0),
-                Size::new((px - fx).max(0.0), 3.0),
+                Point::new(fx, h - 2.0),
+                Size::new((px - fx).max(0.0), 2.0),
                 theme::ACCENT,
             );
-            frame.fill_rectangle(
-                Point::new(px - 1.0, 0.0),
-                Size::new(2.0, h),
-                theme::TEXT_BRIGHT,
-            );
+            frame.fill_rectangle(Point::new(px, 0.0), Size::new(1.0, h), theme::TEXT_BRIGHT);
         }
+        // Thin lines with a small grip, like the chart's own crosshair and tags.
         for x in [fx, tx] {
-            frame.fill_rectangle(Point::new(x - 2.5, 0.0), Size::new(5.0, h), HANDLE);
+            frame.fill_rectangle(Point::new(x, 0.0), Size::new(1.0, h), theme::ACCENT);
+            frame.fill_rectangle(
+                Point::new(x - 2.0, h / 2.0 - 6.0),
+                Size::new(5.0, 12.0),
+                HANDLE,
+            );
         }
         // The years along the bottom, where there's room.
         let first_year = DateTime::from_nanos(self.history.first).year;
@@ -301,17 +1118,13 @@ impl canvas::Program<PanelMessage> for Span<'_> {
             let ts = persephone_core::time::days_from_civil(year, 1, 1) as UnixNanos
                 * persephone_core::time::NANOS_PER_DAY;
             let x = self.x(ts, w);
-            frame.fill_rectangle(
-                Point::new(x, h - 6.0),
-                Size::new(1.0, 6.0),
-                theme::AXIS_LINE,
-            );
+            frame.fill_rectangle(Point::new(x, 0.0), Size::new(1.0, h), theme::GRID_MAJOR);
             frame.fill_text(Text {
                 content: year.to_string(),
-                position: Point::new(x + 3.0, h - 2.0),
+                position: Point::new(x + 4.0, h / 2.0),
                 color: theme::TEXT_MUTED,
-                size: 9.0.into(),
-                align_y: alignment::Vertical::Bottom,
+                size: theme::TEXT_SIZE.into(),
+                align_y: alignment::Vertical::Center,
                 ..Text::default()
             });
         }
@@ -423,13 +1236,13 @@ impl canvas::Program<PanelMessage> for Speed {
         let track_y = 9.0;
         frame.fill_rectangle(
             Point::new(SPEED_INSET, track_y - 2.0),
-            Size::new(w - 2.0 * SPEED_INSET, 4.0),
-            TRACK,
+            Size::new(w - 2.0 * SPEED_INSET, 2.0),
+            theme::LABEL_BACKGROUND,
         );
         let knob = speed_x(self.position, w);
         frame.fill_rectangle(
             Point::new(SPEED_INSET, track_y - 2.0),
-            Size::new(knob - SPEED_INSET, 4.0),
+            Size::new(knob - SPEED_INSET, 2.0),
             theme::ACCENT,
         );
         // Labels where they fit, never closer than their own width.
@@ -446,19 +1259,25 @@ impl canvas::Program<PanelMessage> for Speed {
                 frame.fill_text(Text {
                     content: label.into(),
                     position: Point::new(x, h - 1.0),
-                    color: theme::TEXT_MUTED,
+                    color: theme::TEXT,
                     size: 10.0.into(),
-                    align_x: iced::widget::text::Alignment::Center,
+                    align_x: text::Alignment::Center,
                     align_y: alignment::Vertical::Bottom,
                     ..Text::default()
                 });
             }
         }
         let hot = state.dragging || cursor.position_in(bounds).is_some();
-        let radius = if hot { 7.0 } else { 6.0 };
-        frame.fill(&Path::circle(Point::new(knob, track_y), radius), HANDLE);
+        let radius = if hot { 6.0 } else { 5.0 };
+        frame.fill(
+            &Path::circle(Point::new(knob, track_y - 1.0), radius),
+            HANDLE,
+        );
         if speed_at(self.position).is_none() {
-            frame.fill(&Path::circle(Point::new(knob, track_y), 2.5), theme::ACCENT);
+            frame.fill(
+                &Path::circle(Point::new(knob, track_y - 1.0), 2.0),
+                theme::ACCENT,
+            );
         }
         vec![frame.into_geometry()]
     }

@@ -13,6 +13,8 @@ use std::{
 use iced::{Point, Size};
 use persephone::{
     Message, Persephone, Run,
+    backtest::{BlockRun, OptimizeRun, PanelMessage, TestKind},
+    keymap::Action,
     menu::{MenuMessage, Page},
     persist::{self, Saved, SavedIndicator, SavedStrategy, SavedTile},
 };
@@ -236,6 +238,44 @@ fn saved_plugins_wait_for_their_plugin_then_resolve() {
     assert!((strategy.size_fraction() - 0.25).abs() < 1e-12);
     assert_ne!(strategy, &StrategySpec::new(BuiltInStrategy::EmaCross));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn random_blocks_wont_run_a_strategy_that_asks_ai_models() {
+    let mut app = app();
+    let _ = app.set_plugins(plugins(&["ai_probe"]));
+    menu(&mut app, MenuMessage::SetPluginStrategy("ai_probe".into()));
+    finish_backtest(&mut app);
+    let _ = app.update(Message::Key(Action::Backtest));
+    let _ = app.update(Message::Backtest(PanelMessage::Test(
+        TestKind::RandomBlocks,
+    )));
+    let _ = app.update(Message::Backtest(PanelMessage::RunBlocks));
+    let BlockRun::Failed(error) = &app.panel().unwrap().tests.blocks else {
+        panic!("{:?}", app.panel().unwrap().tests.blocks);
+    };
+    assert!(error.contains("asks AI models"), "{error}");
+}
+
+#[test]
+fn optimize_wont_run_a_strategy_that_asks_ai_models_either() {
+    let mut app = app();
+    let _ = app.set_plugins(plugins(&["ai_probe"]));
+    menu(&mut app, MenuMessage::SetPluginStrategy("ai_probe".into()));
+    finish_backtest(&mut app);
+    let _ = app.update(Message::Key(Action::Backtest));
+    let _ = app.update(Message::Backtest(PanelMessage::Test(TestKind::Optimize)));
+    assert!(
+        app.test_problem(0)
+            .unwrap()
+            .message
+            .contains("asks AI models")
+    );
+    let _ = app.update(Message::Backtest(PanelMessage::RunOptimize));
+    assert!(matches!(
+        app.panel().unwrap().tests.optimize,
+        OptimizeRun::Failed(_)
+    ));
 }
 
 #[test]

@@ -8,6 +8,9 @@ chart, in the strategy report, and in `persephone-cli`. This guide walks through
 - [Tiles and workspaces](#tiles-and-workspaces)
 - [Strategies and backtests](#strategies-and-backtests)
 - [The backtest panel](#the-backtest-panel)
+- [The calendar: replaying a day's trades](#the-calendar-replaying-a-days-trades)
+- [Skill or luck: Monte Carlo and random blocks](#skill-or-luck-monte-carlo-and-random-blocks)
+- [Optimizing a strategy](#optimizing-a-strategy)
 - [Parameter sweeps](#parameter-sweeps)
 - [Drawings](#drawings)
 - [Your own data](#your-own-data)
@@ -35,6 +38,7 @@ time. Binance charts load the latest 5,000 bars of their timeframe.
   - **Indicators ›**: the built-ins, then plugin indicators.
   - **Strategy ›**: the strategy to backtest on this chart.
   - **Draw ›**: drawing tools.
+  - **Backtest**: opens the [backtest panel](#the-backtest-panel).
   - **Symbol**: search Binance pairs and your imported markets. Enter opens any Binance spot
     pair you type. **Import data…** at the bottom imports your own files.
   - **Timeframe**: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M. Weeks start on Monday and months
@@ -76,6 +80,7 @@ mouse.
 | Ctrl+Alt+H/J/K/L (Option on a Mac) | move the divider |
 | Ctrl+T | toggle the split direction |
 | Ctrl+F | fullscreen the focused chart (again to restore) |
+| Ctrl+B | open or close the backtest panel on the focused chart |
 | Ctrl+1…9 | switch to that workspace |
 | Ctrl+Shift+1…9 | move the focused chart to that workspace |
 
@@ -130,10 +135,12 @@ Notes from the strategy go at the bottom, such as a language model's look-ahead 
 
 ## The backtest panel
 
-Click **Backtest** in a strategy's report. A panel opens across the top of the window for that
-chart (it gets a blue outline):
-- **Start**, **Pause**, **⟲** (back to the start) and **Step** (one bar), with the return,
-  drawdown and trades so far, and the equity curve as far as the playback has got.
+Press **Ctrl+B**, or choose **Backtest** from a chart's right-click menu or a strategy's report. A panel opens across the top of
+the window for the focused chart (it gets a blue outline), drawn like a chart pane; **Ctrl+B**
+closes it again:
+- The equity curve as far as the playback has got, with the return, drawdown and trades so far
+  in its legend.
+- Play or pause, back to the start, and one bar on; hovering a button names it.
 - **Span**: two handles over the market's whole history (prices on a log scale behind them).
   Drag a handle to move one end, or the top of the bar between them to move both; when you
   let go, the chart loads that span and backtests it. Strategies warm up on up to 500 bars
@@ -143,7 +150,11 @@ chart (it gets a blue outline):
   1,000,000× and **Max** (the rest of the span in two seconds) on the right. The left half is
   for fine control at slow speeds. Scroll over it to nudge it; the readout says how many bars
   go by a second.
-- **⚙** opens the settings, **✕** closes the panel, and dragging its bottom edge resizes it.
+- **✕**, in the corner under the price axis, closes the panel. Dragging its bottom edge resizes
+  it, but it never gets shorter than it takes to show all the settings.
+- The left 30% holds the **strategy** dropdown (handy after Ctrl+B on a chart without one), the
+  settings below, and a search that adds plugins as tags (click a tag to take it off). Hover a
+  setting's name for what it does.
 
 Playback reveals a finished backtest: the backtest runs once over the span, and playing,
 pausing, stepping or changing speed never reruns it. While it plays, the chart shows only the
@@ -152,7 +163,7 @@ until it's over.
 
 ### Backtest settings
 
-Each setting has its own switch, and **Stock settings** turns them all off at once, for an
+Each setting has its own switch, and **Stock** turns them all off at once, for an
 ideal run to compare against. They're saved with each chart.
 
 | Setting | What it does |
@@ -169,8 +180,110 @@ ideal run to compare against. They're saved with each chart.
 
 Direction and the trading session apply to paper trading too. Position sizing models, dynamic
 slippage, order-book fills, news-driven spreads and latency, holding costs, commission
-schedules and exchange calendars are listed as plugins to come; see
+schedules and exchange calendars are found through the plugin search. Those kinds aren't built
+yet, so a tag has no effect on results for now; see
 [the plugin guide](plugins.md#backtest-plugins-planned).
+
+## The calendar: replaying a day's trades
+
+**Calendar**, beside **Equity** in the panel's legend, shows what the backtest made when: it's for
+understanding the days behind a result. It's part of **Backtest** in **Test**.
+
+1. **Months:** a row for each year, shaded from red through dark to green, with the year's total.
+2. **Days:** click a month for its days, a row for each week from Monday, with the week's total.
+3. **Trades:** click a day for a table of the trades that closed that day: when each opened, long or
+   short, entry and exit prices, how long it was held, and its profit in money and as a percentage
+   of the capital. Hover for its size and fees.
+4. **Replay:** click a trade. Playback pauses and the chart jumps to 10 bars before the trade opened,
+   with later bars hidden. Press **Play**, or **Step** bar by bar, at any speed.
+
+A trade counts on the day it **closed**, even if it opened days earlier; replaying goes to where it
+opened. A trade still open at the end counts on the last bar's day, at that bar's close, so the
+calendar adds up to the backtest's whole profit. Days are in UTC, like the chart's own time axis.
+Changing the backtest takes the calendar back to its months.
+
+## Skill or luck: Monte Carlo and random blocks
+
+A backtest is one path through one stretch of history, which can't tell skill from luck. **Test**
+in the backtest panel's settings has two more ways to look at a strategy. Hover over any control
+or figure in the panel to see what it does. Playback is only for **Backtest**.
+
+**Monte Carlo** takes the trades the backtest made and draws that many at random, with
+replacement, over and over (**Runs**, 1,000 at first). It needs at least 10 trades. A position
+still open at the end counts as a trade at the last close. It runs on its own whenever the
+backtest finishes. The faint lines are up to 200 of the runs, by trade number; the bright one is
+the median of all of them.
+
+- **Median** and **5–95%**: where runs ended. If the low end is well below zero, these trades can
+  lose money overall, whatever the backtest happened to show.
+- **DD 95%**: only one run in twenty fell further than this from a peak. Expect a drawdown of about
+  this size, not just the one in the backtest.
+- **Ruin**: the share of runs that fell as far as **Ruin at** from a peak (50% at first).
+
+It assumes trades don't depend on each other, so it understates streaks that come from the market,
+and it can only draw trades the backtest made.
+
+**Random blocks** backtests random stretches of the span, each with the bars before it to warm up
+on. Pick how many (**Blocks**), how long (one week, 30 days or 91 days), and press **Run**. Blocks
+can overlap. **The span slider decides what's sampled**, so widen it to reach other kinds of
+market. Each line is a block, by bars into it, all from the same capital.
+
+If it can't run, **Run** is disabled and a red line under the test's settings says why and how to
+fix it. A span too short for the blocks also gets a **Widen span** button, which moves the span's
+start back far enough. A chart's latest bars often cover less than a month on short timeframes, so
+this is the usual reason. A number typed without pressing Enter counts once you press Run.
+
+- **Profitable**: the share of blocks that made money. Near 50%, the strategy may have no real edge
+  in this market.
+- **Median**, **Best**, **Worst**: block returns, and the worst block's dates. A best far above the
+  median means the result leans on a few good stretches.
+
+Blocks use the chart's strategy and settings, but orders always fill on the chart's bars, even at
+High precision, to keep a batch quick. Changing the strategy, a setting or the span stops a batch
+and clears its results; so does changing Blocks or the length. A strategy in a process of its own
+runs one block at a time, and **a strategy that asks AI models is refused**, as that many backtests
+could cost real money.
+
+Results aren't saved, but your choices are, with the chart. The same inputs give the same results;
+**Run again** draws new random numbers.
+
+Two related tests are already here: a [parameter sweep](#parameter-sweeps) shows how sensitive a
+result is to a parameter, and [paper trading](#paper-trading-in-the-app) is a forward test on bars
+the strategy has never seen.
+
+## Optimizing a strategy
+
+**Optimize**, under **Test** in the backtest panel, tries a range of one of the strategy's variables
+or two together (including Size %). Pick each variable's **Min**, **Max** and **Step**, what to
+**Score by**, and press **Run**. **Cancel** stops it: backtests already under way finish and are
+discarded.
+
+| Score by | A value is better if | Backtests |
+|---|---|---|
+| Backtest return | it returned more in one backtest | one per value |
+| Monte Carlo | the low end of what its trades could return is higher (19 runs in 20 did better), for survival over peak profit | one per value |
+| Random blocks | its median return over the same random stretches is higher, for consistency | one per value per block |
+
+One variable draws bars. Two draw a heatmap, red below zero and green above, with a scale showing
+the lowest and highest scores. **Grey means no score**: that value made no trades, too few to draw
+from, or couldn't run, such as a Fast above Slow. Hover over it to see which, and the rest of the
+batch carries on. Up to 5,000 backtests are allowed at once. Strategies that ask AI models are
+refused, and strategies in a process of their own run one backtest at a time. Orders always fill
+on the chart's bars.
+
+**The highest score is partly luck**, and the more values you try, the more so. Two things help:
+
+- **Top values are ranked with their neighbours**, so a good value in a good area beats a lone
+  spike. A value at the edge of the range has fewer neighbours, so it can still rank well on its
+  own; the panel warns when the best is at the edge, and a wider range usually settles it.
+- **Keep unseen** (on by default) picks values on the first 70% of the span, then backtests the top
+  5 on the last 30%, warmed up on the bars before it and starting from the full capital. A value
+  that made money where it was picked but lost on the unseen bars shows in orange, and is likely
+  only fit to the past.
+
+Click a row or a bar to put that value on the strategy and see its trades on the chart; the results
+stay, so you can try several, and **Back to the original** undoes it. A live session on that chart
+stops, as it runs the old settings. Changing anything else clears the results.
 
 ## Parameter sweeps
 

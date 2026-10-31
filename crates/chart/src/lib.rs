@@ -313,6 +313,12 @@ impl ChartState {
         self.grid_cache.clear();
     }
 
+    /// Scrolls to the playhead, wherever the chart was, so playing on follows it.
+    pub fn show_playhead(&mut self) {
+        self.viewport.right = self.shown_len() as f64 - 1.0 + viewport::RIGHT_MARGIN_BARS;
+        self.grid_cache.clear();
+    }
+
     #[must_use]
     pub fn drawings(&self) -> &[Drawing] {
         &self.drawings
