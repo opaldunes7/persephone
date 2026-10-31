@@ -431,6 +431,7 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
         "A position is worth capital × Size % × leverage. Margin calls aren't simulated.";
     const DIRECTION: &str = "Trade one way only; the other side's signals close positions instead. Paper trading follows it too.";
     const SLIPPAGE_PERCENT: &str = "Every market order fills this percentage of the price worse, which means the same on any market.";
+    const NEXT_OPEN: &str = "Fill orders at the next bar's open instead of the close they were decided on: a realistic delay, with no finer data needed. Not with Latency or High precision.";
     const COMPOUND: &str = "Size positions from the account as it is now, so profits grow them and losses shrink them. Off, every position is sized from the starting capital.";
     const INVERT: &str = "Trade the opposite of what the strategy says: sell when it buys and buy when it sells, at the same moments. Paper trading follows it too.";
     const SESSION: &str = "Outside these days and times, signals can close positions but not open them. Paper trading follows it too.";
@@ -559,6 +560,21 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
         line(
             switch(settings.compound, Edit::Compound, COMPOUND),
             name("Compound", COMPOUND),
+            no_switch(),
+        ),
+        line(
+            switch(
+                settings.fill_timing == FillTiming::NextOpen,
+                |on| {
+                    Edit::FillTiming(if on {
+                        FillTiming::NextOpen
+                    } else {
+                        FillTiming::Close
+                    })
+                },
+                NEXT_OPEN,
+            ),
+            name("Fill at next open", NEXT_OPEN),
             no_switch(),
         ),
     ];

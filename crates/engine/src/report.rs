@@ -93,8 +93,9 @@ pub(crate) fn build(
     closes: &[UnixNanos],
     starting_balance: f64,
     quote: &str,
+    next_open: bool,
 ) -> BacktestReport {
-    let fills = assign_bars(&raw, closes);
+    let fills = assign_bars(&raw, closes, next_open);
     let equity = equity_curve(&fills, candles, starting_balance);
     BacktestReport {
         max_drawdown: max_drawdown(&equity),
@@ -118,13 +119,18 @@ pub(crate) fn build(
 
 /// Matches each fill to the last bar that had closed by then (fills happen on a bar's close,
 /// which Nautilus stamps as the bar's time). `closes` are the bars' close times, in order.
-fn assign_bars(raw: &[RawFill], closes: &[UnixNanos]) -> Vec<Fill> {
+fn assign_bars(raw: &[RawFill], closes: &[UnixNanos], next_open: bool) -> Vec<Fill> {
     raw.iter()
         .map(|f| {
             let closed = closes.partition_point(|&close| close <= f.ts);
             Fill {
                 ts: f.ts,
-                bar: closed.saturating_sub(1),
+                // At an open it belongs to the bar just opening, not the last one to close.
+                bar: if next_open {
+                    closed.min(closes.len().saturating_sub(1))
+                } else {
+                    closed.saturating_sub(1)
+                },
                 side: f.side,
                 price: f.price,
                 qty: f.qty,
@@ -230,7 +236,7 @@ mod tests {
         }];
         let closes: Vec<u64> = data.iter().map(|c| c.ts + tf).collect();
         assert_eq!(
-            assign_bars(&raw, &closes)[0].bar,
+            assign_bars(&raw, &closes, false)[0].bar,
             1,
             "bar 1 closes at 2 minutes"
         );

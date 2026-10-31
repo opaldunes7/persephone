@@ -33,8 +33,8 @@ use persephone_tiling::TileId;
 pub use persephone_research::{
     Field, RunColumn, WARM_UP_BARS, calendar, optimize, robustness,
     settings::{
-        self, BlockLength, Commission, Edit, OneWay, OptimizeSettings, Precision, ScoreBy, Section,
-        SessionRule, Settings, TestKind, Variable, parse_time, time_text,
+        self, BlockLength, Commission, Edit, FillTiming, OneWay, OptimizeSettings, Precision,
+        ScoreBy, Section, SessionRule, Settings, TestKind, Variable, parse_time, time_text,
     },
     thousands,
 };

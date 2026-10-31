@@ -1298,8 +1298,9 @@ fn every_way_in_gives_the_same_answer() {
 
 /// Every call in the guide: each ```json block that names a tool.
 fn guide_calls() -> Vec<Value> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/lab-agents.md");
-    let text = fs::read_to_string(path).unwrap();
+    let docs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+    let text = fs::read_to_string(docs.join("lab-agents.md")).unwrap()
+        + &fs::read_to_string(docs.join("lab-external-models.md")).unwrap();
     text.split("```json")
         .skip(1)
         .map(|block| {
@@ -2376,8 +2377,9 @@ fn refused_orders_are_reported_and_standard_output_stays_json() {
     }));
     let run = lab.dispatch("run_backtest", &args).unwrap();
     let warnings = run["summary"]["warnings"].as_array().unwrap();
-    assert_eq!(warnings.len(), 1, "{run}");
+    assert_eq!(warnings.len(), 2, "{run}");
     assert!(warnings[0].as_str().unwrap().contains("refused"), "{run}");
+    assert!(warnings[1].as_str().unwrap().contains("depleted"), "{run}");
 
     // What reaches standard output is what a client parses.
     let dir = lab.paths.lab().parent().unwrap().to_owned();
@@ -2821,6 +2823,230 @@ fn a_list_can_run_past_the_span_and_returns_leave_out_warm_up() {
 }
 
 #[test]
+fn what_costs_took_comes_out_as_worked_by_hand() {
+    // Bought at about 100, sold at about 120, both legs slipping 1% and paying a 0.1% fee. In
+    // thousandths, as a market in whole units would round the slippage away.
+    let closes: Vec<f64> = (0..60)
+        .map(|h| if h < 30 { 100.125 } else { 120.125 })
+        .collect();
+    let (lab, times) = market_of(&closes);
+    let list = json!([[times[10], 1], [times[40], 0]]);
+    let args = |settings: Value, more: Value| {
+        let mut args =
+            on_hand_market(json!({"strategy": {"positions": list}, "settings": settings}));
+        for (key, value) in more.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        args
+    };
+    let costs = json!({
+        "commission": {"on": true, "value": {"percent": 0.1}},
+        "slippage_percent": {"on": true, "value": 1},
+    });
+    let run = lab
+        .dispatch("run_backtest", &args(costs.clone(), json!({})))
+        .unwrap();
+    let summary = &run["summary"];
+    let close = |value: &Value, expected: f64, what: &str| {
+        let value = value.as_f64().unwrap_or_else(|| panic!("{what}: {value}"));
+        assert!(
+            (value - expected).abs() < 1e-2,
+            "{what}: {value} against {expected}"
+        );
+    };
+    let fills = lab
+        .dispatch("get_fills", &json!({"run_id": run["run_id"]}))
+        .unwrap();
+    let qty = fills["rows"][0][4].as_f64().unwrap();
+    let bought = fills["rows"][0][3].as_f64().unwrap();
+    let sold = fills["rows"][1][3].as_f64().unwrap();
+    assert!((bought - 100.125 * 1.01).abs() < 0.001, "{fills}");
+    assert!((sold - 120.125 * 0.99).abs() < 0.001, "{fills}");
+    let fees = qty * (bought + sold) * 0.001;
+    let slipped = qty * (100.125 * 0.01 + 120.125 * 0.01);
+    close(&summary["fees"], fees, "fees");
+    assert!(
+        (summary["total_costs_paid"].as_f64().unwrap() - (fees + slipped)).abs() < 1.0,
+        "{summary}"
+    );
+    // Without costs: the same run, at 100 and 120.
+    let free = lab
+        .dispatch(
+            "run_backtest",
+            &args(
+                json!({"commission": {"on": true, "value": {"percent": 0}}}),
+                json!({}),
+            ),
+        )
+        .unwrap();
+    assert_eq!(
+        summary["gross_return"], free["summary"]["net_return"],
+        "{run}"
+    );
+    assert_eq!(
+        free["summary"]["gross_return"],
+        free["summary"]["net_return"]
+    );
+    close(&free["summary"]["total_costs_paid"], 0.0, "no costs");
+
+    // Charging the break-even on every fill leaves about nothing.
+    let bp = summary["break_even_cost_per_fill"].as_f64().unwrap();
+    assert!(bp > 0.0, "{summary}");
+    let at_break_even = lab
+        .dispatch(
+            "run_backtest",
+            &args(
+                json!({"commission": {"on": true, "value": {"percent": bp / 100.0}}}),
+                json!({}),
+            ),
+        )
+        .unwrap();
+    assert!(
+        at_break_even["summary"]["net_return"]
+            .as_f64()
+            .unwrap()
+            .abs()
+            < 1e-3,
+        "{at_break_even}"
+    );
+
+    let skipped = lab
+        .dispatch("run_backtest", &args(costs, json!({"friction": false})))
+        .unwrap();
+    for figure in [
+        "gross_return",
+        "total_costs_paid",
+        "break_even_cost_per_fill",
+    ] {
+        assert!(skipped["summary"][figure].is_null(), "{figure}: {skipped}");
+    }
+
+    // The benchmark, from the first close that could trade, never falling.
+    let benchmark = &summary["benchmark"];
+    close(
+        &benchmark["return"],
+        120.125 / 100.125 - 1.0,
+        "benchmark return",
+    );
+    close(&benchmark["max_drawdown"], 0.0, "benchmark fall");
+    assert_eq!(benchmark["return"], summary["buy_and_hold_return"]);
+    assert!(benchmark["sharpe"].is_number(), "{benchmark}");
+}
+
+#[test]
+fn a_wiped_out_account_still_shows_what_it_made_before_costs_and_says_it_ran_out() {
+    let closes: Vec<f64> = (0..120).map(|h| 100.0 + f64::from(h % 3)).collect();
+    let (lab, times) = market_of(&closes);
+    let list: Vec<Value> = (0..100)
+        .map(|i| json!([times[10 + i], (i % 2) as u8]))
+        .collect();
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({
+                "strategy": {"positions": list, "params": {"Size %": 100}},
+                "settings": {
+                    "compound": true,
+                    "capital": 1000,
+                    "commission": {"on": true, "value": {"percent": 10}},
+                },
+            })),
+        )
+        .unwrap();
+    let summary = &run["summary"];
+    assert!(summary["net_return"].as_f64().unwrap() < -0.9, "{summary}");
+    assert!(
+        summary["gross_return"].as_f64().unwrap() > -0.5,
+        "{summary}"
+    );
+    let warnings = summary["warnings"].to_string();
+    assert!(
+        warnings.contains("Account balance depleted ("),
+        "{warnings}"
+    );
+    assert!(
+        warnings.contains("Unable to open further positions"),
+        "{warnings}"
+    );
+    assert!(!warnings.contains("rounds to nothing"), "{warnings}");
+
+    // Monte Carlo draws it as returns, so nothing falls past everything.
+    let drawn = lab
+        .dispatch(
+            "run_monte_carlo",
+            &json!({"run_id": run["run_id"], "runs": 200, "seed": 1}),
+        )
+        .unwrap();
+    assert!(drawn["low"].as_f64().unwrap() >= -1.0, "{drawn}");
+    assert!(drawn.get("warning").is_none(), "{drawn}");
+}
+
+#[test]
+fn filling_at_the_next_open_does_as_worked_by_hand() {
+    // Each bar opens 3 under where it closes, and well away from the last close.
+    let mut text = String::from("time,open,high,low,close,volume\n");
+    let closes: Vec<f64> = (0..80).map(|h| 200.0 + f64::from(h % 10) * 2.0).collect();
+    for (i, close) in closes.iter().enumerate() {
+        let open = close - 3.0;
+        let (day, hour) = (1 + i / 24, i % 24);
+        text += &format!("2024-01-{day:02} {hour:02}:00:00,{open},{close},{open},{close},10\n");
+    }
+    let (lab, dir) = lab();
+    let file = dir.join("opens.csv");
+    fs::write(&file, text).unwrap();
+    lab.dispatch(
+        "import_data",
+        &json!({"files": [file], "symbol": "HANDUSD", "venue": "HAND", "wait_seconds": 60}),
+    )
+    .unwrap();
+    let time = |hour: usize| JANUARY_2024 + hour as u64 * HOUR;
+    let changes: Vec<(usize, i64)> = vec![(10, 1), (11, -1), (12, 0), (20, -1), (30, 1), (40, 0)];
+    let list: Vec<Value> = changes
+        .iter()
+        .map(|(hour, want)| json!([time(*hour), want]))
+        .collect();
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &on_hand_market(json!({
+                "strategy": {"positions": list},
+                "settings": {"fill_timing": "next_open"},
+            })),
+        )
+        .unwrap();
+    assert_eq!(run["summary"]["warnings"], json!([]), "{run}");
+    let fills = lab
+        .dispatch("get_fills", &json!({"run_id": run["run_id"], "limit": 100}))
+        .unwrap();
+    let rows = fills["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), changes.len(), "{fills}");
+    for (row, (hour, _)) in rows.iter().zip(&changes) {
+        let next = hour + 1;
+        assert_eq!(row[0].as_u64().unwrap(), time(next) + 2_000_000, "{row}");
+        assert_eq!(row[1].as_u64().unwrap(), next as u64, "{row}");
+        assert!(
+            (row[3].as_f64().unwrap() - (closes[next] - 3.0)).abs() < 1e-9,
+            "{row}"
+        );
+    }
+
+    for settings in [
+        json!({"fill_timing": "next_open", "latency": {"on": true, "value": 10}}),
+        json!({"fill_timing": "next_open", "precision": "high"}),
+    ] {
+        let error = lab
+            .dispatch(
+                "run_backtest",
+                &on_hand_market(
+                    json!({"strategy": {"positions": [[time(10), 1]]}, "settings": settings}),
+                ),
+            )
+            .unwrap_err();
+        assert!(error.contains("next open"), "{settings}: {error}");
+    }
+}
+
+#[test]
 fn a_look_back_longer_than_the_warm_up_says_so_even_when_it_trades() {
     let (lab, _source) = binance_lab();
     let at = |hour: u64| START + hour * HOUR;
@@ -2873,6 +3099,9 @@ fn the_batch_table_has_each_runs_years() {
         row[column].as_object().is_some_and(|y| !y.is_empty()),
         "{batch}"
     );
+    // Warnings come as their words, not how many there are.
+    let warnings = columns.iter().position(|c| c == "warnings").unwrap();
+    assert!(row[warnings].is_array(), "{batch}");
 }
 
 #[test]

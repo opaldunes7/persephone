@@ -191,6 +191,7 @@ Backtests any strategy on any span with any settings. The run is saved, so its d
 - `to` (time): End (not included), in UTC.
 - `settings` (object): Costs and rules, as in run_backtest; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
 - `label` (string): A name for grouping runs, saved with the run for finding it with list_runs.
+- `friction` (boolean): false leaves out gross_return, total_costs_paid and break_even_cost_per_fill, which take a second backtest with costs off. Default true.
 
 Returns: `run_id`, `summary`
 

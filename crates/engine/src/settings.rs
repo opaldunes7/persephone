@@ -24,6 +24,9 @@ pub struct SimSettings {
     pub leverage: f64,
     /// Size positions from the account as it is now, rather than as it started.
     pub compound: bool,
+    /// Fill at the next bar's open rather than the close the decision came at, a realistic delay
+    /// with no finer data needed. On time bars, and not alongside latency or ticks.
+    pub next_open: bool,
 }
 
 impl Default for SimSettings {
@@ -36,6 +39,7 @@ impl Default for SimSettings {
             latency_ms: 0,
             leverage: 1.0,
             compound: false,
+            next_open: false,
         }
     }
 }

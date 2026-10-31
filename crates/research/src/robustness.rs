@@ -185,6 +185,8 @@ pub struct MonteCarloJob {
     /// The fall from a peak that counts as ruin, as a fraction.
     pub ruin_at: f64,
     pub seed: u64,
+    /// The run sized its positions from the account, so its trades are drawn as returns on it.
+    pub compound: bool,
 }
 
 impl MonteCarloJob {
@@ -192,7 +194,12 @@ impl MonteCarloJob {
     ///
     /// Returns a message if there are too few trades to say anything.
     pub fn run(&self) -> Result<MonteCarlo, String> {
-        monte_carlo(
+        let draw = if self.compound {
+            monte_carlo_compounding
+        } else {
+            monte_carlo
+        };
+        draw(
             &closed_trades(&self.report),
             self.report.starting_balance,
             self.runs,
@@ -414,6 +421,47 @@ pub fn monte_carlo(
     ruin_at: f64,
     seed: u64,
 ) -> Result<MonteCarlo, String> {
+    draw_runs(trades, capital, runs, ruin_at, seed, |equity, trade| {
+        equity + trade
+    })
+}
+
+/// [`monte_carlo`] for a run sizing its positions from the account: each trade is drawn as what it
+/// made of the account before it, so a line that's fallen trades smaller, and can't go below zero.
+///
+/// # Errors
+///
+/// Returns a message if there are too few trades to say anything.
+pub fn monte_carlo_compounding(
+    trades: &[f64],
+    capital: f64,
+    runs: u32,
+    ruin_at: f64,
+    seed: u64,
+) -> Result<MonteCarlo, String> {
+    let mut equity = capital;
+    let returns: Vec<f64> = trades
+        .iter()
+        .map(|profit| {
+            let made = if equity > 0.0 { profit / equity } else { -1.0 };
+            equity += profit;
+            made.max(-1.0)
+        })
+        .collect();
+    draw_runs(&returns, capital, runs, ruin_at, seed, |equity, made| {
+        equity * (1.0 + made)
+    })
+}
+
+/// Draws `runs` lines from `trades`, each one moving the equity by `step`.
+fn draw_runs(
+    trades: &[f64],
+    capital: f64,
+    runs: u32,
+    ruin_at: f64,
+    seed: u64,
+    step: impl Fn(f64, f64) -> f64,
+) -> Result<MonteCarlo, String> {
     if trades.len() < MIN_TRADES {
         return Err(format!(
             "Monte Carlo needs at least {MIN_TRADES} trades to draw from; this backtest made {}. \
@@ -431,7 +479,7 @@ pub fn monte_carlo(
         let mut path = vec![capital];
         let (mut equity, mut peak, mut fall) = (capital, capital, 0.0_f64);
         for i in 1..=trades.len() {
-            equity += trades[rng.random_range(0..trades.len())];
+            equity = step(equity, trades[rng.random_range(0..trades.len())]);
             peak = peak.max(equity);
             fall = fall.max(1.0 - equity / peak);
             if i % stride == 0 {
@@ -491,7 +539,7 @@ pub fn monte_carlo(
     let mut running = capital;
     let real: Vec<f64> = std::iter::once(capital)
         .chain(trades.iter().map(|trade| {
-            running += trade;
+            running = step(running, *trade);
             running
         }))
         .collect();
@@ -1143,6 +1191,41 @@ mod tests {
         let none = report(Vec::new(), 1_000.0);
         assert_eq!(win_rate(&none), None);
         assert!(pnl_by_trade(&none)["Win Rate"].is_nan());
+    }
+
+    #[test]
+    fn compounding_draws_multiply_and_never_fall_past_everything() {
+        // On 1,000: lose 90%, gain 100%, and so on. In dollars, drawing the 900 lost again and again
+        // would go far below zero; as returns, it only gets close.
+        let mut equity = 1_000.0;
+        let trades: Vec<f64> = (0..40)
+            .map(|i| {
+                let made = equity * if i % 2 == 0 { -0.9 } else { 1.0 };
+                equity += made;
+                made
+            })
+            .collect();
+        let result = monte_carlo_compounding(&trades, 1_000.0, 500, 0.5, 7).unwrap();
+        assert!(result.all_stats.iter().all(|row| row.return_ >= -1.0));
+        assert!(result.all_stats.iter().all(|row| row.drawdown <= 1.0));
+        let adding = monte_carlo(&trades, 1_000.0, 500, 0.5, 7).unwrap();
+        assert!(adding.all_stats.iter().any(|row| row.return_ < -1.0));
+
+        // Drawn in the same order, a constant 10% compounds exactly.
+        let mut equity = 1_000.0;
+        let steady: Vec<f64> = (0..20)
+            .map(|_| {
+                let made = equity * 0.1;
+                equity += made;
+                made
+            })
+            .collect();
+        let result = monte_carlo_compounding(&steady, 1_000.0, 50, 0.5, 7).unwrap();
+        let expected = 1.1_f64.powi(20) - 1.0;
+        for row in &result.all_stats {
+            assert!((row.return_ - expected).abs() < 1e-9, "{row:?}");
+        }
+        assert!((result.actual_stats.return_ - expected).abs() < 1e-9);
     }
 
     #[test]

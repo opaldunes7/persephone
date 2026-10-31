@@ -18,7 +18,7 @@ use persephone_core::{
     signal::{Note, SignalFactory},
     strategy::{StrategyKind, StrategySpec},
 };
-use persephone_engine::{BacktestReport, BacktestRequest, Fill};
+use persephone_engine::{BacktestReport, BacktestRequest, FeeRates, Fill, SimSettings};
 use persephone_research::{
     WARM_UP_BARS,
     calendar::{Calendar, days_in_month, weeks},
@@ -27,10 +27,10 @@ use persephone_research::{
     positions::{Positions, random_entries},
     results::{StrategyRef, with_params},
     robustness::{
-        BlockJob, MonteCarlo, RoundTrip, backtest, closed_trades, monte_carlo, percentile,
-        pick_blocks, pnl_by_trade, pool, round_trips,
+        BlockJob, MonteCarlo, RoundTrip, backtest, closed_trades, monte_carlo,
+        monte_carlo_compounding, percentile, pick_blocks, pnl_by_trade, pool, round_trips,
     },
-    settings::{BlockLength, OptimizeSettings, Precision, ScoreBy, Settings, Variable},
+    settings::{BlockLength, FillTiming, OptimizeSettings, Precision, ScoreBy, Settings, Variable},
 };
 use serde_json::{Map, Value, json};
 
@@ -50,7 +50,7 @@ const LISTED_RUNS: usize = 20;
 const LISTED_VALUES: usize = 50;
 /// The most backtests `run_backtests` takes in one call.
 const MAX_BACKTESTS: usize = 5_000;
-const BATCH_COLUMNS: [&str; 18] = [
+const BATCH_COLUMNS: [&str; 21] = [
     "index",
     "run_id",
     "label",
@@ -67,6 +67,9 @@ const BATCH_COLUMNS: [&str; 18] = [
     "exposure",
     "average_trade",
     "by_year",
+    "gross_return",
+    "total_costs_paid",
+    "break_even_cost_per_fill",
     "warnings",
     "error",
 ];
@@ -223,6 +226,7 @@ fn summary_of(
         "win_rate": winners as f64 / trades.len().max(1) as f64,
         "bars": report.equity.len().saturating_sub(from_index),
         "buy_and_hold_return": buy_and_hold(bars, from_index),
+        "benchmark": benchmark(report.starting_balance, bars, from_index),
         "sharpe": sharpe(report, from_index, bars),
         "profit_factor": (losses > 0.0).then(|| gains / losses),
         "exposure": exposure(report, from_index),
@@ -246,6 +250,57 @@ fn warnings_of(report: &BacktestReport) -> Vec<String> {
         ));
     }
     warnings
+}
+
+/// Whether a backtest has anything to pay: fees, slippage or spread.
+fn costs_something(request: &BacktestRequest) -> bool {
+    let sim = &request.sim;
+    request.fees.maker != 0.0
+        || request.fees.taker != 0.0
+        || sim.fee_per_order.is_some()
+        || sim.slippage_ticks > 0
+        || sim.slippage_percent > 0.0
+        || sim.spread_ticks > 0
+}
+
+/// The same backtest with nothing to pay.
+fn without_costs(request: &BacktestRequest) -> BacktestRequest {
+    let mut free = request.clone();
+    free.fees = FeeRates::ZERO;
+    free.sim.fee_per_order = None;
+    free.sim.slippage_ticks = 0;
+    free.sim.slippage_percent = 0.0;
+    free.sim.spread_ticks = 0;
+    free
+}
+
+/// Fees plus what slippage and spread took from each fill, worked back from its price as
+/// `CostFillModel` moved it. A market's own quotes bring their own spread, which isn't known here.
+fn costs_paid(report: &BacktestReport, sim: &SimSettings, price_precision: u8) -> f64 {
+    let tick = 10_f64.powi(-i32::from(price_precision));
+    let share = sim.slippage_percent / 100.0;
+    let moved: f64 = report
+        .fills
+        .iter()
+        .map(|fill| {
+            let (spread, sign) = if fill.side == Side::Buy {
+                (sim.spread_ticks.div_ceil(2), 1.0)
+            } else {
+                (sim.spread_ticks / 2, -1.0)
+            };
+            let ticks = f64::from(sim.slippage_ticks + spread) * tick;
+            let met = (fill.price - sign * ticks) / (1.0 + sign * share);
+            fill.qty * (fill.price - met) * sign
+        })
+        .sum();
+    report.fees + moved
+}
+
+/// What a backtest with no costs made, per fill, as basis points of the value traded: the cost per
+/// fill that would bring it to nothing.
+fn break_even_bp(free: &BacktestReport) -> Option<f64> {
+    let traded: f64 = free.fills.iter().map(|fill| fill.qty * fill.price).sum();
+    (traded > 0.0).then(|| free.net_pnl() / traded * 10_000.0)
 }
 
 /// A page whose rows are objects, so has no columns to name.
@@ -301,14 +356,45 @@ fn buy_and_hold(bars: &[(u64, f64)], from_index: usize) -> Option<f64> {
     (first > 0.0).then(|| last / first - 1.0)
 }
 
+/// Buying at the first close that could trade and holding to the end, with no costs: the same
+/// figures a run gets, to compare it with.
+fn benchmark(capital: f64, bars: &[(u64, f64)], from_index: usize) -> Value {
+    let span = bars.get(from_index..).unwrap_or(&[]);
+    let Some(&(_, first)) = span.first().filter(|(_, first)| *first > 0.0) else {
+        return Value::Null;
+    };
+    let mut peak = 0.0_f64;
+    let mut fall = 0.0_f64;
+    for &(_, close) in span {
+        peak = peak.max(close);
+        fall = fall.max(1.0 - close / peak);
+    }
+    json!({
+        "return": buy_and_hold(bars, from_index),
+        "sharpe": daily_sharpe(
+            capital,
+            span.iter().map(|&(ts, close)| (ts, capital * close / first)),
+        ),
+        "max_drawdown": fall,
+    })
+}
+
+fn sharpe(report: &BacktestReport, from_index: usize, bars: &[(u64, f64)]) -> Option<f64> {
+    let points = bars.iter().zip(&report.equity).skip(from_index);
+    daily_sharpe(
+        report.starting_balance,
+        points.map(|(&(ts, _), &equity)| (ts, equity)),
+    )
+}
+
 /// The Sharpe ratio of daily returns, with no risk-free rate, over 365 days a year as crypto trades
 /// every day. A day's value is its last bar's equity. `None` if there are too few days to say, or
 /// nothing ever moved.
-fn sharpe(report: &BacktestReport, from_index: usize, bars: &[(u64, f64)]) -> Option<f64> {
+fn daily_sharpe(start: f64, points: impl Iterator<Item = (u64, f64)>) -> Option<f64> {
     const NANOS_PER_DAY: u64 = 86_400_000_000_000;
-    let mut days = vec![report.starting_balance];
+    let mut days = vec![start];
     let mut last_day = None;
-    for (&(ts, _), &equity) in bars.iter().zip(&report.equity).skip(from_index) {
+    for (ts, equity) in points {
         let day = ts / NANOS_PER_DAY;
         if last_day == Some(day) {
             *days.last_mut()? = equity;
@@ -561,6 +647,11 @@ impl Lab {
     fn prepare(&self, args: &Value) -> Result<(BacktestRequest, usize, String), String> {
         let market_args = MarketArgs::parse(args)?;
         let settings = settings_of(args)?;
+        if settings.fill_timing == FillTiming::NextOpen && settings.precision == Precision::High {
+            return Err(
+                "filling at the next open can't go with latency or high precision; pick one".into(),
+            );
+        }
         let strategy = args.get("strategy").unwrap_or(&Value::Null);
         let (spec, mut plugin) = self.resolve(strategy)?;
         let name = spec.info.name.clone();
@@ -614,8 +705,35 @@ impl Lab {
         let times: Vec<u64> = request.candles.iter().map(|c| c.ts).collect();
         let bars: Vec<(u64, f64)> = request.candles.iter().map(|c| (c.ts, c.close)).collect();
         let look_back = look_back_of(args, request.strategy.own_params());
+        let sim = request.sim;
+        let price_precision = request.instrument.price_precision;
+        let wanted = args
+            .get("friction")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let free = (wanted && costs_something(&request)).then(|| without_costs(&request));
         let report = backtest(request)?;
+        let free = free.map(backtest).transpose()?;
         let mut summary = summary_of(&report, from_index, &name, &bars);
+        if wanted {
+            let gross = free.as_ref().unwrap_or(&report);
+            summary["gross_return"] = json!(
+                gross
+                    .equity
+                    .last()
+                    .map_or(0.0, |last| last / gross.starting_balance - 1.0)
+            );
+            summary["total_costs_paid"] = json!(costs_paid(&report, &sim, price_precision));
+            summary["break_even_cost_per_fill"] = json!(break_even_bp(gross));
+        } else {
+            for figure in [
+                "gross_return",
+                "total_costs_paid",
+                "break_even_cost_per_fill",
+            ] {
+                summary[figure] = Value::Null;
+            }
+        }
         if let Some(warning) = look_back_warning(look_back, from_index, times.len())
             && let Some(warnings) = summary["warnings"].as_array_mut()
         {
@@ -858,7 +976,10 @@ impl Lab {
                     summary["exposure"],
                     summary["average_trade"],
                     summary["by_year"],
-                    summary["warnings"].as_array().map_or(0, Vec::len),
+                    summary["gross_return"],
+                    summary["total_costs_paid"],
+                    summary["break_even_cost_per_fill"],
+                    summary["warnings"],
                     null,
                 ])
             })
@@ -1203,7 +1324,18 @@ impl Lab {
             .and_then(Value::as_f64)
             .unwrap_or(50.0);
         job.total.store(draws as usize, Ordering::Relaxed);
-        let found = monte_carlo(
+        // As the app does: `stock` being off turns compounding off with the rest.
+        let compound = run["request"]
+            .get("settings")
+            .map_or(Ok(Settings::default()), read_settings)?
+            .sim()
+            .compound;
+        let draw = if compound {
+            monte_carlo_compounding
+        } else {
+            monte_carlo
+        };
+        let found = draw(
             &closed_trades(&report),
             report.starting_balance,
             draws,
@@ -1211,13 +1343,7 @@ impl Lab {
             number(args, "seed", 0),
         )?;
         job.done.store(draws as usize, Ordering::Relaxed);
-        let mut answer = monte_carlo_json(&found, &report, args)?;
-        if run["request"]["settings"]["compound"] == true {
-            answer["warning"] = json!(
-                "This run compounds, but its trades are redrawn at the amounts they made, not as fractions of the account. Falls can pass 100% that the run itself couldn't have: read these as rough at best."
-            );
-        }
-        Ok(answer)
+        monte_carlo_json(&found, &report, args)
     }
 
     pub(crate) fn run_random_blocks(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {

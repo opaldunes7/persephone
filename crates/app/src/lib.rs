@@ -2675,6 +2675,7 @@ impl Persephone {
                 runs: settings.runs,
                 ruin_at: settings.ruin / 100.0,
                 seed: panel.tests.seed,
+                compound: settings.sim().compound,
             },
         ))
     }

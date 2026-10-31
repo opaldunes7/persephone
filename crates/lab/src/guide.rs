@@ -4,7 +4,11 @@
 use persephone_research::settings::Settings;
 use serde_json::{Value, json};
 
-const GUIDE: &str = include_str!("../../../docs/lab-agents.md");
+const GUIDE: &str = concat!(
+    include_str!("../../../docs/lab-agents.md"),
+    "\n",
+    include_str!("../../../docs/lab-external-models.md"),
+);
 
 /// The guide's opening, before its first topic.
 fn overview() -> &'static str {

@@ -42,7 +42,9 @@ How a backtest works, which decides what its numbers mean.
   a list of `positions`, which holds whatever you put in it.
 - **Fills:** a market order, at that bar's close, plus any slippage and spread. With `latency`, it arrives after
   that close, so on bars it fills at the next bar's close, which is a whole bar's delay however small the latency.
-  Every change still goes out, each from where the order before it will leave things.
+  Every change still goes out, each from where the order before it will leave things. `fill_timing: "next_open"` is
+  the realistic delay for most uses: decide at a close, fill at the next bar's open, with no finer data.
+- **A model's predictions** go in as a list of positions: see the `models` topic.
   With `precision: "high"`, it fills on what's next inside the bars instead: ticks, or 1-minute bars. So `high` only
   changes results alongside `latency`, or on ticks, and otherwise just takes longer.
 - **A strategy says what position it wants:** long, short or flat. One position at a time, in one
@@ -187,7 +189,8 @@ an error.
 | `commission` | `{"percent": 0.1}` of each fill, or `{"per-order": 1.5}` flat, instead of the market's fee |
 | `slippage` | Ticks every market order fills worse. A tick is `10^-price_precision`, from `get_instrument` |
 | `slippage_percent` | Percent of the price every market order fills worse, on top of any in ticks: `0.01` is 1 basis point |
-| `compound` | `true` sizes positions from the account as it is now. Monte Carlo redraws such trades' amounts as they were |
+| `compound` | `true` sizes positions from the account as it is now. Monte Carlo then draws such trades as returns on the account and multiplies, so a fall can't pass 100% |
+| `fill_timing` | `"close"`, or `"next_open"` to fill at the next bar's open. It needs time bars, and can't go with `latency` or `precision: "high"`. Unlike the costs, `stock: false` leaves it alone. A fill's `ts` is 2 ms after that open, and its `bar` is the bar opening. Nothing fills for a decision on the last bar |
 | `spread` | Ticks of spread assumed for bars and trades |
 | `latency` | Milliseconds before orders reach the venue |
 | `leverage` | A multiple of position size, 1 or more. Margin calls aren't simulated |
@@ -213,6 +216,14 @@ What every number means, the same everywhere.
 - **`profit_factor`** is winning trades' profit over losing trades' loss, null if there were no losses.
 - **`exposure`** is the fraction of bars that began with a position open.
 - **`average_trade`** is net profit per trade, in the quote currency, after fees.
+- **`gross_return`** is `net_return` from a second backtest with fees, slippage and spread off, so it's exact with `compound`
+  and with an account that ran out. **`total_costs_paid`** is fees plus what slippage and spread took, in the quote
+  currency. **`break_even_cost_per_fill`** is the cost per fill that would bring the costless run to nothing, in basis
+  points of the value traded: negative if it loses before costs. It's a guide under `compound`, where costs also
+  shrink later positions. A run with costs takes twice as long, so `friction: false` leaves these out for huge
+  batches. A plugin that doesn't repeat itself may differ between the two runs.
+- **`benchmark`** has `return`, `sharpe` and `max_drawdown` for buying at the first close that could trade and holding to
+  the end, with no costs. `return` is the same as `buy_and_hold_return`.
 - **`by_year`** is what each UTC year added, as a fraction of the starting capital, so the years add up to `net_return`.
 - **`return_percent`** on a trade is a percentage of the starting capital, even with `compound`, so add them up rather
   than compounding them.
@@ -227,15 +238,6 @@ What every number means, the same everywhere.
 value, and `ends_with_open_trade` says if there is one. `Max Loser` is the largest loss and `Min Loser` the smallest.
 `closed_positions_pnl`, `returns` and `general` come from Nautilus under its own names, and `closed_positions_pnl`
 leaves out an open trade, so a run holding to the end shows only its entry fee there.
-
-**What a time means, by tool.** Getting this wrong by one bar invalidates a model's test:
-
-| Where | It's when |
-|---|---|
-| `ts` in `get_bars`, `export_data`, `positions` and `get_equity` | The bar opens. `get_equity`'s value is at that bar's close |
-| `ts` in `get_fills`, and `opened` and `closed` in `get_trades` | The bar it filled at closes, so a list's entry fills one bar's length after its `ts` |
-| `ts` sent to a program over a socket, and `hour` and `weekday` | The bar closes |
-| `bar`, `entry_bar` and `exit_bar` | Not a time: numbers counting warm-up bars |
 
 A random block's `to` is its last bar, which is included. To replay one with `run_backtest`, whose `to` isn't
 included, give a `to` one bar later.
@@ -259,7 +261,7 @@ Which bars a call uses, their limits, and what's cached.
 - **Caching:** Binance bars are kept on disk, so a span costs a download once. A first call on a long span
   can take a while; later ones take milliseconds. Don't avoid repeating a span to save time.
 - **For training models elsewhere,** `export_data` writes CSV or Parquet. Then test the predictions as a list of
-  positions: see "Using a model you trained" in the `extending` topic.
+  positions: see the `models` topic, which also says what a time means in each tool.
 
 ## tests
 
@@ -380,7 +382,7 @@ A sensible order for testing an idea, cheapest first. Nothing here is required.
    too (set `commission` to 0), stop: cheaper fills won't save it.
 2. **Compare fairly:** `Size %` 100 and `compound` against `buy_and_hold_return`, and look at `by_year`, as one good year
    often explains everything.
-   To test a model trained elsewhere, see "Using a model you trained" in the `extending` topic.
+   To test a model trained elsewhere, see the `models` topic.
 3. **Vary it:** `run_backtests` across parameters, symbols and costs, with a `label`. A real effect survives nearby values.
 4. **Against chance:** `run_random_entries` on the best, remembering how many you tried.
 5. **On unseen data:** `run_walk_forward`, or `run_optimize` with `hold_out`, each with the market's return beside it.
@@ -427,29 +429,7 @@ runs an ONNX model from `list_models`.
 trade is usually number 500. A program over a socket is sent warm-up bars too, and what it last asked for during them
 is taken up on the first bar that can trade.
 
-**Using a model you trained, three ways, simplest first:**
-
-1. **A list of positions,** written out or as a JSON file's path, as `"positions": "/path/list.json"`, which spares you
-   writing long lists into calls. Export bars with `export_data`, make predictions, and backtest them as
-   `{"positions": [[ts, 1], [ts, -1], [ts, 0]]}`. Each `ts` is a bar's, from `get_bars` or the export: when it opens.
-   It fills at that bar's close and holds until the next entry. A list can run past the span at either end: a span or
-   random block starting later takes up what's wanted by then, and later entries are left out. Inside the span, a time
-   that isn't a bar's is an error. It runs in parallel, but nothing checks the list only used what was known by then:
-   train and predict on separate stretches. It can't go in `save_result`, as it only fits the bars it was made for.
-2. **A program over a socket,** for a full Python stack. It's told one bar at a time, so it can't see ahead, but
-   backtests run one at a time. Listen on a local socket, with a thread per connection, answering one JSON line per
-   request:
-
-   | It's sent | It answers |
-   |---|---|
-   | `{"type":"describe"}` | `{"name":"…","description":"…","params":[{"name":"Fast","default":10,"min":1,"max":100}]}` |
-   | `{"type":"start","params":[10.0]}` | `{}` |
-   | `{"type":"bar","ts":…,"open":…,"high":…,"low":…,"close":…,"volume":…}` | `{"target":1}`, `-1` or `0` |
-   | `{"type":"end"}` | `{}` |
-
-   Any answer may be `{"error":"…"}`, which stops the run. Here `ts` is the bar's close. Add it while it's running
-   with `install_plugin` and a `name` and `address`, then use it as `{"plugin": id}`.
-3. **A compiled plugin,** by `install_plugin` and a `.wasm` file's `path`.
+To use a model you trained, see the `models` topic.
 
 ## limits
 

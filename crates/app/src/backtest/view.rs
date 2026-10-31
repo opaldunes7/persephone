@@ -12,8 +12,8 @@ use persephone_core::{BarSpec, Candle, UnixNanos, time::DateTime};
 use persephone_engine::BacktestReport;
 
 use super::{
-    BlockLength, BlockRun, Commission, Edit, Field, NO_VARIABLE, OneWay, OptimizeRun, Panel,
-    PanelMessage, Precision, RunColumn, ScoreBy, Settings, StrategyChoice, TestKind,
+    BlockLength, BlockRun, Commission, Edit, Field, FillTiming, NO_VARIABLE, OneWay, OptimizeRun,
+    Panel, PanelMessage, Precision, RunColumn, ScoreBy, Settings, StrategyChoice, TestKind,
     calendar::{Calendar, Level, Total, days_in_month, weeks},
     optimize::{OptimizeResult, Outcome},
     progress,

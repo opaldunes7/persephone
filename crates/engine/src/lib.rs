@@ -40,7 +40,7 @@ use persephone_core::{
     BarSpec, Candle, InstrumentSpec, Timeframe, UnixNanos,
     signal::{Note, Signal, SignalFactory},
     strategy::{StrategyKind, StrategySpec},
-    tick::{TickFeed, Ticks},
+    tick::{Aggressor, TickFeed, Ticks, Trade},
     time::{DateTime, NANOS_PER_DAY},
 };
 use rust_decimal::Decimal;
@@ -133,16 +133,33 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
             request.sim.leverage
         )));
     }
+    if request.sim.next_open {
+        if request.sim.latency_ms > 0 || request.ticks.is_some() || request.fill_bars.is_some() {
+            return Err(EngineError::InvalidRequest(
+                "filling at the next open can't go with latency or high precision; pick one".into(),
+            ));
+        }
+        if matches!(request.bars, BarSpec::Ticks(_) | BarSpec::Volume(_)) {
+            return Err(EngineError::InvalidRequest(
+                "filling at the next open needs time bars, as tick and volume bars don't have a gap to the next open".into(),
+            ));
+        }
+    }
     let mut engine = BacktestEngine::new(engine_config())?;
 
     let instrument = convert::instrument(&request.instrument)?;
     let instrument_id = instrument.id();
     let quote = convert::currency(&request.instrument.quote)?;
-    engine.add_venue(venue_config(request, quote, request.ticks.is_none())?)?;
+    let opens = request.sim.next_open.then(|| Opens::of(&request.candles));
+    let feed = request
+        .ticks
+        .as_deref()
+        .or(opens.as_ref().map(|opens| opens as &dyn TickFeed));
+    engine.add_venue(venue_config(request, quote, feed.is_none())?)?;
     engine.add_instrument(&instrument)?;
 
     let closes = request.bars.closes(&request.candles);
-    let bar_type = match (request.bars, &request.ticks) {
+    let bar_type = match (request.bars, feed) {
         (BarSpec::Ticks(_) | BarSpec::Volume(_), None) => convert::untimed_bar_type(instrument_id)?,
         (bars, _) => convert::bar_type(instrument_id, bars)?,
     };
@@ -197,7 +214,7 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
         .compounding(request.sim.compound.then_some(request.starting_balance)),
     )?;
 
-    match &request.ticks {
+    match feed {
         None => {
             engine.add_data(bars, None, true, true)?;
             engine.run(None, None, None, false)?;
@@ -206,7 +223,7 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
             let end = closes.last().copied().unwrap_or_default();
             run_on_ticks(
                 &mut engine,
-                feed.as_ref(),
+                feed,
                 bars,
                 request,
                 end,
@@ -228,6 +245,7 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
         &closes,
         request.starting_balance,
         &request.instrument.quote,
+        request.sim.next_open,
     );
     engine.dispose();
     report.notes = signal.borrow_mut().notes();
@@ -244,6 +262,19 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
         let at = DateTime::from_nanos(ts);
         format!("{} {}", at.date(), at.time())
     };
+    let left = report.equity.last().copied().unwrap_or(0.0);
+    // Compounding sizes from the account, so a position rounding to nothing means it has shrunk.
+    let enough = request.starting_balance * if request.sim.compound { 0.5 } else { 0.01 };
+    let depleted = left <= 0.0 || (missed.too_small > 0 && left < enough);
+    if depleted {
+        report.notes.push(Note {
+            text: format!(
+                "Account balance depleted ({left:.2} {} left). Unable to open further positions.",
+                request.instrument.quote
+            ),
+            warning: true,
+        });
+    }
     if missed.unmet > 0 {
         report.notes.push(Note {
             text: format!(
@@ -254,10 +285,10 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
             warning: true,
         });
     }
-    if missed.too_small > 0 {
+    if missed.too_small > 0 && !depleted {
         report.notes.push(Note {
             text: format!(
-                "On {} bars no order went out because the position rounds to nothing at this market's size steps, first at {}. The account may have run out; if it hasn't, raise the capital or size.",
+                "On {} bars no order went out because the position rounds to nothing at this market's size steps, first at {}. Raise the capital or size.",
                 missed.too_small,
                 at(missed.first_too_small),
             ),
@@ -266,6 +297,39 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
     }
     drop(missed);
     Ok(report)
+}
+
+/// How long an order takes when filling at the next open, and how far into each bar its open trades,
+/// so the order sent at a close gets there first and meets it.
+const ORDER_REACHES_OPEN_MS: u32 = 1;
+const OPEN_TRADES_AT_NANOS: UnixNanos = 2_000_000;
+
+/// Each bar's open as a trade, for orders to fill on.
+#[derive(Debug)]
+struct Opens(Vec<Trade>);
+
+impl Opens {
+    fn of(candles: &[Candle]) -> Self {
+        Self(
+            candles
+                .iter()
+                .map(|candle| Trade {
+                    ts: candle.ts + OPEN_TRADES_AT_NANOS,
+                    price: candle.open,
+                    size: 1.0,
+                    aggressor: Aggressor::Unknown,
+                })
+                .collect(),
+        )
+    }
+}
+
+impl TickFeed for Opens {
+    fn ticks(&self, start: UnixNanos, end: UnixNanos) -> Result<Ticks, String> {
+        let first = self.0.partition_point(|trade| trade.ts < start);
+        let last = self.0.partition_point(|trade| trade.ts < end);
+        Ok(Ticks::Trades(self.0[first..last].to_vec()))
+    }
 }
 
 /// Runs a backtest on its own thread. Join the handle to get the report.
@@ -398,8 +462,13 @@ fn venue_config(
             sim.spread_ticks,
             sim.slippage_percent,
         )))
-        .maybe_latency_model((sim.latency_ms > 0).then(|| {
-            let latency = DurationNanos::new(u64::from(sim.latency_ms) * 1_000_000);
+        .maybe_latency_model((sim.latency_ms > 0 || sim.next_open).then(|| {
+            let ms = if sim.next_open {
+                ORDER_REACHES_OPEN_MS
+            } else {
+                sim.latency_ms
+            };
+            let latency = DurationNanos::new(u64::from(ms) * 1_000_000);
             let none = DurationNanos::new(0);
             LatencyModelHandle::new(StaticLatencyModel::new(latency, none, none, none))
         }))

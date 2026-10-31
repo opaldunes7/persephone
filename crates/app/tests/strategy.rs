@@ -1449,6 +1449,20 @@ mod panel {
     }
 
     #[test]
+    fn filling_at_the_next_open_reaches_the_backtest() {
+        use persephone::backtest::FillTiming;
+        let mut app = ready_panel(TestKind::Backtest);
+        panel(
+            &mut app,
+            PanelMessage::Edit(Edit::FillTiming(FillTiming::NextOpen)),
+        );
+        let (_, request) = app.backtest_request(0).unwrap();
+        assert!(request.sim.next_open);
+        let report = persephone_engine::run_backtest(&request).unwrap();
+        assert!(!report.fills.is_empty());
+    }
+
+    #[test]
     fn the_invert_switch_reruns_the_backtest_on_the_other_side() {
         let mut app = ready_panel(TestKind::Backtest);
         let before = trades(&app);

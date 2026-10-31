@@ -41,6 +41,9 @@ pub struct Settings {
     pub compound: bool,
     pub session: Section<SessionRule>,
     pub precision: Precision,
+    /// When orders fill on the bars.
+    #[serde(default)]
+    pub fill_timing: FillTiming,
     /// Plugins added to the backtest, by name. They're only listed for now: no kind of
     /// backtest plugin exists yet.
     pub plugins: Vec<String>,
@@ -73,6 +76,7 @@ impl Default for Settings {
             compound: false,
             session: Section::off(SessionRule::default()),
             precision: Precision::Standard,
+            fill_timing: FillTiming::Close,
             plugins: Vec::new(),
             test: TestKind::Backtest,
             runs: 1_000,
@@ -229,6 +233,17 @@ pub enum Precision {
     High,
 }
 
+/// When an order fills, on the bars.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FillTiming {
+    /// At the close it was decided on.
+    #[default]
+    Close,
+    /// At the next bar's open.
+    NextOpen,
+}
+
 /// When positions may be opened: some weekdays between two times of day, in a time zone.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionRule {
@@ -329,6 +344,7 @@ pub enum Edit {
     Day(usize),
     CloseAfter(bool),
     Precision(Precision),
+    FillTiming(FillTiming),
 }
 
 impl Settings {
@@ -360,6 +376,7 @@ impl Settings {
             }
             Edit::CloseAfter(on) => self.session.value.close_after = on,
             Edit::Precision(precision) => self.precision = precision,
+            Edit::FillTiming(timing) => self.fill_timing = timing,
         }
     }
 
@@ -499,6 +516,7 @@ impl Settings {
             latency_ms: self.on(&self.latency).copied().unwrap_or(0),
             leverage: self.on(&self.leverage).copied().unwrap_or(1.0),
             compound: self.stock && self.compound,
+            next_open: self.fill_timing == FillTiming::NextOpen,
         }
     }
 

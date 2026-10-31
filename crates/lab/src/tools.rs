@@ -103,6 +103,7 @@ fn settings_schema() -> Value {
         "slippage": section(whole.clone(), "Ticks every market order fills worse."),
         "slippage_percent": section(number.clone(), "Percent of the price every market order fills worse, as 0.01 for 1 basis point."),
         "compound": {"type": "boolean", "description": "Size positions from the account as it is now, rather than as it started."},
+        "fill_timing": {"enum": ["close", "next_open"], "description": "When orders fill on the bars: at the close they were decided on, or at the next bar's open. next_open needs time bars, and can't go with latency or precision high."},
         "spread": section(whole.clone(), "Ticks of spread assumed for bars and trades."),
         "latency": section(whole, "Milliseconds before orders reach the venue."),
         "leverage": section(number, "A multiple of position size, 1 or more."),
@@ -129,6 +130,11 @@ const LABEL: Arg = opt(
     "label",
     "string",
     "A name for grouping runs, saved with the run for finding it with list_runs.",
+);
+const FRICTION: Arg = opt(
+    "friction",
+    "boolean",
+    "false leaves out gross_return, total_costs_paid and break_even_cost_per_fill, which take a second backtest with costs off. Default true.",
 );
 const WAIT: Arg = opt(
     "wait_seconds",
@@ -414,7 +420,7 @@ pub fn tools() -> Vec<Tool> {
         job(
             "run_backtest",
             "Backtests any strategy on any span with any settings. The run is saved, so its details can be read by run_id. Returns and falls are fractions, so 0.05 is 5%.",
-            with(test_args(), &[LABEL]),
+            with(test_args(), &[LABEL, FRICTION]),
             &["run_id", "summary"],
         ),
         job(
