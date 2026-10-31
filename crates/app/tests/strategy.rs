@@ -1303,4 +1303,113 @@ mod panel {
         // Folding away changes nothing about the backtest.
         assert!(matches!(run_state(&app), Run::Done(_)));
     }
+
+    #[test]
+    fn random_blocks_runs_by_itself_like_monte_carlo() {
+        let mut app = app();
+        set_strategy(&mut app, BuiltInStrategy::EmaCross);
+        finish_backtest(&mut app);
+        let _ = app.update(Message::Key(Action::Backtest));
+        assert!(matches!(app.panel().unwrap().tests.blocks, BlockRun::Idle));
+
+        // Choosing it starts it, with results arriving without anything pressed.
+        run_task(&mut app, PanelMessage::Test(TestKind::RandomBlocks));
+        assert!(matches!(
+            app.panel().unwrap().tests.blocks,
+            BlockRun::Done(_)
+        ));
+
+        // A change starts it over.
+        run_task(&mut app, PanelMessage::BlockLength(BlockLength::Week));
+        let BlockRun::Done(summary) = &app.panel().unwrap().tests.blocks else {
+            panic!("no results for the new length");
+        };
+        assert!(summary.paths[0].len() <= 7 * 24);
+
+        // But it stays stopped once cancelled, or if it can't run.
+        panel(&mut app, PanelMessage::StopBlocks);
+        assert!(matches!(app.panel().unwrap().tests.blocks, BlockRun::Idle));
+        panel(&mut app, PanelMessage::BlockLength(BlockLength::Quarter));
+        assert!(
+            matches!(app.panel().unwrap().tests.blocks, BlockRun::Idle),
+            "too long for these bars"
+        );
+
+        // And a backtest that changes brings it back, not a blank pane.
+        panel(&mut app, PanelMessage::BlockLength(BlockLength::Week));
+        panel(&mut app, PanelMessage::Edit(Edit::Slippage(true)));
+        assert!(
+            matches!(app.panel().unwrap().tests.blocks, BlockRun::Idle),
+            "cleared"
+        );
+        finish_backtest(&mut app);
+        assert!(matches!(
+            app.panel().unwrap().tests.blocks,
+            BlockRun::Running { .. }
+        ));
+    }
+
+    #[test]
+    fn something_half_typed_for_another_test_doesnt_stop_this_one() {
+        let mut app = ready_panel(TestKind::Optimize);
+        panel(&mut app, PanelMessage::Input(Field::Step(0), "oops".into()));
+        panel(&mut app, PanelMessage::Test(TestKind::RandomBlocks));
+        panel(&mut app, PanelMessage::BlockLength(BlockLength::Week));
+        run_task(&mut app, PanelMessage::RunBlocks);
+        assert!(app.panel().unwrap().error.is_none());
+        assert!(matches!(
+            app.panel().unwrap().tests.blocks,
+            BlockRun::Done(_)
+        ));
+    }
+
+    #[test]
+    fn picking_a_monte_carlo_line_lists_its_trades_with_a_way_back() {
+        let mut app = ready_panel(TestKind::MonteCarlo);
+        app.monte_carlo_now();
+        let result = app
+            .panel()
+            .unwrap()
+            .tests
+            .monte_carlo
+            .clone()
+            .unwrap()
+            .unwrap();
+        let tests = |app: &Persephone| {
+            let tests = &app.panel().unwrap().tests;
+            (tests.line, tests.showing_trades)
+        };
+
+        panel(&mut app, PanelMessage::SelectLine(Some(result.worst)));
+        assert_eq!(tests(&app), (Some(result.worst), true));
+        measure(&mut app);
+
+        // What it lists adds up to what the line says.
+        let Run::Done(report) = run_state(&app) else {
+            panic!("no backtest");
+        };
+        let trades = round_trips(report);
+        let draws = result.draws(result.worst).unwrap();
+        let made: f64 = draws.iter().map(|&i| trades[i].profit).sum();
+        let expected = result.stats[result.worst].return_ * report.starting_balance;
+        assert!((made - expected).abs() < 1e-6, "{made} against {expected}");
+
+        // A trade can be seen where it really happened, even though the run's order isn't real.
+        let (row, trade) = (2, draws[2]);
+        let exit = trades[trade].exit_bar;
+        panel(&mut app, PanelMessage::ShowTrade(row, trade));
+        assert_eq!(app.panel().unwrap().tests.trade_row, Some(2));
+        let right = app.tile_chart(0).unwrap().viewport().right;
+        assert!((right - exit as f64).abs() < 30.0, "{right} for {exit}");
+
+        // Back to the notable runs, with the line still picked.
+        panel(&mut app, PanelMessage::ShowRuns);
+        assert_eq!(tests(&app), (Some(result.worst), false));
+        assert_eq!(app.panel().unwrap().tests.trade_row, None);
+        measure(&mut app);
+
+        // Clicking away from every line unpicks it.
+        panel(&mut app, PanelMessage::SelectLine(None));
+        assert_eq!(tests(&app), (None, false));
+    }
 }

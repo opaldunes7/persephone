@@ -231,8 +231,9 @@ It assumes trades don't depend on each other, so it understates streaks that com
 and it can only draw trades the backtest made.
 
 **Random blocks** backtests random stretches of the span, each with the bars before it to warm up
-on. Pick how many (**Blocks**), how long (one week, 30 days or 91 days), and press **Run**. Blocks
-can overlap. **The span slider decides what's sampled**, so widen it to reach other kinds of
+on. Pick how many (**Blocks**) and how long (one week, 30 days or 91 days). It runs by itself, like
+Monte Carlo, and again when anything changes; **Cancel** stops it, and **Run** starts it again.
+Strategies in a process of their own wait for **Run**. Blocks can overlap. **The span slider decides what's sampled**, so widen it to reach other kinds of
 market. Each line is a block, by bars into it, all from the same capital.
 
 If it can't run, **Run** is disabled and a red line under the test's settings says why and how to
@@ -244,6 +245,11 @@ this is the usual reason. A number typed without pressing Enter counts once you 
   in this market.
 - **Median**, **Best**, **Worst**: block returns, and the worst block's dates. A best far above the
   median means the result leans on a few good stretches.
+
+Pick a Monte Carlo line, or Best, Middle, Worst or The backtest in the list, to see **that run's
+trades** in the order it drew them, with the equity after each. They're your backtest's real trades
+in a random mix, so one can repeat and another be left out. Click a trade to see where it really
+happened on the chart, and **All runs** to go back to the list.
 
 On both tests, the list beside the lines says what the result means and how each one went. **Click a
 line or a row** to pick it out; hover over a line to see its return and worst fall. On Random blocks

@@ -103,6 +103,10 @@ pub struct Tests {
     pub line: Option<usize>,
     /// How much of that fan shows, from 0 to 1; `None` is all of it.
     pub zoom: Option<(f32, f32)>,
+    /// Whether Monte Carlo's list shows the picked line's trades, not its notable runs.
+    pub showing_trades: bool,
+    /// The row of those trades last sent to the chart.
+    pub trade_row: Option<usize>,
 }
 
 /// Where an optimization has got.
@@ -149,6 +153,8 @@ impl Tests {
     pub fn reset_fan(&mut self) {
         self.line = None;
         self.zoom = None;
+        self.showing_trades = false;
+        self.trade_row = None;
     }
 
     pub fn clear_monte_carlo(&mut self) {
@@ -292,6 +298,11 @@ pub enum PanelMessage {
     Revert,
     /// Pick a line on a fan, or none.
     SelectLine(Option<usize>),
+    /// Back to Monte Carlo's notable runs, keeping the line picked.
+    ShowRuns,
+    /// Move the chart to where this trade really happened: its row, and its place among the
+    /// backtest's trades.
+    ShowTrade(usize, usize),
     /// Show this much of a fan, from 0 to 1, or all of it.
     ZoomFan(Option<(f32, f32)>),
     /// Show the stock settings, or fold them away.
@@ -338,6 +349,17 @@ pub enum Field {
 }
 
 impl Field {
+    /// Whether it's one of `test`'s own settings, which that test applies when it's run.
+    #[must_use]
+    pub const fn belongs_to(self, test: TestKind) -> bool {
+        match test {
+            TestKind::Backtest => false,
+            TestKind::MonteCarlo => matches!(self, Self::Runs | Self::Ruin),
+            TestKind::RandomBlocks => matches!(self, Self::Blocks),
+            TestKind::Optimize => self.belongs_to_tests(),
+        }
+    }
+
     /// Whether it's one of the tests' own settings, which don't change the backtest itself.
     #[must_use]
     pub const fn belongs_to_tests(self) -> bool {

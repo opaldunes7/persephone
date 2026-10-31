@@ -981,7 +981,7 @@ impl Persephone {
                     if let Some(panel) = self.panel.as_mut().filter(|p| p.tile == id) {
                         panel.tests.clear_monte_carlo();
                         self.refresh_variables(id);
-                        return self.draw_monte_carlo();
+                        return Task::batch([self.draw_monte_carlo(), self.auto_run_blocks()]);
                     }
                 }
             }
@@ -2481,7 +2481,11 @@ impl Persephone {
         self.panel = Some(backtest::Panel::new(id, self.window.height, &settings));
         self.relayout(true);
         self.refresh_variables(id);
-        Task::batch([self.load_history(id), self.draw_monte_carlo()])
+        Task::batch([
+            self.load_history(id),
+            self.draw_monte_carlo(),
+            self.auto_run_blocks(),
+        ])
     }
 
     /// Forgets what the panel's tests found about tile `id`, as its backtest is changing.
@@ -2630,10 +2634,12 @@ impl Persephone {
         let (Some(panel), Some(tile)) = (self.panel.as_mut(), self.tiles.get_mut(&id)) else {
             return false;
         };
+        // Only this test's: something half typed for another mustn't stop it.
+        let test = tile.backtest.test;
         let typed: Vec<_> = panel
             .inputs
             .iter()
-            .filter(|(field, _)| field.belongs_to_tests())
+            .filter(|(field, _)| field.belongs_to(test))
             .cloned()
             .collect();
         for (field, text) in typed {
@@ -2856,6 +2862,35 @@ impl Persephone {
             Message::BlocksProgress,
             Message::BlocksDone,
         )
+    }
+
+    /// Runs Random blocks by itself, as Monte Carlo does, if the panel shows it with nothing to
+    /// show yet: it's quick, and Cancel stops it. Not for a strategy in a process of its own,
+    /// which takes one block at a time, nor once it's been cancelled or refused.
+    fn auto_run_blocks(&mut self) -> Task<Message> {
+        let Some(panel) = self.panel.as_ref() else {
+            return Task::none();
+        };
+        let id = panel.tile;
+        let idle = matches!(panel.tests.blocks, backtest::BlockRun::Idle);
+        let Some(tile) = self.tiles.get(&id) else {
+            return Task::none();
+        };
+        let Some(strategy) = &tile.strategy else {
+            return Task::none();
+        };
+        let slow = self
+            .strategy_plugin(&strategy.spec)
+            .is_some_and(|p| p.address().is_some());
+        if !idle
+            || slow
+            || tile.backtest.test != backtest::TestKind::RandomBlocks
+            || !matches!(strategy.run, Run::Done(_))
+            || self.test_problem(id).is_some()
+        {
+            return Task::none();
+        }
+        self.run_blocks()
     }
 
     fn run_optimize(&mut self) -> Task<Message> {
@@ -3100,8 +3135,33 @@ impl Persephone {
             return Task::none();
         };
         match message {
+            P::ShowRuns => {
+                panel.tests.showing_trades = false;
+                panel.tests.trade_row = None;
+                return Task::none();
+            }
+            P::ShowTrade(row, trade) => {
+                panel.tests.trade_row = Some(row);
+                let Some(tile) = self.tiles.get_mut(&id) else {
+                    return Task::none();
+                };
+                let exit = match tile.strategy.as_ref().map(|s| &s.run) {
+                    Some(Run::Done(report)) => backtest::robustness::round_trips(report)
+                        .get(trade)
+                        .map(|trade| trade.exit_bar),
+                    _ => None,
+                };
+                if let (Some(exit), Some(chart)) = (exit, tile.chart.as_mut()) {
+                    // A little past its end, so what came next shows too.
+                    let last = chart.data().candles.len().saturating_sub(1);
+                    chart.show_bar((exit + backtest::REPLAY_LEAD_BARS).min(last));
+                }
+                return Task::none();
+            }
             P::SelectLine(line) => {
                 panel.tests.line = line;
+                panel.tests.showing_trades = line.is_some();
+                panel.tests.trade_row = None;
                 // A block happened at a real time, so the chart can go there.
                 if let (backtest::BlockRun::Done(summary), Some(line)) = (&panel.tests.blocks, line)
                     && self.tiles.get(&id).map(|t| t.backtest.test)
@@ -3161,7 +3221,7 @@ impl Persephone {
                 self.sync_playhead();
                 self.refresh_variables(id);
                 self.save();
-                return self.draw_monte_carlo();
+                return Task::batch([self.draw_monte_carlo(), self.auto_run_blocks()]);
             }
             P::BlockLength(length) => {
                 if let Some(tile) = self.tiles.get_mut(&id) {
@@ -3170,7 +3230,7 @@ impl Persephone {
                 panel.tests.blocks = backtest::BlockRun::Idle;
                 panel.tests.optimize = backtest::OptimizeRun::Idle;
                 self.save();
-                return Task::none();
+                return self.auto_run_blocks();
             }
             P::RunBlocks => {
                 if !self.apply_typed(id) {
@@ -3391,7 +3451,7 @@ impl Persephone {
                                 panel.tests.blocks = backtest::BlockRun::Idle;
                                 panel.tests.optimize = backtest::OptimizeRun::Idle;
                                 self.save();
-                                return Task::none();
+                                return self.auto_run_blocks();
                             }
                             _ => {}
                         }

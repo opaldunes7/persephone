@@ -300,7 +300,17 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                     })
                     .width(Fill)
                     .height(Fill),
-                    monte_carlo_list(result, panel.tests.line, panel.tests.zoom.is_some()),
+                    match panel.tests.line.filter(|_| panel.tests.showing_trades) {
+                        Some(line) => run_trades(
+                            result,
+                            line,
+                            &round_trips(report),
+                            report.starting_balance,
+                            panel.tests.trade_row,
+                        ),
+                        None =>
+                            monte_carlo_list(result, panel.tests.line, panel.tests.zoom.is_some(),),
+                    },
                 ]
                 .into()
             }
@@ -455,10 +465,14 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                 BlockRun::Idle => {
                     // Otherwise the settings say why it can't.
                     if info.problem.is_none() {
-                        note = Some(muted(format!(
-                            "Press Run to backtest {} random stretches of the span.",
-                            info.settings.blocks
-                        )));
+                        note = Some(muted(if matches!(info.status, Status::Done(_)) {
+                            format!(
+                                "Press Run to backtest {} random stretches of the span.",
+                                info.settings.blocks
+                            )
+                        } else {
+                            "Waiting for the backtest…".to_owned()
+                        }));
                     }
                     Space::new().width(Fill).height(Fill).into()
                 }
@@ -476,6 +490,21 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
             Space::new().width(Fill).height(Fill).into()
         }
     };
+    // A run's table of trades leaves little room, and its heading has the run's figures.
+    let table = test == TestKind::MonteCarlo
+        && matches!(info.status, Status::Done(_))
+        && panel.tests.showing_trades
+        && matches!(panel.tests.monte_carlo, Some(Ok(_)));
+    let heading = if table {
+        note = None;
+        row![
+            text(info.title.clone())
+                .size(theme::LEGEND_SIZE)
+                .color(theme::TEXT_BRIGHT)
+        ]
+    } else {
+        heading
+    };
     let mut legend = column![heading].spacing(5).padding(Padding {
         top: 8.0,
         right: 0.0,
@@ -488,7 +517,7 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
     if let Some(note) = note {
         legend = legend.push(note);
     }
-    if let Some(fills) = info.fills {
+    if let Some(fills) = info.fills.filter(|_| !table) {
         legend = legend.push(muted(fills));
     }
     let pane = stack![pane, legend].width(Fill).height(Fill);
@@ -909,7 +938,10 @@ fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMessage> {
         _ => None,
     };
     // A value typed but not applied might fix it: Run applies it, and says if it's no good.
-    let typed = panel.inputs.iter().any(|(f, _)| f.belongs_to_tests());
+    let typed = panel
+        .inputs
+        .iter()
+        .any(|(f, _)| f.belongs_to(settings.test));
     let can_run = info.problem.is_none() || typed;
     let run_or = |what: &str| {
         problem
@@ -1614,7 +1646,7 @@ fn line_row<'a>(
         )
         .padding([2, 6])
         .width(Fill)
-        .on_press(PanelMessage::SelectLine((!selected).then_some(line)))
+        .on_press(PanelMessage::SelectLine(Some(line)))
         .style(move |_, status| result_style(selected, status)),
         what,
         None,
@@ -1700,6 +1732,184 @@ fn monte_carlo_list<'a>(
     fan_list(verdict, rows.into(), zoomed)
 }
 
+/// A Monte Carlo line's trades in the order it drew them, each a click from where it really
+/// happened on the chart, with the way back to the notable runs.
+fn run_trades<'a>(
+    result: &MonteCarlo,
+    line: usize,
+    trades: &[RoundTrip],
+    capital: f64,
+    shown: Option<usize>,
+) -> Element<'a, PanelMessage> {
+    let cell = |content: String, color: Color, width: f32| {
+        text(content)
+            .size(HINT)
+            .font(iced::Font::MONOSPACE)
+            .color(color)
+            .width(width)
+    };
+    let muted = |content: &str, width: f32| cell(content.to_owned(), theme::TEXT_MUTED, width);
+    let backtest = line == result.paths.len();
+    let name = if backtest {
+        "The backtest".to_owned()
+    } else if line == result.best {
+        "Best run".to_owned()
+    } else if line == result.worst {
+        "Worst run".to_owned()
+    } else if line == result.middle {
+        "Middle run".to_owned()
+    } else {
+        "This run".to_owned()
+    };
+    let stats = if backtest {
+        result.actual_stats
+    } else {
+        result.stats.get(line).copied().unwrap_or_default()
+    };
+    let color = if stats.return_ >= 0.0 {
+        theme::UP
+    } else {
+        theme::DOWN
+    };
+    let header = row![
+        tip(
+            button(text("‹ All runs").size(HINT).center())
+                .padding([2, 7])
+                .on_press(PanelMessage::ShowRuns)
+                .style(|_, status| chip(false, status)),
+            "Back to Best, Middle and Worst. This line stays picked.",
+            None,
+        ),
+        text(name).size(SMALL).color(theme::TEXT_BRIGHT),
+        text(format!("{:+.2}%", stats.return_ * 100.0))
+            .size(HINT)
+            .font(iced::Font::MONOSPACE)
+            .color(color),
+        text(format!("fell {:.2}%", stats.drawdown * 100.0))
+            .size(HINT)
+            .font(iced::Font::MONOSPACE)
+            .color(theme::TEXT),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let explain = if backtest {
+        "Every trade once, in the order it really came."
+    } else {
+        "Drawn at random from the backtest's, so a trade can repeat or be left out."
+    };
+    let titles = row![
+        muted("#", COLUMN_DRAW),
+        muted("Opened", COLUMN_OPENED),
+        muted("Side", COLUMN_SIDE),
+        muted("Entry", COLUMN_PRICE),
+        muted("Exit", COLUMN_PRICE),
+        muted("Held", COLUMN_HELD),
+        muted("Profit", COLUMN_PROFIT),
+        muted("Equity", COLUMN_EQUITY),
+    ]
+    .spacing(4)
+    .padding([0, 6]);
+    let draws = result.draws(line).unwrap_or_default();
+    let mut rows = column![].spacing(1);
+    let mut equity = capital;
+    for (place, &index) in draws.iter().enumerate() {
+        let Some(trade) = trades.get(index) else {
+            continue;
+        };
+        equity += trade.profit;
+        // A run can draw thousands of trades; the figures above still count them all.
+        if place >= MAX_TRADE_ROWS {
+            continue;
+        }
+        let profit_color = if trade.profit >= 0.0 {
+            theme::UP
+        } else {
+            theme::DOWN
+        };
+        let opened = DateTime::from_nanos(trade.entry_ts);
+        let (exit, held) = if trade.open {
+            ("open".to_owned(), "–".to_owned())
+        } else {
+            (
+                price_text(trade.exit_price),
+                held_for(trade.exit_ts.saturating_sub(trade.entry_ts)),
+            )
+        };
+        let selected = shown == Some(place);
+        let line = button(
+            row![
+                cell((place + 1).to_string(), theme::TEXT_MUTED, COLUMN_DRAW),
+                cell(
+                    format!("{:02}/{:02} {}", opened.month, opened.day, opened.time()),
+                    theme::TEXT,
+                    COLUMN_OPENED,
+                ),
+                cell(
+                    if trade.long { "Long" } else { "Short" }.to_owned(),
+                    if trade.long { theme::UP } else { theme::DOWN },
+                    COLUMN_SIDE,
+                ),
+                cell(price_text(trade.entry_price), theme::TEXT, COLUMN_PRICE),
+                cell(exit, theme::TEXT, COLUMN_PRICE),
+                cell(held, theme::TEXT, COLUMN_HELD),
+                cell(money(trade.profit), profit_color, COLUMN_PROFIT),
+                cell(format!("{equity:.0}"), theme::TEXT, COLUMN_EQUITY),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        )
+        .padding([2, 6])
+        .width(Fill)
+        .on_press(PanelMessage::ShowTrade(place, index))
+        .style(move |_, status| result_style(selected, status));
+        rows = rows.push(tip_at(
+            line,
+            format!(
+                "{} of the capital. Size {:.4}, fees {:.2}. Click to see where it really happened on the chart.",
+                format_args!("{:+.2}%", trade.profit / capital * 100.0),
+                trade.qty,
+                trade.fees,
+            ),
+            None,
+            tooltip::Position::Left,
+        ));
+    }
+    let mut list = column![
+        header,
+        text(explain).size(HINT).color(theme::TEXT_MUTED),
+        titles,
+        scrollable(rows)
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::hidden()
+            ))
+            .height(Fill),
+    ]
+    .spacing(4)
+    .padding(Padding {
+        top: 8.0,
+        right: 8.0,
+        bottom: 6.0,
+        left: 8.0,
+    })
+    .width(RUN_TRADES_WIDTH)
+    .height(Fill);
+    if draws.len() > MAX_TRADE_ROWS {
+        list = list.push(
+            text(format!(
+                "Showing the first {MAX_TRADE_ROWS} of {} trades.",
+                draws.len()
+            ))
+            .size(HINT)
+            .color(theme::TEXT_MUTED),
+        );
+    }
+    let divider = container(Space::new())
+        .width(1)
+        .height(Fill)
+        .style(|_| container::background(theme::AXIS_LINE));
+    row![divider, list].into()
+}
+
 /// Every block, best first.
 fn blocks_list<'a>(
     summary: &BlockSummary,
@@ -1762,6 +1972,11 @@ const LEDGER_WIDTH: f32 = 500.0;
 const CALENDAR_LABEL: f32 = 34.0;
 const CALENDAR_TOTAL: f32 = 66.0;
 const CALENDAR_ROW: f32 = 28.0;
+/// The widest a Monte Carlo line's table of trades gets, and how many rows it shows.
+const RUN_TRADES_WIDTH: f32 = 524.0;
+const MAX_TRADE_ROWS: usize = 1_000;
+const COLUMN_DRAW: f32 = 26.0;
+const COLUMN_EQUITY: f32 = 52.0;
 const COLUMN_OPENED: f32 = 86.0;
 const COLUMN_SIDE: f32 = 38.0;
 const COLUMN_PRICE: f32 = 70.0;

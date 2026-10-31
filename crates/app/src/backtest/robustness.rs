@@ -181,8 +181,35 @@ pub struct MonteCarlo {
     /// The trades as they really came, and how that went.
     pub actual: Vec<f64>,
     pub actual_stats: LineStats,
+    /// Which run each line is, and the seed, to work out again what a line drew.
+    kept_runs: Vec<usize>,
+    seed: u64,
     /// Trades between a line's points.
     pub stride: usize,
+}
+
+impl MonteCarlo {
+    /// Which of the backtest's trades a line drew, in order, by their place among them. The line
+    /// after the last is the backtest itself, with each trade once as it came. Drawing with
+    /// replacement, a run can have the same trade twice and leave others out.
+    #[must_use]
+    pub fn draws(&self, line: usize) -> Option<Vec<usize>> {
+        if line == self.paths.len() {
+            return Some((0..self.trades).collect());
+        }
+        let mut rng = run_rng(self.seed, *self.kept_runs.get(line)?);
+        Some(
+            (0..self.trades)
+                .map(|_| rng.random_range(0..self.trades))
+                .collect(),
+        )
+    }
+}
+
+/// The random numbers of one run: its own, so what it drew can be worked out again later without
+/// keeping every run's draws. `Run again`'s next seed shares none with this one's.
+fn run_rng(seed: u64, run: usize) -> StdRng {
+    StdRng::seed_from_u64((seed << 32) ^ run as u64)
 }
 
 /// How one line on a fan went.
@@ -226,13 +253,13 @@ pub fn monte_carlo(
             trades.len()
         ));
     }
-    let mut rng = StdRng::seed_from_u64(seed);
     let stride = stride_for(trades.len() + 1);
     let mut returns = Vec::with_capacity(runs as usize);
     let mut drawdowns = Vec::with_capacity(runs as usize);
     let mut paths: Vec<Vec<f64>> = Vec::new();
     let mut ruined = 0_u32;
-    for _ in 0..runs {
+    for run in 0..runs as usize {
+        let mut rng = run_rng(seed, run);
         let mut path = vec![capital];
         let (mut equity, mut peak, mut fall) = (capital, capital, 0.0_f64);
         for i in 1..=trades.len() {
@@ -287,6 +314,7 @@ pub fn monte_carlo(
     let place = |run: usize| kept.iter().position(|&k| k == run).unwrap_or(0);
     let (best, worst, middle) = (place(extremes[0]), place(extremes[1]), place(extremes[2]));
     let stats = kept.iter().map(|&run| in_order[run]).collect();
+    let kept_runs = kept.clone();
     let paths = kept
         .iter()
         .map(|&run| std::mem::take(&mut paths[run]))
@@ -320,6 +348,8 @@ pub fn monte_carlo(
         middle,
         actual,
         actual_stats,
+        kept_runs,
+        seed,
         stride,
     })
 }
@@ -870,6 +900,28 @@ mod tests {
         assert!(result.stats[result.best].return_ >= result.high);
         assert!(result.stats[result.worst].return_ <= result.low);
         assert!((result.stats[result.middle].return_ - result.median).abs() < 0.01);
+    }
+
+    #[test]
+    fn what_a_line_drew_can_be_worked_out_again_and_adds_up_to_it() {
+        let trades: Vec<f64> = (0..40).map(|i| f64::from(i - 15) * 3.0).collect();
+        let result = monte_carlo(&trades, 1_000.0, 5_000, 0.5, 7).unwrap();
+        // Swapped-in extremes included, and whichever seed.
+        for line in [0, result.best, result.worst, result.middle] {
+            let draws = result.draws(line).unwrap();
+            assert_eq!(draws.len(), trades.len());
+            let made: f64 = draws.iter().map(|&i| trades[i]).sum();
+            assert!((made / 1_000.0 - result.stats[line].return_).abs() < 1e-9);
+        }
+        // The line after the last is the trades as they came, each once.
+        let real = result.draws(result.paths.len()).unwrap();
+        assert_eq!(real, (0..trades.len()).collect::<Vec<_>>());
+        assert_eq!(result.draws(result.paths.len() + 1), None);
+        // It really does draw with replacement.
+        let mut drawn = result.draws(result.best).unwrap();
+        drawn.sort_unstable();
+        drawn.dedup();
+        assert!(drawn.len() < trades.len());
     }
 
     #[test]
