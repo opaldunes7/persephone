@@ -22,7 +22,7 @@ use iced::{
     },
 };
 
-use persephone_core::Side;
+use persephone_core::{Side, UnixNanos};
 
 use crate::{
     ChartData, ChartMessage, ChartState, PRICE_AXIS_WIDTH, Panes, TIME_AXIS_HEIGHT,
@@ -292,6 +292,12 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
                         .find(|row| row.contains(start));
                     let header = header_part(self.chart, plot.width, start);
                     let drawing = drawing_at(self.chart, &panes.price, start);
+                    if let Some(id) = event_at(self.chart, &panes.price, start) {
+                        return Some(
+                            canvas::Action::publish(ChartMessage::EventClicked { id })
+                                .and_capture(),
+                        );
+                    }
                     let message = match (header, study, drawing) {
                         (Some(HeaderPart::Tag(tag)), _, _) => ChartMessage::TagClicked { tag },
                         (Some(HeaderPart::Symbol), _, _) => {
@@ -507,6 +513,7 @@ impl canvas::Program<ChartMessage> for Overlay<'_> {
         draw_forming(&mut frame, self.chart, &panes.price);
         draw_last_price_line(&mut frame, self.chart, &panes.price, plot);
         draw_trade_markers(&mut frame, self.chart, &panes.price);
+        draw_event_marks(&mut frame, self.chart, &panes.price, hovered);
         draw_drawings(&mut frame, self.chart, &panes.price, plot, hovered);
         if let Some(c) = hovered {
             draw_crosshair(&mut frame, &panes, plot, c, hovered_bar);
@@ -825,6 +832,88 @@ fn draw_forming(frame: &mut Frame, chart: &ChartState, price: &Projection) {
 
 /// An arrow under the bar for each buy and over it for each sell, labelled with the position
 /// it leaves when bars are wide enough for text.
+/// How far from a headline's mark the mouse may be to hover or click it, in pixels.
+const EVENT_REACH: f32 = 7.0;
+/// Amber, for a headline that names this market.
+const EVENT_MARKET: Color = Color::from_rgb8(0xff, 0xa7, 0x26);
+
+/// Where a headline's mark sits: on its bar, at the bottom of the price pane. `None` if its bar
+/// isn't shown, as it's past the playhead or off the chart.
+fn event_point(chart: &ChartState, price: &Projection, ts: UnixNanos) -> Option<Point> {
+    let bar = chart.bar_of_time(ts)?;
+    (bar < chart.shown_len() && price.visible.contains(&bar))
+        .then(|| Point::new(price.x(bar as f64), price.offset + price.height - 7.0))
+}
+
+/// The headline whose mark is under `at`, if any.
+fn event_at(chart: &ChartState, price: &Projection, at: Point) -> Option<String> {
+    chart.events().iter().rev().find_map(|event| {
+        let point = event_point(chart, price, event.ts)?;
+        ((point.x - at.x).abs() <= EVENT_REACH && (point.y - at.y).abs() <= EVENT_REACH)
+            .then(|| event.id.clone())
+    })
+}
+
+/// A small diamond for each headline, along the bottom of the price pane, and the hovered one's
+/// title beside it.
+fn draw_event_marks(
+    frame: &mut Frame,
+    chart: &ChartState,
+    price: &Projection,
+    hovered: Option<Point>,
+) {
+    let mut hovered_title = None;
+    for event in chart.events() {
+        let Some(point) = event_point(chart, price, event.ts) else {
+            continue;
+        };
+        let color = if event.high {
+            theme::DOWN
+        } else {
+            EVENT_MARKET
+        };
+        let diamond = Path::new(|b| {
+            b.move_to(Point::new(point.x, point.y - 4.5));
+            b.line_to(Point::new(point.x + 4.5, point.y));
+            b.line_to(Point::new(point.x, point.y + 4.5));
+            b.line_to(Point::new(point.x - 4.5, point.y));
+            b.close();
+        });
+        frame.fill(&diamond, color);
+        if hovered.is_some_and(|at| {
+            (at.x - point.x).abs() <= EVENT_REACH && (at.y - point.y).abs() <= EVENT_REACH
+        }) {
+            hovered_title = Some((point, event.title.as_str()));
+        }
+    }
+    if let Some((point, title)) = hovered_title {
+        // Kept to a line; the sidebar has it whole.
+        let shown: String = if title.chars().count() > 80 {
+            title.chars().take(79).chain(std::iter::once('…')).collect()
+        } else {
+            title.to_owned()
+        };
+        let width = shown.chars().count() as f32 * 6.2 + 12.0;
+        let x = (point.x - width / 2.0).clamp(0.0, (price.width - width).max(0.0));
+        let y = point.y - 26.0;
+        frame.fill_rectangle(Point::new(x, y), Size::new(width, 18.0), theme::BACKGROUND);
+        frame.stroke(
+            &Path::rectangle(Point::new(x, y), Size::new(width, 18.0)),
+            Stroke::default()
+                .with_color(theme::AXIS_LINE)
+                .with_width(1.0),
+        );
+        frame.fill_text(Text {
+            content: shown,
+            position: Point::new(x + 6.0, y + 9.0),
+            color: theme::TEXT_BRIGHT,
+            size: Pixels(11.0),
+            align_y: alignment::Vertical::Center,
+            ..Text::default()
+        });
+    }
+}
+
 fn draw_trade_markers(frame: &mut Frame, chart: &ChartState, price: &Projection) {
     let Some(trades) = &chart.trades else { return };
     let first = trades
@@ -1174,4 +1263,71 @@ fn label_with(
         align_y: alignment::Vertical::Center,
         ..Text::default()
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use iced::Size;
+    use persephone_core::{Candle, Timeframe};
+
+    use super::*;
+    use crate::{EventMark, Playhead};
+
+    #[test]
+    fn a_headline_is_marked_on_its_bar_and_never_past_the_playhead() {
+        let hour = Timeframe::H1.nanos();
+        let candles: Vec<Candle> = (0..100u64)
+            .map(|i| Candle {
+                ts: i * hour,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.0,
+                volume: 1.0,
+            })
+            .collect();
+        let mut chart = ChartState::new(ChartData::new("X", "Y", Timeframe::H1, 2, candles));
+        let mark = |ts, id: &str| EventMark {
+            ts,
+            high: true,
+            title: "Fed holds".into(),
+            id: id.into(),
+        };
+        chart.set_events(vec![
+            mark(95 * hour + hour / 2, "late"),
+            mark(90 * hour, "early"),
+        ]);
+        assert_eq!(chart.events()[0].id, "early", "kept in time");
+        let panes = chart.panes(Size::new(800.0, 400.0));
+        let price = &panes.price;
+        let at = event_point(&chart, price, 95 * hour + hour / 2).expect("drawn");
+        assert!((at.x - price.x(95.0)).abs() < 0.01, "on bar 95");
+        assert_eq!(event_at(&chart, price, at).as_deref(), Some("late"));
+        // A playhead before it: not there, nor clickable.
+        chart.set_playhead(Some(Playhead {
+            bars: 93,
+            forming: None,
+        }));
+        let panes = chart.panes(Size::new(800.0, 400.0));
+        assert!(event_point(&chart, &panes.price, 95 * hour + hour / 2).is_none());
+        assert!(event_point(&chart, &panes.price, 90 * hour).is_some());
+        // Before the first bar, it isn't on the chart at all.
+        assert_eq!(chart.bar_of_time(0), Some(0));
+        let mut later = ChartState::new(ChartData::new(
+            "X",
+            "Y",
+            Timeframe::H1,
+            2,
+            vec![Candle {
+                ts: 10 * hour,
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: 1.0,
+            }],
+        ));
+        assert_eq!(later.bar_of_time(hour), None);
+        later.set_events(Vec::new());
+    }
 }

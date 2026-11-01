@@ -13,6 +13,12 @@ use persephone_data::news::{Headline, Importance};
 use super::{Filter, News, NewsMessage};
 use crate::Message;
 
+/// The list's id, for scrolling it to a headline.
+#[must_use]
+pub fn list_id() -> iced::widget::Id {
+    iced::widget::Id::new("news-list")
+}
+
 /// The most headlines listed at once.
 const MOST_ROWS: usize = 300;
 const SMALL: f32 = 12.0;
@@ -169,14 +175,13 @@ pub fn sidebar<'a>(
                 .width(Fill),
         ]
         .spacing(1);
+        // A row's height follows its title, so the bar's is set: two lines, the most titles take.
         let row = row![
-            container(Space::new().width(3).height(Fill))
-                .style(move |_| container::background(mark))
-                .height(iced::Length::Shrink),
+            container(Space::new().width(3).height(32)).style(move |_| container::background(mark)),
             body
         ]
         .spacing(6)
-        .height(iced::Length::Shrink);
+        .align_y(Alignment::Start);
         list = list.push(
             button(row)
                 .padding([4, 6])
@@ -244,7 +249,7 @@ pub fn sidebar<'a>(
         text(status).size(HINT).color(theme::TEXT_MUTED),
         filters,
         notes,
-        scrollable(list).height(Fill),
+        scrollable(list).id(list_id()).height(Fill),
         footer,
     ]
     .spacing(6)

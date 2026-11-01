@@ -240,3 +240,36 @@ fn an_empty_history_says_why() {
     ));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn charts_mark_the_headlines_that_matter_and_a_click_on_one_lights_it() {
+    let mut app = app();
+    let root = dir("marks");
+    with_headlines(&mut app, root.clone());
+    let marks = |app: &Persephone| app.tile_chart(0).unwrap().events().len();
+    assert_eq!(marks(&app), 0, "none while the sidebar's closed");
+    news(&mut app, NewsMessage::Toggle);
+    // Every Fed headline is High, and every Bitcoin one names this market.
+    assert_eq!(marks(&app), 13);
+    let chart = app.tile_chart(0).unwrap();
+    let first = &chart.events()[0];
+    assert!(first.high && first.title.starts_with("Fed"));
+    assert_eq!(
+        chart.bar_of_time(first.ts),
+        Some(100),
+        "on the bar it came out in"
+    );
+    news(&mut app, NewsMessage::Filter(Filter::Market));
+    assert_eq!(marks(&app), 6);
+    assert!(app.tile_chart(0).unwrap().events().iter().all(|e| !e.high));
+
+    let _ = app.update(Message::Chart(
+        0,
+        ChartMessage::EventClicked { id: "h400".into() },
+    ));
+    assert_eq!(app.news().lit.as_deref(), Some("h400"));
+
+    news(&mut app, NewsMessage::Toggle);
+    assert_eq!(marks(&app), 0, "and gone when it closes");
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -109,8 +109,23 @@ pub struct Playhead {
     pub forming: Option<Candle>,
 }
 
+/// A headline marked on the chart, at the time it came out.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EventMark {
+    pub ts: UnixNanos,
+    /// Market-moving, drawn red; otherwise it names this market, drawn amber.
+    pub high: bool,
+    pub title: String,
+    /// Its headline's id, sent back when it's clicked.
+    pub id: String,
+}
+
 #[derive(Clone, Debug)]
 pub enum ChartMessage {
+    /// A headline's mark was clicked.
+    EventClicked {
+        id: String,
+    },
     /// Drag by `dx` pixels; positive moves the bars right (into the past).
     Pan {
         dx: f32,
@@ -185,6 +200,8 @@ pub struct ChartState {
     studies_generation: u64,
     /// A backtest's fills and holding periods, if one ran.
     trades: Option<Trades>,
+    /// Headlines marked along the bottom of the price pane, by time.
+    events: Vec<EventMark>,
     viewport: Viewport,
     grid_cache: canvas::Cache,
     /// A time hovered on another chart, shown as a crosshair line here.
@@ -243,6 +260,7 @@ impl ChartState {
             studies: Arc::new(Vec::new()),
             studies_generation: next_id(),
             trades: None,
+            events: Vec::new(),
             grid_cache: canvas::Cache::new(),
             linked: None,
             drawings: Arc::new(Vec::new()),
@@ -438,6 +456,28 @@ impl ChartState {
         self.trades.as_ref()
     }
 
+    /// Marks these headlines along the bottom of the price pane; none clears them.
+    pub fn set_events(&mut self, mut events: Vec<EventMark>) {
+        events.sort_by_key(|event| event.ts);
+        if events != self.events {
+            self.events = events;
+            self.grid_cache.clear();
+        }
+    }
+
+    #[must_use]
+    pub fn events(&self) -> &[EventMark] {
+        &self.events
+    }
+
+    /// The bar `ts` falls in, counting from the first, if it's within the bars.
+    #[must_use]
+    pub fn bar_of_time(&self, ts: UnixNanos) -> Option<usize> {
+        let candles = &self.data.candles;
+        let first = candles.first()?;
+        (ts >= first.ts).then(|| candles.partition_point(|c| c.ts <= ts) - 1)
+    }
+
     /// Shows (or with `None`, clears) a backtest's trade markers and position shading.
     pub fn set_trades(&mut self, trades: Option<Trades>) {
         self.trades = trades;
@@ -516,6 +556,7 @@ impl ChartState {
             | ChartMessage::StudyClicked { .. }
             | ChartMessage::Hovered { .. }
             | ChartMessage::Placed(_)
+            | ChartMessage::EventClicked { .. }
             | ChartMessage::DrawingClicked { .. } => return,
         }
         self.grid_cache.clear();

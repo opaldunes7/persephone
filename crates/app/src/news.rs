@@ -69,6 +69,8 @@ pub enum NewsMessage {
     Width(f32),
     /// Go to this headline's time on the chart, by its id.
     Pick(String),
+    /// Light this headline in the list and scroll to it, as its mark on a chart was clicked.
+    Show(String),
     /// Open this link in the browser.
     Open(String),
 }
@@ -218,6 +220,7 @@ impl crate::Persephone {
                 self.news.saved.open = !self.news.saved.open;
                 self.relayout(true);
                 self.save();
+                self.sync_news_marks();
                 // Opened for the first time this session: read the feeds now, not in 5 minutes.
                 if self.news.saved.open
                     && self.news.fetched_at.is_none()
@@ -229,6 +232,7 @@ impl crate::Persephone {
             NewsMessage::Filter(filter) => {
                 self.news.saved.filter = filter;
                 self.save();
+                self.sync_news_marks();
             }
             NewsMessage::Collecting(on) => {
                 self.news.saved.collecting = on;
@@ -241,6 +245,25 @@ impl crate::Persephone {
             }
             NewsMessage::Fetched(found, failures) => {
                 self.news.fetched(&found, failures, now());
+                self.sync_news_marks();
+            }
+            NewsMessage::Show(id) => {
+                let (words, _) = self.market_words();
+                let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                let listed = view::shown(&self.news, self.news_replay_time(), &words);
+                let place = listed.iter().position(|headline| headline.id == id);
+                let count = listed.len();
+                self.news.lit = Some(id);
+                if let Some(place) = place {
+                    let share = place as f32 / count.saturating_sub(1).max(1) as f32;
+                    return iced::widget::operation::snap_to(
+                        view::list_id(),
+                        iced::widget::operation::RelativeOffset {
+                            x: None,
+                            y: Some(share),
+                        },
+                    );
+                }
             }
             NewsMessage::Width(x) => {
                 self.news.saved.width = (self.window.width - x).clamp(MIN_WIDTH, MAX_WIDTH);
@@ -278,6 +301,54 @@ impl crate::Persephone {
             }
         }
         iced::Task::none()
+    }
+
+    /// The marks a chart of `symbol` shows: none while the sidebar's closed, else the headlines
+    /// that matter to it, by the sidebar's filter.
+    fn news_marks_for(&self, symbol: &str) -> Vec<persephone_chart::EventMark> {
+        if !self.news.saved.open {
+            return Vec::new();
+        }
+        let words = persephone_data::news::market_words(symbol);
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        self.news
+            .store
+            .all()
+            .iter()
+            .filter(|headline| {
+                let high = headline.importance(&words) == persephone_data::news::Importance::High;
+                match self.news.saved.filter {
+                    Filter::All => high || headline.names_market(&words),
+                    Filter::Market => headline.names_market(&words),
+                    Filter::Macro => headline.is_macro(),
+                }
+            })
+            .map(|headline| persephone_chart::EventMark {
+                ts: headline.published,
+                high: headline.importance(&words) == persephone_data::news::Importance::High,
+                title: headline.title.clone(),
+                id: headline.id.clone(),
+            })
+            .collect()
+    }
+
+    /// Puts each chart's headline marks on it, as the sidebar and its filter have them.
+    pub(crate) fn sync_news_marks(&mut self) {
+        let ids: Vec<crate::TileId> = self.tiles.keys().copied().collect();
+        for id in ids {
+            self.sync_news_marks_on(id);
+        }
+    }
+
+    /// Puts tile `id`'s headline marks on its chart.
+    pub(crate) fn sync_news_marks_on(&mut self, id: crate::TileId) {
+        let Some(symbol) = self.tiles.get(&id).map(|tile| tile.market.symbol.clone()) else {
+            return;
+        };
+        let marks = self.news_marks_for(&symbol);
+        if let Some(chart) = self.tiles.get_mut(&id).and_then(|tile| tile.chart.as_mut()) {
+            chart.set_events(marks);
+        }
     }
 
     /// The news sidebar's state. For tests.

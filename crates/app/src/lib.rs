@@ -1214,6 +1214,9 @@ impl Persephone {
                     }),
                 };
             }
+            Message::Chart(_, ChartMessage::EventClicked { id }) => {
+                return self.on_news(news::NewsMessage::Show(id));
+            }
             Message::Chart(id, message) => {
                 if let Some(chart) = self.tiles.get_mut(&id).and_then(|t| t.chart.as_mut()) {
                     chart.update(message);
@@ -5437,7 +5440,13 @@ impl Persephone {
     /// Rebuilds what tile `id`'s chart draws: its indicators, plus its strategy's equity pane
     /// and trades once a backtest has finished, then a live session's trades from where it
     /// started.
+    /// Rebuilds tile `id`'s indicators, trades and headline marks on its chart.
     fn restudy(&mut self, id: TileId) {
+        self.restudy_chart(id);
+        self.sync_news_marks_on(id);
+    }
+
+    fn restudy_chart(&mut self, id: TileId) {
         let Some(tile) = self.tiles.get_mut(&id) else {
             return;
         };
