@@ -51,7 +51,7 @@ const LISTED_RUNS: usize = 20;
 const LISTED_VALUES: usize = 50;
 /// The most backtests `run_backtests` takes in one call.
 const MAX_BACKTESTS: usize = 5_000;
-const BATCH_COLUMNS: [&str; 27] = [
+const BATCH_COLUMNS: [&str; 29] = [
     "index",
     "run_id",
     "label",
@@ -77,6 +77,8 @@ const BATCH_COLUMNS: [&str; 27] = [
     "limit_orders",
     "limits_filled",
     "fill_rate",
+    "orders_worked",
+    "unfilled_at_end",
     "warnings",
     "error",
 ];
@@ -156,7 +158,7 @@ pub(crate) fn read_settings(value: &Value) -> Result<Settings, String> {
     serde_json::from_value(value.clone()).map_err(|e| format!("`settings`: {e}"))
 }
 
-fn settings_of(args: &Value) -> Result<Settings, String> {
+pub(crate) fn settings_of(args: &Value) -> Result<Settings, String> {
     args.get("settings")
         .map_or_else(|| Ok(Settings::default()), read_settings)
 }
@@ -259,7 +261,7 @@ fn warnings_of(report: &BacktestReport) -> Vec<String> {
         .collect();
     if report.fills.is_empty() {
         warnings.push(format!(
-            "It made no trades. A look-back longer than the {WARM_UP_BARS} bars warmed up on before the span isn't ready until that far in, and a rule on it is false until then."
+            "It made no trades. A look-back longer than the `warm_up_bars` ({WARM_UP_BARS} unless set) warmed up on before the span isn't ready until that far in, and a rule on it is false until then."
         ));
     }
     warnings
@@ -380,6 +382,7 @@ fn report_from(run: &Value) -> BacktestReport {
                 qty: fill[4].as_f64().unwrap_or(f64::NAN),
                 fee: fill[5].as_f64().unwrap_or(0.0),
                 maker: fill[6].as_bool().unwrap_or(false),
+                range_slip: fill[7].as_f64().unwrap_or(0.0),
             })
             .collect()
     });
@@ -414,6 +417,12 @@ fn report_from(run: &Value) -> BacktestReport {
         total_positions: run["total_positions"].as_u64().unwrap_or(0) as usize,
         limit_orders: run["summary"]["limit_orders"].as_u64().unwrap_or(0) as usize,
         limits_filled: run["summary"]["limits_filled"].as_u64().unwrap_or(0) as usize,
+        orders_worked: run["summary"]["orders_worked"].as_u64().unwrap_or(0) as usize,
+        bars_to_fill_average: run["summary"]["bars_to_fill_average"]
+            .as_f64()
+            .unwrap_or(0.0),
+        bars_to_fill_longest: run["summary"]["bars_to_fill_longest"].as_u64().unwrap_or(0) as usize,
+        unfilled_at_end: run["summary"]["unfilled_at_end"].as_f64().unwrap_or(0.0),
         funding_paid: run["summary"]["funding_paid"].as_f64().unwrap_or(0.0),
         borrow_paid: run["summary"]["borrow_paid"].as_f64().unwrap_or(0.0),
         limit_log: Vec::new(),
@@ -495,6 +504,13 @@ fn read_summary(dir: &Path, id: &str) -> Option<Value> {
 }
 
 impl Lab {
+    /// Whether a saved run is of several markets.
+    pub(crate) fn is_portfolio_run(&self, id: &str) -> bool {
+        check_id(id).is_ok()
+            && read_summary(&self.paths.lab().join("runs"), id)
+                .is_some_and(|brief| brief["summary"]["kind"] == "portfolio")
+    }
+
     /// The strategy a call names, and what makes its signal if it isn't built in.
     pub(crate) fn resolve(
         &self,
@@ -685,6 +701,18 @@ impl Lab {
             (report.limit_orders > 0)
                 .then(|| report.limits_filled as f64 / report.limit_orders as f64)
         );
+        summary["range_slippage_paid"] = json!(
+            report
+                .fills
+                .iter()
+                .map(|fill| fill.qty * fill.range_slip)
+                .sum::<f64>()
+                + 0.0
+        );
+        summary["orders_worked"] = json!(report.orders_worked);
+        summary["bars_to_fill_average"] = json!(report.bars_to_fill_average);
+        summary["bars_to_fill_longest"] = json!(report.bars_to_fill_longest);
+        summary["unfilled_at_end"] = json!(report.unfilled_at_end);
         summary["first_bar"] = json!(times.get(from_index).copied().map(time_text));
         summary["last_bar"] = json!(times.last().copied().map(time_text));
         let run_id = new_id("run");
@@ -709,10 +737,11 @@ impl Lab {
                 order.reached_percent,
                 order.move_1_percent,
                 order.move_24_percent,
+                order.filled,
             ])).collect::<Vec<_>>(),
             "market_share": market_share,
             "fills": report.fills.iter().map(|f| json!([
-                f.ts, f.bar, if f.side == Side::Buy { "buy" } else { "sell" }, f.price, f.qty, f.fee, f.maker,
+                f.ts, f.bar, if f.side == Side::Buy { "buy" } else { "sell" }, f.price, f.qty, f.fee, f.maker, f.range_slip,
             ])).collect::<Vec<_>>(),
             "starting_balance": report.starting_balance,
             "max_drawdown": report.max_drawdown,
@@ -889,6 +918,8 @@ impl Lab {
                     summary["limit_orders"],
                     summary["limits_filled"],
                     summary["fill_rate"],
+                    summary["orders_worked"],
+                    summary["unfilled_at_end"],
                     summary["warnings"],
                     null,
                 ])
@@ -912,11 +943,17 @@ impl Lab {
         }))
     }
 
-    fn remember_run(&self, id: &str, run: Arc<Value>) {
+    pub(crate) fn remember_run(&self, id: &str, run: Arc<Value>) {
         if let Ok(mut recent) = self.recent_runs.lock() {
             recent.push_front((id.to_owned(), run));
             recent.truncate(RECENT_RUNS);
         }
+    }
+
+    /// A saved run whole, for tests to look inside.
+    #[doc(hidden)]
+    pub fn load_run_for_test(&self, id: &str) -> Result<Arc<Value>, String> {
+        self.load_run(id)
     }
 
     pub(crate) fn load_run(&self, id: &str) -> Result<Arc<Value>, String> {
@@ -1034,6 +1071,7 @@ impl Lab {
                 "reached_percent",
                 "move_1_percent",
                 "move_24_percent",
+                "filled",
             ],
             rows.len(),
             args,
@@ -1047,7 +1085,16 @@ impl Lab {
         let empty = Vec::new();
         let fills = run["fills"].as_array().unwrap_or(&empty);
         Ok(page_of(
-            &["ts", "bar", "side", "price", "size", "fee", "maker"],
+            &[
+                "ts",
+                "bar",
+                "side",
+                "price",
+                "size",
+                "fee",
+                "maker",
+                "range_slip",
+            ],
             fills.len(),
             args,
             DEFAULT_ROWS,
@@ -1321,7 +1368,7 @@ impl Lab {
             request,
             candles,
             blocks,
-            warm_up: WARM_UP_BARS as usize,
+            warm_up: settings_of(args)?.warm_up_bars as usize,
             workers,
             stop: Arc::clone(&job.stop),
         };
@@ -1429,7 +1476,7 @@ impl Lab {
             .get("train_ratio")
             .and_then(Value::as_f64)
             .filter(|ratio| *ratio > 0.0)
-            .unwrap_or(RATIO);
+            .unwrap_or(settings_of(args).map_or(RATIO, |settings| settings.walk_ratio));
         stretches(candles.len().saturating_sub(from), windows, ratio)?;
         let batch = WalkForwardJob {
             request,
@@ -1439,7 +1486,7 @@ impl Lab {
             score: chosen.score,
             windows,
             ratio,
-            warm_up: WARM_UP_BARS as usize,
+            warm_up: settings_of(args)?.warm_up_bars as usize,
             runs: number(args, "runs", 1_000) as u32,
             ruin_at: args
                 .get("ruin_percent")
@@ -1504,7 +1551,13 @@ impl Lab {
         let grid = Grid::build(&chosen, &request.strategy.info.params)?;
         let candles = std::mem::take(&mut request.candles);
         let from = candles.partition_point(|c| c.ts < request.trade_from);
-        let split = hold_out.then(|| split_at(from, candles.len()));
+        let split = hold_out.then(|| {
+            split_at(
+                from,
+                candles.len(),
+                settings_of(args).map_or(0.7, |s| s.hold_out_percent / 100.0),
+            )
+        });
         let held_out_market = split.and_then(|split| {
             let first = candles.get(split)?.close;
             let last = candles.last()?.close;
@@ -1531,7 +1584,7 @@ impl Lab {
             score,
             split,
             blocks,
-            warm_up: WARM_UP_BARS as usize,
+            warm_up: settings_of(args)?.warm_up_bars as usize,
             runs: number(args, "runs", 1_000) as u32,
             ruin_at: args
                 .get("ruin_percent")

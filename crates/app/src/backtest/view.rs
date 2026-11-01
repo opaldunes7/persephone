@@ -8,16 +8,17 @@ use iced::{
     },
 };
 use persephone_chart::{PRICE_AXIS_WIDTH, theme};
-use persephone_core::{BarSpec, Candle, Side, UnixNanos, time::DateTime};
-use persephone_engine::{BacktestReport, LimitOutcome};
+use persephone_core::{BarSpec, Candle, Side, UnixNanos, strategy::StrategyKind, time::DateTime};
+use persephone_engine::{BacktestReport, LimitOutcome, PortfolioReport};
 use persephone_research::figures::LimitSummary;
 
 use super::{
-    BlockLength, BlockRun, Commission, Edit, Field, FillTiming, NO_VARIABLE, OneWay, OptimizeRun,
-    Panel, PanelMessage, Precision, RunColumn, ScoreBy, Settings, StrategyChoice, TestKind,
-    TestRun,
+    BlockLength, BlockRun, Commission, Edit, Field, FillTiming, LegChoice, NO_VARIABLE, OneWay,
+    OptimizeRun, Panel, PanelMessage, Precision, RunColumn, ScoreBy, Settings, StrategyChoice,
+    TestKind, TestRun,
     calendar::{Calendar, Level, Total, days_in_month, weeks},
     optimize::{OptimizeResult, Outcome},
+    portfolio::{PortfolioRun, SavedPortfolio},
     positions::ONE_TRADE,
     progress,
     robustness::Problem,
@@ -30,8 +31,8 @@ use super::{
     walk_forward::WalkForward,
     widgets::heat,
     widgets::{
-        Distribution, Edge, Equity, Fan, Glyph, HeatScale, Icon, Landscape, RunsTable, Span, Speed,
-        WalkChart, percent,
+        Distribution, Edge, Equity, Fan, Glyph, HeatScale, Icon, Landscape, Lines, RunsTable, Span,
+        Speed, WalkChart, leg_color, percent,
     },
 };
 
@@ -171,7 +172,13 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
             .size(theme::TEXT_SIZE)
             .color(theme::TEXT_MUTED)
     };
-    let title = text(info.title.clone())
+    // A portfolio isn't this chart's market or strategy.
+    let title = if test == TestKind::Portfolio {
+        format!("Portfolio · {} markets", info.settings.portfolio.legs.len())
+    } else {
+        info.title.clone()
+    };
+    let title = text(title)
         .size(theme::LEGEND_SIZE)
         .color(theme::TEXT_BRIGHT);
     let mut heading = row![title].spacing(14).align_y(Alignment::Center);
@@ -376,6 +383,99 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
             Some(Err(_)) => Space::new().width(Fill).height(Fill).into(),
             None => {
                 note = Some(muted("Drawing the trades…".into()));
+                Space::new().width(Fill).height(Fill).into()
+            }
+        },
+        (_, TestKind::Portfolio) => match &panel.tests.portfolio {
+            TestRun::Done(found) => {
+                let figures = &found.figures;
+                let report = &found.report;
+                heading = heading
+                    .push(figure(
+                        "Return",
+                        percent(figures.net_return),
+                        up_or_down(figures.net_return),
+                        "What the account made after all costs.",
+                    ))
+                    .push(figure(
+                        "Before costs",
+                        figures.gross_return.map_or("—".to_owned(), percent),
+                        figures.gross_return.map_or(theme::TEXT, up_or_down),
+                        "The same run with nothing to pay.",
+                    ))
+                    .push(figure(
+                        "Equal shares",
+                        percent(figures.benchmark_return),
+                        up_or_down(figures.benchmark_return),
+                        "An equal share of the capital held in each market from its first bar.",
+                    ))
+                    .push(figure(
+                        "Sharpe",
+                        figures.sharpe.map_or("—".to_owned(), |sharpe| format!("{sharpe:.2}")),
+                        theme::TEXT,
+                        "Return for the ups and downs taken, from daily returns over the span.",
+                    ))
+                    .push(figure(
+                        "Fell",
+                        format!("{:.1}%", report.max_drawdown * 100.0),
+                        theme::TEXT,
+                        "The deepest fall from a peak.",
+                    ))
+                    .push(figure(
+                        "Margin",
+                        format!("{:.0}%", report.peak_margin_use * 100.0),
+                        theme::TEXT,
+                        "The most of the account that margin ever took.",
+                    ))
+                    .push(figure(
+                        "Closest",
+                        report.closest_to_liquidation.map_or("—".to_owned(), |room| format!("{room:.1}×")),
+                        theme::TEXT,
+                        "The least the account ever was, at the worst of a bar, as a multiple of what its positions needed to stay open. At 1× it's liquidated.",
+                    ));
+                let warnings: Vec<&str> = report
+                    .notes
+                    .iter()
+                    .filter(|n| n.warning)
+                    .map(|n| n.text.as_str())
+                    .collect();
+                if !warnings.is_empty() {
+                    note = Some(text(warnings.join(" ")).size(SMALL).color(theme::DOWN));
+                }
+                row![
+                    column![
+                        container(canvas(portfolio_equity(found)).width(Fill).height(Fill))
+                            .height(iced::Length::FillPortion(3)),
+                        container(canvas(portfolio_exposure(report)).width(Fill).height(Fill))
+                            .height(iced::Length::FillPortion(1)),
+                    ]
+                    .padding(Padding {
+                        top: WALK_TOP,
+                        ..Padding::ZERO
+                    })
+                    .width(Fill)
+                    .height(Fill),
+                    portfolio_table(found, panel.tests.portfolio_leg),
+                ]
+                .into()
+            }
+            TestRun::Running { total, .. } => {
+                note = Some(muted(if *total == 0 {
+                    "Reading the saved run…".to_owned()
+                } else {
+                    format!("Loading {total} markets and running them…")
+                }));
+                Space::new().width(Fill).height(Fill).into()
+            }
+            TestRun::Failed(message) => {
+                note = Some(text(message.as_str()).size(SMALL).color(theme::DOWN));
+                Space::new().width(Fill).height(Fill).into()
+            }
+            TestRun::Idle => {
+                note = Some(muted(
+                    "Add markets and weights, then press Run. Costs come from the stock settings."
+                        .into(),
+                ));
                 Space::new().width(Fill).height(Fill).into()
             }
         },
@@ -946,6 +1046,7 @@ fn limit_orders_table(report: &BacktestReport) -> Element<'_, PanelMessage> {
             cell("Placed".into(), 150.0, theme::TEXT_MUTED),
             cell("Side".into(), 46.0, theme::TEXT_MUTED),
             cell("Price".into(), 92.0, theme::TEXT_MUTED),
+            cell("Filled".into(), 64.0, theme::TEXT_MUTED),
             cell("Became".into(), 80.0, theme::TEXT_MUTED),
             cell("Reached".into(), 70.0, theme::TEXT_MUTED),
             cell("A bar on".into(), 72.0, theme::TEXT_MUTED),
@@ -971,6 +1072,7 @@ fn limit_orders_table(report: &BacktestReport) -> Element<'_, PanelMessage> {
             cell(day(order.placed), 150.0, theme::TEXT),
             cell(side.to_owned(), 46.0, theme::TEXT),
             cell(format!("{:.2}", order.price), 92.0, theme::TEXT),
+            cell(format!("{}", order.filled), 64.0, theme::TEXT),
             cell(became.to_owned(), 80.0, color),
             cell(format!("{:+.2}%", order.reached_percent), 70.0, theme::TEXT),
             cell(moved(order.move_1_percent), 72.0, theme::TEXT),
@@ -994,6 +1096,220 @@ fn limit_orders_table(report: &BacktestReport) -> Element<'_, PanelMessage> {
         left: 12.0,
     }))
     .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+/// The account, what equal shares would have done, and what each leg has made.
+fn portfolio_equity(found: &PortfolioRun) -> Lines<'_> {
+    let report = &found.report;
+    let mut lines = vec![
+        (
+            "Account".to_owned(),
+            report.equity.as_slice(),
+            theme::TEXT_BRIGHT,
+        ),
+        (
+            "Equal shares".to_owned(),
+            found.figures.benchmark.as_slice(),
+            theme::TEXT_MUTED,
+        ),
+    ];
+    lines.extend(report.legs.iter().enumerate().map(|(at, leg)| {
+        (
+            leg.symbol.clone(),
+            leg.account_line.as_slice(),
+            leg_color(at),
+        )
+    }));
+    Lines {
+        lines,
+        times: &report.times,
+        start: report.starting_balance,
+        format: |value| format!("{value:.0}"),
+    }
+}
+
+/// What's held long plus short, and long minus short, as shares of the account.
+fn portfolio_exposure(report: &PortfolioReport) -> Lines<'_> {
+    Lines {
+        lines: vec![
+            (
+                "Gross".to_owned(),
+                report.gross_exposure.as_slice(),
+                leg_color(1),
+            ),
+            (
+                "Net".to_owned(),
+                report.net_exposure.as_slice(),
+                leg_color(3),
+            ),
+        ],
+        times: &report.times,
+        start: 0.0,
+        format: |value| format!("{:.0}%", value * 100.0),
+    }
+}
+
+/// Each leg's part, and how their returns moved together.
+fn portfolio_table(found: &PortfolioRun, picked: usize) -> Element<'_, PanelMessage> {
+    let report = &found.report;
+    let cell = |value: String, width: f32, color: Color| {
+        text(value)
+            .size(SMALL)
+            .width(width)
+            .color(color)
+            .font(iced::Font::MONOSPACE)
+    };
+    let mut rows = column![row![
+        cell("Market".into(), 112.0, theme::TEXT_MUTED),
+        cell("Made".into(), 76.0, theme::TEXT_MUTED),
+        cell("Fees".into(), 56.0, theme::TEXT_MUTED),
+        cell("Funding".into(), 56.0, theme::TEXT_MUTED),
+        cell("Borrow".into(), 50.0, theme::TEXT_MUTED),
+        cell("Fills".into(), 40.0, theme::TEXT_MUTED),
+    ]]
+    .spacing(3);
+    for (at, leg) in report.legs.iter().enumerate() {
+        let made = leg.contribution.last().copied().unwrap_or(0.0);
+        rows = rows.push(row![
+            cell(leg.symbol.clone(), 112.0, leg_color(at)),
+            cell(
+                format!("{made:+.0}"),
+                76.0,
+                if made >= 0.0 { theme::UP } else { theme::DOWN }
+            ),
+            cell(format!("{:.0}", leg.fees), 56.0, theme::TEXT),
+            cell(format!("{:.0}", leg.funding_paid), 56.0, theme::TEXT),
+            cell(format!("{:.0}", leg.borrow_paid), 50.0, theme::TEXT),
+            cell(leg.fills.len().to_string(), 40.0, theme::TEXT),
+        ]);
+    }
+    rows = rows.push(Space::new().height(8));
+    rows = rows.push(row![
+        cell("Worked".into(), 112.0, theme::TEXT_MUTED),
+        cell("Orders".into(), 56.0, theme::TEXT_MUTED),
+        cell("Bars".into(), 56.0, theme::TEXT_MUTED),
+        cell("Longest".into(), 62.0, theme::TEXT_MUTED),
+        cell("To go".into(), 62.0, theme::TEXT_MUTED),
+        cell("Gaps".into(), 40.0, theme::TEXT_MUTED),
+    ]);
+    for (at, leg) in report.legs.iter().enumerate() {
+        rows = rows.push(row![
+            cell(leg.symbol.clone(), 112.0, leg_color(at)),
+            cell(leg.orders_worked.to_string(), 56.0, theme::TEXT),
+            cell(
+                format!("{:.1}", leg.bars_to_fill_average),
+                56.0,
+                theme::TEXT
+            ),
+            cell(leg.bars_to_fill_longest.to_string(), 62.0, theme::TEXT),
+            cell(format!("{}", leg.unfilled_at_end), 62.0, theme::TEXT),
+            cell(leg.missing_bars.to_string(), 40.0, theme::TEXT),
+        ]);
+    }
+    rows = rows.push(Space::new().height(8));
+    let mut heading = row![cell("Moved with".into(), 112.0, theme::TEXT_MUTED)];
+    for (at, _) in report.legs.iter().enumerate() {
+        heading = heading.push(cell(format!("{}", at + 1), 50.0, leg_color(at)));
+    }
+    rows = rows.push(heading);
+    for (at, line) in found.figures.correlation.iter().enumerate() {
+        let mut shown = row![cell(
+            format!("{} {}", at + 1, report.legs[at].symbol),
+            112.0,
+            leg_color(at)
+        )];
+        for value in line {
+            shown = shown.push(cell(
+                value.map_or("—".to_owned(), |v| format!("{v:+.2}")),
+                50.0,
+                theme::TEXT,
+            ));
+        }
+        rows = rows.push(shown);
+    }
+    rows = rows.push(Space::new().height(8));
+    rows = rows.push(cell(
+        format!(
+            "Costs {:.0}, of which {:.0} interest. Turned over {:.1}×. {} orders.",
+            found.figures.costs_paid, report.interest_paid, report.turnover, report.total_orders
+        ),
+        398.0,
+        theme::TEXT_MUTED,
+    ));
+    let mut years = column![cell("By year".into(), 112.0, theme::TEXT_MUTED)].spacing(3);
+    for (year, made) in &found.figures.by_year {
+        years = years.push(row![
+            cell(year.to_string(), 112.0, theme::TEXT),
+            cell(
+                percent(*made),
+                76.0,
+                if *made >= 0.0 { theme::UP } else { theme::DOWN }
+            ),
+        ]);
+    }
+    rows = rows.push(Space::new().height(8)).push(years);
+    for note in report.notes.iter().filter(|note| !note.warning) {
+        rows = rows.push(
+            text(note.text.as_str())
+                .size(SMALL)
+                .color(theme::TEXT_MUTED)
+                .width(398.0),
+        );
+    }
+    // One market's fills at a time, as there can be thousands.
+    let mut tabs = row![].spacing(4);
+    for (at, leg) in report.legs.iter().enumerate() {
+        tabs = tabs.push(
+            button(text(leg.symbol.as_str()).size(SMALL))
+                .padding([2, 6])
+                .on_press(PanelMessage::PortfolioLeg(at))
+                .style(move |_, status| chip(at == picked, status)),
+        );
+    }
+    rows = rows.push(Space::new().height(8)).push(tabs);
+    if let Some(leg) = report.legs.get(picked) {
+        rows = rows.push(row![
+            cell("When".into(), 130.0, theme::TEXT_MUTED),
+            cell("Side".into(), 40.0, theme::TEXT_MUTED),
+            cell("Price".into(), 84.0, theme::TEXT_MUTED),
+            cell("Size".into(), 84.0, theme::TEXT_MUTED),
+            cell("Fee".into(), 56.0, theme::TEXT_MUTED),
+        ]);
+        for fill in leg.fills.iter().take(LIMIT_ROWS) {
+            let at = DateTime::from_nanos(fill.ts);
+            let side = if fill.side == Side::Buy {
+                "buy"
+            } else {
+                "sell"
+            };
+            rows = rows.push(row![
+                cell(format!("{} {}", at.date(), at.time()), 130.0, theme::TEXT),
+                cell(side.to_owned(), 40.0, theme::TEXT),
+                cell(format!("{:.2}", fill.price), 84.0, theme::TEXT),
+                cell(format!("{}", fill.qty), 84.0, theme::TEXT),
+                cell(format!("{:.2}", fill.fee), 56.0, theme::TEXT),
+            ]);
+        }
+        if leg.fills.len() > LIMIT_ROWS {
+            rows = rows.push(cell(
+                format!(
+                    "And {} more. `get_portfolio_fills` in Lab has them all.",
+                    leg.fills.len() - LIMIT_ROWS
+                ),
+                398.0,
+                theme::TEXT_MUTED,
+            ));
+        }
+    }
+    iced::widget::scrollable(rows.padding(Padding {
+        top: WALK_TOP,
+        right: 12.0,
+        bottom: 8.0,
+        left: 12.0,
+    }))
+    .width(WALK_TABLE_WIDTH)
     .height(Fill)
     .into()
 }

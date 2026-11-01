@@ -9,6 +9,7 @@
 //! [`SignalFactory`]: persephone_core::signal::SignalFactory
 
 pub(crate) mod builtins;
+pub(crate) mod portfolio;
 pub(crate) mod signal;
 
 pub(crate) use signal::SignalStrategy;

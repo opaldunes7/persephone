@@ -12,6 +12,7 @@ pub mod indicators;
 #[cfg(feature = "live")]
 pub mod live;
 mod models;
+mod portfolio;
 mod report;
 mod settings;
 mod strategies;
@@ -45,12 +46,16 @@ use persephone_core::{
 };
 use rust_decimal::Decimal;
 
-pub use models::impact_share;
+pub use models::{impact_share, range_costs};
+pub use portfolio::{
+    LegReport, PortfolioLeg, PortfolioReport, PortfolioRequest, Rebalance, run_portfolio,
+    spawn_portfolio,
+};
 pub use report::{BacktestReport, Fill, LimitOrderRow, LimitOutcome};
 pub use settings::{Direction, LimitOrders, Session, SimSettings, TradingRules};
 
 use crate::{
-    models::{BarNow, CostFillModel},
+    models::{BarNow, CostFillModel, JitteredLatency},
     strategies::{SignalStrategy, builtins, signal::Missed},
 };
 
@@ -176,6 +181,27 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
             ));
         }
     }
+    if let Some(share) = request.sim.max_participation_percent
+        && !(share > 0.0 && share <= 100.0)
+    {
+        return Err(EngineError::InvalidRequest(format!(
+            "the most of a bar's volume an order can take must be above 0% and at most 100%, not {share}%"
+        )));
+    }
+    if !(request.sim.range_slippage_percent >= 0.0
+        && request.sim.range_slippage_percent.is_finite())
+    {
+        return Err(EngineError::InvalidRequest(format!(
+            "slippage from a bar's range can't be {}%",
+            request.sim.range_slippage_percent
+        )));
+    }
+    if request.sim.latency_jitter_ms > 0 && (request.sim.next_open || request.sim.limit.is_some()) {
+        return Err(EngineError::InvalidRequest(
+            "latency jitter can't go with filling at the next open or with limit orders; pick one"
+                .into(),
+        ));
+    }
     let mut engine = BacktestEngine::new(engine_config())?;
 
     let instrument = convert::instrument(&request.instrument)?;
@@ -243,6 +269,18 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
             .map(|(&close, candle)| (close, candle.open, candle.high, candle.low, candle.volume))
             .collect::<Vec<_>>(),
     );
+    let range_costs = if request.sim.range_slippage_percent > 0.0 {
+        models::range_costs(
+            request.sim.range_slippage_percent,
+            request.sim.range_slippage_look_back,
+            request
+                .candles
+                .iter()
+                .map(|candle| candle.high - candle.low),
+        )
+    } else {
+        Vec::new()
+    };
     engine.add_strategy(
         SignalStrategy::new(
             bar_type,
@@ -267,7 +305,10 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
             request.funding.clone().unwrap_or_default(),
             request.sim.borrow_percent_per_year,
             request.sim.impact_percent,
+            request.sim.volume_warning_percent,
         )
+        .participating(request.sim.max_participation_percent)
+        .slipping(Arc::new(range_costs))
         .compounding(request.sim.compound.then_some(request.starting_balance)),
     )?;
 
@@ -322,6 +363,14 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
     report.limit_orders = missed.limit_orders;
     report.limits_filled = missed.limits_filled;
     report.limit_log = report::limit_rows(&missed.limits, &request.candles, &closes);
+    report.orders_worked = missed.orders_worked;
+    report.bars_to_fill_longest = missed.longest_work;
+    report.bars_to_fill_average = if missed.works_done > 0 {
+        missed.work_bars as f64 / missed.works_done as f64
+    } else {
+        0.0
+    };
+    report.unfilled_at_end = missed.unfilled;
     let at = |ts| {
         let at = DateTime::from_nanos(ts);
         format!("{} {}", at.date(), at.time())
@@ -329,14 +378,33 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
     if missed.over_volume > 0 {
         report.notes.push(Note {
             text: format!(
-                "{} orders were over a tenth of their bar's volume, first at {}. Fills like those are fiction whatever the costs say: a smaller position is the real answer.",
+                "{} orders were over {}% of their bar's volume, first at {}. Fills like those are fiction whatever the costs say: a smaller position is the real answer.",
                 missed.over_volume,
+                request.sim.volume_warning_percent,
                 at(missed.first_over_volume),
             ),
             warning: true,
         });
     }
-    if missed.limit_orders >= 5 && missed.limits_filled * 2 < missed.limit_orders {
+    if request.sim.latency_jitter_ms > 0 && request.ticks.is_none() {
+        report.notes.push(Note {
+            text: "Latency jitter changes nothing here: an order sent at a close reaches the next bar whether it took a little longer or not. Only fills on ticks can show it.".into(),
+            warning: false,
+        });
+    }
+    if missed.cut_short > 0 || missed.unfilled > 0.0 {
+        report.notes.push(Note {
+            text: format!(
+                "{} orders were replaced before all of them had gone out, and {} {} was still to go when the run ended. The position didn't always reach the size asked for, as the volume wasn't there.",
+                missed.cut_short, missed.unfilled, request.instrument.base,
+            ),
+            warning: true,
+        });
+    }
+    if missed.limit_orders >= 5
+        && (missed.limits_filled as f64)
+            < missed.limit_orders as f64 * request.sim.fill_warning_percent / 100.0
+    {
         report.notes.push(Note {
             text: format!(
                 "Only {} of {} limit orders filled. Those that miss are often the ones that would have won, as price ran away, so this flatters the result.",
@@ -384,8 +452,8 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
 
 /// How long an order takes when filling at the next open, and how far into each bar its open trades,
 /// so the order sent at a close gets there first and meets it.
-const ORDER_REACHES_OPEN_MS: u32 = 1;
-const OPEN_TRADES_AT_NANOS: UnixNanos = 2_000_000;
+pub(crate) const ORDER_REACHES_OPEN_MS: u32 = 1;
+pub(crate) const OPEN_TRADES_AT_NANOS: UnixNanos = 2_000_000;
 
 /// Each bar's open as a trade, for orders to fill on.
 #[derive(Debug)]
@@ -502,7 +570,7 @@ fn run_on_ticks(
     Ok(())
 }
 
-fn engine_config() -> BacktestEngineConfig {
+pub(crate) fn engine_config() -> BacktestEngineConfig {
     BacktestEngineConfig {
         logging: LoggerConfig {
             // Standard output may be someone's protocol, as it is for Lab over MCP, and what
@@ -546,18 +614,29 @@ fn venue_config(
             sim.spread_ticks,
             sim.slippage_percent,
             sim.impact_percent,
+            sim.impact_exponent,
+            sim.max_participation_percent.is_some(),
             bar_now,
         )))
-        .maybe_latency_model((sim.latency_ms > 0 || sim.next_open).then(|| {
-            let ms = if sim.next_open {
-                ORDER_REACHES_OPEN_MS
-            } else {
-                sim.latency_ms
-            };
-            let latency = DurationNanos::new(u64::from(ms) * 1_000_000);
-            let none = DurationNanos::new(0);
-            LatencyModelHandle::new(StaticLatencyModel::new(latency, none, none, none))
-        }))
+        .maybe_latency_model(
+            (sim.latency_ms > 0 || sim.latency_jitter_ms > 0 || sim.next_open).then(|| {
+                if sim.latency_jitter_ms > 0 {
+                    return LatencyModelHandle::new(JitteredLatency::new(
+                        sim.latency_ms,
+                        sim.latency_jitter_ms,
+                        sim.latency_seed,
+                    ));
+                }
+                let ms = if sim.next_open {
+                    ORDER_REACHES_OPEN_MS
+                } else {
+                    sim.latency_ms
+                };
+                let latency = DurationNanos::new(u64::from(ms) * 1_000_000);
+                let none = DurationNanos::new(0);
+                LatencyModelHandle::new(StaticLatencyModel::new(latency, none, none, none))
+            }),
+        )
         .bar_execution(bar_execution)
         .build()
         .map_err(|e| EngineError::InvalidRequest(format!("venue config: {e}")))?;

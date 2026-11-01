@@ -7,6 +7,7 @@ pub mod figures;
 pub mod logic;
 pub mod market;
 pub mod optimize;
+pub mod portfolio;
 pub mod positions;
 pub mod results;
 pub mod robustness;
@@ -57,6 +58,25 @@ pub enum Field {
     TakeProfit,
     Borrow,
     Impact,
+    Participation,
+    RangeSlippage,
+    LatencyJitter,
+    LatencySeed,
+    RangeLookBack,
+    ImpactExponent,
+    VolumeWarning,
+    FillWarning,
+    CashInterest,
+    WarmUp,
+    HoldOutShare,
+    WalkRatio,
+    LegVenue(usize),
+    LegSymbol(usize),
+    LegWeight(usize),
+    RebalanceEvery,
+    RebalanceDrift,
+    RebalanceMinTrade,
+    Maintenance,
     Spread,
     Latency,
     Leverage,
@@ -86,6 +106,16 @@ impl Field {
             TestKind::RandomBlocks => matches!(self, Self::Blocks),
             TestKind::Optimize | TestKind::WalkForward => self.belongs_to_tests(),
             TestKind::RandomEntries => matches!(self, Self::Entries),
+            TestKind::Portfolio => matches!(
+                self,
+                Self::LegSymbol(_)
+                    | Self::LegVenue(_)
+                    | Self::LegWeight(_)
+                    | Self::RebalanceEvery
+                    | Self::RebalanceDrift
+                    | Self::RebalanceMinTrade
+                    | Self::Maintenance
+            ),
         }
     }
 
@@ -99,6 +129,15 @@ impl Field {
                 | Self::Blocks
                 | Self::Windows
                 | Self::Entries
+                | Self::HoldOutShare
+                | Self::WalkRatio
+                | Self::LegVenue(_)
+                | Self::LegSymbol(_)
+                | Self::LegWeight(_)
+                | Self::RebalanceEvery
+                | Self::RebalanceDrift
+                | Self::RebalanceMinTrade
+                | Self::Maintenance
                 | Self::Min(_)
                 | Self::Max(_)
                 | Self::Step(_)

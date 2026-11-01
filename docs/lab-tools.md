@@ -207,6 +207,33 @@ Backtests any strategy on any span with any settings. The run is saved, so its d
 
 Returns: `run_id`, `summary`
 
+## `run_portfolio` *job*
+
+Backtests several markets on one account: they share cash and margin, and everything is worked out on one timeline. Each leg runs its own strategy at a weight, holds its weight, or follows a weight table. The guide's `portfolios` topic has how.
+
+- `legs` (list, required): The markets: [{"symbol": "BTCUSDT", "weight": 0.5, "strategy": ..., "venue": ...}]. With a strategy, weight scales its position size, and it must be above 0. Without one, it's the signed share of the capital to hold. A symbol ending -PERP pays funding.
+- `weights` (list_or_path): A weight table instead of strategies: [[time, {"BTCUSDT": 0.5, "ETHUSDT": -0.5}], ...], or a JSON file holding one. Each row states the whole book as signed shares of the account, and a market it leaves out goes flat. A row stamped with a bar's open applies at that bar's close.
+- `rebalance` (object): {"every_bars": 24, "drift_percent": 5, "min_trade_value": 100}: go back to the weights every so many bars, or when a leg is this many points of the account away, skipping trades worth less than this. Rebalancing sizes from the account as it is now.
+- `maintenance_percent` (number): What a position needs to stay open, as a percentage of its value. Everything is liquidated at once when the account falls to it. Default 0.5.
+- `bars` (string): A timeframe every leg shares, as 1h or 1d. Default 1h.
+- `from` (time): Where the span starts.
+- `to` (time): Where it ends.
+- `settings` (object): Costs and rules, as in run_backtest; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
+- `label` (string): A name for grouping runs, saved with the run for finding it with list_runs.
+- `friction` (boolean): false leaves out gross_return, total_costs_paid and break_even_cost_per_fill, which take a second backtest with costs off. Default true.
+
+Returns: `run_id`, `summary`
+
+## `run_portfolios` *job*
+
+Many portfolios in one call, in parallel, to sweep weights, rebalancing or costs. Every run is saved. One that fails doesn't stop the rest.
+
+- `runs` (list_or_path, required): A list of arguments as run_portfolio takes, or a JSON file holding one.
+- `defaults` (object): Arguments every run shares. A run's own win.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
+
+Returns: `columns`, `rows`, `total`, `succeeded`, `failed`
+
 ## `run_backtests` *job*
 
 Many backtests in one call, in parallel: much quicker for an agent than one call each. Every run is saved, so all the tools that take a run_id work on them. One that fails doesn't stop the rest.
@@ -339,6 +366,35 @@ Every limit order a run sent, in pages, filled or not: what became of it, how fa
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 - `outcome` (string): Only filled, lapsed, replaced, cancelled, refused or open.
+- `cursor` (string): Where to carry on, from the last page's next_cursor.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
+
+Returns: `columns`, `rows`, `next_cursor`
+
+## `get_portfolio`
+
+A portfolio run's summary, a table by leg of what each made and paid, and how the markets' own returns moved together, whichever way they're held.
+
+- `run_id` (string, required): A run, from run_backtest or list_runs.
+
+Returns: `summary`, `legs`, `correlation`, `notes`
+
+## `get_portfolio_series`
+
+A portfolio run at each bar of its span, in pages: equity, what equal shares held would be worth, gross and net exposure, and each leg's value and what it has made.
+
+- `run_id` (string, required): A run, from run_backtest or list_runs.
+- `cursor` (string): Where to carry on, from the last page's next_cursor.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
+
+Returns: `columns`, `rows`, `next_cursor`
+
+## `get_portfolio_fills`
+
+A portfolio run's fills for one leg, in pages.
+
+- `run_id` (string, required): A run, from run_backtest or list_runs.
+- `symbol` (string, required): Which leg.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 

@@ -20,6 +20,7 @@ pub fn load(
     symbol: &str,
     bars: BarSpec,
     span: Option<(UnixNanos, UnixNanos)>,
+    warm_up: u64,
 ) -> anyhow::Result<MarketData> {
-    load_local(store, venue, symbol, bars, span).map(MarketData::from)
+    load_local(store, venue, symbol, bars, span, warm_up).map(MarketData::from)
 }

@@ -148,7 +148,24 @@ fn calls(lab: &Arc<Lab>, dir: &std::path::Path) -> Vec<(&'static str, Value)> {
     )
     .unwrap();
     fs::write(dir.join("drawings.ron"), "{\"BTCUSDT\": [Line((a: 1.5))]}").unwrap();
+    let basket = json!({"legs": [{"symbol": "BTCUSDT", "venue": "TEST", "weight": 0.5}], "bars": "1h", "wait_seconds": 120});
+    let portfolio = lab.dispatch("run_portfolio", &basket).unwrap();
+    let portfolio_id = portfolio["run_id"].clone();
     vec![
+        ("run_portfolio", basket.clone()),
+        (
+            "run_portfolios",
+            json!({"runs": [basket], "wait_seconds": 120}),
+        ),
+        ("get_portfolio", json!({"run_id": portfolio_id})),
+        (
+            "get_portfolio_series",
+            json!({"run_id": portfolio_id, "limit": 2}),
+        ),
+        (
+            "get_portfolio_fills",
+            json!({"run_id": portfolio_id, "symbol": "BTCUSDT"}),
+        ),
         ("get_guide", json!({"topic": "units"})),
         ("get_settings", json!({})),
         ("list_markets", json!({})),
@@ -362,6 +379,7 @@ fn a_run_read_back_gives_the_same_numbers_as_the_engine() {
         "BTCUSDT",
         Timeframe::H1.into(),
         None,
+        persephone_research::WARM_UP_BARS,
     )
     .unwrap();
     let spec = StrategySpec::with_params(BuiltInStrategy::EmaCross, &[5.0, 20.0, 10.0]);
@@ -3965,4 +3983,390 @@ fn lab_is_built_without_live_trading() {
     assert!(!tree.contains("persephone-engine feature \"live\""));
     assert!(!tree.contains("nautilus-live"));
     assert!(!tree.contains("nautilus-binance"));
+}
+
+/// Two markets made by hand, the second missing a bar.
+fn two_hand_markets() -> Arc<Lab> {
+    let (lab, dir) = lab();
+    for (symbol, start, step, skip) in [
+        ("AAAUSD", 100.0, 1.0, None),
+        ("BBBUSD", 50.0, -0.1, Some(10)),
+    ] {
+        let file = dir.join(format!("{symbol}.csv"));
+        let mut text = String::from("time,open,high,low,close,volume\n");
+        for i in 0..48 {
+            if skip == Some(i) {
+                continue;
+            }
+            let close: f64 = start + step * f64::from(i);
+            text += &format!(
+                "2024-01-{:02} {:02}:00:00,{close},{close},{close},{close},1000\n",
+                1 + i / 24,
+                i % 24
+            );
+        }
+        fs::write(&file, text).unwrap();
+        lab.dispatch(
+            "import_data",
+            &json!({"files": [file], "symbol": symbol, "venue": "HAND", "wait_seconds": 60}),
+        )
+        .unwrap();
+    }
+    lab
+}
+
+fn pair(more: Value) -> Value {
+    let mut args = json!({
+        "legs": [
+            {"symbol": "AAAUSD", "venue": "HAND", "weight": 0.5},
+            {"symbol": "BBBUSD", "venue": "HAND", "weight": -0.5},
+        ],
+        "bars": "1h",
+        "wait_seconds": 120,
+    });
+    for (key, value) in more.as_object().unwrap() {
+        args[key] = value.clone();
+    }
+    args
+}
+
+#[test]
+fn a_portfolio_runs_from_tools_and_every_part_of_it_can_be_read() {
+    let lab = two_hand_markets();
+    let run = lab.dispatch("run_portfolio", &pair(json!({}))).unwrap();
+    let summary = &run["summary"];
+    assert_eq!(summary["kind"], "portfolio");
+    assert_eq!(summary["bars"], 48);
+    assert!(summary["net_return"].as_f64().unwrap() > 0.0, "{summary}");
+    assert!(
+        summary["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("BBBUSD had no bar"),
+        "{summary}"
+    );
+    let id = run["run_id"].as_str().unwrap();
+
+    let whole = lab
+        .dispatch("get_portfolio", &json!({"run_id": id}))
+        .unwrap();
+    assert_eq!(whole["legs"][1]["symbol"], "BBBUSD");
+    assert_eq!(whole["legs"][1]["missing_bars"], 1);
+    assert_eq!(whole["correlation"].as_array().unwrap().len(), 2);
+
+    let series = lab
+        .dispatch("get_portfolio_series", &json!({"run_id": id, "limit": 5}))
+        .unwrap();
+    assert_eq!(series["total"], 48);
+    let columns = series["columns"].as_array().unwrap();
+    assert!(columns.contains(&json!("BBBUSD_made")), "{columns:?}");
+    assert_eq!(series["rows"][0].as_array().unwrap().len(), columns.len());
+
+    let fills = lab
+        .dispatch(
+            "get_portfolio_fills",
+            &json!({"run_id": id, "symbol": "bbbusd"}),
+        )
+        .unwrap();
+    assert_eq!(fills["rows"][0][2], "sell");
+
+    // A backtest's readers say it isn't one of theirs, and the other way about.
+    let wrong = lab
+        .dispatch(
+            "get_portfolio_fills",
+            &json!({"run_id": id, "symbol": "XXX"}),
+        )
+        .unwrap_err();
+    assert!(wrong.contains("XXX"), "{wrong}");
+    let listed = lab.dispatch("list_runs", &json!({})).unwrap();
+    assert!(listed.to_string().contains(id));
+    let backtest_reader = lab
+        .dispatch("get_fills", &json!({"run_id": id}))
+        .unwrap_err();
+    assert!(
+        backtest_reader.contains("get_portfolio"),
+        "{backtest_reader}"
+    );
+}
+
+#[test]
+fn a_weight_table_and_costs_work_from_tools_and_a_sweep_ranks_them() {
+    let lab = two_hand_markets();
+    let table = json!([
+        ["2024-01-01", {"AAAUSD": 0.5, "BBBUSD": -0.5}],
+        ["2024-01-01 12:00", {"AAAUSD": 0.25}],
+    ]);
+    let run = lab
+        .dispatch(
+            "run_portfolio",
+            &pair(json!({
+                "weights": table,
+                "settings": {
+                    "commission": {"on": true, "value": {"percent": 0.1}},
+                    "max_participation_percent": {"on": true, "value": 50},
+                    "range_slippage_percent": {"on": true, "value": 1},
+                },
+            })),
+        )
+        .unwrap();
+    let summary = &run["summary"];
+    assert!(
+        summary["total_costs_paid"].as_f64().unwrap() > 0.0,
+        "{summary}"
+    );
+    assert!(
+        summary["net_return"].as_f64().unwrap() < summary["gross_return"].as_f64().unwrap(),
+        "{summary}"
+    );
+
+    let sweep = lab
+        .dispatch(
+            "run_portfolios",
+            &json!({
+                "runs": [
+                    pair(json!({"label": "half"})),
+                    {"legs": [{"symbol": "AAAUSD", "venue": "HAND", "weight": 0.1}], "bars": "1h", "label": "little"},
+                    {"legs": [{"symbol": "NOPE", "venue": "HAND", "weight": 0.1}], "bars": "1h"},
+                ],
+                "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    assert_eq!(sweep["succeeded"], 2, "{sweep}");
+    assert_eq!(sweep["failed"], 1, "{sweep}");
+    assert_eq!(sweep["rows"][0][2], "half", "{sweep}");
+}
+
+#[test]
+fn what_a_portfolio_cant_take_is_said_plainly() {
+    let lab = two_hand_markets();
+    let wrong = |args: Value| lab.dispatch("run_portfolio", &args).unwrap_err();
+    assert!(wrong(json!({"legs": [], "wait_seconds": 60})).contains("`legs`"));
+    assert!(wrong(pair(json!({"rebalance": {"evry_bars": 2}}))).contains("evry_bars"));
+    let misspelt =
+        json!({"legs": [{"symbol": "AAAUSD", "venue": "HAND", "wieght": 1}], "wait_seconds": 60});
+    assert!(wrong(misspelt).contains("wieght"));
+    let no_weight = json!({"legs": [{"symbol": "AAAUSD", "venue": "HAND"}], "wait_seconds": 60});
+    assert!(wrong(no_weight).contains("needs a weight"));
+    let stops = pair(json!({"settings": {"stop_loss_percent": {"on": true, "value": 1}}}));
+    assert!(wrong(stops).contains("at the market"));
+}
+
+#[test]
+fn a_setup_in_settings_is_accepted_and_the_new_settings_are_listed() {
+    let lab = two_hand_markets();
+    let run = lab
+        .dispatch(
+            "run_portfolio",
+            &pair(json!({
+                "settings": {"portfolio": {"legs": [{"symbol": "AAAUSD", "weight": 1.0}]}},
+            })),
+        )
+        .unwrap();
+    assert!(run["run_id"].is_string());
+    let defaults = lab.dispatch("get_settings", &json!({})).unwrap();
+    for name in [
+        "max_participation_percent",
+        "range_slippage_percent",
+        "latency_jitter",
+        "latency_seed",
+        "portfolio",
+    ] {
+        assert!(defaults["settings"].get(name).is_some(), "{name}");
+    }
+}
+
+#[test]
+fn one_market_as_a_portfolio_reads_as_its_backtest_does() {
+    let (lab, _dir) = lab();
+    let settings = json!({"commission": {"on": true, "value": {"percent": 0.1}}});
+    let single = backtest_with(&lab, &settings);
+    let portfolio = lab
+        .dispatch(
+            "run_portfolio",
+            &json!({
+                "legs": [{"symbol": "BTCUSDT", "venue": "TEST", "weight": 1.0, "strategy": ema()}],
+                "bars": "1h",
+                "settings": settings,
+                "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    let (a, b) = (&single["summary"], &portfolio["summary"]);
+    for figure in ["first_bar", "last_bar", "bars"] {
+        assert_eq!(a[figure], b[figure], "{figure}");
+    }
+    for figure in [
+        "net_return",
+        "max_drawdown",
+        "sharpe",
+        "gross_return",
+        "total_costs_paid",
+    ] {
+        let (x, y) = (a[figure].as_f64().unwrap(), b[figure].as_f64().unwrap());
+        assert!((x - y).abs() < 1e-9, "{figure}: {x} and {y}");
+    }
+    let (x, y) = (&a["by_year"]["2024"], &b["by_year"]["2024"]);
+    assert!(
+        (x.as_f64().unwrap() - y.as_f64().unwrap()).abs() < 1e-9,
+        "{x} and {y}"
+    );
+}
+
+fn backtest_with(lab: &Arc<Lab>, settings: &Value) -> Value {
+    lab.dispatch(
+        "run_backtest",
+        &with(json!({"strategy": ema(), "settings": settings, "wait_seconds": 120})),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_portfolio_can_fill_at_the_next_open_as_a_backtest_does() {
+    let (lab, _dir) = lab();
+    let settings = json!({"fill_timing": "next_open"});
+    let single = backtest_with(&lab, &settings);
+    let portfolio = lab
+        .dispatch(
+            "run_portfolio",
+            &json!({
+                "legs": [{"symbol": "BTCUSDT", "venue": "TEST", "weight": 1.0, "strategy": ema()}],
+                "bars": "1h",
+                "settings": settings,
+                "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    assert_eq!(portfolio["summary"]["fills_on"], "next_open");
+    assert_eq!(single["summary"]["fills_on"], "next_open");
+    let (x, y) = (
+        single["summary"]["net_return"].as_f64().unwrap(),
+        portfolio["summary"]["net_return"].as_f64().unwrap(),
+    );
+    assert!((x - y).abs() < 1e-9, "{x} and {y}");
+}
+
+#[test]
+fn weight_rows_that_never_apply_are_said() {
+    let lab = two_hand_markets();
+    let run = lab
+        .dispatch(
+            "run_portfolio",
+            &pair(json!({"weights": [["2030-01-01", {"AAAUSD": 0.5}]]})),
+        )
+        .unwrap();
+    let warnings = run["summary"]["warnings"].to_string();
+    assert!(warnings.contains("after the last bar"), "{warnings}");
+}
+
+#[test]
+fn a_list_in_a_portfolio_trades_when_it_does_in_a_backtest() {
+    let (lab, _dir) = lab();
+    let bars = lab
+        .dispatch("get_bars", &with(json!({"limit": 40})))
+        .unwrap();
+    let time = |at: usize| bars["rows"][at][0].clone();
+    let list = json!([[time(10), 1], [time(20), -1], [time(30), 0]]);
+    let single = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({"strategy": {"positions": list}, "wait_seconds": 120})),
+        )
+        .unwrap();
+    let portfolio = lab
+        .dispatch(
+            "run_portfolio",
+            &json!({
+                "legs": [{"symbol": "BTCUSDT", "venue": "TEST", "weight": 1.0, "strategy": {"positions": list}}],
+                "bars": "1h",
+                "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    let id = portfolio["run_id"].as_str().unwrap();
+    let theirs = lab
+        .dispatch("get_fills", &json!({"run_id": single["run_id"]}))
+        .unwrap();
+    let ours = lab
+        .dispatch(
+            "get_portfolio_fills",
+            &json!({"run_id": id, "symbol": "BTCUSDT"}),
+        )
+        .unwrap();
+    assert_eq!(theirs["rows"].as_array().unwrap().len(), 3, "{theirs}");
+    for (a, b) in theirs["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(ours["rows"].as_array().unwrap())
+    {
+        assert_eq!(a[0], b[0]);
+        assert_eq!(a[3], b[3]);
+    }
+}
+
+#[test]
+fn a_longer_warm_up_loads_more_bars_before_the_span() {
+    let (lab, _dir) = lab();
+    let bars = lab
+        .dispatch("get_bars", &with(json!({"limit": 200})))
+        .unwrap();
+    let from = bars["rows"][100][0].clone();
+    let figures = |warm_up: u64| {
+        lab.dispatch(
+            "run_portfolio",
+            &json!({
+                "legs": [{"symbol": "BTCUSDT", "venue": "TEST", "weight": 0.5}],
+                "bars": "1h",
+                "from": from,
+                "settings": {"warm_up_bars": warm_up},
+                "wait_seconds": 120,
+            }),
+        )
+        .unwrap()
+    };
+    let few = figures(1);
+    let many = figures(24);
+    let rows = |run: &Value| run["run_id"].as_str().unwrap().to_owned();
+    let count = |id: String| {
+        lab.load_run_for_test(&id).unwrap()["times"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    assert_eq!(count(rows(&many)), count(rows(&few)) + 23);
+    assert_eq!(few["summary"]["bars"], many["summary"]["bars"]);
+}
+
+#[test]
+fn a_run_saved_outside_lab_is_read_by_lab_and_lab_s_by_anyone() {
+    let lab = two_hand_markets();
+    let run = lab.dispatch("run_portfolio", &pair(json!({}))).unwrap();
+    let id = run["run_id"].as_str().unwrap();
+    let dir = lab.paths.lab().join("runs");
+    let back = persephone_research::portfolio::load_saved(&dir, id).unwrap();
+    assert_eq!(back.report.legs[1].missing_bars, 1);
+    assert_eq!(
+        back.figures.net_return,
+        run["summary"]["net_return"].as_f64().unwrap()
+    );
+    assert!(
+        persephone_research::portfolio::list_saved(&dir)
+            .iter()
+            .any(|saved| saved.id == id)
+    );
+
+    // As the app writes one.
+    let (summary, whole) = persephone_research::portfolio::written(
+        &back,
+        "run-from-the-app",
+        1,
+        &json!({"label": "App"}),
+    );
+    persephone_research::portfolio::save(&dir, &whole, &summary, &json!({"label": "App"})).unwrap();
+    let read = lab
+        .dispatch("get_portfolio", &json!({"run_id": "run-from-the-app"}))
+        .unwrap();
+    assert_eq!(read["summary"]["label"], "App");
+    assert_eq!(read["legs"][1]["symbol"], "BBBUSD");
 }

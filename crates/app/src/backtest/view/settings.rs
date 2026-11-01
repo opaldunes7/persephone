@@ -54,6 +54,11 @@ pub(super) fn test_tabs<'a>(current: TestKind, panel: &'a Panel) -> Element<'a, 
             TestKind::RandomEntries,
             "Places the backtest's trades at random times many times over, keeping how long each was held. If that does as well, the entries are worth nothing.",
         ),
+        tab(
+            "Portfolio",
+            TestKind::Portfolio,
+            "Several markets on one account: they share cash and margin, and costs are the same as the backtest's. Hold them at weights, trade this chart's strategy on each, or follow a table of weights.",
+        ),
     ]
     .spacing(3)
     .align_y(Alignment::Center);
@@ -359,6 +364,177 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                     .into(),
             )
         }
+        TestKind::Portfolio => {
+            let setup = &settings.portfolio;
+            let run = match &panel.tests.portfolio {
+                TestRun::Running { .. } => action(
+                    "Cancel",
+                    false,
+                    Some(PanelMessage::StopPortfolio),
+                    "Stop waiting for this portfolio.".to_owned(),
+                ),
+                TestRun::Done(_) => action(
+                    "Run",
+                    false,
+                    can_run.then_some(PanelMessage::RunPortfolio),
+                    run_or("Run it again, with whatever's changed. Orders go at the market, at the closes or next opens as the settings say."),
+                ),
+                _ => action(
+                    "Run",
+                    true,
+                    can_run.then_some(PanelMessage::RunPortfolio),
+                    run_or("Load these markets on this chart's timeframe and span, and run them on one account. Orders go at the market, at the closes or next opens as the settings say."),
+                ),
+            };
+            let plain = LegChoice {
+                label: if setup.use_chart_strategy {
+                    "Chart's strategy".to_owned()
+                } else {
+                    "Holds its weight".to_owned()
+                },
+                choice: None,
+            };
+            let mut choices = vec![plain.clone()];
+            choices.extend(info.strategies.iter().map(|choice| LegChoice {
+                label: choice.name.clone(),
+                choice: Some(choice.clone()),
+            }));
+            let hint = |content: &'a str, width: f32| {
+                text(content).size(HINT).color(theme::TEXT_MUTED).width(width)
+            };
+            let mut legs = column![row![
+                hint("Market", 92.0),
+                hint("Venue", 56.0),
+                hint("Weight", 50.0),
+                hint("Trades", 130.0),
+            ]
+            .spacing(4)]
+            .spacing(3);
+            for (at, leg) in setup.legs.iter().enumerate() {
+                let selected = match &leg.strategy {
+                    None => plain.clone(),
+                    Some(written) => {
+                        let id = written.get("builtin").or_else(|| written.get("plugin"));
+                        choices
+                            .iter()
+                            .find(|option| {
+                                option.choice.as_ref().is_some_and(|choice| match &choice.kind {
+                                    StrategyKind::BuiltIn(kind) => {
+                                        id.and_then(serde_json::Value::as_str) == Some(kind.id())
+                                    }
+                                    StrategyKind::Plugin(plugin) => {
+                                        id.and_then(serde_json::Value::as_str) == Some(plugin.as_str())
+                                    }
+                                })
+                            })
+                            .cloned()
+                            .unwrap_or_else(|| LegChoice {
+                                label: "Its own strategy".to_owned(),
+                                choice: None,
+                            })
+                    }
+                };
+                legs = legs.push(
+                    row![
+                        tip(input(Field::LegSymbol(at), 92.0), "A market, as BTCUSDT, or BTCUSDT-PERP for a perpetual, which pays funding.", None),
+                        tip(input(Field::LegVenue(at), 56.0), "Where its bars come from, for a market you imported. Blank is where this chart's come from.", None),
+                        tip(input(Field::LegWeight(at), 50.0), "With no strategy, the signed share of the capital to hold: 0.5 is half, and -0.5 half of it short. With a strategy, what its position size is multiplied by, above 0. A table of weights takes over from this.", None),
+                        tip(
+                            pick_list(choices.clone(), Some(selected), move |choice| PanelMessage::LegStrategy(at, choice))
+                                .text_size(HINT)
+                                .padding([3, 6])
+                                .width(130.0)
+                                .style(|_, status| list_style(status))
+                                .menu_style(|_| list_menu_style()),
+                            "What decides this market's position. Each can trade its own, with its default values. A table of weights can't go with these.",
+                            None,
+                        ),
+                        action("×", false, Some(PanelMessage::Edit(Edit::RemoveLeg(at))), "Take this market out.".to_owned()),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+                );
+            }
+            let saved = tip(
+                pick_list(
+                    panel.tests.saved_portfolios.clone(),
+                    None::<SavedPortfolio>,
+                    PanelMessage::OpenPortfolio,
+                )
+                .on_open(PanelMessage::ListPortfolios)
+                .placeholder("Saved runs")
+                .text_size(HINT)
+                .padding([3, 6])
+                .width(110.0)
+                .style(|_, status| list_style(status))
+                .menu_style(|_| list_menu_style()),
+                "Go back to a portfolio run from here or from Lab. Every one is kept, with Lab's runs.",
+                None,
+            );
+            let small = |label: &'a str, field: Field, what: &'a str| {
+                tip(
+                    row![
+                        text(label).size(HINT).color(theme::TEXT_MUTED),
+                        input(field, 46.0)
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+                    what,
+                    None,
+                )
+            };
+            let table: Element<'a, PanelMessage> = match setup
+                .weights
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+            {
+                Some(rows) => row![
+                    text(format!("A table of {} rows", rows.len())).size(HINT).color(theme::TEXT_MUTED),
+                    action("Clear", false, Some(PanelMessage::Edit(Edit::ClearWeights)), "Go back to the weights above.".to_owned()),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center)
+                .into(),
+                None => action(
+                    "Load weights",
+                    false,
+                    Some(PanelMessage::PickWeights),
+                    "A JSON file of [[time, {\"BTCUSDT\": 0.5, \"ETHUSDT\": -0.5}], ...]. Each row states the whole book as signed shares of the account, from that bar's close.".to_owned(),
+                ),
+            };
+            Some(
+                column![
+                    legs,
+                    row![
+                        saved,
+                        action("Add market", false, Some(PanelMessage::Edit(Edit::AddLeg)), "Add a market to trade on the same account.".to_owned()),
+                        table,
+                        tip(
+                            toggler(setup.use_chart_strategy)
+                                .label("Chart's")
+                                .size(14)
+                                .text_size(HINT)
+                                .on_toggle(|on| PanelMessage::Edit(Edit::LegsUseStrategy(on))),
+                            "Every market trades this chart's strategy at its weight, rather than holding its weight.",
+                            None,
+                        ),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                    row![
+                        small("Every", Field::RebalanceEvery, "Go back to the weights every so many bars. Blank never does. Rebalancing sizes from the account as it is now."),
+                        small("Drift", Field::RebalanceDrift, "Go back to the weights when a leg is this many points of the account away. Blank never does."),
+                        small("Min", Field::RebalanceMinTrade, "Trades worth less than this aren't made, so small changes don't pay fees for nothing."),
+                        small("Margin %", Field::Maintenance, "What a position needs to stay open, as a percentage of its value. Everything is liquidated at once when the account falls to it, whatever the volume limit."),
+                        container(run).align_right(Fill),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                ]
+                .spacing(5)
+                .into(),
+            )
+        }
         TestKind::RandomEntries => {
             let run = match &panel.tests.random_entries {
                 TestRun::Running { .. } => action(
@@ -530,13 +706,32 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                 },
             };
             let extra: Element<'a, PanelMessage> = if walking {
-                small(
-                    "Windows",
-                    Field::Windows,
-                    "How many times to slide along: each picks on a stretch three times the length of the unseen one after it.",
-                )
+                row![
+                    small(
+                        "Windows",
+                        Field::Windows,
+                        "How many times to slide along.",
+                    ),
+                    small(
+                        "Ratio",
+                        Field::WalkRatio,
+                        "How many times longer than its unseen stretch each window picks on.",
+                    ),
+                ]
+                .spacing(6)
+                .into()
             } else {
-                keep
+                row![
+                    keep,
+                    small(
+                        "Pick on %",
+                        Field::HoldOutShare,
+                        "With Keep unseen on, how much of the span values are picked on. The rest stays unseen.",
+                    ),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .into()
             };
             let mut rows = column![
                 variable_row(0),
@@ -587,6 +782,13 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
     const STOP: &str = "A real stop this far from the entry, from the bar after it. It fills inside a bar at its level, or at the open on a gap.";
     const TARGET: &str = "A real target this far from the entry, from the bar after it. On a bar reaching both, the stop's assumed to have come first.";
     const IMPACT: &str = "How far a market order fills worse when it's all of its bar's volume. It moves with the square root of its share of that volume. A rough assumption.";
+    const PARTICIPATION: &str = "The most of a bar's volume an order can take. What's left goes out on the next bars at their prices, so big positions take time to build and to leave. A resting limit fills no more than this of each bar.";
+    const RANGE_SLIPPAGE: &str = "What a market order or stop pays on top, as a percentage of a bar's high to low, times how many times wider that bar is than the median of the last 100. A wild bar costs far more than a quiet one. A rough assumption.";
+    const WARNINGS: &str = "Warn when an order's over this share of its bar's volume, with Impact on, or when fewer than this share of limit orders fill.";
+    const WARM_UP: &str = "How many bars before the span strategies warm up on. Raise it for look-backs longer than this. Press Enter to load them.";
+    const CASH_INTEREST: &str = "What cash below zero costs in a portfolio, as a percentage a year. Without it, a book holding more than the account borrows free.";
+    const JITTER: &str = "How much longer than the latency orders take on average, drawn for each order. Most are quick and a few slow. Only fills on ticks can show it.";
+    const SEED: &str = "Which draws of jitter a run uses, so it can be repeated.";
     const BORROW: &str = "What borrowing costs a short, as a percentage of its value a year. Perpetuals pay funding instead.";
     const COMPOUND: &str = "Size positions from the account as it is now, so profits grow them and losses shrink them. Off, every position is sized from the starting capital.";
     const INVERT: &str = "Trade the opposite of what the strategy says: sell when it buys and buy when it sells, at the same moments. Paper trading follows it too.";
@@ -600,7 +802,7 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
             None,
         )
     };
-    // These two have more to them, so get the width of the section.
+    // These have more to them, so get the width of the section.
     let wide: Vec<Element<'a, PanelMessage>> = vec![
         line(
             switch(settings.commission.on, Edit::Commission, FEES),
@@ -654,6 +856,39 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                 None,
             ),
         ),
+        line(
+            switch(settings.range_slippage_percent.on, Edit::RangeSlippage, RANGE_SLIPPAGE),
+            name("Range slip", RANGE_SLIPPAGE),
+            tip(
+                row![input(Field::RangeSlippage, 54.0), unit("% over"), input(Field::RangeLookBack, 46.0), unit("bars")]
+                    .spacing(3)
+                    .align_y(Alignment::Center),
+                RANGE_SLIPPAGE,
+                None,
+            ),
+        ),
+        line(
+            switch(settings.impact_percent.on, Edit::Impact, IMPACT),
+            name("Impact", IMPACT),
+            tip(
+                row![input(Field::Impact, 54.0), unit("% power"), input(Field::ImpactExponent, 40.0)]
+                    .spacing(3)
+                    .align_y(Alignment::Center),
+                IMPACT,
+                None,
+            ),
+        ),
+        line(
+            no_switch(),
+            name("Warn at", WARNINGS),
+            tip(
+                row![input(Field::VolumeWarning, 46.0), unit("% volume"), input(Field::FillWarning, 46.0), unit("% filled")]
+                    .spacing(3)
+                    .align_y(Alignment::Center),
+                WARNINGS,
+                None,
+            ),
+        ),
     ];
     let simulation = vec![
         line(
@@ -700,13 +935,13 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
             ),
         ),
         line(
-            switch(settings.impact_percent.on, Edit::Impact, IMPACT),
-            name("Impact", IMPACT),
+            switch(settings.max_participation_percent.on, Edit::Participation, PARTICIPATION),
+            name("Volume limit", PARTICIPATION),
             tip(
-                row![input(Field::Impact, 54.0), unit("%")]
+                row![input(Field::Participation, 54.0), unit("%")]
                     .spacing(3)
                     .align_y(Alignment::Center),
-                IMPACT,
+                PARTICIPATION,
                 None,
             ),
         ),
@@ -730,6 +965,38 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
             switch(settings.latency.on, Edit::Latency, LATENCY),
             name("Latency", LATENCY),
             ticks_box(Field::Latency, "ms", LATENCY),
+        ),
+        line(
+            switch(settings.cash_interest_percent_per_year.on, Edit::CashInterest, CASH_INTEREST),
+            name("Cash interest", CASH_INTEREST),
+            tip(
+                row![input(Field::CashInterest, 54.0), unit("%")]
+                    .spacing(3)
+                    .align_y(Alignment::Center),
+                CASH_INTEREST,
+                None,
+            ),
+        ),
+        line(
+            no_switch(),
+            name("Warm-up", WARM_UP),
+            tip(
+                row![input(Field::WarmUp, 54.0), unit("bars")]
+                    .spacing(3)
+                    .align_y(Alignment::Center),
+                WARM_UP,
+                None,
+            ),
+        ),
+        line(
+            switch(settings.latency_jitter.on, Edit::LatencyJitter, JITTER),
+            name("Jitter", JITTER),
+            ticks_box(Field::LatencyJitter, "ms", JITTER),
+        ),
+        line(
+            no_switch(),
+            name("Jitter seed", SEED),
+            tip(input(Field::LatencySeed, 92.0), SEED, None),
         ),
         line(
             switch(settings.leverage.on, Edit::Leverage, LEVERAGE),

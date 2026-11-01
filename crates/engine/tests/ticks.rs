@@ -249,3 +249,31 @@ fn tick_bars_decide_after_their_last_tick() {
         );
     }
 }
+
+#[test]
+fn jitter_on_ticks_repeats_by_seed_and_changes_with_it() {
+    let feed = Arc::new(Wave::new(TickKind::Quotes, 10 * SECOND, 10));
+    let with = |seed| {
+        let mut request = request(&feed, true);
+        request.sim.latency_ms = 10;
+        request.sim.latency_jitter_ms = 60_000;
+        request.sim.latency_seed = seed;
+        run(&request)
+    };
+    let prices = |report: &BacktestReport| {
+        report
+            .fills
+            .iter()
+            .map(|fill| (fill.ts, fill.price.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    let first = with(1);
+    assert_eq!(prices(&first), prices(&with(1)));
+    assert_ne!(prices(&first), prices(&with(2)));
+    let refused = first
+        .notes
+        .iter()
+        .any(|note| note.text.contains("fault") || note.text.contains("refused"));
+    assert!(!refused, "{:?}", first.notes);
+    assert!(!first.notes.iter().any(|note| note.text.contains("jitter")));
+}

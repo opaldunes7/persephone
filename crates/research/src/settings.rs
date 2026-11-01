@@ -38,10 +38,35 @@ pub struct Settings {
     pub borrow_percent_per_year: Section<f64>,
     /// How far a market order fills worse, as a percentage, when it's all of its bar's volume.
     pub impact_percent: Section<f64>,
+    /// How steeply that grows with an order's share of its bar's volume: 0.5 is the square root.
+    pub impact_exponent: f64,
+    /// An order over this percentage of its bar's volume, or fewer than this percentage of limits
+    /// filling, gets a warning.
+    pub volume_warning_percent: f64,
+    pub fill_warning_percent: f64,
+    /// What cash below zero costs in a portfolio, as a percentage a year.
+    pub cash_interest_percent_per_year: Section<f64>,
+    /// How many bars before a span strategies warm up on.
+    pub warm_up_bars: u32,
+    /// How much of a span Keep unseen picks values on, as a percentage.
+    pub hold_out_percent: f64,
+    /// How many times longer than its unseen stretch a walk-forward window picks on.
+    pub walk_ratio: f64,
+    /// The most of a bar's volume an order can take, as a percentage.
+    pub max_participation_percent: Section<f64>,
+    /// What a taker pays on top as a percentage of a bar's range, more when that bar's unusually wide.
+    pub range_slippage_percent: Section<f64>,
+    /// How many bars back the usual range is judged from.
+    pub range_look_back: u32,
     /// A spread assumed for bar data, in ticks.
     pub spread: Section<u32>,
     /// Milliseconds orders take to reach the venue.
     pub latency: Section<u32>,
+    /// How much longer orders take on average, drawn for each, and which draws those are.
+    pub latency_jitter: Section<u32>,
+    pub latency_seed: u32,
+    /// The markets the Portfolio test trades together.
+    pub portfolio: crate::portfolio::PortfolioSetup,
     pub leverage: Section<f64>,
     pub direction: Section<OneWay>,
     /// Trade the opposite of what the strategy says.
@@ -90,8 +115,21 @@ impl Default for Settings {
             take_profit_percent: Section::off(4.0),
             borrow_percent_per_year: Section::off(10.0),
             impact_percent: Section::off(1.0),
+            impact_exponent: 0.5,
+            volume_warning_percent: 10.0,
+            fill_warning_percent: 50.0,
+            cash_interest_percent_per_year: Section::off(5.0),
+            warm_up_bars: crate::WARM_UP_BARS as u32,
+            hold_out_percent: crate::optimize::PICKED_ON * 100.0,
+            walk_ratio: crate::walk_forward::RATIO,
+            max_participation_percent: Section::off(5.0),
+            range_slippage_percent: Section::off(1.0),
+            range_look_back: 100,
             spread: Section::off(2),
             latency: Section::off(100),
+            latency_jitter: Section::off(50),
+            latency_seed: 0,
+            portfolio: crate::portfolio::PortfolioSetup::default(),
             leverage: Section::off(2.0),
             direction: Section::off(OneWay::LongOnly),
             invert: false,
@@ -129,6 +167,8 @@ pub enum TestKind {
     WalkForward,
     /// The backtest's holds placed at random times, to compare it with chance.
     RandomEntries,
+    /// Several markets on one account.
+    Portfolio,
 }
 
 /// What the Optimize test varies and how it scores the results.
@@ -382,6 +422,14 @@ pub enum Edit {
     TakeProfit(bool),
     Borrow(bool),
     Impact(bool),
+    Participation(bool),
+    RangeSlippage(bool),
+    LatencyJitter(bool),
+    AddLeg,
+    RemoveLeg(usize),
+    LegsUseStrategy(bool),
+    CashInterest(bool),
+    ClearWeights,
     Spread(bool),
     Latency(bool),
     Leverage(bool),
@@ -433,6 +481,23 @@ impl Settings {
             Edit::TakeProfit(on) => self.take_profit_percent.on = on,
             Edit::Borrow(on) => self.borrow_percent_per_year.on = on,
             Edit::Impact(on) => self.impact_percent.on = on,
+            Edit::Participation(on) => self.max_participation_percent.on = on,
+            Edit::RangeSlippage(on) => self.range_slippage_percent.on = on,
+            Edit::LatencyJitter(on) => self.latency_jitter.on = on,
+            Edit::AddLeg => self.portfolio.legs.push(crate::portfolio::LegSetup {
+                symbol: String::new(),
+                venue: None,
+                weight: 0.0,
+                strategy: None,
+            }),
+            Edit::RemoveLeg(leg) => {
+                if leg < self.portfolio.legs.len() {
+                    self.portfolio.legs.remove(leg);
+                }
+            }
+            Edit::LegsUseStrategy(on) => self.portfolio.use_chart_strategy = on,
+            Edit::CashInterest(on) => self.cash_interest_percent_per_year.on = on,
+            Edit::ClearWeights => self.portfolio.weights = None,
             Edit::Spread(on) => self.spread.on = on,
             Edit::Latency(on) => self.latency.on = on,
             Edit::Leverage(on) => self.leverage.on = on,
@@ -472,6 +537,46 @@ impl Settings {
             Field::TakeProfit => trim(self.take_profit_percent.value),
             Field::Borrow => trim(self.borrow_percent_per_year.value),
             Field::Impact => trim(self.impact_percent.value),
+            Field::Participation => trim(self.max_participation_percent.value),
+            Field::RangeSlippage => trim(self.range_slippage_percent.value),
+            Field::LatencyJitter => self.latency_jitter.value.to_string(),
+            Field::LatencySeed => self.latency_seed.to_string(),
+            Field::RangeLookBack => self.range_look_back.to_string(),
+            Field::ImpactExponent => trim(self.impact_exponent),
+            Field::VolumeWarning => trim(self.volume_warning_percent),
+            Field::FillWarning => trim(self.fill_warning_percent),
+            Field::CashInterest => trim(self.cash_interest_percent_per_year.value),
+            Field::WarmUp => self.warm_up_bars.to_string(),
+            Field::HoldOutShare => trim(self.hold_out_percent),
+            Field::WalkRatio => trim(self.walk_ratio),
+            Field::LegVenue(leg) => self
+                .portfolio
+                .legs
+                .get(leg)
+                .and_then(|leg| leg.venue.clone())
+                .unwrap_or_default(),
+            Field::LegSymbol(leg) => self
+                .portfolio
+                .legs
+                .get(leg)
+                .map_or_else(String::new, |leg| leg.symbol.clone()),
+            Field::LegWeight(leg) => self
+                .portfolio
+                .legs
+                .get(leg)
+                .map_or_else(String::new, |leg| trim(leg.weight)),
+            Field::RebalanceEvery => self
+                .portfolio
+                .rebalance
+                .every_bars
+                .map_or_else(String::new, |bars| bars.to_string()),
+            Field::RebalanceDrift => self
+                .portfolio
+                .rebalance
+                .drift_percent
+                .map_or_else(String::new, trim),
+            Field::RebalanceMinTrade => trim(self.portfolio.rebalance.min_trade_value),
+            Field::Maintenance => trim(self.portfolio.maintenance_percent),
             Field::Slippage => self.slippage.value.to_string(),
             Field::SlippagePercent => trim(self.slippage_percent.value),
             Field::Spread => self.spread.value.to_string(),
@@ -557,6 +662,71 @@ impl Settings {
                 self.borrow_percent_per_year.value = number(0.0, 1_000.0, "A borrowing rate")?;
             }
             Field::Impact => self.impact_percent.value = number(0.0, 100.0, "Impact")?,
+            Field::Participation => {
+                self.max_participation_percent.value = number(0.001, 100.0, "A share of volume")?;
+            }
+            Field::RangeSlippage => {
+                self.range_slippage_percent.value = number(0.0, 100.0, "A share of the range")?;
+            }
+            Field::LatencyJitter => self.latency_jitter.value = whole(600_000, "Jitter")?,
+            Field::LatencySeed => self.latency_seed = whole(u32::MAX, "The seed")?,
+            Field::RangeLookBack => {
+                self.range_look_back = whole(100_000, "Bars to look back")?.max(1);
+            }
+            Field::ImpactExponent => {
+                self.impact_exponent = number(0.1, 2.0, "How steeply impact grows")?;
+            }
+            Field::VolumeWarning => {
+                self.volume_warning_percent = number(0.0, 100.0, "A share of volume")?;
+            }
+            Field::FillWarning => {
+                self.fill_warning_percent = number(0.0, 100.0, "A share of limits")?;
+            }
+            Field::CashInterest => {
+                self.cash_interest_percent_per_year.value =
+                    number(0.0, 1_000.0, "An interest rate")?;
+            }
+            Field::WarmUp => self.warm_up_bars = whole(100_000, "Warm-up bars")?,
+            Field::HoldOutShare => {
+                self.hold_out_percent = number(10.0, 95.0, "The share to pick on")?;
+            }
+            Field::WalkRatio => self.walk_ratio = number(0.1, 50.0, "The ratio")?,
+            Field::LegVenue(leg) => {
+                if let Some(leg) = self.portfolio.legs.get_mut(leg) {
+                    leg.venue = (!text.is_empty()).then(|| text.to_uppercase());
+                }
+            }
+            Field::LegSymbol(leg) => {
+                if let Some(leg) = self.portfolio.legs.get_mut(leg) {
+                    leg.symbol = text.to_uppercase();
+                }
+            }
+            Field::LegWeight(leg) => {
+                let weight = number(-100.0, 100.0, "A weight")?;
+                if let Some(leg) = self.portfolio.legs.get_mut(leg) {
+                    leg.weight = weight;
+                }
+            }
+            Field::RebalanceEvery => {
+                self.portfolio.rebalance.every_bars = if text.is_empty() {
+                    None
+                } else {
+                    Some(whole(1_000_000, "Rebalancing every so many bars")?.max(1))
+                };
+            }
+            Field::RebalanceDrift => {
+                self.portfolio.rebalance.drift_percent = if text.is_empty() {
+                    None
+                } else {
+                    Some(number(0.0, 1_000.0, "How far a leg may drift")?)
+                };
+            }
+            Field::RebalanceMinTrade => {
+                self.portfolio.rebalance.min_trade_value = number(0.0, 1e12, "The smallest trade")?;
+            }
+            Field::Maintenance => {
+                self.portfolio.maintenance_percent = number(0.0, 100.0, "Maintenance margin")?;
+            }
             Field::Slippage => self.slippage.value = whole(10_000, "Slippage")?,
             Field::SlippagePercent => {
                 self.slippage_percent.value = number(0.0, 10.0, "A percentage")?;
@@ -600,6 +770,10 @@ impl Settings {
             + self.take_profit_percent.on as usize
             + self.borrow_percent_per_year.on as usize
             + self.impact_percent.on as usize
+            + self.cash_interest_percent_per_year.on as usize
+            + self.max_participation_percent.on as usize
+            + self.range_slippage_percent.on as usize
+            + self.latency_jitter.on as usize
             + self.spread.on as usize
             + self.latency.on as usize
             + self.leverage.on as usize
@@ -652,6 +826,18 @@ impl Settings {
             take_profit_percent: self.on(&self.take_profit_percent).copied(),
             borrow_percent_per_year: self.on(&self.borrow_percent_per_year).copied(),
             impact_percent: self.on(&self.impact_percent).copied().unwrap_or(0.0),
+            impact_exponent: self.impact_exponent,
+            volume_warning_percent: self.volume_warning_percent,
+            fill_warning_percent: self.fill_warning_percent,
+            cash_interest_percent_per_year: self.on(&self.cash_interest_percent_per_year).copied(),
+            range_slippage_look_back: self.range_look_back,
+            max_participation_percent: self.on(&self.max_participation_percent).copied(),
+            range_slippage_percent: self
+                .on(&self.range_slippage_percent)
+                .copied()
+                .unwrap_or(0.0),
+            latency_jitter_ms: self.on(&self.latency_jitter).copied().unwrap_or(0),
+            latency_seed: u64::from(self.latency_seed),
         }
     }
 

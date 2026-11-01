@@ -1070,6 +1070,7 @@ mod tests {
             qty,
             fee,
             maker: false,
+            range_slip: 0.0,
         }
     }
 

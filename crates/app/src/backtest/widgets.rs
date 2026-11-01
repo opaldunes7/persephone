@@ -664,6 +664,115 @@ impl canvas::Program<PanelMessage> for WalkChart<'_> {
     }
 }
 
+/// Lines over one timeline, named above them, with what each reads under the mouse.
+pub struct Lines<'a> {
+    pub lines: Vec<(String, &'a [f64], Color)>,
+    pub times: &'a [UnixNanos],
+    /// Where its axis's own line is drawn.
+    pub start: f64,
+    /// How a value reads.
+    pub format: fn(f64) -> String,
+}
+
+/// A color for the `at`th leg of a portfolio.
+#[must_use]
+pub fn leg_color(at: usize) -> Color {
+    const COLORS: [Color; 6] = [
+        Color::from_rgb8(0x66, 0xbb, 0x6a),
+        Color::from_rgb8(0xff, 0xa7, 0x26),
+        Color::from_rgb8(0xab, 0x47, 0xbc),
+        Color::from_rgb8(0x26, 0xc6, 0xda),
+        Color::from_rgb8(0xef, 0x53, 0x50),
+        Color::from_rgb8(0xd4, 0xe1, 0x57),
+    ];
+    COLORS[at % COLORS.len()]
+}
+
+impl canvas::Program<PanelMessage> for Lines<'_> {
+    type State = ();
+
+    fn update(
+        &self,
+        _state: &mut (),
+        event: &Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<canvas::Action<PanelMessage>> {
+        matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }))
+            .then(|| cursor.position_in(bounds))
+            .flatten()
+            .map(|_| canvas::Action::request_redraw())
+    }
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let size = bounds.size();
+        let mut frame = Frame::new(renderer, size);
+        let count = self.times.len();
+        let values = self
+            .lines
+            .iter()
+            .flat_map(|(_, line, _)| line.iter().copied())
+            .chain(std::iter::once(self.start));
+        let pane = pane_with_room(values, self.start, count, size, 16.0);
+        price_grid(&mut frame, &pane);
+        axes_and_start(&mut frame, &pane, self.start);
+        // No more points than pixels: the rest can't be seen.
+        let stride = (count as f32 / pane.width.max(1.0)).ceil().max(1.0) as usize;
+        for (_, line, color) in &self.lines {
+            if line.len() > 1 {
+                let path = Path::new(|b| {
+                    b.move_to(Point::new(pane.x(0.0), pane.y(line[0])));
+                    for at in (stride..line.len()).step_by(stride) {
+                        b.line_to(Point::new(pane.x(at as f64), pane.y(line[at])));
+                    }
+                });
+                frame.stroke(&path, Stroke::default().with_color(*color).with_width(1.2));
+            }
+        }
+        let mut x = 12.0;
+        for (name, _, color) in &self.lines {
+            frame.fill_text(Text {
+                content: name.clone(),
+                position: Point::new(x, 8.0),
+                color: *color,
+                size: theme::TEXT_SIZE.into(),
+                align_y: alignment::Vertical::Center,
+                ..Text::default()
+            });
+            x += name.len() as f32 * 6.5 + 14.0;
+        }
+        if let Some(at) = cursor
+            .position_in(bounds)
+            .filter(|p| p.x < pane.width && p.y < pane.height)
+            && let Some(index) = pane.bar_at(at.x, count)
+        {
+            let when = DateTime::from_nanos(self.times[index]);
+            let read: Vec<String> = self
+                .lines
+                .iter()
+                .filter_map(|(name, line, _)| {
+                    Some(format!("{name} {}", (self.format)(*line.get(index)?)))
+                })
+                .collect();
+            hover_label(
+                &mut frame,
+                format!("{} {}: {}", when.date(), when.time(), read.join(", ")),
+                at.x,
+                at.y,
+                pane.width,
+            );
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
 // --- The tests' fan of equity lines ----------------------------------------------------------
 
 /// A picked line, in a color nothing else on the fan uses.

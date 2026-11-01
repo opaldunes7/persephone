@@ -16,8 +16,6 @@ use persephone_data::{
 };
 use persephone_engine::FeeRates;
 
-use crate::WARM_UP_BARS;
-
 /// How many bars a chart with no chosen span loads.
 pub const HISTORY_BARS: u64 = 5_000;
 /// The most ticks a chart's backtest replays (about 8 s in a release build). Past this, its
@@ -85,11 +83,12 @@ pub fn load_local(
     symbol: &str,
     bars: BarSpec,
     span: Option<(UnixNanos, UnixNanos)>,
+    warm_up_bars: u64,
 ) -> anyhow::Result<MarketBars> {
     let market = store.market(venue, symbol)?;
     let candles = match span {
         Some((from, to)) => {
-            let warm_up = bars.timeframe().map_or(0, |tf| WARM_UP_BARS * tf.nanos());
+            let warm_up = bars.timeframe().map_or(0, |tf| warm_up_bars * tf.nanos());
             market.candles_between(bars, from.saturating_sub(warm_up), to)?
         }
         None => market.candles_by(bars, HISTORY_BARS as usize)?,
@@ -155,12 +154,13 @@ pub fn load_binance(
     symbol: &str,
     timeframe: Timeframe,
     span: Option<(UnixNanos, UnixNanos)>,
+    warm_up_bars: u64,
 ) -> anyhow::Result<MarketBars> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
     let latest = timeframe.close_time(now); // include the forming bar
     let (start, end) = match span {
         Some((from, to)) => {
-            let start = from.saturating_sub(WARM_UP_BARS * timeframe.nanos());
+            let start = from.saturating_sub(warm_up_bars * timeframe.nanos());
             let end = to.min(latest);
             check_range(timeframe, start, end)?;
             (start, end)

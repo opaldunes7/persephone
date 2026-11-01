@@ -1513,6 +1513,161 @@ mod panel {
         assert!(shows(&app, "Picked"));
     }
 
+    /// A panel set up with two markets on one account, the chart's and another.
+    fn portfolio_panel() -> Persephone {
+        let mut app = ready_panel(TestKind::Portfolio);
+        let candles = (0..1_500u64)
+            .map(|i| {
+                let p = 3_000.0 + 200.0 * (i as f64 / 30.0).cos();
+                Candle {
+                    ts: i * Timeframe::H1.nanos(),
+                    open: p,
+                    high: p + 4.0,
+                    low: p - 4.0,
+                    close: p + 1.0,
+                    volume: 50.0,
+                }
+            })
+            .collect();
+        app.preload_leg(
+            0,
+            ChartData::new("ETHUSDT", "BINANCE", Timeframe::H1, 2, candles),
+        );
+        for (at, (symbol, weight)) in [("BTCUSDT", "0.5"), ("ETHUSDT", "-0.25")]
+            .iter()
+            .enumerate()
+        {
+            panel(&mut app, PanelMessage::Edit(Edit::AddLeg));
+            panel(
+                &mut app,
+                PanelMessage::Input(Field::LegSymbol(at), (*symbol).into()),
+            );
+            panel(&mut app, PanelMessage::Submit(Field::LegSymbol(at)));
+            panel(
+                &mut app,
+                PanelMessage::Input(Field::LegWeight(at), (*weight).into()),
+            );
+            panel(&mut app, PanelMessage::Submit(Field::LegWeight(at)));
+        }
+        app
+    }
+
+    #[test]
+    fn a_portfolio_runs_from_the_panel_and_shows_each_market_and_how_they_moved() {
+        let mut app = portfolio_panel();
+        assert!(shows(&app, "Add market"));
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        let persephone::backtest::TestRun::Done(found) = &app.panel().unwrap().tests.portfolio
+        else {
+            panic!("{:?}", app.panel().unwrap().tests.portfolio);
+        };
+        assert_eq!(found.report.legs.len(), 2);
+        assert_eq!(found.report.legs[0].fills.len(), 1);
+        assert_eq!(
+            found.report.legs[1].fills[0].side,
+            persephone_core::Side::Sell
+        );
+        for words in ["Equal shares", "Margin", "Moved with", "ETHUSDT"] {
+            assert!(shows(&app, words), "{words}");
+        }
+    }
+
+    #[test]
+    fn a_portfolio_on_the_panel_fills_at_the_next_open_when_the_settings_say() {
+        let mut app = portfolio_panel();
+        panel(
+            &mut app,
+            PanelMessage::Edit(Edit::FillTiming(persephone::backtest::FillTiming::NextOpen)),
+        );
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        let persephone::backtest::TestRun::Done(found) = &app.panel().unwrap().tests.portfolio
+        else {
+            panic!("{:?}", app.panel().unwrap().tests.portfolio);
+        };
+        // ETH opens at a price with no 1 on it, where its closes all have one.
+        let fill = found.report.legs[1].fills[0];
+        let bar = fill.bar;
+        assert!(bar >= 1);
+        assert!(
+            (fill.price - (found.report.legs[1].closes[bar] - 1.0)).abs() < 1e-6,
+            "{fill:?}"
+        );
+    }
+
+    #[test]
+    fn a_leg_can_trade_its_own_strategy_and_every_leg_figure_shows() {
+        let mut app = portfolio_panel();
+        panel(
+            &mut app,
+            PanelMessage::LegStrategy(
+                0,
+                persephone::backtest::LegChoice {
+                    label: "EMA Cross".into(),
+                    choice: Some(StrategyChoice {
+                        kind: StrategyKind::BuiltIn(BuiltInStrategy::EmaCross),
+                        name: "EMA Cross".into(),
+                    }),
+                },
+            ),
+        );
+        assert!(shows(&app, "Market"));
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        let persephone::backtest::TestRun::Done(found) = &app.panel().unwrap().tests.portfolio
+        else {
+            panic!("{:?}", app.panel().unwrap().tests.portfolio);
+        };
+        assert!(
+            found.report.legs[0].fills.len() > 2,
+            "it trades its strategy"
+        );
+        assert_eq!(found.report.legs[1].fills.len(), 1, "the other still holds");
+        for words in [
+            "Sharpe", "By year", "Worked", "Longest", "To go", "Borrow", "When",
+        ] {
+            assert!(shows(&app, words), "{words}");
+        }
+        panel(&mut app, PanelMessage::PortfolioLeg(1));
+        assert_eq!(app.panel().unwrap().tests.portfolio_leg, 1);
+    }
+
+    #[test]
+    fn the_numbers_that_were_fixed_can_be_set_from_the_panel() {
+        let mut app = ready_panel(TestKind::Backtest);
+        for (field, value) in [
+            (Field::RangeLookBack, "50"),
+            (Field::ImpactExponent, "0.75"),
+            (Field::VolumeWarning, "2"),
+            (Field::FillWarning, "25"),
+            (Field::CashInterest, "7"),
+        ] {
+            panel(&mut app, PanelMessage::Input(field, value.into()));
+            panel(&mut app, PanelMessage::Submit(field));
+        }
+        panel(&mut app, PanelMessage::Edit(Edit::CashInterest(true)));
+        let sim = app.backtest_request(0).unwrap().1.sim;
+        assert_eq!(sim.range_slippage_look_back, 50);
+        assert_eq!(sim.impact_exponent, 0.75);
+        assert_eq!(sim.volume_warning_percent, 2.0);
+        assert_eq!(sim.fill_warning_percent, 25.0);
+        assert_eq!(sim.cash_interest_percent_per_year, Some(7.0));
+        assert!(shows(&app, "Warm-up"));
+        assert!(shows(&app, "Cash interest"));
+    }
+
+    #[test]
+    fn a_portfolio_with_nothing_in_it_says_what_to_do_and_a_removed_leg_takes_its_typing() {
+        let mut app = ready_panel(TestKind::Portfolio);
+        assert!(app.test_problem(0).is_some());
+        panel(&mut app, PanelMessage::Edit(Edit::AddLeg));
+        assert!(app.test_problem(0).unwrap().message.contains("Name every"));
+        panel(
+            &mut app,
+            PanelMessage::Input(Field::LegSymbol(0), "BTCUSDT".into()),
+        );
+        panel(&mut app, PanelMessage::Edit(Edit::RemoveLeg(0)));
+        assert!(app.panel().unwrap().input(Field::LegSymbol(0)).is_none());
+    }
+
     #[test]
     fn random_entries_runs_from_the_panel_and_shows_how_it_compares() {
         let mut app = ready_panel(TestKind::RandomEntries);

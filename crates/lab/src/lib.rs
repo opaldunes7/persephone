@@ -12,6 +12,7 @@ pub mod guide;
 pub mod http;
 pub mod jobs;
 pub mod mcp;
+pub mod portfolio;
 pub mod runs;
 pub mod state;
 pub mod tools;
@@ -26,10 +27,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use persephone_core::{
-    UnixNanos,
-    time::{DateTime, NANOS_PER_DAY, NANOS_PER_MINUTE, days_from_civil},
-};
+use persephone_core::{UnixNanos, time::DateTime};
 use persephone_data::store::Store;
 use persephone_ml::models::Models;
 use persephone_plugin_host::{Host, Plugins, Services};
@@ -213,46 +211,7 @@ pub fn new_id(prefix: &str) -> String {
 ///
 /// Returns a message saying what would be right.
 pub fn parse_time(value: &Value) -> Result<UnixNanos, String> {
-    if let Some(nanos) = value.as_u64() {
-        return Ok(nanos);
-    }
-    let bad = || {
-        format!(
-            "expected a time like `2024-01-31` or `2024-01-31 09:30` in UTC, or nanoseconds since 1970, not {value}"
-        )
-    };
-    let text = value.as_str().ok_or_else(bad)?.trim();
-    let text = text.strip_suffix('Z').unwrap_or(text);
-    let (date, time) = text
-        .split_once(['T', ' '])
-        .map_or((text, None), |(date, time)| (date, Some(time)));
-    let mut parts = date.split('-');
-    let mut number = |max: i64| {
-        parts
-            .next()
-            .and_then(|part| part.parse::<i64>().ok())
-            .filter(|n| (0..=max).contains(n))
-    };
-    let (Some(year), Some(month), Some(day)) = (number(9_999), number(12), number(31)) else {
-        return Err(bad());
-    };
-    if year < 1970 || month == 0 || day == 0 {
-        return Err(bad());
-    }
-    let days = days_from_civil(year, month as u32, day as u32) as u64;
-    let minutes = match time {
-        Some(time) => {
-            let mut parts = time.split(':');
-            let hours = parts.next().and_then(|p| p.parse::<u64>().ok());
-            let minutes = parts.next().and_then(|p| p.parse::<u64>().ok());
-            match (hours, minutes) {
-                (Some(h), Some(m)) if h <= 24 && m < 60 => h * 60 + m,
-                _ => return Err(bad()),
-            }
-        }
-        None => 0,
-    };
-    Ok(days * NANOS_PER_DAY + minutes * NANOS_PER_MINUTE)
+    persephone_research::portfolio::moment(value)
 }
 
 /// A time as tools show it: `2024-01-31 09:30`.
@@ -264,6 +223,7 @@ pub fn time_text(ts: UnixNanos) -> String {
 
 #[cfg(test)]
 mod tests {
+    use persephone_core::time::NANOS_PER_MINUTE;
     use serde_json::json;
 
     use super::*;

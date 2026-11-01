@@ -31,7 +31,7 @@ use persephone_engine::BacktestReport;
 use persephone_tiling::TileId;
 
 pub use persephone_research::{
-    Field, RunColumn, WARM_UP_BARS, calendar, figures, optimize, positions, robustness,
+    Field, RunColumn, WARM_UP_BARS, calendar, figures, optimize, portfolio, positions, robustness,
     settings::{
         self, BlockLength, Commission, Edit, FillTiming, OneWay, OptimizeSettings, Precision,
         ScoreBy, Section, SessionRule, Settings, TestKind, Variable, parse_time, time_text,
@@ -104,6 +104,10 @@ pub struct Tests {
     pub optimize: OptimizeRun,
     pub walk_forward: TestRun<walk_forward::WalkForward>,
     pub random_entries: TestRun<positions::RandomEntries>,
+    pub portfolio: TestRun<portfolio::PortfolioRun>,
+    /// The leg whose fills show, and the runs saved to go back to.
+    pub portfolio_leg: usize,
+    pub saved_portfolios: Vec<portfolio::SavedPortfolio>,
     /// The strategy's parameters before a result was applied, to go back to.
     pub original: Option<Vec<f64>>,
     /// The line picked on a Monte Carlo or Random blocks fan; one past the last for the backtest.
@@ -132,6 +136,9 @@ impl Default for Tests {
             optimize: OptimizeRun::Idle,
             walk_forward: TestRun::Idle,
             random_entries: TestRun::Idle,
+            portfolio: TestRun::Idle,
+            portfolio_leg: 0,
+            saved_portfolios: Vec::new(),
             original: None,
             line: None,
             zoom: None,
@@ -223,6 +230,7 @@ impl Tests {
         self.optimize = OptimizeRun::Idle;
         self.walk_forward = TestRun::Idle;
         self.random_entries = TestRun::Idle;
+        self.portfolio = TestRun::Idle;
         self.original = None;
     }
 
@@ -398,6 +406,13 @@ pub enum PanelMessage {
     StopOptimize,
     RunWalkForward,
     StopWalkForward,
+    RunPortfolio,
+    StopPortfolio,
+    PickWeights,
+    LegStrategy(usize, LegChoice),
+    PortfolioLeg(usize),
+    ListPortfolios,
+    OpenPortfolio(portfolio::SavedPortfolio),
     RunRandomEntries,
     StopRandomEntries,
     /// Write this chart's setup to a file.
@@ -449,6 +464,20 @@ pub struct StrategyChoice {
 impl fmt::Display for StrategyChoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.name)
+    }
+}
+
+/// What a portfolio's leg can be told to trade.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegChoice {
+    pub label: String,
+    /// `None` holds its weight, or trades the chart's strategy if that's on.
+    pub choice: Option<StrategyChoice>,
+}
+
+impl fmt::Display for LegChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label)
     }
 }
 
@@ -1063,6 +1092,7 @@ mod tests {
                     qty: 1.0,
                     fee: 0.0,
                     maker: false,
+                    range_slip: 0.0,
                 },
                 persephone_engine::Fill {
                     ts: 0,
@@ -1072,6 +1102,7 @@ mod tests {
                     qty: 1.0,
                     fee: 0.0,
                     maker: false,
+                    range_slip: 0.0,
                 },
             ],
             ..BacktestReport::default()

@@ -220,19 +220,42 @@ pub fn friction(
 /// Whether a backtest has anything to pay: fees, slippage or spread.
 #[must_use]
 pub fn costs_something(request: &BacktestRequest) -> bool {
-    let sim = &request.sim;
     request.fees.maker != 0.0
         || request.fees.taker != 0.0
-        || sim.fee_per_order.is_some()
-        || sim.slippage_ticks > 0
-        || sim.slippage_percent > 0.0
-        || sim.spread_ticks > 0
-        || sim.impact_percent > 0.0
-        || sim.borrow_percent_per_year.is_some()
+        || sim_costs_something(&request.sim)
         || request
             .funding
             .as_ref()
             .is_some_and(|rates| !rates.is_empty())
+}
+
+/// Whether the settings themselves charge anything.
+#[must_use]
+pub fn sim_costs_something(sim: &SimSettings) -> bool {
+    sim.fee_per_order.is_some()
+        || sim.slippage_ticks > 0
+        || sim.slippage_percent > 0.0
+        || sim.spread_ticks > 0
+        || sim.impact_percent > 0.0
+        || sim.range_slippage_percent > 0.0
+        || sim.borrow_percent_per_year.is_some()
+        || sim.cash_interest_percent_per_year.is_some()
+}
+
+/// The same settings charging nothing.
+#[must_use]
+pub fn free_sim(sim: &SimSettings) -> SimSettings {
+    SimSettings {
+        fee_per_order: None,
+        slippage_ticks: 0,
+        slippage_percent: 0.0,
+        spread_ticks: 0,
+        impact_percent: 0.0,
+        range_slippage_percent: 0.0,
+        borrow_percent_per_year: None,
+        cash_interest_percent_per_year: None,
+        ..*sim
+    }
 }
 
 /// The same backtest with nothing to pay.
@@ -240,12 +263,7 @@ pub fn costs_something(request: &BacktestRequest) -> bool {
 pub fn without_costs(request: &BacktestRequest) -> BacktestRequest {
     let mut free = request.clone();
     free.fees = FeeRates::ZERO;
-    free.sim.fee_per_order = None;
-    free.sim.slippage_ticks = 0;
-    free.sim.slippage_percent = 0.0;
-    free.sim.spread_ticks = 0;
-    free.sim.impact_percent = 0.0;
-    free.sim.borrow_percent_per_year = None;
+    free.sim = free_sim(&request.sim);
     free.funding = None;
     free
 }
@@ -253,7 +271,8 @@ pub fn without_costs(request: &BacktestRequest) -> BacktestRequest {
 /// All a run paid: fees, funding and borrowing as they were charged, and what slippage, spread and
 /// impact took from each order that didn't rest, worked back from its price as the fill model moved
 /// it. A market's own quotes bring their own spread, which isn't known here.
-fn costs_paid(
+#[must_use]
+pub fn costs_paid(
     report: &BacktestReport,
     sim: &SimSettings,
     price_precision: u8,
@@ -271,10 +290,10 @@ fn costs_paid(
                 (sim.spread_ticks / 2, -1.0)
             };
             let volume = volumes.get(fill.bar).copied().unwrap_or(0.0);
-            let share =
-                sim.slippage_percent / 100.0 + impact_share(sim.impact_percent, fill.qty, volume);
+            let share = sim.slippage_percent / 100.0
+                + impact_share(sim.impact_percent, sim.impact_exponent, fill.qty, volume);
             let ticks = f64::from(sim.slippage_ticks + spread) * tick;
-            let met = (fill.price - sign * ticks) / (1.0 + sign * share);
+            let met = (fill.price - sign * (ticks + fill.range_slip)) / (1.0 + sign * share);
             fill.qty * (fill.price - met) * sign
         })
         .sum();

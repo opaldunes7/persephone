@@ -511,11 +511,30 @@ The panel's stock settings go beyond market orders:
 - **Stop loss** and **Target** are real orders from the bar after an entry. On a bar reaching both, the stop's assumed to have come first.
 - **Fees** have an **m/t** choice, for separate maker and taker rates. A maker's can be below zero, for a rebate.
 - **Impact** makes market orders fill worse the larger they are against their bar's volume. It's a rough assumption.
+- **Volume limit** stops an order taking more than that share of a bar's volume. What's left goes out at the next closes, at their prices, so big positions take time to build and to leave. A resting limit fills no more than that share of each bar, and a stop takes that share and leaves the rest to the closes after.
+- **Range slip** makes market orders and stops pay a share of a bar's high to low, times how many times wider it is than usual. A bar 10 times the usual width costs 100 times a usual one, so wild markets cost what they should. It's a rough assumption.
+- **Warn at** says how large an order against its bar, and how few limits filling, gets a warning. **Warm-up** is how many bars before the span strategies warm up on: raise it for longer look-backs. **Cash interest** charges a portfolio for cash below zero, a year's rate. Optimize's **Pick on %** and Walk-forward's **Ratio** set how a span is split into what's picked on and what's unseen. Range slip's **over** and Impact's **power** set how far back a usual bar is judged from and how steeply impact grows.
+- **Jitter** makes each order take a random time longer than the latency. An order sent at a close reaches the next bar anyway, so only fills on ticks can show it.
 - **Borrow a year** charges shorts on spot, which otherwise cost nothing to hold, unlike in reality.
 
 For perpetuals, type a symbol like `BTCUSDT-PERP`. It uses Binance's USD-M futures bars and fees, and the statistics show **Funding paid**.
 
 Paper and live trading stay on market orders and spot markets for now, and won't start with any of this on.
+
+## Portfolios: several markets on one account
+
+**Portfolio**, under **Test**, runs several markets together on this chart's timeframe and span. They share one cash balance and one margin, so a profit on one supports another.
+
+**Add market** for each, as `BTCUSDT`, or `BTCUSDT-PERP` for a perpetual, with its weight: 0.5 holds half the capital in it, and -0.5 half short. Under **Trades**, each can hold its weight or trade a strategy of its own, with **Chart's** making those that hold trade this chart's strategy instead. **Venue** is for a market you imported, blank meaning where this chart's bars come from. Or use **Load weights** for a JSON file of `[[time, {"BTCUSDT": 0.5, "ETHUSDT": -0.5}], ...]`, which states the whole book at each time and is how to run pairs or rotation. **Every** and **Drift** go back to the weights every so many bars or when a leg strays, and **Min** skips trades too small to be worth their fees. Costs come from the settings above.
+
+The results show the account, equal shares of each market held, and what each market has made, with gross and net exposure below. The tables have each market's part, how large orders were worked (**To go** being what never got out, **Gaps** bars it was missing), how the markets' own returns moved together, returns by year, and each market's fills, a click on its name away.
+
+Every run is kept where Lab keeps its runs. **Saved runs** goes back to one, including those from Lab, and Lab reads the app's with `get_portfolio`. They travel in **Export all** with **Runs** on.
+
+- A market with no bar at some moment is valued at its last close, and can't trade until it has one.
+- **Margin %** is what positions need to stay open. When the account falls to it, judged at each market's worst in the bar, everything is sold at that close, whatever the volume limit, and trading stops. **Closest** says how near it came.
+- Exchanges' discounts for hedged books aren't modelled, so a hedge gets no margin relief.
+- Portfolios use market orders, at the closes they decide on, or at the next opens with **Fill at next open** on, which is the fairer test of a weight table. Limit orders, stops, Monte Carlo and walk-forward are for single markets for now, and paper and live trading don't run them.
 
 ## Exporting and importing
 

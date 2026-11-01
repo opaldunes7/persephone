@@ -72,7 +72,7 @@ How a backtest works, which decides what its numbers mean.
   order refused is a fault in the backtest, and one where the position rounds to nothing means raising the capital or size.
 - Unless `compound` is set, a strategy trading in and out falls behind `buy_and_hold_return` as profits build. To
   compare fairly, use `Size %` 100 and `compound`.
-- One market at a time: there are no portfolios.
+- `run_backtest` is one market. Several on one account are `run_portfolio`: see `portfolios`.
 - **`limit` orders** rest from the close by `offset_percent`, for `expires_bars`. They fill only when price trades **through**
   them, as a bar can't show a place in the queue, at their own price, even on a gap past them, and pay the maker's fee. An entry
   that doesn't fill lapses, and an exit goes at the market, including all of a reversal at the taker's fee. A level-based strategy will
@@ -95,11 +95,73 @@ How a backtest works, which decides what its numbers mean.
   isn't realistic.
 - **`impact_percent`** is a rough assumption: market orders fill worse by it times the square root of the order's share of its bar's volume.
   `warnings` says when an order's over a tenth of its bar, where fills are fiction anyway.
+- **`max_participation_percent`** limits an order to that share of the volume of the bar just closed. What's left goes out at the next
+  closes, at their prices, so `orders_worked`, `bars_to_fill_average`, `bars_to_fill_longest` and `unfilled_at_end` say how that went,
+  and `warnings` says if a position never got there. A different wish replaces what's still to go and works from what's held. A resting
+  limit fills no more than that share of each bar, its `filled` in `get_limit_orders`. A stop takes that share at its level, and the rest
+  goes at the closes after. It's a real constraint rather than a cost, so `gross_return`'s run keeps it.
+- **`range_slippage_percent`** makes takers pay that percentage of a bar's high to low, times how many times wider the bar is than the median
+  of the last 100, if it's wider at all. So a bar 10 times the usual width costs 100 times a usual one. A market order reads the bar just
+  closed and a stop the bar it fills in, as that's the venue's conditions and not something the strategy saw. Limits and targets pay none.
+  Each fill's `range_slip` in `get_fills` says what it took per unit of the market, in price, so multiply by its size before adding them up. It's a rough assumption: to stress a strategy, sweep it with `run_backtests`.
+- **`latency_jitter`** adds an exponential draw averaging that many milliseconds to each order's `latency`, `latency_seed` choosing the draws
+  so a run repeats. An order sent at a close reaches the next bar however long it took, so only `precision: "high"` on ticks can show it,
+  and a note says so otherwise. It can't go with limits or `next_open`.
 
 
 A strategy is `{"builtin": id}`, `{"plugin": id}`, `{"logic": tree}` or `{"positions": list}`, each with optional
 `"params"`.
 `list_strategies` lists them, and `describe_strategy` gives one's parameters and limits.
+
+## portfolios
+
+`run_portfolio` runs several markets on one account: one cash balance, one timeline. `run_portfolios` sweeps many in one call.
+
+```json
+{"tool": "run_portfolio", "args": {
+  "legs": [{"symbol": "BTCUSDT", "weight": 0.5}, {"symbol": "ETHUSDT", "weight": -0.5}],
+  "bars": "1h", "from": "2024-02-01", "to": "2024-03-01",
+  "rebalance": {"every_bars": 24, "min_trade_value": 100},
+  "settings": {"slippage_percent": {"on": true, "value": 0.01}}
+}}
+```
+
+- **What decides a leg's position, one of three.** A `strategy` on the leg, as anywhere else, with `weight` multiplying its position size. No
+  strategy: it holds `weight`, a signed share of the capital. Or `weights`, a table for the whole book, from your own code: this is how to
+  do pairs, rotation, risk parity and delta-neutral. `[[time, {"BTCUSDT": 0.5, "ETHUSDT": -0.5}], ...]` as signed shares of the account,
+  a market a row leaves out going flat. A row stamped with a bar's open applies at that bar's close, as position lists do, so stamp it with
+  the bar it was worked out from. With a table, a weight of 2 is twice the account, and needs `leverage` to match.
+- **Rebalancing** takes the whole book back to the weights `every_bars`, or when any leg is `drift_percent` points of the account away, skipping
+  trades worth under `min_trade_value`. Rebalanced and table runs size from the account as it is now. Without either a leg stays as it was sized.
+  With costs off it can trade at other times, so on a run rebalancing on drift `gross_return` less `net_return` isn't just the costs:
+  `total_costs_paid` is what was really paid.
+- **Cash below zero** is free unless `cash_interest_percent_per_year` is set, which flatters weights adding up to over 1. `interest_paid` says what
+  it came to, and it's in `total_costs_paid`. `warnings` says if the book needed well over the account in margin.
+- **A row before `from`** takes effect at the span's first bar, the last such row winning. Rows out of order are put in order. A row between
+  closes waits for the next one. Rows after the last bar do nothing, and `warnings` says so.
+- **One timeline.** Every moment any leg's bar closes is a moment for all of them. A leg with no bar then carries its last close at no volume,
+  so cash, equity and margin always read every market at the same moment. It can't trade there, and signals don't hear it. `warnings`
+  says how many a leg had. A leg trades from its first bar, and a table's weight before that is reported.
+- **Funding** is snapped to the nearest minute and settled across all legs in the same step, net into the one balance. Each leg pays its own
+  fees. Shorts pay `borrow_percent_per_year` only on legs with no funding.
+- **Cross-margin.** A profit on one leg supports another. Margin is the sum of position values over `leverage`. When the account falls to
+  `maintenance_percent` of what's held (0.5 by default), everything is liquidated at that close, whatever `max_participation_percent` says, and
+  nothing trades after. The account's judged at each market's worst in the bar, as bars can't show what came first, so a hedged book may be
+  cut sooner than it really would. `warnings` says if the book ever needed more margin than the account had, which isn't refused here but a venue wouldn't allow. `peak_margin_use` and `closest_to_liquidation` say how near it came, the latter as a multiple of what was
+  needed, so 1 is liquidated. Exchanges' discounts for hedged books aren't modelled, so a hedge gets no margin relief: those are venue-specific
+  stress tables, and a rough version would flatter delta-neutral books.
+- **Reading one.** `get_portfolio` has the summary, a table by leg, and `correlation`, which is of the markets' own returns, whichever way they're held, so a long and a short of markets moving together shows near +1. `get_portfolio_series` has equity, equal shares held,
+  exposure, and each leg's value and what it's made at each moment. `get_portfolio_fills` has one leg's fills. `benchmark_return` is an equal
+  share of the capital held in each market from its first bar, with no funding taken off. `list_runs` and `compare_runs` include them, with `kind: "portfolio"`. The app saves its portfolio runs in the same place, so these tools read those too, and its Saved runs list shows these.
+- **`fill_timing: "next_open"`** works as on one market: an order decided at a close goes at the next bar's open, with each leg at its own open at
+  the same moment. A leg with no next bar waits for the close before one it has, as its last price isn't one anyone could trade at. Liquidation
+  is then at the next open, gap and all, so an account can end below zero. This is the fair way to run a weight table: the delay between
+  working out a weight and trading it often takes much of an edge.
+- **What it doesn't do yet.** Market orders only: `limit`, stops and targets are for single
+  markets, and are refused. `precision: "high"` does nothing here, as portfolios fill on bars. Optimize, Monte Carlo, walk-forward and random entries don't take a portfolio, so
+  sweep with `run_portfolios`. A plugin can be a leg or write a weight table, but can't see several markets at once. All legs must be quoted in
+  one currency and share time bars. Paper and live trading don't run them.
+- **A check on all of this:** one leg at weight 1 with its strategy comes out exactly as `run_backtest` does: its fills, equity, costs and figures.
 
 ## logic
 
@@ -207,7 +269,7 @@ an error.
 
 | Setting | Value |
 |---|---|
-| `stock` | `false` turns all of the below off at once, except `capital` and `precision` |
+| `stock` | `false` turns all of the below off at once, except `capital` and `precision`. A market's own fees and a perpetual's funding aren't settings, so they stay |
 | `capital` | Starting cash, in the quote currency |
 | `commission` | `{"percent": 0.1}` of each fill, `{"per-order": 1.5}` flat, or `{"rates": {"maker": 0.02, "taker": 0.05}}`, instead of the market's fee. A maker's can be below zero, for a rebate |
 | `limit` | `{"offset_percent": 0.05, "expires_bars": 3, "through_percent": 0.01}`: send orders as limits, `through_percent` being optional. See `backtests` |
@@ -215,6 +277,19 @@ an error.
 | `take_profit_percent` | A real target this far from the entry |
 | `borrow_percent_per_year` | What borrowing costs a short |
 | `impact_percent` | How far a market order fills worse at all of its bar's volume |
+| `max_participation_percent` | The most of a bar's volume an order can take. See `backtests` |
+| `range_slippage_percent` | What takers pay on top from a bar's range. See `backtests` |
+| `latency_jitter` | Milliseconds orders take on top of `latency` on average, drawn for each. See `backtests` |
+| `latency_seed` | Which draws of `latency_jitter` a run uses |
+| `range_look_back` | How many bars back `range_slippage_percent` judges a bar's usual range from. Default 100 |
+| `impact_exponent` | How steeply `impact_percent` grows with an order's share of its bar's volume: 0.5, the default, is the square root, 1 in proportion |
+| `volume_warning_percent` | With impact on, orders over this share of their bar's volume get a warning. Default 10 |
+| `fill_warning_percent` | Fewer than this share of limit orders filling gets a warning, from 5 orders up. Default 50 |
+| `cash_interest_percent_per_year` | What cash below zero costs in a portfolio, in `interest_paid` |
+| `warm_up_bars` | How many bars before `from` strategies warm up on. Default 500. Raise it for longer look-backs |
+| `hold_out_percent` | How much of the span an optimization with `hold_out` picks on. Default 70 |
+| `walk_ratio` | How many times longer than its unseen stretch a walk-forward window picks on. Default 3. `train_ratio` on the call wins |
+| `portfolio` | What the app's Portfolio test trades: legs, weights and rebalancing, as `run_portfolio` takes them. Calls to `run_portfolio` don't read it |
 | `slippage` | Ticks every market order fills worse. A tick is `10^-price_precision`, from `get_instrument` |
 | `slippage_percent` | Percent of the price every market order fills worse, on top of any in ticks: `0.01` is 1 basis point |
 | `compound` | `true` sizes positions from the account as it is now. Monte Carlo then draws such trades as returns on the account and multiplies, so a fall can't pass 100% |
@@ -494,6 +569,8 @@ imports. API keys, what AI models a plugin may use, plugins' code and market dat
 | Optimize: the best, and what they did unseen | `top`, `on_edge`, `held_out_buy_and_hold` |
 | Walk-forward: chart and table | `run_walk_forward`'s `chart` and `windows` |
 | Random entries: both charts | `run_random_entries`' `return_chart` and `fall_chart` |
+| Portfolio: figures and the table by market | `get_portfolio` |
+| Portfolio: the account and exposure charts | `get_portfolio_series` |
 | A parameter sweep | `run_optimize`, or `run_backtests` across the values |
 | Export and Import buttons | `export_state`, `import_state` |
 | Backtest: Limits view, each order and how they compare | `get_limit_orders`, `summary.limit_summary` |

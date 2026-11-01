@@ -1845,6 +1845,35 @@ fn statistics<'a>(
             bright,
         ));
     }
+    let range_slip: f64 = report
+        .fills
+        .iter()
+        .map(|fill| fill.qty * fill.range_slip)
+        .sum();
+    if range_slip > 0.0 {
+        rows.push((
+            "Range slip paid".into(),
+            format!("{range_slip:.2} {quote}"),
+            bright,
+        ));
+    }
+    if report.orders_worked > 0 {
+        rows.push((
+            "Orders worked".into(),
+            format!(
+                "{}, {:.1} bars on average, longest {}",
+                report.orders_worked, report.bars_to_fill_average, report.bars_to_fill_longest
+            ),
+            bright,
+        ));
+    }
+    if report.unfilled_at_end > 0.0 {
+        rows.push((
+            "Still to go".into(),
+            format!("{}", report.unfilled_at_end),
+            bright,
+        ));
+    }
     if report.funding_paid != 0.0 {
         rows.push((
             "Funding paid".into(),

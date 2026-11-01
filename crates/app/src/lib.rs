@@ -127,6 +127,8 @@ pub struct Market {
     /// The span to load, as bar opens `[from, to)`, with bars before it for strategies to warm
     /// up on; `None` loads the latest bars.
     span: Option<(UnixNanos, UnixNanos)>,
+    /// How many bars before that span to load, for strategies to warm up on.
+    warm_up: u64,
 }
 
 /// One market's bars plus what the engine needs to trade it.
@@ -393,6 +395,8 @@ pub enum Message {
     /// This many of an optimization's backtests are done: run, count.
     OptimizeProgress(u64, usize),
     OptimizeDone(u64, Result<Arc<backtest::optimize::OptimizeResult>, String>),
+    PortfolioDone(u64, Result<Arc<backtest::portfolio::PortfolioRun>, String>),
+    WeightsRead(TileId, Result<serde_json::Value, String>),
     WalkForwardProgress(u64, usize),
     WalkForwardDone(
         u64,
@@ -546,6 +550,7 @@ impl Persephone {
             symbol: data.symbol.clone(),
             bars: data.bars,
             span: None,
+            warm_up: backtest::WARM_UP_BARS,
         };
         let instrument = InstrumentSpec {
             symbol: data.symbol.clone(),
@@ -1163,6 +1168,33 @@ impl Persephone {
                     };
                 }
             }
+            Message::PortfolioDone(run, result) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.portfolio.finish(run, result);
+                }
+            }
+            Message::WeightsRead(tile, result) => match result {
+                Ok(table) => {
+                    let symbols: Vec<String> = self.tiles.get(&tile).map_or_else(Vec::new, |t| {
+                        t.backtest
+                            .portfolio
+                            .legs
+                            .iter()
+                            .map(|leg| leg.symbol.clone())
+                            .collect()
+                    });
+                    match backtest::portfolio::parse_weights(&table, &symbols) {
+                        Ok(_) => {
+                            if let Some(tile) = self.tiles.get_mut(&tile) {
+                                tile.backtest.portfolio.weights = Some(table);
+                            }
+                            self.save();
+                        }
+                        Err(error) => self.notify(error, true),
+                    }
+                }
+                Err(error) => self.notify(error, true),
+            },
             Message::WalkForwardProgress(run, count) => {
                 if let Some(panel) = self.panel.as_mut() {
                     panel.tests.walk_forward.progress(run, count);
@@ -1404,9 +1436,10 @@ impl Persephone {
         if sim.limit.is_some()
             || sim.stop_loss_percent.is_some()
             || sim.take_profit_percent.is_some()
+            || sim.max_participation_percent.is_some()
         {
             return Some(
-                "Paper and live trading use market orders for now. Turn off limit orders, stops and targets first.",
+                "Paper and live trading use whole market orders for now. Turn off limit orders, stops, targets and the volume limit first.",
             );
         }
         match tile.market.bars.timeframe() {
@@ -1673,6 +1706,7 @@ impl Persephone {
                     symbol: DEFAULT_SYMBOL.to_owned(),
                     bars,
                     span: None,
+                    warm_up: backtest::WARM_UP_BARS,
                 },
             )
         }))
@@ -1757,6 +1791,7 @@ impl Persephone {
                 symbol: info.symbol.clone(),
                 bars: t.market.bars,
                 span: None,
+                warm_up: t.market.warm_up,
             };
             tasks.push(self.set_market(id, market));
         }
@@ -2849,6 +2884,28 @@ impl Persephone {
         if settings.test == TestKind::Backtest {
             return None;
         }
+        if settings.test == TestKind::Portfolio {
+            let setup = &settings.portfolio;
+            if setup.legs.is_empty() {
+                return Some(robustness::Problem::new(
+                    "Add the markets to trade together.",
+                ));
+            }
+            if setup.legs.iter().any(|leg| leg.symbol.is_empty()) {
+                return Some(robustness::Problem::new("Name every market."));
+            }
+            if setup.use_chart_strategy && tile.strategy.is_none() {
+                return Some(robustness::Problem::new(
+                    "Add a strategy to this chart for the markets to trade.",
+                ));
+            }
+            if tile.market.bars.timeframe().is_none() {
+                return Some(robustness::Problem::new(
+                    "A portfolio needs time bars, so its markets line up.",
+                ));
+            }
+            return None;
+        }
         let Some(strategy) = &tile.strategy else {
             return Some(robustness::Problem::new("Pick a strategy first."));
         };
@@ -2896,7 +2953,7 @@ impl Persephone {
             return backtest::walk_forward::stretches(
                 end.saturating_sub(from),
                 settings.windows as usize,
-                backtest::walk_forward::RATIO,
+                settings.walk_ratio,
             )
             .err()
             .map(robustness::Problem::new);
@@ -2916,8 +2973,8 @@ impl Persephone {
                 )));
             }
             if chosen.hold_out {
-                end = optimize::split_at(from, end);
-                share = optimize::PICKED_ON;
+                share = settings.hold_out_percent / 100.0;
+                end = optimize::split_at(from, end, share);
                 if end < from + 2 || end >= candles.len() {
                     return Some(robustness::Problem {
                         message: "The span has too few bars to keep some unseen. Widen it, or \
@@ -3041,7 +3098,7 @@ impl Persephone {
                 request,
                 candles,
                 blocks,
-                warm_up: backtest::WARM_UP_BARS as usize,
+                warm_up: tile.backtest.warm_up_bars as usize,
                 workers,
                 stop,
             },
@@ -3086,7 +3143,7 @@ impl Persephone {
         let from = span_start(&candles, tile.market.span);
         let split = chosen
             .hold_out
-            .then(|| optimize::split_at(from, candles.len()));
+            .then(|| optimize::split_at(from, candles.len(), settings.hold_out_percent / 100.0));
         let blocks = if chosen.score == ScoreBy::RandomBlocks {
             match backtest::robustness::pick_blocks(
                 &candles[..split.unwrap_or(candles.len())],
@@ -3116,7 +3173,7 @@ impl Persephone {
             score: chosen.score,
             split,
             blocks,
-            warm_up: backtest::WARM_UP_BARS as usize,
+            warm_up: tile.backtest.warm_up_bars as usize,
             runs: settings.runs,
             ruin_at: settings.ruin / 100.0,
             seed: panel.tests.seed,
@@ -3495,8 +3552,8 @@ impl Persephone {
             grid,
             score: chosen.score,
             windows: settings.windows as usize,
-            ratio: walk_forward::RATIO,
-            warm_up: backtest::WARM_UP_BARS as usize,
+            ratio: settings.walk_ratio,
+            warm_up: tile.backtest.warm_up_bars as usize,
             runs: settings.runs,
             ruin_at: settings.ruin / 100.0,
             seed: panel.tests.seed,
@@ -3510,6 +3567,207 @@ impl Persephone {
             stop: backtest::StopOnDrop(stop),
         };
         Some((run, job))
+    }
+
+    /// A strategy from the panel's list, written as a strategy is anywhere else.
+    fn written_choice(&self, kind: &StrategyKind) -> Option<serde_json::Value> {
+        match kind {
+            StrategyKind::BuiltIn(kind) => Some(serde_json::json!({"builtin": kind.id()})),
+            StrategyKind::Plugin(plugin) => match plugin.strip_prefix(LAB_PREFIX) {
+                Some(result) => self
+                    .lab_results
+                    .iter()
+                    .find(|saved| saved.id == result)
+                    .map(|saved| saved.strategy.clone()),
+                None => Some(serde_json::json!({"plugin": plugin})),
+            },
+        }
+    }
+
+    /// What a strategy written down in a portfolio comes to.
+    fn written_strategy(
+        &self,
+        written: &serde_json::Value,
+    ) -> Result<(StrategySpec, Option<Arc<dyn SignalFactory>>), String> {
+        use persephone_research::results::{StrategyRef, with_params};
+        match StrategyRef::parse(written)? {
+            StrategyRef::BuiltIn(kind) => Ok((
+                with_params(StrategyKind::BuiltIn(kind), Arc::new(kind.info()), written)?,
+                None,
+            )),
+            StrategyRef::Plugin(id) => {
+                let plugin = self
+                    .plugins
+                    .strategies
+                    .get(&id)
+                    .ok_or_else(|| format!("there's no plugin `{id}`"))?;
+                let spec = with_params(
+                    StrategyKind::Plugin(id.clone()),
+                    Arc::clone(&plugin.info),
+                    written,
+                )?;
+                Ok((spec, Some(Arc::clone(plugin) as Arc<dyn SignalFactory>)))
+            }
+            StrategyRef::Positions(list) => {
+                let spec = with_params(list.spec().kind, Arc::new(list.info()), written)?;
+                Ok((spec, Some(Arc::new(list) as Arc<dyn SignalFactory>)))
+            }
+            StrategyRef::Logic(logic) => {
+                let spec = with_params(logic.spec().kind, Arc::new(logic.info()), written)?;
+                Ok((spec, Some(Arc::new(*logic) as Arc<dyn SignalFactory>)))
+            }
+        }
+    }
+
+    /// Another market's bars, as though they'd been loaded, for trying portfolios with no network.
+    #[doc(hidden)]
+    pub fn preload_leg(&mut self, tile: TileId, data: Arc<ChartData>) {
+        let Some(chart) = self.tiles.get(&tile).map(|tile| tile.market.clone()) else {
+            return;
+        };
+        let Some(Bars::Ready(known)) = self.bars.get(&chart) else {
+            return;
+        };
+        let known = known.clone();
+        let market = Market {
+            symbol: data.symbol.clone(),
+            ..chart
+        };
+        let instrument = InstrumentSpec {
+            symbol: data.symbol.clone(),
+            ..known.instrument.clone()
+        };
+        self.bars.insert(
+            market,
+            Bars::Ready(MarketData {
+                data,
+                instrument,
+                ..known
+            }),
+        );
+    }
+
+    /// Loads the markets and runs the portfolio set up on the panel's chart.
+    fn run_portfolio_test(&mut self) -> Task<Message> {
+        use backtest::{TestRun, portfolio};
+        let Some(id) = self.panel.as_ref().map(|panel| panel.tile) else {
+            return Task::none();
+        };
+        if let Some(problem) = self.test_problem(id) {
+            if let Some(panel) = self.panel.as_mut() {
+                panel.tests.portfolio = TestRun::Failed(problem.message);
+            }
+            return Task::none();
+        }
+        let Some(tile) = self.tiles.get(&id) else {
+            return Task::none();
+        };
+        let setup = tile.backtest.portfolio.clone();
+        let settings = tile.backtest.clone();
+        let chart = tile.market.clone();
+        let chart_strategy = setup
+            .use_chart_strategy
+            .then(|| self.backtest_request(id))
+            .flatten()
+            .map(|(_, request)| (request.strategy, request.plugin));
+        let mut strategies = Vec::with_capacity(setup.legs.len());
+        for leg in &setup.legs {
+            let found = match (&leg.strategy, &chart_strategy) {
+                (Some(written), _) => match self.written_strategy(written) {
+                    Ok(found) => Some(found),
+                    Err(error) => {
+                        if let Some(panel) = self.panel.as_mut() {
+                            panel.tests.portfolio =
+                                TestRun::Failed(format!("{}: {error}", leg.symbol));
+                        }
+                        return Task::none();
+                    }
+                },
+                (None, Some(found)) if setup.weights.is_none() => Some(found.clone()),
+                _ => None,
+            };
+            strategies.push(found);
+        }
+        let store = self.store.clone();
+        let runs_dir = self.places().map(|places| places.runs);
+        let run_args = serde_json::json!({
+            "label": setup
+                .legs
+                .iter()
+                .map(|leg| leg.symbol.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            "legs": setup.legs,
+            "weights": setup.weights,
+            "rebalance": setup.rebalance,
+            "maintenance_percent": setup.maintenance_percent,
+            "bars": chart.bars.to_string(),
+            "settings": settings,
+        });
+        // Those a chart has loaded already needn't be loaded again.
+        let market_of = |leg: &portfolio::LegSetup| Market {
+            symbol: leg.symbol.clone(),
+            local: leg.venue.clone().or_else(|| chart.local.clone()),
+            ..chart.clone()
+        };
+        let loaded: Vec<Option<MarketData>> = setup
+            .legs
+            .iter()
+            .map(|leg| match self.bars.get(&market_of(leg)) {
+                Some(Bars::Ready(found)) => Some(found.clone()),
+                _ => None,
+            })
+            .collect();
+        let run = backtest::next_run();
+        let Some(panel) = self.panel.as_mut() else {
+            return Task::none();
+        };
+        panel.tests.portfolio = TestRun::Running {
+            run,
+            done: 0,
+            total: setup.legs.len(),
+            stop: backtest::StopOnDrop(Arc::new(AtomicBool::new(false))),
+        };
+        let go = move || {
+            let mut markets = Vec::with_capacity(setup.legs.len());
+            for (leg, loaded) in setup.legs.iter().zip(loaded) {
+                let market = Market {
+                    symbol: leg.symbol.clone(),
+                    local: leg.venue.clone().or_else(|| chart.local.clone()),
+                    ..chart.clone()
+                };
+                let found = match loaded {
+                    Some(found) => found,
+                    None => fetch(&market, store.as_ref())
+                        .map_err(|error| format!("{}: {error}", leg.symbol))?,
+                };
+                markets.push(portfolio::LegMarket {
+                    instrument: found.instrument,
+                    bars: market.bars,
+                    candles: found.data.candles.clone(),
+                    fees: found.fees,
+                    funding: found.funding,
+                });
+            }
+            let trade_from = chart.span.map_or(0, |(from, _)| from);
+            let request = portfolio::request(&setup, markets, strategies, &settings, trade_from)?;
+            let mut found = portfolio::run(request, true)?;
+            // Where Lab keeps its runs, so each sees the other's.
+            if let Some(dir) = runs_dir {
+                let id = format!("run-{}-{}-{run}", now_ms(), std::process::id());
+                let (summary, whole) = portfolio::written(&found, &id, now_ms(), &run_args);
+                if let Err(error) = portfolio::save(&dir, &whole, &summary, &run_args) {
+                    found.report.notes.push(persephone_core::signal::Note {
+                        text: format!("This run wasn't saved: {error}"),
+                        warning: false,
+                    });
+                }
+            }
+            Ok(Arc::new(found))
+        };
+        Task::perform(on_thread(go), move |result| {
+            Message::PortfolioDone(run, result)
+        })
     }
 
     fn run_walk_forward(&mut self) -> Task<Message> {
@@ -4193,6 +4451,7 @@ impl Persephone {
                     Some(backtest::TestKind::Optimize) => self.run_optimize(),
                     Some(backtest::TestKind::WalkForward) => self.run_walk_forward(),
                     Some(backtest::TestKind::RandomEntries) => self.run_random_entries(),
+                    Some(backtest::TestKind::Portfolio) => self.run_portfolio_test(),
                     _ => self.draw_monte_carlo(),
                 };
             }
@@ -4217,6 +4476,77 @@ impl Persephone {
                 return pick_export(what);
             }
             P::Import => return pick_import(),
+            P::LegStrategy(leg, choice) => {
+                let written = choice
+                    .choice
+                    .and_then(|choice| self.written_choice(&choice.kind));
+                if let Some(leg) = self
+                    .tiles
+                    .get_mut(&id)
+                    .and_then(|tile| tile.backtest.portfolio.legs.get_mut(leg))
+                {
+                    leg.strategy = written;
+                }
+                self.save();
+                return Task::none();
+            }
+            P::PortfolioLeg(leg) => panel.tests.portfolio_leg = leg,
+            P::ListPortfolios => {
+                let found = self.places().map_or_else(Vec::new, |places| {
+                    backtest::portfolio::list_saved(&places.runs)
+                });
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.saved_portfolios = found;
+                }
+                return Task::none();
+            }
+            P::OpenPortfolio(saved) => {
+                let Some(places) = self.places() else {
+                    return Task::none();
+                };
+                let run = backtest::next_run();
+                let Some(panel) = self.panel.as_mut() else {
+                    return Task::none();
+                };
+                panel.tests.portfolio_leg = 0;
+                panel.tests.portfolio = backtest::TestRun::Running {
+                    run,
+                    done: 0,
+                    total: 0,
+                    stop: backtest::StopOnDrop(Arc::new(AtomicBool::new(false))),
+                };
+                return Task::perform(
+                    on_thread(move || {
+                        backtest::portfolio::load_saved(&places.runs, &saved.id).map(Arc::new)
+                    }),
+                    move |result| Message::PortfolioDone(run, result),
+                );
+            }
+            P::RunPortfolio => {
+                if !self.apply_typed(id) {
+                    return Task::none();
+                }
+                return self.run_portfolio_test();
+            }
+            P::StopPortfolio => {
+                panel.tests.portfolio = backtest::TestRun::Idle;
+                return Task::none();
+            }
+            P::PickWeights => {
+                let dialog = rfd::AsyncFileDialog::new()
+                    .set_title("A table of weights")
+                    .add_filter("JSON", &["json"]);
+                return Task::perform(
+                    async move {
+                        let Some(file) = dialog.pick_file().await else {
+                            return Err("No file picked.".to_owned());
+                        };
+                        serde_json::from_slice(&file.read().await)
+                            .map_err(|e| format!("That isn't JSON: {e}"))
+                    },
+                    move |result| Message::WeightsRead(id, result),
+                );
+            }
             P::RunWalkForward => {
                 if !self.apply_typed(id) {
                     return Task::none();
@@ -4245,7 +4575,7 @@ impl Persephone {
                 let share = if settings.test == backtest::TestKind::Optimize
                     && settings.optimize.hold_out
                 {
-                    backtest::optimize::PICKED_ON
+                    settings.hold_out_percent / 100.0
                 } else {
                     1.0
                 };
@@ -4435,6 +4765,31 @@ impl Persephone {
                                 self.save();
                                 return self.auto_run_blocks();
                             }
+                            // More bars to warm up on means loading them.
+                            backtest::Field::WarmUp => {
+                                let market = Market {
+                                    warm_up: u64::from(tile.backtest.warm_up_bars),
+                                    ..tile.market.clone()
+                                };
+                                self.save();
+                                return self.set_market(id, market);
+                            }
+                            backtest::Field::HoldOutShare | backtest::Field::WalkRatio => {
+                                panel.tests.optimize = backtest::OptimizeRun::Idle;
+                                panel.tests.walk_forward = backtest::TestRun::Idle;
+                                self.save();
+                                return Task::none();
+                            }
+                            backtest::Field::LegSymbol(_)
+                            | backtest::Field::LegVenue(_)
+                            | backtest::Field::LegWeight(_)
+                            | backtest::Field::RebalanceEvery
+                            | backtest::Field::RebalanceDrift
+                            | backtest::Field::RebalanceMinTrade
+                            | backtest::Field::Maintenance => {
+                                self.save();
+                                return Task::none();
+                            }
                             _ => {}
                         }
                         self.save();
@@ -4444,6 +4799,15 @@ impl Persephone {
                 }
             }
             P::Edit(edit) => {
+                // What's typed for a leg belongs to the place it was in.
+                if matches!(edit, backtest::Edit::RemoveLeg(_)) {
+                    panel.inputs.retain(|(field, _)| {
+                        !matches!(
+                            field,
+                            backtest::Field::LegSymbol(_) | backtest::Field::LegWeight(_)
+                        )
+                    });
+                }
                 if let Some(tile) = self.tiles.get_mut(&id) {
                     tile.backtest.apply(edit);
                     self.save();
@@ -4569,6 +4933,7 @@ impl Persephone {
                 symbol: DEFAULT_SYMBOL.into(),
                 bars: Timeframe::M1.into(),
                 span: None,
+                warm_up: backtest::WARM_UP_BARS,
             },
             |tile| tile.market.clone(),
         )
@@ -5288,6 +5653,12 @@ fn restore_tile(t: &SavedTile) -> Restored {
         symbol: t.symbol.clone(),
         bars: t.timeframe.parse().unwrap_or(BarSpec::Time(Timeframe::M1)),
         span: t.span.filter(|(from, to)| from < to),
+        warm_up: t
+            .backtest
+            .as_ref()
+            .map_or(backtest::WARM_UP_BARS, |settings| {
+                u64::from(settings.warm_up_bars)
+            }),
     };
     let mut hidden = Hidden {
         drawings: t.drawings_hidden,
@@ -5365,6 +5736,7 @@ fn market_from_args(args: &[String]) -> Market {
         symbol,
         bars,
         span: None,
+        warm_up: backtest::WARM_UP_BARS,
     }
 }
 
@@ -5642,11 +6014,20 @@ async fn backtest_on_thread(request: BacktestRequest) -> Result<Arc<BacktestRepo
 fn fetch(market: &Market, store: Option<&Store>) -> Result<MarketData, String> {
     let result = match &market.local {
         Some(venue) => match store {
-            Some(store) => local::load(store, venue, &market.symbol, market.bars, market.span),
+            Some(store) => local::load(
+                store,
+                venue,
+                &market.symbol,
+                market.bars,
+                market.span,
+                market.warm_up,
+            ),
             None => Err(anyhow::anyhow!("there's no local store on this system")),
         },
         None => match market.bars.timeframe() {
-            Some(timeframe) => fetch_binance(&market.symbol, timeframe, market.span),
+            Some(timeframe) => {
+                fetch_binance(&market.symbol, timeframe, market.span, market.warm_up)
+            }
             None => Err(anyhow::anyhow!(
                 "Binance serves time bars; tick and volume bars need a local market"
             )),
@@ -5659,6 +6040,8 @@ fn fetch_binance(
     symbol: &str,
     timeframe: Timeframe,
     span: Option<(UnixNanos, UnixNanos)>,
+    warm_up: u64,
 ) -> anyhow::Result<MarketData> {
-    persephone_research::market::load_binance(symbol, timeframe, span).map(MarketData::from)
+    persephone_research::market::load_binance(symbol, timeframe, span, warm_up)
+        .map(MarketData::from)
 }

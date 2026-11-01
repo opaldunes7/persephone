@@ -46,6 +46,8 @@ pub(crate) struct MarketArgs {
     pub bars: BarSpec,
     pub from: Option<UnixNanos>,
     pub to: Option<UnixNanos>,
+    /// How many bars before `from` strategies warm up on.
+    pub warm_up: u64,
 }
 
 impl MarketArgs {
@@ -67,6 +69,11 @@ impl MarketArgs {
                 .map_err(|_| format!("`bars`: `{bars}` isn't 1m, 1h, 1d, 100t, 5v or the like"))?,
             from: time("from")?,
             to: time("to")?,
+            warm_up: args
+                .get("settings")
+                .and_then(|settings| settings.get("warm_up_bars"))
+                .and_then(Value::as_u64)
+                .unwrap_or(WARM_UP_BARS),
         })
     }
 
@@ -110,15 +117,22 @@ impl Lab {
     pub(crate) fn load_market(&self, market: &MarketArgs) -> Result<MarketBars, String> {
         let span = market.span();
         if let Some(venue) = &market.venue {
-            return load_local(&self.store, venue, &market.symbol, market.bars, span)
-                .map_err(error_text);
+            return load_local(
+                &self.store,
+                venue,
+                &market.symbol,
+                market.bars,
+                span,
+                market.warm_up,
+            )
+            .map_err(error_text);
         }
         // Only closed bars, from the cache: the same span always gives the same answer.
         let timeframe = market.timeframe()?;
         let forming = self.cache.forming(timeframe);
         let (start, end) = match span {
             Some((from, to)) => {
-                let start = from.saturating_sub(WARM_UP_BARS * timeframe.nanos());
+                let start = from.saturating_sub(market.warm_up * timeframe.nanos());
                 let end = to.min(forming);
                 check_range(timeframe, start, end).map_err(error_text)?;
                 (start, end)

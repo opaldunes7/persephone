@@ -57,6 +57,8 @@ impl Tool {
                 json!(["string", "integer"])
             } else if arg.kind == "list_or_path" {
                 json!(["array", "string"])
+            } else if arg.kind == "list" {
+                json!("array")
             } else {
                 json!(arg.kind)
             };
@@ -110,6 +112,18 @@ fn settings_schema() -> Value {
         "take_profit_percent": section(number.clone(), "A target this far from the entry, resting from the bar after it."),
         "borrow_percent_per_year": section(number.clone(), "What borrowing costs a short, as a percentage of its value a year."),
         "impact_percent": section(number.clone(), "How far a market order fills worse when it's all of its bar's volume; it moves with the square root of its share."),
+        "max_participation_percent": section(number.clone(), "The most of a bar's volume an order can take. What's left goes out on the next bars at their prices, a resting limit fills no more than this of each bar, and a stop takes this and leaves the rest to the closes after."),
+        "range_slippage_percent": section(number.clone(), "What a market order or stop pays on top, as a percentage of a bar's high to low, times how many times wider that bar is than the median of the last 100. A market order reads the bar just closed, and a stop the bar it fills in. Sweep it with run_backtests to stress a strategy."),
+        "latency_jitter": section(whole.clone(), "Milliseconds orders take on top of latency on average, drawn for each from an exponential distribution. Only fills on ticks can show it."),
+        "latency_seed": {"type": "integer", "description": "Which draws of jitter a run uses, so it can be repeated."},
+        "range_look_back": {"type": "integer", "description": "How many bars back range_slippage_percent judges a bar's usual range from. Default 100."},
+        "impact_exponent": {"type": "number", "description": "How steeply impact grows with an order's share of its bar's volume. 0.5, the default, is the square root; 1 is in proportion."},
+        "volume_warning_percent": {"type": "number", "description": "With impact on, orders over this share of their bar's volume get a warning. Default 10."},
+        "fill_warning_percent": {"type": "number", "description": "Fewer than this share of limit orders filling gets a warning, from 5 orders up. Default 50."},
+        "cash_interest_percent_per_year": section(number.clone(), "What cash below zero costs in a portfolio, as a percentage a year. A book holding more than the account borrows free without it."),
+        "warm_up_bars": {"type": "integer", "description": "How many bars before `from` strategies warm up on. Default 500. Raise it for look-backs longer than that."},
+        "hold_out_percent": {"type": "number", "description": "How much of the span an optimization with hold_out picks on, as a percentage. Default 70."},
+        "walk_ratio": {"type": "number", "description": "How many times longer than its unseen stretch a walk-forward window picks on. Default 3. train_ratio on the call wins."},
         "compound": {"type": "boolean", "description": "Size positions from the account as it is now, rather than as it started."},
         "fill_timing": {"enum": ["close", "next_open"], "description": "When orders fill on the bars: at the close they were decided on, or at the next bar's open. next_open needs time bars, and can't go with latency or precision high."},
         "spread": section(whole.clone(), "Ticks of spread assumed for bars and trades."),
@@ -449,6 +463,61 @@ pub fn tools() -> Vec<Tool> {
             &["run_id", "summary"],
         ),
         job(
+            "run_portfolio",
+            "Backtests several markets on one account: they share cash and margin, and everything is worked out on one timeline. Each leg runs its own strategy at a weight, holds its weight, or follows a weight table. The guide's `portfolios` topic has how.",
+            vec![
+                arg(
+                    "legs",
+                    "list",
+                    "The markets: [{\"symbol\": \"BTCUSDT\", \"weight\": 0.5, \"strategy\": ..., \"venue\": ...}]. With a strategy, weight scales its position size, and it must be above 0. Without one, it's the signed share of the capital to hold. A symbol ending -PERP pays funding.",
+                ),
+                opt(
+                    "weights",
+                    "list_or_path",
+                    "A weight table instead of strategies: [[time, {\"BTCUSDT\": 0.5, \"ETHUSDT\": -0.5}], ...], or a JSON file holding one. Each row states the whole book as signed shares of the account, and a market it leaves out goes flat. A row stamped with a bar's open applies at that bar's close.",
+                ),
+                opt(
+                    "rebalance",
+                    "object",
+                    "{\"every_bars\": 24, \"drift_percent\": 5, \"min_trade_value\": 100}: go back to the weights every so many bars, or when a leg is this many points of the account away, skipping trades worth less than this. Rebalancing sizes from the account as it is now.",
+                ),
+                opt(
+                    "maintenance_percent",
+                    "number",
+                    "What a position needs to stay open, as a percentage of its value. Everything is liquidated at once when the account falls to it. Default 0.5.",
+                ),
+                opt(
+                    "bars",
+                    "string",
+                    "A timeframe every leg shares, as 1h or 1d. Default 1h.",
+                ),
+                opt("from", "time", "Where the span starts."),
+                opt("to", "time", "Where it ends."),
+                SETTINGS,
+                LABEL,
+                FRICTION,
+            ],
+            &["run_id", "summary"],
+        ),
+        job(
+            "run_portfolios",
+            "Many portfolios in one call, in parallel, to sweep weights, rebalancing or costs. Every run is saved. One that fails doesn't stop the rest.",
+            vec![
+                arg(
+                    "runs",
+                    "list_or_path",
+                    "A list of arguments as run_portfolio takes, or a JSON file holding one.",
+                ),
+                opt(
+                    "defaults",
+                    "object",
+                    "Arguments every run shares. A run's own win.",
+                ),
+                LIMIT,
+            ],
+            &["columns", "rows", "total", "succeeded", "failed"],
+        ),
+        job(
             "run_backtests",
             "Many backtests in one call, in parallel: much quicker for an agent than one call each. Every run is saved, so all the tools that take a run_id work on them. One that fails doesn't stop the rest.",
             vec![
@@ -700,6 +769,24 @@ pub fn tools() -> Vec<Tool> {
             &["columns", "rows", "next_cursor"],
         ),
         tool(
+            "get_portfolio",
+            "A portfolio run's summary, a table by leg of what each made and paid, and how the markets' own returns moved together, whichever way they're held.",
+            vec![RUN_ID],
+            &["summary", "legs", "correlation", "notes"],
+        ),
+        tool(
+            "get_portfolio_series",
+            "A portfolio run at each bar of its span, in pages: equity, what equal shares held would be worth, gross and net exposure, and each leg's value and what it has made.",
+            vec![RUN_ID, CURSOR, LIMIT],
+            &["columns", "rows", "next_cursor"],
+        ),
+        tool(
+            "get_portfolio_fills",
+            "A portfolio run's fills for one leg, in pages.",
+            vec![RUN_ID, arg("symbol", "string", "Which leg."), CURSOR, LIMIT],
+            &["columns", "rows", "next_cursor"],
+        ),
+        tool(
             "get_equity",
             "A run's equity at each bar's close, in pages, beside what holding the market with a position of the same size would be worth: the line the app draws.",
             vec![RUN_ID, CURSOR, LIMIT],
@@ -911,6 +998,7 @@ pub(crate) fn check_args(tool: &Tool, args: &Value) -> Result<(), String> {
             "object" => value.is_object(),
             "array" => value.is_array(),
             "list_or_path" => value.is_array() || value.is_string(),
+            "list" => value.is_array(),
             _ => value.is_string() || value.is_u64(),
         };
         if !fits {
@@ -943,6 +1031,15 @@ impl Lab {
             )
         })?;
         check_args(tool, args)?;
+        // A portfolio's run has no one market's trades, and an empty answer would read as none made.
+        if let Some(id) = args.get("run_id").and_then(Value::as_str)
+            && !name.starts_with("get_portfolio")
+            && self.is_portfolio_run(id)
+        {
+            return Err(format!(
+                "`{id}` is a portfolio, which {name} can't read; get_portfolio, get_portfolio_series and get_portfolio_fills do"
+            ));
+        }
         match name {
             "get_guide" => crate::guide::get_guide(args),
             "get_settings" => Ok(crate::guide::get_settings()),
@@ -963,6 +1060,9 @@ impl Lab {
             "get_trades" => self.get_trades(args),
             "get_fills" => self.get_fills(args),
             "get_limit_orders" => self.get_limit_orders(args),
+            "get_portfolio" => self.get_portfolio(args),
+            "get_portfolio_series" => self.get_portfolio_series(args),
+            "get_portfolio_fills" => self.get_portfolio_fills(args),
             "get_equity" => self.get_equity(args),
             "get_returns" => self.get_returns(args),
             "get_calendar" => self.get_calendar(args),
@@ -988,6 +1088,8 @@ impl Lab {
                     "compute_indicator" => lab.compute_indicator(&owned),
                     "run_backtest" => lab.run_backtest(&owned),
                     "run_backtests" => lab.run_backtests(&owned, job),
+                    "run_portfolio" => lab.run_portfolio(&owned),
+                    "run_portfolios" => lab.run_portfolios(&owned, job),
                     "run_monte_carlo" => lab.run_monte_carlo(&owned, job),
                     "run_random_blocks" => lab.run_random_blocks(&owned, job),
                     "run_optimize" => lab.run_optimize(&owned, job),

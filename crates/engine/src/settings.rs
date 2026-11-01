@@ -38,6 +38,27 @@ pub struct SimSettings {
     /// How far a market order fills worse, as a percentage, when it's all of its bar's volume. It
     /// moves with the square root of its share of that volume.
     pub impact_percent: f64,
+    /// The most of a bar's volume an order can take, as a percentage. What's left goes out on the
+    /// next bars, at their prices, and a resting limit fills no more than this of each bar.
+    pub max_participation_percent: Option<f64>,
+    /// What a taker pays on top, as a percentage of a bar's range, and more when that bar is unusually
+    /// wide: the range times this, times how many times wider than the median of the last 100 it is.
+    pub range_slippage_percent: f64,
+    /// How many bars back that median looks.
+    pub range_slippage_look_back: u32,
+    /// How steeply impact grows with an order's share of its bar's volume: 0.5 is the square root.
+    pub impact_exponent: f64,
+    /// An order over this percentage of its bar's volume gets a warning.
+    pub volume_warning_percent: f64,
+    /// Fewer than this percentage of limit orders filling gets a warning.
+    pub fill_warning_percent: f64,
+    /// What cash below zero costs in a portfolio, as a percentage a year.
+    pub cash_interest_percent_per_year: Option<f64>,
+    /// How much longer than `latency_ms` an order takes on average, drawn for each: most are quick and
+    /// a few slow, as on real networks. Only fills on ticks can show it.
+    pub latency_jitter_ms: u32,
+    /// Which draws those are, so a run can be repeated.
+    pub latency_seed: u64,
 }
 
 /// How a strategy's orders go out as limits.
@@ -68,6 +89,15 @@ impl Default for SimSettings {
             take_profit_percent: None,
             borrow_percent_per_year: None,
             impact_percent: 0.0,
+            max_participation_percent: None,
+            range_slippage_percent: 0.0,
+            range_slippage_look_back: 100,
+            impact_exponent: 0.5,
+            volume_warning_percent: 10.0,
+            fill_warning_percent: 50.0,
+            cash_interest_percent_per_year: None,
+            latency_jitter_ms: 0,
+            latency_seed: 0,
         }
     }
 }

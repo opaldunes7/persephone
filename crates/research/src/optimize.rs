@@ -220,8 +220,8 @@ impl Grid {
 
 /// Where the bars values are picked on end, when the rest is kept back.
 #[must_use]
-pub fn split_at(from: usize, bars: usize) -> usize {
-    from + (bars.saturating_sub(from) as f64 * PICKED_ON).round() as usize
+pub fn split_at(from: usize, bars: usize, picked_on: f64) -> usize {
+    from + (bars.saturating_sub(from) as f64 * picked_on).round() as usize
 }
 
 /// How a combination did.
@@ -683,8 +683,12 @@ mod tests {
 
     #[test]
     fn the_split_keeps_the_last_part_of_the_span_back() {
-        assert_eq!(split_at(0, 100), 70);
-        assert_eq!(split_at(500, 1_500), 1_200, "warm-up bars aren't counted");
+        assert_eq!(split_at(0, 100, PICKED_ON), 70);
+        assert_eq!(
+            split_at(500, 1_500, PICKED_ON),
+            1_200,
+            "warm-up bars aren't counted"
+        );
     }
 
     #[test]

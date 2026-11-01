@@ -16,6 +16,7 @@ pub(crate) struct RawFill {
     pub(crate) qty: f64,
     pub(crate) fee: f64,
     pub(crate) maker: bool,
+    pub(crate) range_slip: f64,
 }
 
 /// One execution, for trade markers on the chart.
@@ -31,6 +32,8 @@ pub struct Fill {
     pub fee: f64,
     /// It rested on the book rather than taking what was there.
     pub maker: bool,
+    /// What slippage from the bar's range took per unit, which varies from fill to fill.
+    pub range_slip: f64,
 }
 
 /// What a finished backtest hands back to the app.
@@ -50,6 +53,12 @@ pub struct BacktestReport {
     /// How many limit orders went out, and how many of them filled.
     pub limit_orders: usize,
     pub limits_filled: usize,
+    /// Orders too big for a bar's volume, worked over several bars, and how many bars that took.
+    pub orders_worked: usize,
+    pub bars_to_fill_average: f64,
+    pub bars_to_fill_longest: usize,
+    /// What was still to go when the run ended, in the base currency.
+    pub unfilled_at_end: f64,
     /// What funding came to, positive when it cost, and what borrowing for shorts cost.
     pub funding_paid: f64,
     pub borrow_paid: f64,
@@ -122,6 +131,10 @@ pub(crate) fn build(
         total_positions: result.total_positions,
         limit_orders: 0,
         limits_filled: 0,
+        orders_worked: 0,
+        bars_to_fill_average: 0.0,
+        bars_to_fill_longest: 0,
+        unfilled_at_end: 0.0,
         funding_paid,
         borrow_paid,
         limit_log: Vec::new(),
@@ -139,7 +152,7 @@ pub(crate) fn build(
 
 /// Matches each fill to the last bar that had closed by then (fills happen on a bar's close,
 /// which Nautilus stamps as the bar's time). `closes` are the bars' close times, in order.
-fn assign_bars(raw: &[RawFill], closes: &[UnixNanos], next_open: bool) -> Vec<Fill> {
+pub(crate) fn assign_bars(raw: &[RawFill], closes: &[UnixNanos], next_open: bool) -> Vec<Fill> {
     raw.iter()
         .map(|f| {
             let closed = closes.partition_point(|&close| close <= f.ts);
@@ -156,6 +169,7 @@ fn assign_bars(raw: &[RawFill], closes: &[UnixNanos], next_open: bool) -> Vec<Fi
                 qty: f.qty,
                 fee: f.fee,
                 maker: f.maker,
+                range_slip: f.range_slip,
             }
         })
         .collect()
@@ -184,6 +198,7 @@ pub(crate) struct RawLimit {
     pub(crate) side: Side,
     pub(crate) price: f64,
     pub(crate) qty: f64,
+    pub(crate) filled: f64,
     pub(crate) outcome: LimitOutcome,
     pub(crate) ended: UnixNanos,
 }
@@ -196,6 +211,8 @@ pub struct LimitOrderRow {
     pub side: Side,
     pub price: f64,
     pub qty: f64,
+    /// How much of it filled, which can be part of it when a bar's volume limits it.
+    pub filled: f64,
     pub outcome: LimitOutcome,
     /// When it filled or stopped resting.
     pub ended: UnixNanos,
@@ -248,6 +265,7 @@ pub(crate) fn limit_rows(
                 side: order.side,
                 price: order.price,
                 qty: order.qty,
+                filled: order.filled,
                 outcome: order.outcome,
                 ended: order.ended,
                 bars: rested.len(),
@@ -277,7 +295,7 @@ pub(crate) const NANOS_PER_YEAR: f64 = 365.0 * 86_400_000_000_000.0;
 /// Cash plus the position valued at each close, and what funding and borrowing took. Fills are
 /// applied at the bar they belong to. What's held into a bar pays what falls due from its open up to
 /// its close, at its open, so a rate stamped on the hour falls to what was held going into that hour.
-fn equity_curve(
+pub(crate) fn equity_curve(
     fills: &[Fill],
     candles: &[Candle],
     closes: &[UnixNanos],
@@ -327,7 +345,7 @@ fn equity_curve(
     (equity, funding_paid, borrow_paid)
 }
 
-fn max_drawdown(equity: &[f64]) -> f64 {
+pub(crate) fn max_drawdown(equity: &[f64]) -> f64 {
     let mut peak = f64::MIN;
     equity.iter().fold(0.0, |worst: f64, &e| {
         peak = peak.max(e);
@@ -371,6 +389,7 @@ mod tests {
             qty,
             fee,
             maker: false,
+            range_slip: 0.0,
         }
     }
 
@@ -399,6 +418,7 @@ mod tests {
             qty: 1.0,
             fee: 0.0,
             maker: false,
+            range_slip: 0.0,
         }];
         let closes: Vec<u64> = data.iter().map(|c| c.ts + tf).collect();
         assert_eq!(
