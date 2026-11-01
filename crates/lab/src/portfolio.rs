@@ -26,7 +26,7 @@ use crate::{
 
 const DEFAULT_ROWS: usize = 100;
 const MOST_RUNS: usize = 5_000;
-const COLUMNS: [&str; 18] = [
+const COLUMNS: [&str; 19] = [
     "index",
     "run_id",
     "label",
@@ -41,6 +41,7 @@ const COLUMNS: [&str; 18] = [
     "benchmark_return",
     "turnover",
     "peak_margin_use",
+    "orders_capped",
     "closest_to_liquidation",
     "liquidated_at",
     "warnings",
@@ -276,6 +277,7 @@ impl Lab {
                     summary["benchmark_return"],
                     summary["turnover"],
                     summary["peak_margin_use"],
+                    summary["orders_capped"],
                     summary["closest_to_liquidation"],
                     summary["liquidated_at"],
                     summary["warnings"],

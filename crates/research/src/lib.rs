@@ -62,6 +62,7 @@ pub enum Field {
     Borrow,
     Impact,
     Participation,
+    MaxGross,
     RangeSlippage,
     LatencyJitter,
     LatencySeed,

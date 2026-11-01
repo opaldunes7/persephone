@@ -184,6 +184,7 @@ ideal run to compare against. They're saved with each chart.
 | Spread | A spread assumed for bar and trade data (quotes have their own): buys pay the larger half of it, sells the rest. |
 | Latency | Orders reach the venue this many milliseconds late. |
 | Leverage | A position is worth capital × Size % × leverage. Margin calls aren't simulated. |
+| Most exposure | Portfolios only. The most the book may hold, long plus short, as a percentage of the account times the leverage. Orders that would take it past are cut; what's held isn't sold to get under it unless the book is rebalanced. Off by default. |
 | Intra-bar precision | **Standard** fills at the bars, and playback shows each bar as it closes: fast and light, best for long spans. **High** fills on ticks or 1-minute bars, and at slow speeds playback builds each bar as it formed, from the ticks (imported tick data), 1-minute bars (Binance, and 1-minute imports; they load in the background) or, with nothing finer, a simulated path from open through low and high to close. |
 | Direction | Long only, or short only; the other side's signals close positions instead. |
 | Invert | Trade the opposite of what the strategy says: short for long and long for short, at the same moments. It comes before Direction, so Long only still means only long positions. Going flat stays flat, and the panel's title says **inverted**. |

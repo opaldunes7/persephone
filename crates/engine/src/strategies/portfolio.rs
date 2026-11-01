@@ -120,6 +120,8 @@ pub(crate) struct Outcome {
     /// Orders replaced before all of them had gone out.
     pub(crate) cut_short: usize,
     pub(crate) too_small: usize,
+    /// Orders made smaller to keep the book within its most gross exposure.
+    pub(crate) orders_capped: usize,
     pub(crate) over_volume: usize,
     /// Table rows that gave a weight to a leg with no bars yet.
     pub(crate) early_weights: Vec<usize>,
@@ -144,6 +146,8 @@ pub(crate) struct Settings {
     pub(crate) rebalance: Rebalance,
     /// Weights by when they apply, one for each leg.
     pub(crate) table: Option<crate::portfolio::WeightTable>,
+    /// The most gross exposure, as a share of the account before leverage.
+    pub(crate) max_gross: Option<f64>,
 }
 
 pub(crate) struct PortfolioStrategy {
@@ -431,6 +435,7 @@ impl PortfolioStrategy {
         } else {
             self.settings.starting_balance
         };
+        let mut set_now = Vec::new();
         for index in 0..self.legs.len() {
             let Some(step) = self.step_of(index, at).filter(|step| step.real) else {
                 continue;
@@ -453,10 +458,69 @@ impl PortfolioStrategy {
             let change = (goal - leg.expected()).abs() * step.candle.close;
             if change >= min_trade || goal == 0.0 {
                 leg.goal = goal;
+                set_now.push(index);
                 // What was still going out has been replaced by this.
                 if std::mem::take(&mut leg.working_bars) > 0 {
                     self.outcome.borrow_mut().cut_short += 1;
                 }
+            }
+        }
+        if let Some(most) = self.settings.max_gross {
+            self.cap_goals(
+                at,
+                account.max(0.0) * most * self.settings.leverage,
+                &set_now,
+            );
+        }
+    }
+
+    /// Cuts the goals just set so the book's gross exposure, at this moment's closes, is no more
+    /// than `cap`. Only what's growing is cut, all of it by the same share, and what's held stays,
+    /// unless the book is being rebalanced, when every goal just set is cut alike.
+    fn cap_goals(&mut self, at: usize, cap: f64, set_now: &[usize]) {
+        let rebalancing = self.settings.rebalance.every_bars.is_some()
+            || self.settings.rebalance.drift_percent.is_some();
+        let price = |index: usize| {
+            self.step_of(index, at)
+                .map_or(0.0, |step| step.candle.close)
+        };
+        // What stays whatever happens, and what may be cut, in the quote currency.
+        let (mut fixed, mut growth) = (0.0, 0.0);
+        let mut cuttable = Vec::new();
+        for index in 0..self.legs.len() {
+            let leg = &self.legs[index];
+            let value = leg.goal.abs() * price(index);
+            if !set_now.contains(&index) {
+                fixed += value;
+                continue;
+            }
+            let held = leg.expected();
+            let base = if rebalancing || held.signum() != leg.goal.signum() {
+                0.0
+            } else {
+                held.abs().min(leg.goal.abs())
+            };
+            let grows = leg.goal.abs() - base;
+            if grows <= 0.0 {
+                fixed += value;
+                continue;
+            }
+            fixed += base * price(index);
+            growth += grows * price(index);
+            cuttable.push((index, base, grows));
+        }
+        if growth <= 0.0 || fixed + growth <= cap * (1.0 + 1e-9) {
+            return;
+        }
+        let share = ((cap - fixed) / growth).clamp(0.0, 1.0);
+        for (index, base, grows) in cuttable {
+            let leg = &mut self.legs[index];
+            let steps = 10_f64.powi(i32::from(leg.size_precision));
+            let size = ((base + grows * share) * steps).floor() / steps;
+            let goal = leg.goal.signum() * size;
+            if goal != leg.goal {
+                leg.goal = goal;
+                self.outcome.borrow_mut().orders_capped += 1;
             }
         }
     }

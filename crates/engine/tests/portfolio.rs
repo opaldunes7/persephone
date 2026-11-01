@@ -885,3 +885,111 @@ fn a_strategy_hears_the_real_volume_of_its_bars() {
     run(&request(vec![leg]));
     assert_eq!(*heard.0.lock().unwrap(), vec![VOLUME, VOLUME]);
 }
+
+fn capped(mut request: PortfolioRequest, percent: f64) -> PortfolioRequest {
+    request.sim.max_gross_percent = Some(percent);
+    request
+}
+
+#[test]
+fn legs_entering_at_different_times_stack_past_the_account_unless_capped() {
+    let legs = || {
+        let a = holding("AAAUSDT", &[100.0, 100.0, 100.0, 100.0, 100.0], 0.6);
+        let mut b = holding("BBBUSDT", &[50.0, 50.0, 50.0, 50.0, 50.0], 0.6);
+        b.candles.drain(..2);
+        vec![a, b]
+    };
+    let free = run(&request(legs()));
+    assert!(close(free.peak_margin_use, 1.2), "{}", free.peak_margin_use);
+    assert_eq!(free.orders_capped, 0);
+
+    let report = run(&capped(request(legs()), 100.0));
+    assert!(
+        report.peak_margin_use <= 1.0 + 1e-6,
+        "{}",
+        report.peak_margin_use
+    );
+    // The first leg stays as it was; the second takes only what's left.
+    assert!(close(report.legs[0].fills[0].qty, 600.0));
+    assert!(
+        close(report.legs[1].fills[0].qty, 800.0),
+        "{:?}",
+        report.legs[1].fills
+    );
+    assert_eq!(report.orders_capped, 1);
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.text.contains("1 orders were cut"))
+    );
+    assert!(
+        !report
+            .notes
+            .iter()
+            .any(|note| note.text.contains("in margin"))
+    );
+}
+
+#[test]
+fn a_cap_cuts_legs_growing_together_by_the_same_share() {
+    let closes = [100.0, 100.0, 100.0];
+    let legs = || {
+        vec![
+            holding("AAAUSDT", &closes, 0.8),
+            holding("BBBUSDT", &closes, -0.8),
+        ]
+    };
+    let report = run(&capped(request(legs()), 100.0));
+    assert!(close(report.legs[0].fills[0].qty, 500.0));
+    assert!(close(report.legs[1].fills[0].qty, 500.0));
+    assert_eq!(report.legs[1].fills[0].side, Side::Sell);
+    assert_eq!(report.orders_capped, 2);
+    // With leverage, the account goes that much further.
+    let mut levered = capped(request(legs()), 100.0);
+    levered.sim.leverage = 2.0;
+    let report = run(&levered);
+    assert_eq!(report.orders_capped, 0);
+    assert!(close(report.legs[0].fills[0].qty, 800.0));
+}
+
+#[test]
+fn a_cap_that_never_binds_changes_nothing() {
+    let legs = || {
+        vec![
+            PortfolioLeg {
+                candles: wave(300),
+                ..holding("AAAUSDT", &[], 0.5)
+            },
+            PortfolioLeg {
+                candles: wave(300),
+                ..holding("BBBUSDT", &[], -0.3)
+            },
+        ]
+    };
+    let mut free = request(legs());
+    free.rebalance.every_bars = Some(10);
+    let mut wide = capped(request(legs()), 1_000.0);
+    wide.rebalance.every_bars = Some(10);
+    let (free, wide) = (run(&free), run(&wide));
+    assert_eq!(free.equity, wide.equity);
+    assert_eq!(free.total_orders, wide.total_orders);
+    assert_eq!(wide.orders_capped, 0);
+}
+
+#[test]
+fn rebalancing_under_a_cap_keeps_the_whole_book_within_it() {
+    let rising = [100.0, 100.0, 120.0, 140.0, 160.0, 180.0];
+    let legs = vec![
+        holding("AAAUSDT", &rising, 0.7),
+        holding("BBBUSDT", &[100.0; 6], 0.7),
+    ];
+    let mut book = capped(request(legs), 100.0);
+    book.rebalance.every_bars = Some(1);
+    let report = run(&book);
+    // Bought at one close, valued at the next: within a step of the cap.
+    for (at, gross) in report.gross_exposure.iter().enumerate().skip(1) {
+        assert!(*gross <= 1.0 + 0.12, "{gross} at {at}");
+    }
+    assert!(report.orders_capped >= 2);
+}

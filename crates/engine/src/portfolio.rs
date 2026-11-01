@@ -135,6 +135,8 @@ pub struct PortfolioReport {
     /// needed to stay open. `None` if it never held anything.
     pub closest_to_liquidation: Option<f64>,
     pub liquidated_at: Option<UnixNanos>,
+    /// Orders made smaller to keep within `max_gross_percent`.
+    pub orders_capped: usize,
     pub notes: Vec<Note>,
 }
 
@@ -580,6 +582,7 @@ pub fn run_portfolio(request: &PortfolioRequest) -> Result<PortfolioReport, Engi
             trade_from: request.trade_from,
             rebalance: request.rebalance,
             table: request.weights.clone(),
+            max_gross: sim.max_gross_percent.map(|percent| percent / 100.0),
         },
         Arc::clone(&times),
         Arc::new(expected_bars),
@@ -775,6 +778,7 @@ fn build_report(
         peak_margin_use: outcome.peak_margin_use,
         closest_to_liquidation: outcome.closest_to_liquidation,
         liquidated_at: outcome.liquidated_at,
+        orders_capped: outcome.orders_capped,
         notes,
     }
 }
@@ -803,7 +807,7 @@ fn notes_of(
     // A little over is only fees on a position that took all the cash.
     if outcome.peak_margin_use > 1.05 {
         notes.push(warn(format!(
-            "At its most the book needed {:.0}% of the account in margin at a leverage of {}, which a venue wouldn't allow: it would have refused the orders or closed positions. Lower the weights, or raise the leverage setting if that much is really on offer.",
+            "At its most the book needed {:.0}% of the account in margin at a leverage of {}, which a venue wouldn't allow: it would have refused the orders or closed positions. Lower the weights, raise the leverage setting if that much is really on offer, or turn on `max_gross_percent` to cut orders that would take the book past what the account allows.",
             outcome.peak_margin_use * 100.0,
             request.sim.leverage,
         )));
@@ -849,6 +853,17 @@ fn notes_of(
             "{} orders were over {}% of their bar's volume. Fills like those are fiction whatever the costs say: a smaller position is the real answer.",
             outcome.over_volume, request.sim.volume_warning_percent
         )));
+    }
+    if outcome.orders_capped > 0
+        && let Some(most) = request.sim.max_gross_percent
+    {
+        notes.push(Note {
+            text: format!(
+                "{} orders were cut to keep the book within {most}% of the account at a leverage of {}, as max_gross_percent asks.",
+                outcome.orders_capped, request.sim.leverage
+            ),
+            warning: false,
+        });
     }
     if outcome.too_small > 0 {
         notes.push(warn(format!(

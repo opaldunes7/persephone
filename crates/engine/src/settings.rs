@@ -63,6 +63,10 @@ pub struct SimSettings {
     pub latency_jitter_ms: u32,
     /// Which draws those are, so a run can be repeated.
     pub latency_seed: u64,
+    /// A portfolio's most gross exposure, long plus short, as a percentage of the account times the
+    /// leverage. New or growing orders past it are cut; what's held isn't sold to get under it,
+    /// unless the book is being rebalanced. `None` lets the legs stack up as they will.
+    pub max_gross_percent: Option<f64>,
 }
 
 /// How a strategy's orders go out as limits.
@@ -104,6 +108,7 @@ impl Default for SimSettings {
             cash_interest_percent_per_year: None,
             latency_jitter_ms: 0,
             latency_seed: 0,
+            max_gross_percent: None,
         }
     }
 }

@@ -480,6 +480,7 @@ pub fn written(run: &PortfolioRun, run_id: &str, created: u64, args: &Value) -> 
         "total_orders": report.total_orders,
         "turnover": report.turnover,
         "peak_margin_use": report.peak_margin_use,
+        "orders_capped": report.orders_capped,
         "closest_to_liquidation": report.closest_to_liquidation,
         "liquidated_at": report.liquidated_at.map(time_text),
         "warnings": warnings,
@@ -707,6 +708,7 @@ fn from_written(run: &Value) -> PortfolioRun {
         peak_margin_use: summary["peak_margin_use"].as_f64().unwrap_or(0.0),
         closest_to_liquidation: summary["closest_to_liquidation"].as_f64(),
         liquidated_at: run["liquidated_ts"].as_u64(),
+        orders_capped: summary["orders_capped"].as_u64().unwrap_or(0) as usize,
         notes: run["notes"]
             .as_array()
             .unwrap_or(&empty)

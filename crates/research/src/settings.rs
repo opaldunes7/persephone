@@ -58,6 +58,8 @@ pub struct Settings {
     pub walk_ratio: f64,
     /// The most of a bar's volume an order can take, as a percentage.
     pub max_participation_percent: Section<f64>,
+    /// A portfolio's most gross exposure, as a percentage of the account times the leverage.
+    pub max_gross_percent: Section<f64>,
     /// What a taker pays on top as a percentage of a bar's range, more when that bar's unusually wide.
     pub range_slippage_percent: Section<f64>,
     /// How many bars back the usual range is judged from.
@@ -136,6 +138,7 @@ impl Default for Settings {
             hold_out_percent: crate::optimize::PICKED_ON * 100.0,
             walk_ratio: crate::walk_forward::RATIO,
             max_participation_percent: Section::off(5.0),
+            max_gross_percent: Section::off(100.0),
             range_slippage_percent: Section::off(1.0),
             range_look_back: 100,
             spread: Section::off(2),
@@ -443,6 +446,7 @@ pub enum Edit {
     Borrow(bool),
     Impact(bool),
     Participation(bool),
+    MaxGross(bool),
     RangeSlippage(bool),
     LatencyJitter(bool),
     AddLeg,
@@ -505,6 +509,7 @@ impl Settings {
             Edit::Borrow(on) => self.borrow_percent_per_year.on = on,
             Edit::Impact(on) => self.impact_percent.on = on,
             Edit::Participation(on) => self.max_participation_percent.on = on,
+            Edit::MaxGross(on) => self.max_gross_percent.on = on,
             Edit::RangeSlippage(on) => self.range_slippage_percent.on = on,
             Edit::LatencyJitter(on) => self.latency_jitter.on = on,
             Edit::AddLeg => self.portfolio.legs.push(crate::portfolio::LegSetup {
@@ -565,6 +570,7 @@ impl Settings {
             Field::Borrow => trim(self.borrow_percent_per_year.value),
             Field::Impact => trim(self.impact_percent.value),
             Field::Participation => trim(self.max_participation_percent.value),
+            Field::MaxGross => trim(self.max_gross_percent.value),
             Field::RangeSlippage => trim(self.range_slippage_percent.value),
             Field::LatencyJitter => self.latency_jitter.value.to_string(),
             Field::LatencySeed => self.latency_seed.to_string(),
@@ -696,6 +702,9 @@ impl Settings {
             Field::Participation => {
                 self.max_participation_percent.value = number(0.001, 100.0, "A share of volume")?;
             }
+            Field::MaxGross => {
+                self.max_gross_percent.value = number(1.0, 10_000.0, "The most gross exposure")?;
+            }
             Field::RangeSlippage => {
                 self.range_slippage_percent.value = number(0.0, 100.0, "A share of the range")?;
             }
@@ -813,6 +822,7 @@ impl Settings {
             + self.impact_percent.on as usize
             + self.cash_interest_percent_per_year.on as usize
             + self.max_participation_percent.on as usize
+            + self.max_gross_percent.on as usize
             + self.range_slippage_percent.on as usize
             + self.latency_jitter.on as usize
             + self.spread.on as usize
@@ -845,6 +855,7 @@ impl Settings {
                 "max_participation_percent",
                 self.max_participation_percent.on,
             ),
+            ("max_gross_percent", self.max_gross_percent.on),
             ("range_slippage_percent", self.range_slippage_percent.on),
             ("latency_jitter", self.latency_jitter.on),
             ("spread", self.spread.on),
@@ -940,6 +951,7 @@ impl Settings {
                 .unwrap_or(0.0),
             latency_jitter_ms: self.on(&self.latency_jitter).copied().unwrap_or(0),
             latency_seed: u64::from(self.latency_seed),
+            max_gross_percent: self.on(&self.max_gross_percent).copied(),
         };
         if self.no_costs {
             crate::figures::free_sim(&sim)

@@ -4423,6 +4423,7 @@ fn a_setup_in_settings_is_accepted_and_the_new_settings_are_listed() {
     let defaults = lab.dispatch("get_settings", &json!({})).unwrap();
     for name in [
         "max_participation_percent",
+        "max_gross_percent",
         "range_slippage_percent",
         "latency_jitter",
         "latency_seed",
@@ -4430,6 +4431,41 @@ fn a_setup_in_settings_is_accepted_and_the_new_settings_are_listed() {
     ] {
         assert!(defaults["settings"].get(name).is_some(), "{name}");
     }
+}
+
+#[test]
+fn a_portfolio_can_be_kept_within_the_account() {
+    let lab = two_hand_markets();
+    let heavy = json!({"legs": [
+        {"symbol": "AAAUSD", "venue": "HAND", "weight": 0.9},
+        {"symbol": "BBBUSD", "venue": "HAND", "weight": -0.9},
+    ]});
+    let free = lab.dispatch("run_portfolio", &pair(heavy.clone())).unwrap();
+    assert!(free["summary"]["peak_margin_use"].as_f64().unwrap() > 1.7);
+    assert_eq!(free["summary"]["orders_capped"], 0);
+    let warning = free["summary"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|w| w.as_str().filter(|w| w.contains("in margin")))
+        .unwrap()
+        .to_owned();
+    assert!(warning.contains("max_gross_percent"), "{warning}");
+
+    let mut args = pair(heavy);
+    args["settings"] = json!({"max_gross_percent": {"on": true, "value": 100}});
+    let capped = lab.dispatch("run_portfolio", &args).unwrap();
+    let summary = &capped["summary"];
+    assert!(
+        summary["peak_margin_use"].as_f64().unwrap() <= 1.0 + 1e-6,
+        "{summary}"
+    );
+    assert_eq!(summary["orders_capped"], 2);
+    // And it's the same reading it back.
+    let read = lab
+        .dispatch("get_portfolio", &json!({"run_id": capped["run_id"]}))
+        .unwrap();
+    assert_eq!(read["summary"]["orders_capped"], 2);
 }
 
 #[test]

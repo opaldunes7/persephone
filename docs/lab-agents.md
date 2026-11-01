@@ -152,7 +152,7 @@ A strategy is `{"builtin": id}`, `{"plugin": id}`, `{"logic": tree}` or `{"posit
 - **Cross-margin.** A profit on one leg supports another. Margin is the sum of position values over `leverage`. When the account falls to
   `maintenance_percent` of what's held (0.5 by default), everything is liquidated at that close, whatever `max_participation_percent` says, and
   nothing trades after. The account's judged at each market's worst in the bar, as bars can't show what came first, so a hedged book may be
-  cut sooner than it really would. `warnings` says if the book ever needed more margin than the account had, which isn't refused here but a venue wouldn't allow. `peak_margin_use` and `closest_to_liquidation` say how near it came, the latter as a multiple of what was
+  cut sooner than it really would. `warnings` says if the book ever needed more margin than the account had, which isn't refused here but a venue wouldn't allow: each leg is sized from the account at its own entry and never trimmed, so legs entering at different times can stack past it. `max_gross_percent` stops that: with it on, new or growing orders that would take the book's gross exposure past that percentage of the account times `leverage` are cut, all by the same share, and `orders_capped` counts them. What's held isn't sold to get under it unless the book is rebalanced, when every leg being rebalanced is cut alike. It's a constraint, not a cost, so `gross_return`'s run keeps it. A single market can't go past `Size %` × `leverage`, so it doesn't apply there. `peak_margin_use` and `closest_to_liquidation` say how near it came, the latter as a multiple of what was
   needed, so 1 is liquidated. Exchanges' discounts for hedged books aren't modelled, so a hedge gets no margin relief: those are venue-specific
   stress tables, and a rough version would flatter delta-neutral books.
 - **By time:** `by_hour` and `by_weekday` in a summary are what trades made by the UTC hour and weekday (Monday first) they started. They add up to everything trades made, and the app draws them in the Calendar view.
@@ -293,6 +293,7 @@ an error.
 | `borrow_percent_per_year` | What borrowing costs a short |
 | `impact_percent` | How far a market order fills worse at all of its bar's volume |
 | `max_participation_percent` | The most of a bar's volume an order can take. See `backtests` |
+| `max_gross_percent` | Portfolios only: the most gross exposure, long plus short, as a percentage of the account times `leverage`, as `{"on": true, "value": 100}`. Off by default. See `portfolios` |
 | `range_slippage_percent` | What takers pay on top from a bar's range. See `backtests` |
 | `latency_jitter` | Milliseconds orders take on top of `latency` on average, drawn for each. See `backtests` |
 | `latency_seed` | Which draws of `latency_jitter` a run uses |

@@ -958,6 +958,7 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
     const LATENCY: &str = "Orders reach the venue this many milliseconds late.";
     const LEVERAGE: &str =
         "A position is worth capital × Size % × leverage. Margin calls aren't simulated.";
+    const MAX_GROSS: &str = "Portfolios only. The most the book may hold, long plus short, as a percentage of the account times the leverage. Orders that would take it past are cut; what's held isn't sold to get under it unless the book is rebalanced.";
     const DIRECTION: &str = "Trade one way only; the other side's signals close positions instead. Paper trading follows it too.";
     const SLIPPAGE_PERCENT: &str = "Every market order fills this percentage of the price worse, which means the same on any market.";
     const NEXT_OPEN: &str = "Fill orders at the next bar's open instead of the close they were decided on: a realistic delay, with no finer data needed. Not with Latency or High precision.";
@@ -1207,6 +1208,17 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                     .spacing(3)
                     .align_y(Alignment::Center),
                 LEVERAGE,
+                None,
+            ),
+        ),
+        line(
+            switch(settings.max_gross_percent.on, Edit::MaxGross, MAX_GROSS),
+            name("Most exposure", MAX_GROSS),
+            tip(
+                row![input(Field::MaxGross, 54.0), unit("%")]
+                    .spacing(3)
+                    .align_y(Alignment::Center),
+                MAX_GROSS,
                 None,
             ),
         ),
