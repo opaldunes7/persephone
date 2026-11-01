@@ -125,6 +125,23 @@ pub fn results_dir(data_root: &Path) -> PathBuf {
     data_root.join("lab").join("results")
 }
 
+/// Writes `result` into `dir` as `<id>.json`, where the app watches and Lab lists. It's written
+/// aside and moved into place, so neither ever reads half a file.
+///
+/// # Errors
+///
+/// Returns a message if it can't be written.
+pub fn save_result(dir: &Path, result: &SavedResult) -> Result<PathBuf, String> {
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let path = dir.join(format!("{}.json", result.id));
+    let text = serde_json::to_string_pretty(result).map_err(|e| e.to_string())?;
+    let partial = dir.join(format!("{}.partial", result.id));
+    fs::write(&partial, text)
+        .and_then(|()| fs::rename(&partial, &path))
+        .map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
 /// Every result in `dir`, newest first. A file that can't be read is left out.
 #[must_use]
 pub fn load_results(dir: &Path) -> Vec<SavedResult> {

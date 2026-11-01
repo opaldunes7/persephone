@@ -5,6 +5,7 @@ pub mod bundle;
 pub mod calendar;
 pub mod figures;
 pub mod logic;
+pub mod logic_draft;
 pub mod market;
 pub mod optimize;
 pub mod portfolio;

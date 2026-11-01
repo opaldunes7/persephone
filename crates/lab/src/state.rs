@@ -19,7 +19,7 @@ use persephone_research::{
     bundle::{Bundle, ChartSetup, Places},
     logic,
     positions::Positions,
-    results::{SavedResult, load_results, results_dir},
+    results::{SavedResult, load_results, results_dir, save_result},
 };
 use serde_json::{Value, json};
 
@@ -638,15 +638,7 @@ impl Lab {
             summary,
             saved_at: now_ms(),
         };
-        let dir = results_dir(&self.paths.data);
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let path = dir.join(format!("{id}.json"));
-        let text = serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?;
-        // Written aside and moved, so the app never reads half a file.
-        let partial = dir.join(format!("{id}.partial"));
-        fs::write(&partial, text)
-            .and_then(|()| fs::rename(&partial, &path))
-            .map_err(|e| e.to_string())?;
+        let path = save_result(&results_dir(&self.paths.data), &result)?;
         Ok(json!({"id": id, "path": path}))
     }
 
