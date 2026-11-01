@@ -840,7 +840,7 @@ const EVENT_MARKET: Color = Color::from_rgb8(0xff, 0xa7, 0x26);
 /// Where a headline's mark sits: on its bar, at the bottom of the price pane. `None` if its bar
 /// isn't shown, as it's past the playhead or off the chart.
 fn event_point(chart: &ChartState, price: &Projection, ts: UnixNanos) -> Option<Point> {
-    let bar = chart.bar_of_time(ts)?;
+    let bar = chart.bar_within(ts)?;
     (bar < chart.shown_len() && price.visible.contains(&bar))
         .then(|| Point::new(price.x(bar as f64), price.offset + price.height - 7.0))
 }
@@ -1339,6 +1339,13 @@ mod tests {
         let at = event_point(&chart, price, 95 * hour + hour / 2).expect("drawn");
         assert!((at.x - price.x(95.0)).abs() < 0.01, "on bar 95");
         assert_eq!(event_at(&chart, price, at).as_deref(), Some("late"));
+        // After the last bar's close, it isn't piled onto the last bar: it's off the chart.
+        assert!(
+            event_point(&chart, price, 99 * hour + hour / 2).is_some(),
+            "in the last bar"
+        );
+        assert!(event_point(&chart, price, 100 * hour).is_none());
+        assert!(event_point(&chart, price, 5_000 * hour).is_none());
         // A playhead before it: not there, nor clickable.
         chart.set_playhead(Some(Playhead {
             bars: 93,

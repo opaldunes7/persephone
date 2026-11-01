@@ -487,9 +487,9 @@ impl ChartState {
     }
 
     /// Puts the bar `ts` falls in at the middle of a plot `plot_width` pixels wide, at the zoom
-    /// it has. `false`, leaving the view as it was, if `ts` is before the first bar.
+    /// it has. `false`, leaving the view as it was, if `ts` isn't within the bars.
     pub fn center_on_time(&mut self, ts: UnixNanos, plot_width: f32) -> bool {
-        let Some(bar) = self.bar_of_time(ts) else {
+        let Some(bar) = self.bar_within(ts) else {
             return false;
         };
         let half = f64::from(plot_width.max(1.0)) / self.viewport.spacing / 2.0;
@@ -502,6 +502,16 @@ impl ChartState {
     #[must_use]
     pub fn middle_bar(&self, plot_width: f32) -> f64 {
         self.viewport.right - f64::from(plot_width) / self.viewport.spacing / 2.0
+    }
+
+    /// The bar `ts` falls in, if it's within the bars: from the first's open to the last's close.
+    /// Unlike [`Self::bar_of_time`], a time after the last bar is in none of them.
+    #[must_use]
+    pub fn bar_within(&self, ts: UnixNanos) -> Option<usize> {
+        let last = self.data.candles.last()?;
+        (ts < last.ts.saturating_add(self.data.typical_nanos.max(1)))
+            .then(|| self.bar_of_time(ts))
+            .flatten()
     }
 
     /// The bar `ts` falls in, counting from the first, if it's within the bars.

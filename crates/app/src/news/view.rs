@@ -98,6 +98,7 @@ pub fn sidebar<'a>(
     words: &[&str],
     market: &str,
     now: UnixNanos,
+    span: Option<(UnixNanos, UnixNanos)>,
 ) -> Element<'a, Message> {
     let filter = news.saved.filter;
     let status = match (replay, news.fetched_at) {
@@ -146,9 +147,21 @@ pub fn sidebar<'a>(
             ago(headline.published, now)
         };
         let lit = news.lit.as_deref() == Some(headline.id.as_str());
+        // Off the focused chart's bars: a click can't show it there, so it's said and dimmed.
+        let off_chart =
+            span.is_some_and(|(from, to)| headline.published < from || headline.published >= to);
+        let off: Element<'a, Message> = if off_chart {
+            text("not on this chart")
+                .size(HINT)
+                .color(theme::TEXT_MUTED)
+                .into()
+        } else {
+            Space::new().width(0).into()
+        };
         let body = column![
             row![
                 text(time).size(HINT).color(theme::TEXT_MUTED),
+                off,
                 text(headline.source.clone())
                     .size(HINT)
                     .color(theme::TEXT_MUTED)
@@ -167,7 +180,9 @@ pub fn sidebar<'a>(
             .align_y(Alignment::Center),
             text(headline.title.clone())
                 .size(SMALL)
-                .color(if importance == Importance::High {
+                .color(if off_chart {
+                    theme::TEXT_MUTED
+                } else if importance == Importance::High {
                     theme::TEXT_BRIGHT
                 } else {
                     theme::TEXT

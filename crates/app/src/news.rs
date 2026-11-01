@@ -300,7 +300,25 @@ impl crate::Persephone {
     pub(crate) fn news_view(&self) -> iced::Element<'_, Message> {
         let (words, chip) = self.market_words();
         let words: Vec<&str> = words.iter().map(String::as_str).collect();
-        view::sidebar(&self.news, self.news_replay_time(), &words, &chip, now())
+        // What the focused chart covers, so headlines off it can say so.
+        let span = self
+            .tiles
+            .get(&self.layout.focused())
+            .and_then(|tile| tile.chart.as_ref())
+            .and_then(|chart| {
+                let data = chart.data();
+                let first = data.candles.first()?.ts;
+                let last = data.candles.last()?.ts;
+                Some((first, last.saturating_add(data.typical_nanos.max(1))))
+            });
+        view::sidebar(
+            &self.news,
+            self.news_replay_time(),
+            &words,
+            &chip,
+            now(),
+            span,
+        )
     }
 
     pub(crate) fn on_news(&mut self, message: NewsMessage) -> iced::Task<Message> {
@@ -388,12 +406,22 @@ impl crate::Persephone {
                     else {
                         continue;
                     };
-                    let first = chart.data().candles.first().map(|c| c.ts);
+                    let ends = chart
+                        .data()
+                        .candles
+                        .first()
+                        .zip(chart.data().candles.last())
+                        .map(|(first, last)| (first.ts, last.ts));
                     if !chart.center_on_time(at, width) && tile == focused {
-                        self.news.note = Some(match first {
-                            Some(first) => format!(
+                        let date = |ts| persephone_core::time::DateTime::from_nanos(ts).date();
+                        self.news.note = Some(match ends {
+                            Some((first, _)) if at < first => format!(
                                 "That's from before this chart's first bar, {}. Widen its span to see it.",
-                                persephone_core::time::DateTime::from_nanos(first).date()
+                                date(first)
+                            ),
+                            Some((_, last)) => format!(
+                                "That's from after this chart's last bar, {}. Load later bars to see it.",
+                                date(last)
                             ),
                             None => "This chart has no bars yet.".into(),
                         });

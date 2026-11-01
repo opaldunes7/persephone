@@ -478,3 +478,56 @@ fn a_click_brings_every_chart_on_screen_to_the_headline() {
     }
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn a_headline_after_the_charts_last_bar_isnt_marked_on_it() {
+    const START: u64 = 1_704_067_200_000_000_000;
+    let mut app = app_in_2024();
+    let root = dir("after");
+    app.use_news_root(root.clone());
+    // Long after the chart's 500 bars, as a 2026 headline is on a chart ending in 2022.
+    let later = Headline {
+        published: START + 5_000 * HOUR,
+        ..headline(0, "Bitcoin much later")
+    };
+    // In the last bar, half an hour after it opened: on the chart.
+    let last_bar = Headline {
+        published: START + 499 * HOUR + HOUR / 2,
+        ..headline(1, "Bitcoin in the last hour")
+    };
+    news(
+        &mut app,
+        NewsMessage::Fetched(Arc::new(vec![later.clone(), last_bar.clone()]), Vec::new()),
+    );
+    news(&mut app, NewsMessage::Toggle);
+    settle(&mut app);
+    let chart = app.tile_chart(0).unwrap();
+    let marked: Vec<&str> = chart.events().iter().map(|e| e.id.as_str()).collect();
+    assert!(
+        marked.contains(&"h1") && marked.contains(&"h0"),
+        "{marked:?}"
+    );
+    assert_eq!(chart.bar_within(later.published), None);
+    assert_eq!(chart.bar_within(last_bar.published), Some(499));
+    assert!(
+        shows(&app, "not on this chart"),
+        "the list says so before a click"
+    );
+
+    let width = app.tile_rect(0).unwrap().width - persephone_chart::PRICE_AXIS_WIDTH;
+    let before = app.tile_chart(0).unwrap().middle_bar(width);
+    news(&mut app, NewsMessage::Pick(later.id.clone()));
+    let note = app.news().note.clone().unwrap();
+    assert!(
+        note.contains("after this chart's last bar, 2024-01-21"),
+        "{note}"
+    );
+    assert_eq!(
+        app.tile_chart(0).unwrap().middle_bar(width),
+        before,
+        "the chart stays where it was"
+    );
+    news(&mut app, NewsMessage::Pick(last_bar.id.clone()));
+    assert_eq!(app.news().note, None);
+    std::fs::remove_dir_all(root).unwrap();
+}
