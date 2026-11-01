@@ -138,7 +138,8 @@ pub fn moment(value: &Value) -> Result<UnixNanos, String> {
 
 /// A weight table from JSON, one weight per symbol in each row, those a row leaves out going flat. A
 /// row stamped with a bar's open applies at that bar's close, as position lists do, as a weight
-/// worked out from a bar can't trade before it's closed.
+/// worked out from a bar can't trade before it's closed. `{}` on its own is a table that's flat
+/// throughout, the candidate a walk-forward can always fall back on.
 ///
 /// # Errors
 ///
@@ -147,9 +148,12 @@ pub fn parse_weights(
     value: &Value,
     symbols: &[String],
 ) -> Result<Vec<(UnixNanos, Vec<f64>)>, String> {
+    if value.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Ok(vec![(0, vec![0.0; symbols.len()])]);
+    }
     let rows = value
         .as_array()
-        .ok_or("`weights` should be a list of [time, {symbol: weight}]")?;
+        .ok_or("`weights` should be a list of [time, {symbol: weight}], or {} to stay flat")?;
     let mut table = Vec::with_capacity(rows.len());
     for (at, row) in rows.iter().enumerate() {
         let (Some(when), Some(weights)) = (row.get(0), row.get(1).and_then(Value::as_object))
@@ -310,6 +314,7 @@ pub struct PortfolioFigures {
     pub costs_paid: f64,
     pub sharpe: Option<f64>,
     pub by_year: BTreeMap<i64, f64>,
+    pub by_year_compounded: BTreeMap<i64, Option<f64>>,
     /// An equal share of the capital held in each market from its first bar in the span.
     pub benchmark_return: f64,
     pub benchmark: Vec<f64>,
@@ -393,17 +398,44 @@ fn time_text(ts: UnixNanos) -> String {
     format!("{} {}", at.date(), at.time())
 }
 
+/// Says when what the costs took doesn't explain the gap between the run before costs and after. The
+/// run before costs is run again without them, and when weights are kept to a share of the account
+/// (rebalancing, or a table) it then trades other sizes, so the gap holds more than costs.
+fn gross_gap_warning(run: &PortfolioRun) -> Option<String> {
+    let figures = &run.figures;
+    let capital = run.report.starting_balance;
+    let gross = figures.gross_return?;
+    if !run.friction || capital <= 0.0 || figures.costs_paid <= 0.0 {
+        return None;
+    }
+    let gap = (gross - figures.net_return) * capital;
+    ((gap - figures.costs_paid).abs() > 0.1 * figures.costs_paid).then(|| {
+        format!(
+            "Before costs less after is {gap:.2}, but the costs paid were {:.2}. The run without costs traded other sizes, as its account grew differently, so the gap isn't only costs: `total_costs_paid` is what was really paid.",
+            figures.costs_paid
+        )
+    })
+}
+
 /// What's listed about a run, and all of it, as both Lab and the app write it down.
 #[must_use]
 pub fn written(run: &PortfolioRun, run_id: &str, created: u64, args: &Value) -> (Value, Value) {
     let (report, figures, opens, from_index) =
         (&run.report, &run.figures, &run.opens, run.from_index);
-    let warnings: Vec<&str> = report
+    let mut warnings: Vec<String> = report
         .notes
         .iter()
         .filter(|note| note.warning)
-        .map(|note| note.text.as_str())
+        .map(|note| note.text.clone())
         .collect();
+    if let Some(ignored) = args
+        .get("settings")
+        .and_then(|settings| serde_json::from_value::<Settings>(settings.clone()).ok())
+        .and_then(|settings| settings.ignored_warning())
+    {
+        warnings.push(ignored);
+    }
+    warnings.extend(gross_gap_warning(run));
     let mut summary = json!({
         "kind": "portfolio",
         "fills_on": if run.next_open { "next_open" } else { "bars" },
@@ -418,6 +450,7 @@ pub fn written(run: &PortfolioRun, run_id: &str, created: u64, args: &Value) -> 
         "max_drawdown": report.max_drawdown.abs(),
         "sharpe": figures.sharpe,
         "by_year": figures.by_year.iter().map(|(year, made)| (year.to_string(), json!(made))).collect::<serde_json::Map<_, _>>(),
+        "by_year_compounded": figures.by_year_compounded.iter().map(|(year, made)| (year.to_string(), json!(made))).collect::<serde_json::Map<_, _>>(),
         "benchmark_return": figures.benchmark_return,
         "benchmark_after_funding": figures.benchmark_after_funding,
         "weights_held_return": figures.weights_held_return,
@@ -681,6 +714,15 @@ fn from_written(run: &Value) -> PortfolioRun {
                     .filter_map(|(year, made)| Some((year.parse().ok()?, made.as_f64()?)))
                     .collect()
             }),
+        by_year_compounded: summary["by_year_compounded"].as_object().map_or_else(
+            BTreeMap::new,
+            |years| {
+                years
+                    .iter()
+                    .filter_map(|(year, made)| Some((year.parse().ok()?, made.as_f64())))
+                    .collect()
+            },
+        ),
         benchmark_return: summary["benchmark_return"].as_f64().unwrap_or(0.0),
         benchmark_after_funding: summary["benchmark_after_funding"].as_f64().unwrap_or(0.0),
         weights_held_return: summary["weights_held_return"].as_f64(),
@@ -755,6 +797,7 @@ impl PortfolioFigures {
             costs_paid: costs_paid(report, request),
             sharpe: figures::sharpe(&whole, from_index, &bars),
             by_year: figures::by_year(&whole, from_index, &bars),
+            by_year_compounded: figures::by_year_compounded(&whole, from_index, &bars),
             benchmark_return: benchmark
                 .last()
                 .map_or(0.0, |last| last / report.starting_balance - 1.0),
@@ -923,7 +966,12 @@ mod tests {
         let wrong = parse_weights(&json!([[0, {"XRPUSDT": 1.0}]]), &symbols).unwrap_err();
         assert!(wrong.contains("XRPUSDT"), "{wrong}");
         assert!(parse_weights(&json!([[0]]), &symbols).is_err());
-        assert!(parse_weights(&json!({}), &symbols).is_err());
+        // `{}` alone is flat throughout; any other object isn't a table.
+        assert_eq!(
+            parse_weights(&json!({}), &symbols).unwrap(),
+            vec![(0, vec![0.0; symbols.len()])]
+        );
+        assert!(parse_weights(&json!({"BTCUSDT": 1.0}), &symbols).is_err());
     }
 
     #[test]
@@ -984,6 +1032,7 @@ mod tests {
                 costs_paid: 3.0,
                 sharpe: Some(1.5),
                 by_year: BTreeMap::from([(2024, 0.01)]),
+                by_year_compounded: BTreeMap::from([(2024, Some(0.01)), (2025, None)]),
                 benchmark_return: 0.5,
                 benchmark: vec![1_000.0, 1_500.0],
                 benchmark_after_funding: 0.4,
@@ -999,6 +1048,20 @@ mod tests {
         };
         let dir = std::env::temp_dir().join(format!("portfolio-run-{}", std::process::id()));
         let (summary, whole) = written(&run, "run-1", 9, &json!({"label": "Mine"}));
+        // Before costs less after is 10, but only 3 was paid: it says the gap's more than costs.
+        assert!(
+            summary["warnings"]
+                .to_string()
+                .contains("costs paid were 3.00"),
+            "{summary}"
+        );
+        let mut explained = run.clone();
+        explained.figures.costs_paid = 10.0;
+        let (quiet, _) = written(&explained, "run-1", 9, &json!({}));
+        assert!(
+            !quiet["warnings"].to_string().contains("costs paid"),
+            "{quiet}"
+        );
         save(&dir, &whole, &summary, &json!({"label": "Mine"})).unwrap();
         let listed = list_saved(&dir);
         assert_eq!(listed[0].id, "run-1");
@@ -1019,6 +1082,10 @@ mod tests {
         assert_eq!(x.unfilled_at_end, y.unfilled_at_end);
         assert_eq!(x.missing_bars, y.missing_bars);
         assert_eq!(back.figures.by_year, run.figures.by_year);
+        assert_eq!(
+            back.figures.by_year_compounded,
+            run.figures.by_year_compounded
+        );
         assert_eq!(back.figures.correlation, run.figures.correlation);
         assert_eq!(back.figures.sharpe, run.figures.sharpe);
         assert_eq!(back.figures.benchmark_after_funding, 0.4);

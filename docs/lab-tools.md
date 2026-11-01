@@ -53,7 +53,7 @@ When a market's history starts and ends.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
 - `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
 
-Returns: `first`, `last`
+Returns: `first`, `last`, `first_ts`, `last_ts`
 
 ## `get_bars`
 
@@ -95,7 +95,7 @@ Writes bars or ticks to a file, for large pulls and training outside Persephone.
 - `format` (string): csv (the default) or parquet.
 - `path` (string): Where to write it. Default: Lab's exports folder.
 
-Returns: `path`, `rows`, `format`
+Returns: `path`, `rows`, `format`, `columns`
 
 ## `import_data` *job*
 
@@ -141,7 +141,7 @@ An indicator's values over a market's bars.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `columns`, `rows`, `next_cursor`
+Returns: `columns`, `rows`, `next_cursor`, `total`
 
 ## `list_models`
 
@@ -171,7 +171,7 @@ One strategy's parameters, with their defaults and limits. Works for a logic tre
 
 - `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional "params": {"name": value}.
 
-Returns: `name`, `description`, `params`
+Returns: `name`, `description`, `params`, `values`
 
 ## `validate_logic`
 
@@ -232,7 +232,7 @@ Many portfolios in one call, in parallel, to sweep weights, rebalancing or costs
 - `defaults` (object): Arguments every run shares. A run's own win.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `columns`, `rows`, `total`, `succeeded`, `failed`
+Returns: `columns`, `rows`, `total`, `succeeded`, `failed`, `first_error`, `not_run`
 
 ## `run_shifted` *job*
 
@@ -241,8 +241,9 @@ A run's positions or a portfolio's weights moved along the span by random amount
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 - `runs` (number): How many shifts. Default 200.
 - `seed` (number): Which shifts; the same gives the same.
+- `variants_tried` (integer): How many variants this run was picked from, counting every setting, rule and span you tried. `share_matching_adjusted` is then the chance that one of that many worthless tries would have done as well. Default 1.
 
-Returns: `runs`, `actual_return`, `share_matching_return`, `median`, `low`, `high`, `return_chart`, `fall_chart`
+Returns: `runs`, `actual_return`, `share_matching_return`, `median`, `low`, `high`, `return_chart`, `fall_chart`, `actual_fell`, `changes`, `share_matching_fall`, `warning`, `variants_tried`, `share_matching_adjusted`
 
 ## `run_portfolio_monte_carlo` *job*
 
@@ -255,7 +256,7 @@ A portfolio's account returns drawn again in blocks along its timeline, keeping 
 - `seed` (number): Which draws; the same gives the same.
 - `include_lines` (boolean): Add up to 200 of the drawn lines. Costs more to read.
 
-Returns: `runs`, `median`, `low`, `high`, `ruin_share`, `losing_share`, `return_chart`, `fall_chart`, `median_line`, `low_line`, `high_line`, `actual_line`
+Returns: `runs`, `median`, `low`, `high`, `ruin_share`, `losing_share`, `return_chart`, `fall_chart`, `median_line`, `low_line`, `high_line`, `actual_line`, `actual_fell`, `actual_return`, `block_bars`, `share_matching_return`, `stride`
 
 ## `run_portfolio_walk_forward` *job*
 
@@ -267,7 +268,7 @@ Each window picks the best of the setups you give on its stretch, and trades it 
 - `train_ratio` (number): How many times longer than its unseen stretch a window picks on. Default walk_ratio in settings, 3.
 - `pick_by` (string): `return` (default) or `sharpe`.
 
-Returns: `windows`, `unseen_return`, `buy_and_hold_return`, `profitable_windows`, `deepest_fall`, `chart`
+Returns: `windows`, `unseen_return`, `buy_and_hold_return`, `profitable_windows`, `deepest_fall`, `chart`, `buy_and_hold_compounded`, `buy_and_hold_whole`, `test_bars`, `trades`, `train_bars`, `unseen_compounded`
 
 ## `run_backtests` *job*
 
@@ -277,7 +278,7 @@ Many backtests in one call, in parallel: much quicker for an agent than one call
 - `defaults` (object): Arguments every run shares, such as bars, from, to and settings. A run's own win.
 - `limit` (integer): How many runs to list, best return first. Default 100.
 
-Returns: `columns`, `rows`, `total`, `succeeded`, `failed`, `not_run`
+Returns: `columns`, `rows`, `total`, `succeeded`, `failed`, `not_run`, `first_error`
 
 ## `run_monte_carlo` *job*
 
@@ -291,7 +292,7 @@ Draws a run's trades at random many times, to see the range of results they coul
 - `show_run` (integer): A run's number, to list what it drew; one past the last is the backtest.
 - `limit` (integer): How many runs to list, best first. Default 20.
 
-Returns: `trades`, `runs`, `median`, `low`, `high`, `drawdown`, `ruin`, `actual`, `best_runs`, `chart`
+Returns: `trades`, `runs`, `median`, `low`, `high`, `drawdown`, `ruin`, `actual`, `best_runs`, `chart`, `run_columns`, `run_rows`
 
 ## `run_random_blocks` *job*
 
@@ -311,7 +312,7 @@ Backtests random stretches of a span, to see whether a strategy works throughout
 - `include_lines` (boolean): Add every line the app's fan draws to `chart`, not just the few that sum it up. Costs more to read.
 - `limit` (integer): How many blocks to list. Default 50.
 
-Returns: `profitable`, `median`, `best`, `worst`, `blocks`, `total`, `chart`
+Returns: `profitable`, `median`, `best`, `worst`, `blocks`, `total`, `chart`, `median_buy_and_hold`, `warning`, `worst_dates`
 
 ## `run_random_entries` *job*
 
@@ -320,8 +321,9 @@ Whether a run beat chance: the same holds and directions at random times, on the
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 - `runs` (integer): How many random placings. Default 200.
 - `seed` (integer): The same seed gives the same placings. Default 0.
+- `variants_tried` (integer): How many variants this run was picked from, counting every setting, rule and span you tried. `share_matching_adjusted` is then the chance that one of that many worthless tries would have done as well. Default 1.
 
-Returns: `runs`, `trades`, `actual_return`, `share_matching_return`, `share_matching_fall`, `median`, `low`, `high`
+Returns: `runs`, `trades`, `actual_return`, `share_matching_return`, `share_matching_fall`, `median`, `low`, `high`, `actual_fell`, `fall_chart`, `return_chart`, `warning`, `variants_tried`, `share_matching_adjusted`
 
 ## `run_walk_forward` *job*
 
@@ -342,7 +344,7 @@ Picks the best values on one stretch, tests them on the next, unseen, and slides
 - `ruin_percent` (number): For monte-carlo. Default 50.
 - `seed` (integer): Default 0.
 
-Returns: `windows`, `unseen_return`, `profitable_windows`, `deepest_fall`, `trades`
+Returns: `windows`, `unseen_return`, `profitable_windows`, `deepest_fall`, `trades`, `buy_and_hold_compounded`, `buy_and_hold_return`, `buy_and_hold_whole`, `chart`, `test_bars`, `train_bars`, `unseen_compounded`, `warning`
 
 ## `run_optimize` *job*
 
@@ -365,7 +367,7 @@ Backtests a range of one or two parameters, scored by return, Monte Carlo or ran
 - `seed` (integer): Default 0.
 - `limit` (integer): How many values to list, best first. Default 50.
 
-Returns: `values`, `total`, `top`, `on_edge`, `held_out`, `backtests`, `chart`
+Returns: `values`, `total`, `top`, `on_edge`, `held_out`, `backtests`, `chart`, `held_out_buy_and_hold`, `warning`
 
 ## `get_report`
 
@@ -373,7 +375,7 @@ A run's full report: every statistic and note. Its own figures are fractions, an
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 
-Returns: `run_id`, `request`, `summary`, `pnl`, `returns`, `general`, `notes`
+Returns: `run_id`, `request`, `summary`, `pnl`, `returns`, `general`, `notes`, `closed_positions_pnl`, `ends_with_open_trade`, `fees`, `max_drawdown`, `starting_balance`, `total_orders`, `total_positions`
 
 ## `get_trades`
 
@@ -383,7 +385,7 @@ A run's trades, from flat to flat, in pages: profit in the quote currency, retur
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `columns`, `rows`, `next_cursor`
+Returns: `columns`, `rows`, `next_cursor`, `total`
 
 ## `get_fills`
 
@@ -393,7 +395,7 @@ A run's fills, in pages.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `columns`, `rows`, `next_cursor`
+Returns: `columns`, `rows`, `next_cursor`, `total`
 
 ## `get_limit_orders`
 
@@ -404,7 +406,7 @@ Every limit order a run sent, in pages, filled or not: what became of it, how fa
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `columns`, `rows`, `next_cursor`
+Returns: `columns`, `rows`, `next_cursor`, `total`
 
 ## `get_decisions`
 
@@ -412,11 +414,11 @@ A run's decision for each bar, in pages, if it ran with `decision_log` on: what 
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 - `why` (string): Only rows with this reason.
-- `wanted_only` (boolean): Only bars where the strategy asked for something.
+- `wanted_only` (boolean): Only bars where the strategy asked for something, and not those while it was warming up. `reasons` then counts only these.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `columns`, `rows`, `next_cursor`, `reasons`
+Returns: `columns`, `rows`, `next_cursor`, `reasons`, `total`
 
 ## `get_portfolio`
 
@@ -424,7 +426,7 @@ A portfolio run's summary, a table by leg of what each made and paid, and how th
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 
-Returns: `summary`, `legs`, `correlation`, `notes`
+Returns: `summary`, `legs`, `correlation`, `notes`, `run_id`
 
 ## `get_portfolio_series`
 
@@ -434,7 +436,7 @@ A portfolio run at each bar of its span, in pages: equity, what equal shares hel
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `columns`, `rows`, `next_cursor`
+Returns: `columns`, `rows`, `next_cursor`, `total`
 
 ## `get_portfolio_fills`
 
@@ -445,7 +447,7 @@ A portfolio run's fills for one leg, in pages.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `columns`, `rows`, `next_cursor`
+Returns: `columns`, `rows`, `next_cursor`, `total`
 
 ## `get_equity`
 
@@ -455,7 +457,7 @@ A run's equity at each bar's close, in pages, beside what holding the market wit
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `columns`, `rows`, `next_cursor`
+Returns: `columns`, `rows`, `next_cursor`, `total`
 
 ## `get_returns`
 
@@ -465,7 +467,7 @@ A run's per-period returns, as Nautilus works them out, in pages.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `columns`, `rows`, `next_cursor`
+Returns: `columns`, `rows`, `next_cursor`, `total`
 
 ## `get_calendar`
 
@@ -488,7 +490,7 @@ Saved runs, newest first unless sorted. Searching reads every summary, so it tak
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `rows`, `next_cursor`
+Returns: `rows`, `next_cursor`, `total`
 
 ## `compare_runs`
 
@@ -505,7 +507,7 @@ How a job is doing, and its result once it's done. Give wait_seconds rather than
 - `job_id` (string, required): A job id.
 - `wait_seconds` (number): How long to wait for it to finish, answering the moment it does. Default 0.
 
-Returns: `job_id`, `status`
+Returns: `job_id`, `status`, `result`, `tool`
 
 ## `cancel_job`
 
@@ -561,7 +563,7 @@ Writes saved results, the layout, drawings and which plugins are in use to one J
 - `settings` (object): Settings, for one chart's setup.
 - `name` (string): A name for one chart's setup.
 
-Returns: `path`, `results`, `runs`, `plugins`, `bytes`
+Returns: `path`, `results`, `runs`, `plugins`, `bytes`, `chart`, `drawings`, `layout`
 
 ## `import_state`
 

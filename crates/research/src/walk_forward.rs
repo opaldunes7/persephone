@@ -47,6 +47,10 @@ pub struct WalkForward {
     /// The unseen stretches' returns added up, each from the same capital.
     pub unseen_return: f64,
     pub buy_and_hold_return: f64,
+    /// The market held once from the first unseen stretch's start to the last one's end, so over
+    /// the same bars as `compounded`, but without the gaps and re-buying between windows that
+    /// adding or compounding window by window brings.
+    pub buy_and_hold_whole: f64,
     pub profitable_windows: usize,
     pub deepest_fall: f64,
     pub trades: usize,
@@ -231,10 +235,19 @@ impl WalkForwardJob {
             });
             rows.push(row);
         }
+        let whole_from = candles[first + train].close;
+        let whole = candles.last().map_or(0.0, |last| {
+            if whole_from > 0.0 {
+                last.close / whole_from - 1.0
+            } else {
+                0.0
+            }
+        });
         Ok(WalkForward {
             windows: rows,
             unseen_return: unseen_total,
             buy_and_hold_return: held_total,
+            buy_and_hold_whole: whole,
             profitable_windows: profitable,
             deepest_fall: deepest,
             trades,

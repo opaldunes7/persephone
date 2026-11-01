@@ -380,6 +380,8 @@ struct Brackets {
     stop: Option<ClientOrderId>,
     stop_qty: f64,
     stop_level: f64,
+    /// Whether the resting stop is the trailing one, as it was nearer than the fixed one.
+    stop_trails: bool,
     take: Option<ClientOrderId>,
     take_qty: f64,
 }
@@ -531,7 +533,8 @@ nautilus_strategy!(SignalStrategy, {
         } else {
             self.range_now.0
         };
-        self.after_fill(event.client_order_id, event.ts_event.as_u64());
+        let signed_qty = if side == Side::Buy { qty } else { -qty };
+        self.after_fill(event.client_order_id, event.ts_event.as_u64(), signed_qty);
         let fill = RawFill {
             ts: event.ts_event.as_u64(),
             side,
@@ -1035,7 +1038,7 @@ impl SignalStrategy {
     }
 
     /// What follows a fill: what it replaces, or what's now out of date, goes.
-    fn after_fill(&mut self, order: ClientOrderId, filled_at: UnixNanos) {
+    fn after_fill(&mut self, order: ClientOrderId, filled_at: UnixNanos, filled: f64) {
         let bracket = self.brackets.stop == Some(order) || self.brackets.take == Some(order);
         if bracket {
             let stopped = self.brackets.stop == Some(order);
@@ -1045,11 +1048,11 @@ impl SignalStrategy {
                     wanted: None,
                     held: self.held(),
                     target: None,
-                    order: 0.0,
-                    why: if stopped {
-                        "a stop filled"
-                    } else {
-                        "a target filled"
+                    order: filled,
+                    why: match (stopped, self.brackets.stop_trails) {
+                        (true, true) => "a trailing stop filled",
+                        (true, false) => "a stop filled",
+                        (false, _) => "a target filled",
                     },
                 };
                 self.missed.borrow_mut().decisions.push(row);
@@ -1159,6 +1162,7 @@ impl SignalStrategy {
             }),
             (one, other) => one.or(other),
         };
+        let trails = trail.is_some() && stop_at == trail;
         let take_at = self
             .take_profit
             .map(|percent| self.entry_price * (1.0 + side * percent / 100.0));
@@ -1173,6 +1177,11 @@ impl SignalStrategy {
             self.end_resting(LimitOutcome::Cancelled)?;
             self.asked = 0;
             self.stop_working(true);
+            self.now.why = if trails {
+                "past its trailing stop at this close"
+            } else {
+                "past its stop at this close"
+            };
             if self.participation.is_some() {
                 self.start_way_out();
                 if let Some(working) = self.working {
@@ -1180,7 +1189,6 @@ impl SignalStrategy {
                 }
             }
             self.now.order = -side * qty.as_f64();
-            self.now.why = "past its stop at this close";
             let order = self.market_order(closing, qty, true);
             self.in_flight
                 .push((order.client_order_id(), -side * qty.as_f64()));
@@ -1227,6 +1235,7 @@ impl SignalStrategy {
             self.brackets.stop = Some(order.client_order_id());
             self.brackets.stop_qty = stop_qty.as_f64();
             self.brackets.stop_level = at;
+            self.brackets.stop_trails = trails;
             self.submit_order(order, None, None, None)?;
         }
         let Some(take) = take_at else {

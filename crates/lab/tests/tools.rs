@@ -312,6 +312,7 @@ fn every_tool_answers_as_it_says_and_none_gives_a_key_away() {
             tool.name
         );
     }
+    let mut unlisted = Vec::new();
     for (name, args) in calls {
         let answer = lab
             .dispatch(name, &args)
@@ -321,6 +322,16 @@ fn every_tool_answers_as_it_says_and_none_gives_a_key_away() {
             assert!(
                 answer.get(*key).is_some(),
                 "{name} has no `{key}`: {answer}"
+            );
+        }
+        // And everything it answers is listed, so an agent reading the tools knows it's there.
+        if let Some(keys) = answer.as_object() {
+            unlisted.extend(
+                keys.keys()
+                    // What a job's call is, said of every job, by the job.
+                    .filter(|key| *key != "job_id")
+                    .filter(|key| !tool.returns.contains(&key.as_str()))
+                    .map(|key| format!("{name}.{key}")),
             );
         }
         assert!(
@@ -338,6 +349,7 @@ fn every_tool_answers_as_it_says_and_none_gives_a_key_away() {
             );
         }
     }
+    assert!(unlisted.is_empty(), "answered but not listed: {unlisted:?}");
     let log = fs::read_to_string(dir.join("lab").join("calls.jsonl")).unwrap();
     assert!(log.contains("get_report"), "calls are logged");
 }
@@ -2120,6 +2132,25 @@ fn walk_forward_picks_only_on_what_came_before_what_it_tests() {
     assert!((answer["unseen_return"].as_f64().unwrap() - total).abs() < 1e-9);
     assert!(answer["buy_and_hold_return"].is_number(), "{answer}");
     assert!(windows[0]["buy_and_hold_return"].is_number(), "{answer}");
+    // The market held once over all the unseen bars is a backtest's market over them.
+    let whole = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({
+                "strategy": strategy,
+                "from": windows[0]["test_from"],
+                "to": next_hour(windows[2]["test_to"].as_str().unwrap()),
+                "wait_seconds": 240,
+            })),
+        )
+        .unwrap();
+    assert!(
+        (answer["buy_and_hold_whole"].as_f64().unwrap()
+            - whole["summary"]["buy_and_hold_return"].as_f64().unwrap())
+        .abs()
+            < 1e-9,
+        "{answer} against {whole}"
+    );
 
     let error = lab
         .dispatch(
@@ -2183,6 +2214,9 @@ fn serve_external() -> String {
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             thread::spawn(move || {
+                // Answers go at once, as a real one's should: otherwise every bar waits on the
+                // other side's delayed acknowledgement.
+                stream.set_nodelay(true).unwrap();
                 let mut out = stream.try_clone().unwrap();
                 for line in BufReader::new(stream).lines().map_while(Result::ok) {
                     let message: Value = serde_json::from_str(&line).unwrap();
@@ -2193,7 +2227,7 @@ fn serve_external() -> String {
                         "bar" => json!({"target": 1}),
                         _ => json!({}),
                     };
-                    writeln!(out, "{answer}").unwrap();
+                    out.write_all(format!("{answer}\n").as_bytes()).unwrap();
                 }
             });
         }
@@ -4501,6 +4535,23 @@ fn a_run_of_either_kind_can_be_shifted_and_a_portfolio_drawn_and_walked() {
         .unwrap();
     assert_eq!(moved["runs"], 8, "{moved}");
     assert!(moved["share_matching_return"].as_f64().unwrap() <= 1.0);
+    assert_eq!(
+        moved["share_matching_adjusted"], moved["share_matching_return"],
+        "one variant by default"
+    );
+    let picked = lab
+        .dispatch(
+            "run_shifted",
+            &json!({"run_id": single["run_id"], "runs": 8, "variants_tried": 11, "wait_seconds": 120}),
+        )
+        .unwrap();
+    let share = picked["share_matching_return"].as_f64().unwrap();
+    let adjusted = picked["share_matching_adjusted"].as_f64().unwrap();
+    assert!(
+        (adjusted - (1.0 - (1.0 - share).powi(11))).abs() < 1e-12,
+        "{picked}"
+    );
+    assert_eq!(picked["variants_tried"], 11);
     let actual = moved["actual_return"].as_f64().unwrap();
     assert!((actual - single["summary"]["net_return"].as_f64().unwrap()).abs() < 1e-9);
 
@@ -4547,6 +4598,39 @@ fn a_run_of_either_kind_can_be_shifted_and_a_portfolio_drawn_and_walked() {
     assert_eq!(walked["windows"][0]["label"], "long", "{walked}");
     assert_eq!(walked["profitable_windows"], 2);
 
+    // A literal `{}` table stays flat, and beats a candidate that loses.
+    let flat_or_short = lab
+        .dispatch(
+            "run_portfolio_walk_forward",
+            &json!({
+                "candidates": [
+                    {"legs": legs(-0.5), "label": "short"},
+                    {"legs": legs(0.0), "weights": {}, "label": "flat"},
+                ],
+                "defaults": {"bars": "1h"},
+                "windows": 2,
+                "train_ratio": 1,
+                "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    for window in flat_or_short["windows"].as_array().unwrap() {
+        assert_eq!(window["label"], "flat", "{flat_or_short}");
+    }
+    assert!(flat_or_short["unseen_return"].as_f64().unwrap().abs() < 1e-12);
+    // A candidate that's wrong says which it is.
+    let wrong = lab
+        .dispatch(
+            "run_portfolio_walk_forward",
+            &json!({
+                "candidates": [{"legs": legs(0.5)}, {"legs": legs(0.5), "weights": 3}],
+                "defaults": {"bars": "1h"},
+                "wait_seconds": 60,
+            }),
+        )
+        .unwrap_err();
+    assert!(wrong.contains("item 1"), "{wrong}");
+
     let wrong = lab
         .dispatch(
             "run_portfolio_walk_forward",
@@ -4591,6 +4675,15 @@ fn decisions_and_a_trailing_stop_work_from_settings() {
     let asked = lab
         .dispatch("get_decisions", &json!({"run_id": id, "wanted_only": true}))
         .unwrap();
+    // Its reasons count only the bars it lists.
+    let counted: u64 = asked["reasons"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|count| count.as_u64().unwrap())
+        .sum();
+    assert_eq!(counted, asked["total"].as_u64().unwrap(), "{asked}");
+    assert!(asked["reasons"].get("warming up").is_none(), "{asked}");
     assert!(
         asked["rows"]
             .as_array()
@@ -4642,4 +4735,37 @@ fn a_long_look_back_on_a_longer_timeframe_is_warned_of_in_the_charts_bars() {
     let warnings = run["summary"]["warnings"].to_string();
     assert!(warnings.contains("look-back"), "{warnings}");
     assert!(warnings.contains("7200"), "{warnings}");
+}
+
+#[test]
+fn settings_switched_on_but_ignored_as_stock_is_off_are_named() {
+    let (lab, _dir) = lab();
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({
+                "strategy": ema(),
+                "settings": {"stock": false, "leverage": {"on": true, "value": 3}},
+                "wait_seconds": 120,
+            })),
+        )
+        .unwrap();
+    let warnings = run["summary"]["warnings"].to_string();
+    assert!(
+        warnings.contains("`leverage`") && warnings.contains("`stock` is off"),
+        "{warnings}"
+    );
+    let lab = two_hand_markets();
+    let run = lab
+        .dispatch(
+            "run_portfolio",
+            &pair(json!({"settings": {"stock": false, "leverage": {"on": true, "value": 3}}})),
+        )
+        .unwrap();
+    assert!(
+        run["summary"]["warnings"]
+            .to_string()
+            .contains("`leverage`"),
+        "{run}"
+    );
 }

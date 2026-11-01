@@ -3,8 +3,10 @@
 
 use std::{fs, sync::Arc, sync::atomic::Ordering};
 
-use persephone_engine::PortfolioRequest;
+use persephone_core::Timeframe;
+use persephone_engine::{PortfolioLeg, PortfolioRequest};
 use persephone_research::{
+    figures,
     portfolio::{self, LegSetup, PortfolioSetup, RebalanceSetup},
     portfolio_tests::{self, Candidate, PickBy, ShiftedJob, ShiftedPortfolioJob, WalkJob},
     robustness::pool,
@@ -16,7 +18,7 @@ use crate::{
     data::MarketArgs,
     jobs::{Job, check_id},
     new_id, now_ms,
-    runs::{histogram_json, report_from, settings_of, walk_answer},
+    runs::{histogram_json, look_back_of, report_from, settings_of, variants_tried, walk_answer},
     time_text,
     tools::{check_args, limit_of, page_of, text, tools},
 };
@@ -130,7 +132,7 @@ fn workers() -> usize {
 }
 
 impl Lab {
-    fn prepare_portfolio(&self, args: &Value) -> Result<PortfolioRequest, String> {
+    pub(crate) fn prepare_portfolio(&self, args: &Value) -> Result<PortfolioRequest, String> {
         let weights = weights_of(args)?;
         let setup = setup_of(args, weights)?;
         let settings = settings_of(args)?;
@@ -171,9 +173,15 @@ impl Lab {
             .get("friction")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let look_backs = leg_look_back_warnings(args, &request);
         let found = portfolio::run(request, friction)?;
         let run_id = new_id("run");
-        let (summary, run) = portfolio::written(&found, &run_id, now_ms(), args);
+        let (mut summary, mut run) = portfolio::written(&found, &run_id, now_ms(), args);
+        for written in [&mut summary, &mut run] {
+            if let Some(warnings) = written["warnings"].as_array_mut() {
+                warnings.extend(look_backs.iter().map(|warning| json!(warning)));
+            }
+        }
         portfolio::save(&self.paths.lab().join("runs"), &run, &summary, args)?;
         self.remember_run(&run_id, Arc::new(run));
         Ok(json!({"run_id": run_id, "summary": summary}))
@@ -334,6 +342,8 @@ impl Lab {
         Ok(json!({
             "runs": found.runs,
             "changes": found.trades,
+            "variants_tried": variants_tried(args),
+            "share_matching_adjusted": figures::adjusted_for_variants(found.share_matching_return, variants_tried(args)),
             "warning": (found.trades < 2).then_some("It only changed once, so moving it says almost nothing about its timing."),
             "actual_return": found.actual_return,
             "actual_fell": found.actual_fell,
@@ -432,7 +442,9 @@ impl Lab {
                     .and_then(Value::as_str)
                     .map_or_else(|| format!("Setup {}", at + 1), ToOwned::to_owned),
                 values: Vec::new(),
-                request: self.prepare_portfolio(&call)?,
+                request: self
+                    .prepare_portfolio(&call)
+                    .map_err(|e| format!("`candidates`: item {at}: {e}"))?,
             });
         }
         let settings = settings_of(&Value::Object(shared.cloned().unwrap_or_default()))?;
@@ -550,4 +562,29 @@ impl Lab {
             |at| fills[at].clone(),
         ))
     }
+}
+
+/// Each leg's logic tree that looks back further than the bars before the span, as one market's run
+/// says it.
+fn leg_look_back_warnings(args: &Value, request: &PortfolioRequest) -> Vec<String> {
+    let chart_bar = request.bars.timeframe().map_or(0, Timeframe::nanos);
+    request
+        .legs
+        .iter()
+        .enumerate()
+        .filter_map(|(at, leg)| {
+            let strategy = leg.strategy.as_ref()?;
+            let asked = json!({"strategy": args["legs"].get(at)?.get("strategy")?});
+            let look_back = look_back_of(&asked, strategy.own_params(), chart_bar);
+            let before = leg
+                .candles
+                .partition_point(|candle| candle.ts < request.trade_from);
+            figures::look_back_warning(look_back, before, leg.candles.len())
+                .map(|warning| format!("{}: {warning}", leg_name(leg)))
+        })
+        .collect()
+}
+
+fn leg_name(leg: &PortfolioLeg) -> String {
+    leg.instrument.symbol.clone()
 }

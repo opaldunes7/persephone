@@ -740,10 +740,28 @@ impl WalkJob {
                 picked,
             });
         }
+        // Equal shares of the markets, held once over every unseen stretch together.
+        let whole_from = time_at(from + train);
+        let held: Vec<f64> = first
+            .request
+            .legs
+            .iter()
+            .filter_map(|leg| {
+                let start = leg.candles.iter().find(|c| c.ts >= whole_from)?;
+                let end = leg.candles.last()?;
+                (start.close > 0.0).then(|| end.close / start.close - 1.0)
+            })
+            .collect();
+        let whole = if held.is_empty() {
+            0.0
+        } else {
+            held.iter().sum::<f64>() / held.len() as f64
+        };
         Ok(WalkForward {
             windows,
             unseen_return,
             buy_and_hold_return: market_return,
+            buy_and_hold_whole: whole,
             profitable_windows: profitable,
             deepest_fall: deepest,
             trades,

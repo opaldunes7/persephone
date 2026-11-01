@@ -1244,8 +1244,47 @@ fn the_decision_log_says_when_a_stop_filled() {
     };
     let report = run(&bars, &[(1, 1)], sim, NO_FEES);
     assert_eq!(report.fills.len(), 2);
+    // With the size it sold.
+    let sold = report.fills[1].qty;
     assert!(
         report
+            .decisions
+            .iter()
+            .any(|row| row.why == "a stop filled" && (row.order + sold).abs() < 1e-9),
+        "{:?}",
+        report.decisions
+    );
+}
+
+#[test]
+fn the_decision_log_says_when_a_trailing_stop_filled() {
+    // Up to 110 after the entry, then down through 10% under that, but not 20% under the entry.
+    let bars = [
+        FLAT,
+        FLAT,
+        (100.0, 110.0, 100.0, 110.0),
+        (110.0, 110.0, 97.0, 97.0),
+        FLAT,
+    ];
+    let sim = SimSettings {
+        decision_log: true,
+        stop_loss_percent: Some(20.0),
+        trailing_stop_percent: Some(10.0),
+        ..SimSettings::default()
+    };
+    let report = run(&bars, &[(1, 1)], sim, NO_FEES);
+    assert_eq!(report.fills.len(), 2, "{:?}", report.fills);
+    let sold = report.fills[1].qty;
+    assert!(
+        report
+            .decisions
+            .iter()
+            .any(|row| row.why == "a trailing stop filled" && (row.order + sold).abs() < 1e-9),
+        "{:?}",
+        report.decisions
+    );
+    assert!(
+        !report
             .decisions
             .iter()
             .any(|row| row.why == "a stop filled"),

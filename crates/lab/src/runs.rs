@@ -249,6 +249,7 @@ fn summary_of(
         "exposure": figures::exposure(report, from_index),
         "average_trade": (!trades.is_empty()).then(|| profit / trades.len() as f64),
         "by_year": figures::by_year(report, from_index, bars),
+        "by_year_compounded": figures::by_year_compounded(report, from_index, bars),
         "by_hour": by_hour,
         "by_weekday": by_weekday,
         "excess_return": figures::benchmark(report.starting_balance, bars, from_index, funding)
@@ -369,6 +370,7 @@ pub(crate) fn walk_answer(found: &WalkForward) -> Value {
         "unseen_compounded": found.compounded().0,
         "buy_and_hold_compounded": found.compounded().1,
         "buy_and_hold_return": found.buy_and_hold_return,
+        "buy_and_hold_whole": found.buy_and_hold_whole,
         "profitable_windows": found.profitable_windows,
         "deepest_fall": found.deepest_fall,
         "trades": found.trades,
@@ -387,7 +389,36 @@ fn named_rows(mut page: Value) -> Value {
 }
 
 /// How many bars a logic tree needs before all its rules are ready. Nothing else says.
-fn look_back_of(args: &Value, params: &[f64], chart_bar: u64) -> usize {
+/// How many variants the run being tested was picked from, as said, or 1.
+pub(crate) fn variants_tried(args: &Value) -> u64 {
+    args.get("variants_tried")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Said when a logic tree looks back further than the bars each stretch of a test is warmed up on,
+/// so its rules can't be true at the start of every stretch. A test of stretches can't say it per
+/// stretch, so it's said once.
+fn stretch_look_back_warning(
+    args: &Value,
+    request: &BacktestRequest,
+    warm_up: usize,
+) -> Option<String> {
+    let look_back = look_back_of(
+        args,
+        request.strategy.own_params(),
+        request.bars.timeframe().map_or(0, Timeframe::nanos),
+    );
+    (look_back > warm_up).then(|| {
+        format!(
+            "A look-back here needs about {look_back} bars, but each stretch is warmed up on only {warm_up} (`warm_up_bars`), so rules on it can't be true for about the first {} bars of each.",
+            look_back - warm_up
+        )
+    })
+}
+
+pub(crate) fn look_back_of(args: &Value, params: &[f64], chart_bar: u64) -> usize {
     args["strategy"]
         .get("logic")
         .map_or(0, |_| match StrategyRef::parse(&args["strategy"]) {
@@ -727,6 +758,7 @@ impl Lab {
         for warning in [
             figures::look_back_warning(look_back, from_index, times.len()),
             limits.warning(),
+            settings_of(args)?.ignored_warning(),
         ]
         .into_iter()
         .flatten()
@@ -859,6 +891,8 @@ impl Lab {
             "actual_fell": found.actual_fell,
             "share_matching_return": found.share_matching_return,
             "share_matching_fall": found.share_matching_fall,
+            "variants_tried": variants_tried(args),
+            "share_matching_adjusted": figures::adjusted_for_variants(found.share_matching_return, variants_tried(args)),
             "warning": (found.trades < 2).then_some(ONE_TRADE),
             "median": found.median,
             "low": found.low,
@@ -893,6 +927,8 @@ impl Lab {
                 items.len()
             ));
         }
+        // Known now, so a call asking straight away hears how many, not 0 while they're read.
+        job.total.store(items.len(), Ordering::Relaxed);
         let shared = args.get("defaults").and_then(Value::as_object);
         let calls: Vec<Value> = items
             .iter()
@@ -912,7 +948,6 @@ impl Lab {
             .map(|(spec, _)| self.workers_for(&spec))
             .min()
             .unwrap_or(1);
-        job.total.store(calls.len(), Ordering::Relaxed);
         let all = tools();
         let tool = all
             .iter()
@@ -1155,13 +1190,18 @@ impl Lab {
             .get("wanted_only")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let rows: Vec<&Value> = all
+        let asked: Vec<&Value> = all
             .iter()
-            .filter(|row| wanted.is_none_or(|why| row[6] == why))
             .filter(|row| !wanted_only || (!row[2].is_null() && row[6] != "warming up"))
             .collect();
+        let rows: Vec<&Value> = asked
+            .iter()
+            .copied()
+            .filter(|row| wanted.is_none_or(|why| row[6] == why))
+            .collect();
+        // Over what `wanted_only` leaves, but every reason, so `why` can pick among them.
         let mut reasons = BTreeMap::new();
-        for row in all {
+        for row in asked {
             *reasons
                 .entry(row[6].as_str().unwrap_or_default().to_owned())
                 .or_insert(0_u64) += 1;
@@ -1461,11 +1501,13 @@ impl Lab {
         // On the bars whatever the precision, as the app does, to keep a batch quick.
         request.ticks = None;
         request.fill_bars = None;
+        let warm_up = settings_of(args)?.warm_up_bars as usize;
+        let look_back = stretch_look_back_warning(args, &request, warm_up);
         let batch = BlockJob {
             request,
             candles,
             blocks,
-            warm_up: settings_of(args)?.warm_up_bars as usize,
+            warm_up,
             workers,
             stop: Arc::clone(&job.stop),
         };
@@ -1519,11 +1561,16 @@ impl Lab {
         held.sort_by(f64::total_cmp);
         let median_held = held.get(held.len() / 2).copied();
         let total = rows.len();
-        let warning = summary.blocks.iter().all(|block| block.fills == 0).then(|| {
-            format!(
-                "No block made a trade. A look-back longer than the {WARM_UP_BARS} bars warmed up on before each block is never ready in time."
-            )
-        });
+        let warning = summary
+            .blocks
+            .iter()
+            .all(|block| block.fills == 0)
+            .then(|| {
+                format!(
+                    "No block made a trade. A look-back longer than the {warm_up} bars warmed up on before each block is never ready in time."
+                )
+            })
+            .or(look_back);
         rows.truncate(limit_of(args, LISTED_VALUES));
         let mut chart = json!({
             "bars_between_points": summary.stride,
@@ -1575,6 +1622,8 @@ impl Lab {
             .filter(|ratio| *ratio > 0.0)
             .unwrap_or(settings_of(args).map_or(RATIO, |settings| settings.walk_ratio));
         stretches(candles.len().saturating_sub(from), windows, ratio)?;
+        let warm_up = settings_of(args)?.warm_up_bars as usize;
+        let warning = stretch_look_back_warning(args, &request, warm_up);
         let batch = WalkForwardJob {
             request,
             candles,
@@ -1583,7 +1632,7 @@ impl Lab {
             score: chosen.score,
             windows,
             ratio,
-            warm_up: settings_of(args)?.warm_up_bars as usize,
+            warm_up,
             runs: number(args, "runs", 1_000) as u32,
             ruin_at: args
                 .get("ruin_percent")
@@ -1596,7 +1645,9 @@ impl Lab {
         };
         job.total.store(batch.total(), Ordering::Relaxed);
         let found = batch.run(&|done| job.done.store(done, Ordering::Relaxed))?;
-        Ok(walk_answer(&found))
+        let mut answer = walk_answer(&found);
+        answer["warning"] = json!(warning);
+        Ok(answer)
     }
 
     pub(crate) fn run_optimize(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {
@@ -1637,6 +1688,15 @@ impl Lab {
         };
         request.ticks = None;
         request.fill_bars = None;
+        let warning = figures::look_back_warning(
+            look_back_of(
+                args,
+                request.strategy.own_params(),
+                request.bars.timeframe().map_or(0, Timeframe::nanos),
+            ),
+            from,
+            candles.len(),
+        );
         let batch = OptimizeJob {
             request,
             candles,
@@ -1710,6 +1770,7 @@ impl Lab {
             "held_out": found.held_out,
             "held_out_buy_and_hold": held_out_market,
             "backtests": total,
+            "warning": warning,
         }))
     }
 }

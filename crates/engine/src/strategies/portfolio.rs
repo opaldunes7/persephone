@@ -244,7 +244,7 @@ impl PortfolioStrategy {
             && self.settings.interest_percent_per_year > 0.0
         {
             let bought: f64 = (0..self.legs.len())
-                .filter(|&index| self.legs[index].funding.is_empty())
+                .filter(|&index| self.legs[index].borrows)
                 .filter_map(|index| {
                     Some(self.legs[index].position * self.step_of(index, before)?.candle.close)
                 })

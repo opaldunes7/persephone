@@ -822,6 +822,62 @@ impl Settings {
             + self.session.on as usize
     }
 
+    /// The stock settings switched on, by their names in Lab's JSON.
+    #[must_use]
+    pub fn stock_names_on(&self) -> Vec<&'static str> {
+        [
+            ("commission", self.commission.on),
+            ("slippage", self.slippage.on),
+            ("slippage_percent", self.slippage_percent.on),
+            ("limit", self.limit.on),
+            ("stop_loss_percent", self.stop_loss_percent.on),
+            ("trailing_stop_percent", self.trailing_stop_percent.on),
+            ("take_profit_percent", self.take_profit_percent.on),
+            ("borrow_percent_per_year", self.borrow_percent_per_year.on),
+            ("impact_percent", self.impact_percent.on),
+            (
+                "cash_interest_percent_per_year",
+                self.cash_interest_percent_per_year.on,
+            ),
+            (
+                "max_participation_percent",
+                self.max_participation_percent.on,
+            ),
+            ("range_slippage_percent", self.range_slippage_percent.on),
+            ("latency_jitter", self.latency_jitter.on),
+            ("spread", self.spread.on),
+            ("latency", self.latency.on),
+            ("leverage", self.leverage.on),
+            ("direction", self.direction.on),
+            ("invert", self.invert),
+            ("compound", self.compound),
+            ("session", self.session.on),
+        ]
+        .into_iter()
+        .filter_map(|(name, on)| on.then_some(name))
+        .collect()
+    }
+
+    /// Says which settings were switched on but did nothing, as `stock` is off and it switches
+    /// them all off together.
+    #[must_use]
+    pub fn ignored_warning(&self) -> Option<String> {
+        if self.stock {
+            return None;
+        }
+        let names = self.stock_names_on();
+        (!names.is_empty()).then(|| {
+            format!(
+                "`stock` is off, so these settings were ignored though they're on: {}. Set `stock` to true to use them.",
+                names
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+    }
+
     fn on<'a, T>(&self, section: &'a Section<T>) -> Option<&'a T> {
         (self.stock && section.on).then_some(&section.value)
     }
@@ -1020,9 +1076,16 @@ mod tests {
         assert_eq!((sim.slippage_ticks, sim.fee_per_order), (1, Some(2.5)));
         assert_eq!(settings.rules().unwrap().direction, Direction::LongOnly);
 
+        assert_eq!(settings.ignored_warning(), None);
         settings.stock = false;
         assert_eq!(settings.sim(), SimSettings::default(), "all off at once");
         assert_eq!(settings.rules().unwrap().direction, Direction::Both);
+        // And it says which it ignored.
+        let ignored = settings.ignored_warning().expect("a warning");
+        for name in ["`slippage`", "`commission`", "`direction`"] {
+            assert!(ignored.contains(name), "{ignored}");
+        }
+        assert!(!ignored.contains("`leverage`"), "{ignored}");
 
         settings.invert = true;
         assert!(!settings.rules().unwrap().invert, "off with the rest");

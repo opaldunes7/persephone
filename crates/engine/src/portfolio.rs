@@ -533,7 +533,8 @@ pub fn run_portfolio(request: &PortfolioRequest) -> Result<PortfolioReport, Engi
             size_precision: spec.size_precision,
             wants,
             steps: Arc::new(steps),
-            borrows: rates.is_empty(),
+            // A perpetual is one given funding, even if no rate fell in its span.
+            borrows: leg.funding.is_none(),
             funding: rates,
             bar_now,
             next_funding: 0,
@@ -636,7 +637,7 @@ fn build_report(
                 )
             })
             .collect();
-        let borrow = if funding[index].is_empty() {
+        let borrow = if leg.funding.is_none() {
             request.sim.borrow_percent_per_year.unwrap_or(0.0)
         } else {
             0.0
@@ -715,8 +716,8 @@ fn build_report(
             // A perpetual isn't bought with cash: only what's bought outright can be a loan.
             let held: f64 = legs
                 .iter()
-                .zip(funding)
-                .filter(|(_, rates)| rates.is_empty())
+                .zip(&request.legs)
+                .filter(|(_, asked)| asked.funding.is_none())
                 .map(|(leg, _)| leg.values[at - 1])
                 .sum();
             let cash = equity[at - 1] - held;
@@ -802,7 +803,7 @@ fn notes_of(
     // A little over is only fees on a position that took all the cash.
     if outcome.peak_margin_use > 1.05 {
         notes.push(warn(format!(
-            "At its most the book needed {:.0}% of the account in margin at a leverage of {}, which a venue wouldn't allow: it would have refused the orders or closed positions. Lower the weights, or use more leverage if that's really on offer.",
+            "At its most the book needed {:.0}% of the account in margin at a leverage of {}, which a venue wouldn't allow: it would have refused the orders or closed positions. Lower the weights, or raise the leverage setting if that much is really on offer.",
             outcome.peak_margin_use * 100.0,
             request.sim.leverage,
         )));

@@ -136,9 +136,11 @@ A strategy is `{"builtin": id}`, `{"plugin": id}`, `{"logic": tree}` or `{"posit
 - **Rebalancing** takes the whole book back to the weights `every_bars`, or when any leg is `drift_percent` points of the account away, skipping
   trades worth under `min_trade_value`. Rebalanced and table runs size from the account as it is now. Without either a leg stays as it was sized.
   With costs off it trades other sizes, and on drift at other times, so on these and on table runs `gross_return` less `net_return` isn't just the costs:
-  `total_costs_paid` is what was really paid.
+  `total_costs_paid` is what was really paid. `warnings` says so on any run where the two differ by more than a tenth.
 - **Cash below zero** on what's bought outright is free unless `cash_interest_percent_per_year` is set (perpetuals aren't bought with cash, and pay funding instead), which flatters weights adding up to over 1. `interest_paid` says what
-  it came to, and it's in `total_costs_paid`. `warnings` says if the book needed well over the account in margin.
+  it came to, and it's in `total_costs_paid`. Interest not paid goes on the loan, as on a margin account, so it compounds every bar: a year at 5% on
+  a loan that stays the same costs about 5.13% of it, not 5%. A market is a perpetual when it's given funding (a `-PERP` symbol), even if no
+  funding fell due in the span. `warnings` says if the book needed well over the account in margin.
 - **A row before `from`** takes effect at the span's first bar, the last such row winning. Rows out of order are put in order. A row between
   closes waits for the next one. Rows after the last bar do nothing, and `warnings` says so.
 - **One timeline.** Every moment any leg's bar closes is a moment for all of them. A leg with no bar then carries its last close at no volume,
@@ -165,7 +167,7 @@ A strategy is `{"builtin": id}`, `{"plugin": id}`, `{"logic": tree}` or `{"posit
 - **Is it luck?** `run_shifted` takes any run, of one market or a portfolio, and moves its positions or weights along the span, wrapping round, so what's held and for how long stay
   the same and only the timing goes. `share_matching_return` near 0.5 means the timing added nothing. For a portfolio, its book becomes a table of weights, and `actual_return` there is that table run with no shift, as sizing
   from weights isn't quite how a strategy sizes. A table run is already a table, so there it's the run itself. `run_portfolio_monte_carlo` draws the account's returns again in blocks along the timeline, keeping how the markets moved together. It doesn't run fills or costs again.
-  `run_portfolio_walk_forward` picks among `candidates` on each stretch and trades the pick on the unseen one after. A candidate of `{}` weights stays flat, and is picked when all else loses. In its answer `buy_and_hold_return` is equal shares of the markets, with no funding taken off. It and `unseen_return` add up each window from the same capital, and `unseen_compounded` and `buy_and_hold_compounded` run them one after another.
+  `run_portfolio_walk_forward` picks among `candidates` on each stretch and trades the pick on the unseen one after. A candidate with `"weights": {}` stays flat, and is picked when all else loses. A candidate that can't be run stops the call, saying which `item` it is. In its answer `buy_and_hold_return` is equal shares of the markets, with no funding taken off. It and `unseen_return` add up each window from the same capital, and `unseen_compounded` and `buy_and_hold_compounded` run them one after another. `buy_and_hold_whole` is equal shares held once from the first unseen bar to the last, with no gaps between windows: the market to beat.
 - **What it doesn't do yet.** Market orders only: `limit`, stops and targets are for single
   markets, and are refused. `precision: "high"` does nothing here, as portfolios fill on bars. `run_optimize`, `run_monte_carlo`, `run_walk_forward` and `run_random_entries` don't take a portfolio, so
   sweep with `run_portfolios`. A plugin can be a leg or write a weight table, but can't see several markets at once. All legs must be quoted in
@@ -279,13 +281,13 @@ an error.
 
 | Setting | Value |
 |---|---|
-| `stock` | `false` turns all of the below off at once, except `capital` and `precision`. A market's own fees and a perpetual's funding aren't settings, so they stay |
+| `stock` | `false` turns all of the below off at once, except `capital` and `precision`. A market's own fees and a perpetual's funding aren't settings, so they stay. `warnings` names any switched on that it ignored |
 | `capital` | Starting cash, in the quote currency |
 | `commission` | `{"percent": 0.1}` of each fill, `{"per-order": 1.5}` flat, or `{"rates": {"maker": 0.02, "taker": 0.05}}`, instead of the market's fee. A maker's can be below zero, for a rebate |
 | `limit` | `{"offset_percent": 0.05, "expires_bars": 3, "through_percent": 0.01}`: send orders as limits, `through_percent` being optional. See `backtests` |
 | `stop_loss_percent` | A real stop this far from the entry |
 | `trailing_stop_percent` | A real stop this far from the best price since entry, moved at each close. With `stop_loss_percent` too, whichever is nearer goes first. See `backtests` |
-| `decision_log` | `true` keeps a row for each bar, read with `get_decisions`: what was asked, what was held, what the rules made of it, and why no order went out |
+| `decision_log` | `true` keeps a row for each bar, read with `get_decisions`: what was asked, what was held, what the rules made of it, and why no order went out. A stop or target filling between closes gets a row of its own with the size it filled, saying whether the stop was the trailing one |
 | `take_profit_percent` | A real target this far from the entry |
 | `borrow_percent_per_year` | What borrowing costs a short |
 | `impact_percent` | How far a market order fills worse at all of its bar's volume |
@@ -356,6 +358,8 @@ What every number means, the same everywhere.
   `run_optimize`'s `chart` has every score in the grid, row by row, `across` one variable's values and `down` the other's.
   The `results` topic lists every screen in the app and where its data comes from.
 - **`by_year`** is what each UTC year added, as a fraction of the starting capital, so the years add up to `net_return`.
+  **`by_year_compounded`** is each year's return on what the account held going into it, so the years compound to `net_return`; it's
+  what a year really returned once earlier years grew or shrank the account. `null` for a year that began with nothing left.
 - **`return_percent`** on a trade is a percentage of the starting capital, even with `compound`, so add them up rather
   than compounding them.
 - **Times:** `ts` is nanoseconds since 1970, and `time` is `YYYY-MM-DD HH:MM`. All are UTC.
@@ -475,7 +479,10 @@ Walk-forward picks the best values on a stretch, tests them on the next, unseen,
 ```
 
 Each of `windows` says what it picked, its `unseen_return`, and the market's `buy_and_hold_return` over it. The
-top-level figures add them up, as each stretch starts from the same capital. It fills on the chart's bars whatever the `precision`.
+top-level `unseen_return` and `buy_and_hold_return` add them up, as each stretch starts from the same capital, and so change with
+how many windows there are. `unseen_compounded` and `buy_and_hold_compounded` run them one after another, and
+`buy_and_hold_whole` holds the market once over all the unseen bars. `warning` says if a logic tree looks back further than
+`warm_up_bars`, as each stretch is warmed up on only that many. It fills on the chart's bars whatever the `precision`.
 
 **Against chance:** `run_random_entries` places a run's own holds and directions at random times, on the same bars and
 settings, and says how many placings did as well.
@@ -485,8 +492,10 @@ settings, and says how many placings did as well.
 ```
 
 `share_matching_return` is the share that did as well, so a low one is good, and `share_matching_fall` likewise for the
-deepest fall. It doesn't allow for how many strategies you tried before picking this one: picking the best of 100 will
-often give 1 in 100 by luck.
+deepest fall. On its own it doesn't allow for how many strategies you tried before picking this one: picking the best of
+100 will often give 1 in 100 by luck. Say how many in `variants_tried`, counting every setting, rule and span you tried, and
+`share_matching_adjusted` is the chance that at least one of that many worthless tries would have done as well: 3% after 11
+tries is 28%. `run_shifted` takes it too.
 
 Give any backtest a `label` to keep experiments apart. `list_runs` finds and sorts them, with
 `{"label": "my-idea", "sort": "sharpe"}`, by any summary figure.

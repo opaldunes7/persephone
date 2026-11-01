@@ -153,6 +153,36 @@ pub fn by_year(
     years
 }
 
+/// What each UTC year returned on what the account held going into it, so they compound to the net
+/// return rather than add up to it. A year that started with nothing left reads `None`.
+#[must_use]
+pub fn by_year_compounded(
+    report: &BacktestReport,
+    from_index: usize,
+    bars: &[(u64, f64)],
+) -> BTreeMap<i64, Option<f64>> {
+    let mut years: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
+    let mut before = report.starting_balance;
+    for (&(ts, _), &equity) in bars.iter().zip(&report.equity).skip(from_index) {
+        let (year, _, _) = civil_from_days((ts / NANOS_PER_DAY) as i64);
+        years.entry(year).or_insert((before, before)).1 = equity;
+        before = equity;
+    }
+    years
+        .into_iter()
+        .map(|(year, (start, end))| (year, (start > 0.0).then(|| end / start - 1.0)))
+        .collect()
+}
+
+/// A share of chance runs that did as well, made fair for having picked the best of `variants`
+/// tries: the chance that at least one of that many tries of no worth would have done as well. With
+/// one try it's the share itself.
+#[must_use]
+pub fn adjusted_for_variants(share: f64, variants: u64) -> f64 {
+    let share = share.clamp(0.0, 1.0);
+    1.0 - (1.0 - share).powf(variants.max(1) as f64)
+}
+
 /// Winnings over losses across a run's trades, if it has any losses.
 #[must_use]
 pub fn profit_factor(report: &BacktestReport) -> Option<f64> {
@@ -448,6 +478,7 @@ pub struct RunFigures {
     pub profit_factor: Option<f64>,
     pub exposure: f64,
     pub by_year: BTreeMap<i64, f64>,
+    pub by_year_compounded: BTreeMap<i64, Option<f64>>,
     pub benchmark: Option<Benchmark>,
     /// The share of limit orders that filled, if any went out.
     pub fill_rate: Option<f64>,
@@ -470,6 +501,7 @@ impl RunFigures {
             profit_factor: profit_factor(report),
             exposure: exposure(report, from_index),
             by_year: by_year(report, from_index, bars),
+            by_year_compounded: by_year_compounded(report, from_index, bars),
             benchmark: benchmark(report.starting_balance, bars, from_index, funding),
             fill_rate: (report.limit_orders > 0)
                 .then(|| report.limits_filled as f64 / report.limit_orders as f64),
@@ -480,6 +512,40 @@ impl RunFigures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_share_matching_grows_with_the_variants_tried() {
+        assert!((adjusted_for_variants(0.03, 1) - 0.03).abs() < 1e-12);
+        assert!((adjusted_for_variants(0.03, 0) - 0.03).abs() < 1e-12);
+        // 1 - 0.97^11: the agent's 3% after its 11 look-backs.
+        assert!((adjusted_for_variants(0.03, 11) - (1.0 - 0.97_f64.powi(11))).abs() < 1e-12);
+        assert!(adjusted_for_variants(0.03, 11) > 0.28);
+        assert_eq!(adjusted_for_variants(1.0, 5), 1.0);
+    }
+
+    #[test]
+    fn years_compound_to_the_whole_return_where_by_year_adds_up_to_it() {
+        // 2023-12-31 and 2024-01-01, 2024-12-31 and 2025-01-01, at noon.
+        let days = [19_722_u64, 19_723, 20_088, 20_089];
+        let bars: Vec<(u64, f64)> = days
+            .iter()
+            .map(|day| (day * NANOS_PER_DAY + NANOS_PER_DAY / 2, 1.0))
+            .collect();
+        let report = BacktestReport {
+            starting_balance: 100.0,
+            equity: vec![110.0, 110.0, 132.0, 66.0],
+            ..BacktestReport::default()
+        };
+        let compounded = by_year_compounded(&report, 0, &bars);
+        let close = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-12;
+        assert!(close(compounded[&2023], 0.1));
+        assert!(close(compounded[&2024], 0.2), "{compounded:?}");
+        assert!(close(compounded[&2025], -0.5));
+        let whole: f64 = compounded.values().map(|r| 1.0 + r.unwrap()).product();
+        assert!((whole - 0.66).abs() < 1e-12);
+        // Where by_year is shares of the capital: 2024 made 22 of 100.
+        assert!((by_year(&report, 0, &bars)[&2024] - 0.22).abs() < 1e-12);
+    }
 
     #[test]
     fn by_hour_and_weekday_add_up_to_all_that_was_made() {

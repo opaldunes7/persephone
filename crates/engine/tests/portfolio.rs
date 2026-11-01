@@ -790,6 +790,17 @@ fn a_perpetual_is_no_loan_so_it_pays_funding_and_not_interest() {
     asked.sim.leverage = 3.0;
     asked.sim.cash_interest_percent_per_year = Some(10.0);
     assert_eq!(run(&asked).interest_paid, 0.0);
+
+    // Still a perpetual when no funding fell in its span, so still no loan, and no borrowing.
+    let mut quiet = holding("AAAUSDT-PERP", &[100.0; 4], -2.0);
+    quiet.funding = Some(Arc::new(Vec::new()));
+    let mut asked = request(vec![quiet]);
+    asked.sim.leverage = 3.0;
+    asked.sim.cash_interest_percent_per_year = Some(10.0);
+    asked.sim.borrow_percent_per_year = Some(10.0);
+    let report = run(&asked);
+    assert_eq!(report.interest_paid, 0.0);
+    assert_eq!(report.borrow_paid, 0.0);
 }
 
 #[test]

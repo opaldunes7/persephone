@@ -1723,14 +1723,27 @@ fn portfolio_table(found: &PortfolioRun, picked: usize) -> Element<'_, PanelMess
         398.0,
         theme::TEXT_MUTED,
     ));
-    let mut years = column![cell("By year".into(), 112.0, theme::TEXT_MUTED)].spacing(3);
+    let mut years = column![row![
+        cell("By year".into(), 112.0, theme::TEXT_MUTED),
+        cell("Of capital".into(), 76.0, theme::TEXT_MUTED),
+        cell("On the year".into(), 90.0, theme::TEXT_MUTED),
+    ]]
+    .spacing(3);
+    let sign = |value: f64| if value >= 0.0 { theme::UP } else { theme::DOWN };
     for (year, made) in &found.figures.by_year {
+        let compounded = found
+            .figures
+            .by_year_compounded
+            .get(year)
+            .copied()
+            .flatten();
         years = years.push(row![
             cell(year.to_string(), 112.0, theme::TEXT),
+            cell(percent(*made), 76.0, sign(*made)),
             cell(
-                percent(*made),
-                76.0,
-                if *made >= 0.0 { theme::UP } else { theme::DOWN }
+                compounded.map_or_else(|| "–".into(), percent),
+                90.0,
+                compounded.map_or(theme::TEXT_MUTED, sign)
             ),
         ]);
     }

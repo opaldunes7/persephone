@@ -1918,12 +1918,24 @@ fn statistics<'a>(
             theme::DOWN,
         ));
     }
-    for (year, made) in figures.iter().flat_map(|f| &f.by_year) {
-        rows.push((
-            year.to_string(),
-            format!("{:+.2}%", made * 100.0),
-            signed(*made),
-        ));
+    // A share of the capital, which adds up to the return, and on what the year started with,
+    // which compounds to it.
+    for figures in figures.iter() {
+        for (year, made) in &figures.by_year {
+            let on_the_year = figures
+                .by_year_compounded
+                .get(year)
+                .copied()
+                .flatten()
+                .map_or_else(String::new, |r| {
+                    format!(" ({:+.2}% on the year)", r * 100.0)
+                });
+            rows.push((
+                year.to_string(),
+                format!("{:+.2}%{on_the_year}", made * 100.0),
+                signed(*made),
+            ));
+        }
     }
     rows.into_iter()
         .map(|(label, value, color)| {
