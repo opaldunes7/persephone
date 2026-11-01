@@ -142,9 +142,14 @@ Notes from the strategy go at the bottom, such as a language model's look-ahead 
 
 ## The backtest panel
 
-Press **Ctrl+B**, or choose **Backtest** from a chart's right-click menu or a strategy's report. A panel opens across the top of
-the window for the focused chart (it gets a blue outline), drawn like a chart pane; **Ctrl+B**
-closes it again:
+Press **Ctrl+B**, choose **Backtest** from a chart's right-click menu or a strategy's report, or
+click any test in the **top bar**. The top bar runs across the window: on the Mac it's the title
+bar, with the tests beside the window's own buttons, and elsewhere it's just under the title bar.
+It holds every test, from **Backtest** to **Portfolio** (one opens the panel on that test if it's
+closed), what the panel last said, and **Export chart**, **Export all** and **Import**. Drag its
+empty part to move the window, and double-click it to maximise. The panel opens under it for the
+focused chart (which gets a blue outline), a pane of its own a gap from the charts, as the news
+sidebar is; **Ctrl+B** closes it again:
 - The equity curve as far as the playback has got, with the return, drawdown and trades so far
   in its legend.
 - Play or pause, back to the start, and one bar on; hovering a button names it.
@@ -158,7 +163,7 @@ closes it again:
   for fine control at slow speeds. Scroll over it to nudge it; the readout says how many bars
   go by a second.
 - **✕**, in the corner under the price axis, closes the panel. Dragging its bottom edge resizes
-  it, but it never gets shorter than it takes to show all the settings.
+  it, but it never gets shorter than it takes to show its settings, with the chapters you've opened.
 - The left 30% holds the **strategy** dropdown (handy after Ctrl+B on a chart without one), the
   settings below, and a search that adds plugins as tags (click a tag to take it off). Hover a
   setting's name for what it does.
@@ -170,11 +175,23 @@ until it's over.
 
 ### Backtest settings
 
-**Stock settings** folds away with the arrow beside its name, for more room; they still apply, and
-the fold shows how many are on.
+Over everything are the strategy and its **Capital**, then the test's own main line with its
+**Run**: Precision for Backtest, Runs for Monte Carlo, the variables for Optimize and Walk-forward,
+and so on. Every other setting is in a chapter, each opened and closed with the arrow on its
+heading, which says how many of its switches are on. They all start closed, so the panel opens
+short; opening one makes the panel tall enough for it, and closing it gives the room back. The
+chapters:
 
-Each setting has its own switch, and **Stock** turns them all off at once, for an
-ideal run to compare against. They're saved with each chart.
+- the test's own **options** (Optimize's score and Keep unseen, Walk-forward's score and ratio;
+  a portfolio's **Markets** and **Rebalancing & margin**),
+- **Costs** (No costs, fees, slippage, spread, range slip, impact, borrowing, cash interest),
+- **Orders & fills** (next open, limits, volume limit, warnings, latency, jitter, precision),
+- **Exits** (stop loss, trailing stop, target),
+- **Position & account** (compound, leverage, most exposure, direction, invert),
+- **Trading hours** (the session), **Data & records** (warm-up, decision log) and **Plugins**.
+
+Each setting has its own switch, and they're saved with each chart. A layout saved with the old
+**Stock** switch off opens with each of those settings off instead.
 
 | Setting | What it does |
 |---|---|
@@ -561,7 +578,7 @@ new.
 
 ## Limit orders, stops and funding
 
-The panel's stock settings go beyond market orders:
+The panel's settings go beyond market orders:
 
 - **Limit orders** rest a set percentage better than the close, for a set number of bars. They fill only when price trades through
   them, at their own price, and pay the maker's fee. An entry that doesn't fill lapses; an exit goes at the market. **Through** requires the
@@ -574,7 +591,7 @@ The panel's stock settings go beyond market orders:
 - **Volume limit** stops an order taking more than that share of a bar's volume. What's left goes out at the next closes, at their prices, so big positions take time to build and to leave. A resting limit fills no more than that share of each bar, and a stop takes that share and leaves the rest to the closes after.
 - **Range slip** makes market orders and stops pay a share of a bar's high to low, times how many times wider it is than usual. A bar 10 times the usual width costs 100 times a usual one, so wild markets cost what they should. It's a rough assumption.
 - **Trailing stop** follows the best price since entry, moved at each close, so it only tightens. **Decision log**, when on, adds a **Decisions** table to the Backtest tab: for each bar, what the strategy asked for, what was held, what went out, and why not.
-- **No costs**, beside Stock settings, takes off everything there is to pay, including a market's own fees and funding, which turning Stock off leaves on.
+- **No costs**, first under Costs, takes off everything there is to pay, including a market's own fees and funding.
 - **Warn at** says how large an order against its bar, and how few limits filling, gets a warning. **Warm-up** is how many bars before the span strategies warm up on: raise it for longer look-backs. **Cash interest** charges a portfolio for cash below zero, a year's rate. Optimize's **Pick on %** and Walk-forward's **Ratio** set how a span is split into what's picked on and what's unseen. Range slip's **over** and Impact's **power** set how far back a usual bar is judged from and how steeply impact grows.
 - **Jitter** makes each order take a random time longer than the latency. An order sent at a close reaches the next bar anyway, so only fills on ticks can show it.
 - **Borrow a year** charges shorts on spot, which otherwise cost nothing to hold, unlike in reality.

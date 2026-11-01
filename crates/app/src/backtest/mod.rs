@@ -43,7 +43,7 @@ pub use persephone_research::{
 pub use self::view::{PLUGIN_SLOTS, PanelInfo, Status, panel, test_tabs};
 
 /// The panel's share of the window when it opens, and the least it's ever given.
-pub const DEFAULT_SHARE: f32 = 0.3;
+pub const DEFAULT_SHARE: f32 = 0.22;
 pub const MIN_HEIGHT: f32 = 190.0;
 /// The panel's draggable bottom edge.
 const EDGE_HEIGHT: f32 = 5.0;
@@ -55,6 +55,89 @@ const CHARTS_ROOM: f32 = 160.0;
 const MAX_SPEED_SECONDS: f64 = 2.0;
 /// Where on the speed slider Max begins.
 const MAX_FROM: f32 = 0.95;
+
+/// A chapter of the panel's settings, each opened and closed on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Chapter {
+    /// What the test being shown has beyond its main line.
+    TestOptions,
+    /// A portfolio's markets and how they're held.
+    Markets,
+    Rebalancing,
+    Costs,
+    Orders,
+    Exits,
+    Position,
+    Hours,
+    Records,
+    Plugins,
+}
+
+impl Chapter {
+    /// Its name, as headed. The test's own options are named after it.
+    #[must_use]
+    pub fn name(self, test: TestKind) -> &'static str {
+        match self {
+            Self::TestOptions => match test {
+                TestKind::Optimize => "Optimize options",
+                TestKind::WalkForward => "Walk-forward options",
+                _ => "Options",
+            },
+            Self::Markets => "Markets",
+            Self::Rebalancing => "Rebalancing & margin",
+            Self::Costs => "Costs",
+            Self::Orders => "Orders & fills",
+            Self::Exits => "Exits",
+            Self::Position => "Position & account",
+            Self::Hours => "Trading hours",
+            Self::Records => "Data & records",
+            Self::Plugins => "Plugins",
+        }
+    }
+
+    /// How many of its switches are on, for its heading; `None` for one with none to count.
+    #[must_use]
+    pub fn on(self, settings: &Settings) -> Option<usize> {
+        let count = |list: &[bool]| list.iter().filter(|on| **on).count();
+        Some(match self {
+            Self::TestOptions | Self::Markets | Self::Rebalancing => return None,
+            Self::Costs => count(&[
+                settings.no_costs,
+                settings.commission.on,
+                settings.slippage.on,
+                settings.slippage_percent.on,
+                settings.spread.on,
+                settings.range_slippage_percent.on,
+                settings.impact_percent.on,
+                settings.borrow_percent_per_year.on,
+                settings.cash_interest_percent_per_year.on,
+            ]),
+            Self::Orders => count(&[
+                settings.fill_timing == FillTiming::NextOpen,
+                settings.limit.on,
+                settings.max_participation_percent.on,
+                settings.latency.on,
+                settings.latency_jitter.on,
+                settings.precision == Precision::High,
+            ]),
+            Self::Exits => count(&[
+                settings.stop_loss_percent.on,
+                settings.trailing_stop_percent.on,
+                settings.take_profit_percent.on,
+            ]),
+            Self::Position => count(&[
+                settings.compound,
+                settings.leverage.on,
+                settings.max_gross_percent.on,
+                settings.direction.on,
+                settings.invert,
+            ]),
+            Self::Hours => count(&[settings.session.on]),
+            Self::Records => count(&[settings.decision_log]),
+            Self::Plugins => settings.plugins.len(),
+        })
+    }
+}
 
 /// The panel's state; the chart's settings and span live on its tile.
 #[derive(Debug)]
@@ -89,6 +172,8 @@ pub struct Panel {
     pub notice: Option<(String, bool)>,
     /// The search for plugins to add: every kind not already on.
     pub plugin_search: combo_box::State<&'static str>,
+    /// The settings' chapters open; all are closed until opened.
+    pub open_chapters: std::collections::BTreeSet<Chapter>,
     /// How far the Monte Carlo and Random blocks tests have got.
     pub tests: Tests,
     /// Whether the backtest's calendar is showing, and how far into it.
@@ -491,6 +576,7 @@ impl Panel {
             decisions_shown: false,
             notice: None,
             plugin_search: plugin_search(settings),
+            open_chapters: std::collections::BTreeSet::new(),
             tests: Tests::default(),
             calendar: calendar::CalendarView::default(),
             inspect: None,
@@ -648,7 +734,8 @@ pub enum PanelMessage {
     /// Show this much of a fan, from 0 to 1, or all of it.
     ZoomFan(Option<(f32, f32)>),
     /// Show the stock settings, or fold them away.
-    StockOpen(bool),
+    /// A chapter of the settings opened (true) or closed.
+    Chapter(Chapter, bool),
     /// Show the backtest's calendar, or its equity curve.
     ShowCalendar(bool),
     /// Show each limit order rather than the equity curve or calendar.

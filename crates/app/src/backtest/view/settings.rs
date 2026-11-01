@@ -2,6 +2,8 @@
 
 use iced::widget::column;
 
+use crate::backtest::Chapter;
+
 use super::*;
 
 /// The panel's left side: the strategy, every stock setting and the plugin slots, packed into
@@ -128,7 +130,6 @@ pub fn test_tabs<'a>(
 
 pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMessage> {
     let (panel, settings) = (info.panel, info.settings);
-    let stock = settings.stock;
     let input = |field: Field, width: f32| {
         let typed = panel
             .input(field)
@@ -153,7 +154,7 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
         tip(
             toggler(on)
                 .size(15)
-                .on_toggle_maybe(stock.then_some(move |on| PanelMessage::Edit(edit(on))))
+                .on_toggle(move |on| PanelMessage::Edit(edit(on)))
                 .style(switch_style),
             what,
             None,
@@ -201,62 +202,6 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
         None,
         tooltip::Position::Right,
     );
-    let open = settings.stock_open;
-    let mut stock_title = row![tip(
-        button(
-            row![
-                text(if open { "▾" } else { "▸" }).size(SMALL + 4.0),
-                text("Stock settings").size(SMALL),
-            ]
-            .spacing(5)
-            .align_y(Alignment::Center),
-        )
-        .padding(0)
-        .on_press(PanelMessage::StockOpen(!open))
-        .style(|_, status| plain(status)),
-        if open {
-            "Fold the stock settings away, for more room. They still apply."
-        } else {
-            "Show the stock settings."
-        },
-        None,
-    )]
-    .spacing(8)
-    .align_y(Alignment::Center);
-    if !open {
-        stock_title = stock_title.push(
-            text(format!(
-                "{} of 8 on, capital {}",
-                settings.stock_sections_on(),
-                settings.text(Field::Capital)
-            ))
-            .size(HINT)
-            .color(theme::TEXT_MUTED),
-        );
-    }
-    let stock_title = stock_title
-        .push(tip(
-            toggler(settings.no_costs)
-                .label("No costs")
-                .size(15)
-                .text_size(HINT)
-                .on_toggle(|on| PanelMessage::Edit(Edit::NoCosts(on)))
-                .style(switch_style),
-            "Nothing to pay at all: no fees, funding or cost settings. Stock off leaves a market's own fees and funding on; this doesn't.",
-            None,
-        ))
-        .push(
-            container(tip(
-                toggler(stock)
-                    .size(15)
-                    .on_toggle(|on| PanelMessage::Edit(Edit::Stock(on)))
-                    .style(switch_style),
-                "Off turns all the stock settings off at once, for an ideal run to compare against.",
-                None,
-            ))
-            .align_right(Fill),
-        );
-
     let entries_mode = |shifted: bool| -> Element<'a, PanelMessage> {
         tip(
             toggler(shifted)
@@ -339,8 +284,36 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
             "How many random stretches to backtest; they can overlap. Press Enter to apply.",
         )
     };
+    // A test's options beyond its main line, each a chapter of its own.
+    let mut own_chapters: Vec<(Chapter, Element<'a, PanelMessage>)> = Vec::new();
+    let precision_line = || {
+        line(
+            no_switch(),
+            name(
+                "Precision",
+                "How finely backtests and their playback follow prices inside a bar.",
+            ),
+            row![
+                choice(
+                    "Standard",
+                    settings.precision == Precision::Standard,
+                    Edit::Precision(Precision::Standard),
+                    "Fills at the bars, and shows each bar as it closes.",
+                ),
+                choice(
+                    "High",
+                    settings.precision == Precision::High,
+                    Edit::Precision(Precision::High),
+                    "Fills on ticks or 1-minute bars, and shows slow playback's bars forming. It takes longer to load.",
+                ),
+            ]
+            .spacing(2)
+            .into(),
+        )
+    };
     let test_settings: Option<Element<'a, PanelMessage>> = match settings.test {
-        TestKind::Backtest | TestKind::Build => None,
+        TestKind::Backtest => Some(precision_line()),
+        TestKind::Build => None,
         TestKind::MonteCarlo => Some(
             row![
                 boxed(
@@ -666,9 +639,12 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
             if let Some(extra) = extra {
                 below = below.push(extra);
             }
-            Some(
+            if view == PortfolioView::Run {
+                below = below.push(container(run).align_right(Fill));
+            }
+            own_chapters.push((
+                Chapter::Markets,
                 column![
-                    below,
                     legs,
                     row![
                         saved,
@@ -686,19 +662,23 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
-                    row![
-                        small("Every", Field::RebalanceEvery, "Go back to the weights every so many bars. Blank never does. Rebalancing sizes from the account as it is now."),
-                        small("Drift", Field::RebalanceDrift, "Go back to the weights when a leg is this many points of the account away. Blank never does."),
-                        small("Min", Field::RebalanceMinTrade, "Trades worth less than this aren't made, so small changes don't pay fees for nothing."),
-                        small("Margin %", Field::Maintenance, "What a position needs to stay open, as a percentage of its value. Everything is liquidated at once when the account falls to it, whatever the volume limit."),
-                        container(if view == PortfolioView::Run { run } else { Space::new().into() }).align_right(Fill),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
                 ]
                 .spacing(5)
                 .into(),
-            )
+            ));
+            own_chapters.push((
+                Chapter::Rebalancing,
+                row![
+                    small("Every", Field::RebalanceEvery, "Go back to the weights every so many bars. Blank never does. Rebalancing sizes from the account as it is now."),
+                    small("Drift", Field::RebalanceDrift, "Go back to the weights when a leg is this many points of the account away. Blank never does."),
+                    small("Min", Field::RebalanceMinTrade, "Trades worth less than this aren't made, so small changes don't pay fees for nothing."),
+                    small("Margin %", Field::Maintenance, "What a position needs to stay open, as a percentage of its value. Everything is liquidated at once when the account falls to it, whatever the volume limit."),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .into(),
+            ));
+            Some(below.into())
         }
         TestKind::RandomEntries if panel.tests.entries_shifted => {
             let run = match &panel.tests.shifted {
@@ -908,49 +888,55 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                 ),
                 },
             };
-            let extra: Element<'a, PanelMessage> = if walking {
-                row![
-                    small(
-                        "Windows",
-                        Field::Windows,
-                        "How many times to slide along.",
-                    ),
-                    small(
-                        "Ratio",
-                        Field::WalkRatio,
-                        "How many times longer than its unseen stretch each window picks on.",
-                    ),
-                ]
-                .spacing(6)
-                .into()
-            } else {
-                row![
-                    keep,
-                    small(
-                        "Pick on %",
-                        Field::HoldOutShare,
-                        "With Keep unseen on, how much of the span values are picked on. The rest stays unseen.",
-                    ),
-                ]
-                .spacing(6)
-                .align_y(Alignment::Center)
-                .into()
-            };
-            let mut rows = column![
-                variable_row(0),
-                variable_row(1),
-                row![score, extra, container(run).align_right(Fill)]
+            // The main line has the windows to walk; the rest is in the test's options.
+            let (main_extra, options_extra): (Element<'a, PanelMessage>, Element<'a, PanelMessage>) =
+                if walking {
+                    (
+                        small("Windows", Field::Windows, "How many times to slide along."),
+                        small(
+                            "Ratio",
+                            Field::WalkRatio,
+                            "How many times longer than its unseen stretch each window picks on.",
+                        ),
+                    )
+                } else {
+                    (
+                        Space::new().width(0).into(),
+                        row![
+                            keep,
+                            small(
+                                "Pick on %",
+                                Field::HoldOutShare,
+                                "With Keep unseen on, how much of the span values are picked on. The rest stays unseen.",
+                            ),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center)
+                        .into(),
+                    )
+                };
+            let mut options = column![
+                row![score, options_extra]
                     .spacing(8)
-                    .align_y(Alignment::Center),
+                    .align_y(Alignment::Center)
             ]
             .spacing(5);
             if chosen.score == ScoreBy::RandomBlocks && !walking {
-                rows = rows.push(
+                options = options.push(
                     row![blocks_box(), lengths()]
                         .spacing(10)
                         .align_y(Alignment::Center),
                 );
             }
+            own_chapters.push((Chapter::TestOptions, options.into()));
+            let mut rows = column![
+                variable_row(0),
+                variable_row(1),
+                row![main_extra, container(run).align_right(Fill)]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+            ]
+            .spacing(5);
             if let Some(plan) = &info.plan {
                 rows = rows.push(text(plan.clone()).size(HINT).color(theme::TEXT_MUTED));
             }
@@ -969,6 +955,8 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
     } else {
         Space::new().width(0).into()
     };
+    const NO_COSTS: &str =
+        "Nothing to pay at all: no fees, funding or cost settings, whatever else is on here.";
     const CAPITAL: &str =
         "Starting cash, in the market's quote currency. Paper trading starts with it too.";
     const FEES: &str =
@@ -1009,8 +997,8 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
         )
     };
     // These have more to them, so get the width of the section.
-    let wide: Vec<Element<'a, PanelMessage>> = vec![
-        line(
+    let wide: Vec<(Chapter, Element<'a, PanelMessage>)> = vec![
+        (Chapter::Costs, line(
             switch(settings.commission.on, Edit::Commission, FEES),
             name("Fees", FEES),
             row![
@@ -1038,8 +1026,8 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
             .spacing(2)
             .align_y(Alignment::Center)
             .into(),
-        ),
-        line(
+        )),
+        (Chapter::Orders, line(
             switch(settings.limit.on, Edit::Limit, LIMIT),
             name("Limit orders", LIMIT),
             tip(
@@ -1061,8 +1049,8 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                 LIMIT,
                 None,
             ),
-        ),
-        line(
+        )),
+        (Chapter::Costs, line(
             switch(settings.range_slippage_percent.on, Edit::RangeSlippage, RANGE_SLIPPAGE),
             name("Range slip", RANGE_SLIPPAGE),
             tip(
@@ -1072,8 +1060,8 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                 RANGE_SLIPPAGE,
                 None,
             ),
-        ),
-        line(
+        )),
+        (Chapter::Costs, line(
             switch(settings.impact_percent.on, Edit::Impact, IMPACT),
             name("Impact", IMPACT),
             tip(
@@ -1083,8 +1071,8 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                 IMPACT,
                 None,
             ),
-        ),
-        line(
+        )),
+        (Chapter::Orders, line(
             no_switch(),
             name("Warn at", WARNINGS),
             tip(
@@ -1094,221 +1082,269 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                 WARNINGS,
                 None,
             ),
-        ),
+        )),
     ];
-    let simulation = vec![
-        line(
-            no_switch(),
-            name("Capital", CAPITAL),
-            tip(input(Field::Capital, 92.0), CAPITAL, None),
-        ),
-        line(
-            switch(settings.slippage.on, Edit::Slippage, SLIPPAGE),
-            name("Slippage", SLIPPAGE),
-            ticks_box(Field::Slippage, "ticks", SLIPPAGE),
-        ),
-        line(
-            switch(settings.slippage_percent.on, Edit::SlippagePercent, SLIPPAGE_PERCENT),
-            name("Slippage %", SLIPPAGE_PERCENT),
-            tip(
-                row![input(Field::SlippagePercent, 54.0), unit("%")]
-                    .spacing(3)
-                    .align_y(Alignment::Center),
-                SLIPPAGE_PERCENT,
-                None,
+    let simulation: Vec<(Chapter, Element<'a, PanelMessage>)> = vec![
+        (
+            Chapter::Costs,
+            line(
+                switch(settings.slippage.on, Edit::Slippage, SLIPPAGE),
+                name("Slippage", SLIPPAGE),
+                ticks_box(Field::Slippage, "ticks", SLIPPAGE),
             ),
         ),
-        line(
-            switch(settings.stop_loss_percent.on, Edit::StopLoss, STOP),
-            name("Stop loss", STOP),
-            tip(
-                row![input(Field::StopLoss, 54.0), unit("%")]
-                    .spacing(3)
-                    .align_y(Alignment::Center),
-                STOP,
-                None,
-            ),
-        ),
-        line(
-            switch(settings.trailing_stop_percent.on, Edit::TrailingStop, TRAILING),
-            name("Trailing stop", TRAILING),
-            tip(
-                row![input(Field::TrailingStop, 54.0), unit("%")]
-                    .spacing(3)
-                    .align_y(Alignment::Center),
-                TRAILING,
-                None,
-            ),
-        ),
-        line(
-            switch(settings.decision_log, Edit::DecisionLog, DECISIONS),
-            name("Decision log", DECISIONS),
-            Space::new().into(),
-        ),
-        line(
-            switch(settings.take_profit_percent.on, Edit::TakeProfit, TARGET),
-            name("Target", TARGET),
-            tip(
-                row![input(Field::TakeProfit, 54.0), unit("%")]
-                    .spacing(3)
-                    .align_y(Alignment::Center),
-                TARGET,
-                None,
-            ),
-        ),
-        line(
-            switch(settings.max_participation_percent.on, Edit::Participation, PARTICIPATION),
-            name("Volume limit", PARTICIPATION),
-            tip(
-                row![input(Field::Participation, 54.0), unit("%")]
-                    .spacing(3)
-                    .align_y(Alignment::Center),
-                PARTICIPATION,
-                None,
-            ),
-        ),
-        line(
-            switch(settings.borrow_percent_per_year.on, Edit::Borrow, BORROW),
-            name("Borrow a year", BORROW),
-            tip(
-                row![input(Field::Borrow, 54.0), unit("%")]
-                    .spacing(3)
-                    .align_y(Alignment::Center),
-                BORROW,
-                None,
-            ),
-        ),
-        line(
-            switch(settings.spread.on, Edit::Spread, SPREAD),
-            name("Spread", SPREAD),
-            ticks_box(Field::Spread, "ticks", SPREAD),
-        ),
-        line(
-            switch(settings.latency.on, Edit::Latency, LATENCY),
-            name("Latency", LATENCY),
-            ticks_box(Field::Latency, "ms", LATENCY),
-        ),
-        line(
-            switch(settings.cash_interest_percent_per_year.on, Edit::CashInterest, CASH_INTEREST),
-            name("Cash interest", CASH_INTEREST),
-            tip(
-                row![input(Field::CashInterest, 54.0), unit("%")]
-                    .spacing(3)
-                    .align_y(Alignment::Center),
-                CASH_INTEREST,
-                None,
-            ),
-        ),
-        line(
-            no_switch(),
-            name("Warm-up", WARM_UP),
-            tip(
-                row![input(Field::WarmUp, 54.0), unit("bars")]
-                    .spacing(3)
-                    .align_y(Alignment::Center),
-                WARM_UP,
-                None,
-            ),
-        ),
-        line(
-            switch(settings.latency_jitter.on, Edit::LatencyJitter, JITTER),
-            name("Jitter", JITTER),
-            ticks_box(Field::LatencyJitter, "ms", JITTER),
-        ),
-        line(
-            no_switch(),
-            name("Jitter seed", SEED),
-            tip(input(Field::LatencySeed, 92.0), SEED, None),
-        ),
-        line(
-            switch(settings.leverage.on, Edit::Leverage, LEVERAGE),
-            name("Leverage", LEVERAGE),
-            tip(
-                row![unit("1 :"), input(Field::Leverage, 54.0)]
-                    .spacing(3)
-                    .align_y(Alignment::Center),
-                LEVERAGE,
-                None,
-            ),
-        ),
-        line(
-            switch(settings.max_gross_percent.on, Edit::MaxGross, MAX_GROSS),
-            name("Most exposure", MAX_GROSS),
-            tip(
-                row![input(Field::MaxGross, 54.0), unit("%")]
-                    .spacing(3)
-                    .align_y(Alignment::Center),
-                MAX_GROSS,
-                None,
-            ),
-        ),
-        line(
-            no_switch(),
-            name(
-                "Precision",
-                "How finely backtests and their playback follow prices inside a bar.",
-            ),
-            row![
-                choice(
-                    "Standard",
-                    settings.precision == Precision::Standard,
-                    Edit::Precision(Precision::Standard),
-                    "Fills at the bars, and shows each bar as it closes.",
+        (
+            Chapter::Costs,
+            line(
+                switch(
+                    settings.slippage_percent.on,
+                    Edit::SlippagePercent,
+                    SLIPPAGE_PERCENT,
                 ),
-                choice(
-                    "High",
-                    settings.precision == Precision::High,
-                    Edit::Precision(Precision::High),
-                    "Fills on ticks or 1-minute bars, and shows slow playback's bars forming. It takes longer to load.",
+                name("Slippage %", SLIPPAGE_PERCENT),
+                tip(
+                    row![input(Field::SlippagePercent, 54.0), unit("%")]
+                        .spacing(3)
+                        .align_y(Alignment::Center),
+                    SLIPPAGE_PERCENT,
+                    None,
                 ),
-            ]
-            .spacing(2)
-            .into(),
-        ),
-        line(
-            switch(settings.direction.on, Edit::Direction, DIRECTION),
-            name("Direction", DIRECTION),
-            row![
-                choice(
-                    "Long",
-                    settings.direction.value == OneWay::LongOnly,
-                    Edit::OneWay(OneWay::LongOnly),
-                    "Long positions only; short signals close them.",
-                ),
-                choice(
-                    "Short",
-                    settings.direction.value == OneWay::ShortOnly,
-                    Edit::OneWay(OneWay::ShortOnly),
-                    "Short positions only; long signals close them.",
-                ),
-            ]
-            .spacing(2)
-            .into(),
-        ),
-        line(
-            switch(settings.invert, Edit::Invert, INVERT),
-            name("Invert", INVERT),
-            no_switch(),
-        ),
-        line(
-            switch(settings.compound, Edit::Compound, COMPOUND),
-            name("Compound", COMPOUND),
-            no_switch(),
-        ),
-        line(
-            switch(
-                settings.fill_timing == FillTiming::NextOpen,
-                |on| {
-                    Edit::FillTiming(if on {
-                        FillTiming::NextOpen
-                    } else {
-                        FillTiming::Close
-                    })
-                },
-                NEXT_OPEN,
             ),
-            name("Fill at next open", NEXT_OPEN),
-            no_switch(),
+        ),
+        (
+            Chapter::Exits,
+            line(
+                switch(settings.stop_loss_percent.on, Edit::StopLoss, STOP),
+                name("Stop loss", STOP),
+                tip(
+                    row![input(Field::StopLoss, 54.0), unit("%")]
+                        .spacing(3)
+                        .align_y(Alignment::Center),
+                    STOP,
+                    None,
+                ),
+            ),
+        ),
+        (
+            Chapter::Exits,
+            line(
+                switch(
+                    settings.trailing_stop_percent.on,
+                    Edit::TrailingStop,
+                    TRAILING,
+                ),
+                name("Trailing stop", TRAILING),
+                tip(
+                    row![input(Field::TrailingStop, 54.0), unit("%")]
+                        .spacing(3)
+                        .align_y(Alignment::Center),
+                    TRAILING,
+                    None,
+                ),
+            ),
+        ),
+        (
+            Chapter::Records,
+            line(
+                switch(settings.decision_log, Edit::DecisionLog, DECISIONS),
+                name("Decision log", DECISIONS),
+                Space::new().into(),
+            ),
+        ),
+        (
+            Chapter::Exits,
+            line(
+                switch(settings.take_profit_percent.on, Edit::TakeProfit, TARGET),
+                name("Target", TARGET),
+                tip(
+                    row![input(Field::TakeProfit, 54.0), unit("%")]
+                        .spacing(3)
+                        .align_y(Alignment::Center),
+                    TARGET,
+                    None,
+                ),
+            ),
+        ),
+        (
+            Chapter::Orders,
+            line(
+                switch(
+                    settings.max_participation_percent.on,
+                    Edit::Participation,
+                    PARTICIPATION,
+                ),
+                name("Volume limit", PARTICIPATION),
+                tip(
+                    row![input(Field::Participation, 54.0), unit("%")]
+                        .spacing(3)
+                        .align_y(Alignment::Center),
+                    PARTICIPATION,
+                    None,
+                ),
+            ),
+        ),
+        (
+            Chapter::Costs,
+            line(
+                switch(settings.borrow_percent_per_year.on, Edit::Borrow, BORROW),
+                name("Borrow a year", BORROW),
+                tip(
+                    row![input(Field::Borrow, 54.0), unit("%")]
+                        .spacing(3)
+                        .align_y(Alignment::Center),
+                    BORROW,
+                    None,
+                ),
+            ),
+        ),
+        (
+            Chapter::Costs,
+            line(
+                switch(settings.spread.on, Edit::Spread, SPREAD),
+                name("Spread", SPREAD),
+                ticks_box(Field::Spread, "ticks", SPREAD),
+            ),
+        ),
+        (
+            Chapter::Orders,
+            line(
+                switch(settings.latency.on, Edit::Latency, LATENCY),
+                name("Latency", LATENCY),
+                ticks_box(Field::Latency, "ms", LATENCY),
+            ),
+        ),
+        (
+            Chapter::Costs,
+            line(
+                switch(
+                    settings.cash_interest_percent_per_year.on,
+                    Edit::CashInterest,
+                    CASH_INTEREST,
+                ),
+                name("Cash interest", CASH_INTEREST),
+                tip(
+                    row![input(Field::CashInterest, 54.0), unit("%")]
+                        .spacing(3)
+                        .align_y(Alignment::Center),
+                    CASH_INTEREST,
+                    None,
+                ),
+            ),
+        ),
+        (
+            Chapter::Records,
+            line(
+                no_switch(),
+                name("Warm-up", WARM_UP),
+                tip(
+                    row![input(Field::WarmUp, 54.0), unit("bars")]
+                        .spacing(3)
+                        .align_y(Alignment::Center),
+                    WARM_UP,
+                    None,
+                ),
+            ),
+        ),
+        (
+            Chapter::Orders,
+            line(
+                switch(settings.latency_jitter.on, Edit::LatencyJitter, JITTER),
+                name("Jitter", JITTER),
+                ticks_box(Field::LatencyJitter, "ms", JITTER),
+            ),
+        ),
+        (
+            Chapter::Orders,
+            line(
+                no_switch(),
+                name("Jitter seed", SEED),
+                tip(input(Field::LatencySeed, 92.0), SEED, None),
+            ),
+        ),
+        (
+            Chapter::Position,
+            line(
+                switch(settings.leverage.on, Edit::Leverage, LEVERAGE),
+                name("Leverage", LEVERAGE),
+                tip(
+                    row![unit("1 :"), input(Field::Leverage, 54.0)]
+                        .spacing(3)
+                        .align_y(Alignment::Center),
+                    LEVERAGE,
+                    None,
+                ),
+            ),
+        ),
+        (
+            Chapter::Position,
+            line(
+                switch(settings.max_gross_percent.on, Edit::MaxGross, MAX_GROSS),
+                name("Most exposure", MAX_GROSS),
+                tip(
+                    row![input(Field::MaxGross, 54.0), unit("%")]
+                        .spacing(3)
+                        .align_y(Alignment::Center),
+                    MAX_GROSS,
+                    None,
+                ),
+            ),
+        ),
+        (
+            Chapter::Position,
+            line(
+                switch(settings.direction.on, Edit::Direction, DIRECTION),
+                name("Direction", DIRECTION),
+                row![
+                    choice(
+                        "Long",
+                        settings.direction.value == OneWay::LongOnly,
+                        Edit::OneWay(OneWay::LongOnly),
+                        "Long positions only; short signals close them.",
+                    ),
+                    choice(
+                        "Short",
+                        settings.direction.value == OneWay::ShortOnly,
+                        Edit::OneWay(OneWay::ShortOnly),
+                        "Short positions only; long signals close them.",
+                    ),
+                ]
+                .spacing(2)
+                .into(),
+            ),
+        ),
+        (
+            Chapter::Position,
+            line(
+                switch(settings.invert, Edit::Invert, INVERT),
+                name("Invert", INVERT),
+                no_switch(),
+            ),
+        ),
+        (
+            Chapter::Position,
+            line(
+                switch(settings.compound, Edit::Compound, COMPOUND),
+                name("Compound", COMPOUND),
+                no_switch(),
+            ),
+        ),
+        (
+            Chapter::Orders,
+            line(
+                switch(
+                    settings.fill_timing == FillTiming::NextOpen,
+                    |on| {
+                        Edit::FillTiming(if on {
+                            FillTiming::NextOpen
+                        } else {
+                            FillTiming::Close
+                        })
+                    },
+                    NEXT_OPEN,
+                ),
+                name("Fill at next open", NEXT_OPEN),
+                no_switch(),
+            ),
         ),
     ];
 
@@ -1411,7 +1447,20 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
     // As many columns as fit in the panel's left side.
     let side_width = info.width * f32::from(SETTINGS_PORTION) / 10.0;
     let columns = ((side_width / 200.0) as usize).clamp(1, 3);
-    let mut body = column![top].spacing(7);
+    // The strategy, and the capital it starts with, over every test.
+    let capital = tip(
+        row![unit("Capital"), input(Field::Capital, 92.0)]
+            .spacing(5)
+            .align_y(Alignment::Center),
+        CAPITAL,
+        None,
+    );
+    let mut body = column![
+        row![container(top).width(Fill), capital]
+            .spacing(10)
+            .align_y(Alignment::Center)
+    ]
+    .spacing(7);
     if let Some(test_settings) = test_settings {
         body = body.push(test_settings);
     }
@@ -1439,14 +1488,92 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
     if let Some(error) = &panel.error {
         body = body.push(text(error.as_str()).size(SMALL).color(theme::DOWN));
     }
-    body = body.push(stock_title);
-    if open {
-        body = body
-            .extend(wide)
-            .push(grid(simulation, columns))
-            .push(session_row);
+
+    // Every other setting, in chapters, each opened on its own; all start closed.
+    let no_costs = line(
+        switch(settings.no_costs, Edit::NoCosts, NO_COSTS),
+        name("No costs", NO_COSTS),
+        no_switch(),
+    );
+    let mut wide = wide;
+    wide.insert(0, (Chapter::Costs, no_costs));
+    wide.push((Chapter::Hours, session_row.into()));
+    wide.push((Chapter::Plugins, plugin_row.into()));
+    let mut simulation = simulation;
+    if settings.test != TestKind::Backtest {
+        simulation.push((Chapter::Orders, precision_line()));
     }
-    body = body.push(plugin_row);
+    let legs_named = settings
+        .portfolio
+        .legs
+        .iter()
+        .map(|leg| format!("{} {}", leg.symbol, trim_weight(leg.weight)))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    for chapter in [
+        Chapter::TestOptions,
+        Chapter::Markets,
+        Chapter::Rebalancing,
+        Chapter::Costs,
+        Chapter::Orders,
+        Chapter::Exits,
+        Chapter::Position,
+        Chapter::Hours,
+        Chapter::Records,
+        Chapter::Plugins,
+    ] {
+        let take = |list: Vec<(Chapter, Element<'a, PanelMessage>)>| {
+            list.into_iter()
+                .partition::<Vec<_>, _>(|(tag, _)| *tag == chapter)
+        };
+        let (own, rest) = take(own_chapters);
+        own_chapters = rest;
+        let (full, rest) = take(wide);
+        wide = rest;
+        let (cells, rest) = take(simulation);
+        simulation = rest;
+        if own.is_empty() && full.is_empty() && cells.is_empty() {
+            continue;
+        }
+        let open = panel.open_chapters.contains(&chapter);
+        let said = match chapter.on(settings) {
+            Some(on) => format!("{on} on"),
+            None if chapter == Chapter::Markets => legs_named.clone(),
+            None => String::new(),
+        };
+        let head = button(
+            row![
+                text(if open { "▾" } else { "▸" }).size(SMALL + 2.0),
+                text(chapter.name(settings.test))
+                    .size(SMALL)
+                    .color(theme::TEXT_BRIGHT),
+                text(said).size(HINT).color(theme::TEXT_MUTED),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .width(Fill)
+        .padding([3, 0])
+        .on_press(PanelMessage::Chapter(chapter, !open))
+        .style(|_, status| plain(status));
+        body = body.push(head);
+        if open {
+            let mut inside = column![].spacing(7).padding(Padding {
+                left: 14.0,
+                ..Padding::ZERO
+            });
+            for (_, element) in own.into_iter().chain(full) {
+                inside = inside.push(element);
+            }
+            if !cells.is_empty() {
+                inside = inside.push(grid(
+                    cells.into_iter().map(|(_, element)| element).collect(),
+                    columns,
+                ));
+            }
+            body = body.push(inside);
+        }
+    }
 
     // The panel is kept tall enough for what the sensor measures, so there's nothing to scroll.
     // The scrollable is what lets it measure the full height, and covers a window too short to
@@ -1466,4 +1593,10 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
     .width(Fill)
     .height(Fill)
     .into()
+}
+
+/// A leg's weight as typed: `0.5`, `-1`.
+fn trim_weight(weight: f64) -> String {
+    let text = format!("{weight:.4}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
 }

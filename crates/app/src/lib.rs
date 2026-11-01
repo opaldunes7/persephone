@@ -2992,6 +2992,8 @@ impl Persephone {
         if let Some(tile) = self.tiles.get_mut(&id) {
             tile.hidden = hidden;
             tile.backtest = settings;
+            // The app has no master switch any more: one saved off is each setting off.
+            tile.backtest.retire_stock_switch();
             tile.draft = draft;
         }
         task
@@ -5035,11 +5037,12 @@ impl Persephone {
                 panel.tests.zoom = zoom;
                 return Task::none();
             }
-            P::StockOpen(open) => {
-                if let Some(tile) = self.tiles.get_mut(&id) {
-                    tile.backtest.stock_open = open;
+            P::Chapter(chapter, open) => {
+                if open {
+                    panel.open_chapters.insert(chapter);
+                } else {
+                    panel.open_chapters.remove(&chapter);
                 }
-                self.save();
                 return Task::none();
             }
             P::ShowCalendar(shown) => {

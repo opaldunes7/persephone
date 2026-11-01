@@ -871,6 +871,37 @@ impl Settings {
         .collect()
     }
 
+    /// With `stock` off, every stock setting off one by one instead, and `stock` back on: the
+    /// same run, said without the master switch, which the app no longer has.
+    pub fn retire_stock_switch(&mut self) {
+        if self.stock {
+            return;
+        }
+        self.commission.on = false;
+        self.slippage.on = false;
+        self.slippage_percent.on = false;
+        self.limit.on = false;
+        self.stop_loss_percent.on = false;
+        self.trailing_stop_percent.on = false;
+        self.take_profit_percent.on = false;
+        self.borrow_percent_per_year.on = false;
+        self.impact_percent.on = false;
+        self.cash_interest_percent_per_year.on = false;
+        self.max_participation_percent.on = false;
+        self.max_gross_percent.on = false;
+        self.range_slippage_percent.on = false;
+        self.latency_jitter.on = false;
+        self.spread.on = false;
+        self.latency.on = false;
+        self.leverage.on = false;
+        self.direction.on = false;
+        self.invert = false;
+        self.compound = false;
+        self.session.on = false;
+        self.stock = true;
+        debug_assert_eq!(self.stock_sections_on(), 0);
+    }
+
     /// Says which settings were switched on but did nothing, as `stock` is off and it switches
     /// them all off together.
     #[must_use]
@@ -1012,6 +1043,26 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retiring_the_stock_switch_runs_the_same() {
+        let mut settings = Settings {
+            stock: false,
+            ..Settings::default()
+        };
+        settings.commission.on = true;
+        settings.leverage.on = true;
+        settings.compound = true;
+        let before = settings.sim();
+        settings.retire_stock_switch();
+        assert!(settings.stock && settings.stock_sections_on() == 0);
+        assert_eq!(settings.sim(), before);
+        // On, it changes nothing.
+        let mut on = Settings::default();
+        on.commission.on = true;
+        on.retire_stock_switch();
+        assert!(on.commission.on);
+    }
+
     use persephone_core::time::NANOS_PER_DAY;
 
     use super::*;

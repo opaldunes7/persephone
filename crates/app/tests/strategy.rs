@@ -650,7 +650,11 @@ mod panel {
         let height = app.panel().unwrap().height_in(900.0);
         assert!(height >= settings, "{height} for {settings} of settings");
 
-        // Tags can take more lines, and the panel grows with them.
+        // Tags can take more lines, and the panel grows with them, once their chapter's open.
+        panel(
+            &mut app,
+            PanelMessage::Chapter(persephone::backtest::Chapter::Plugins, true),
+        );
         for (name, _) in persephone::backtest::PLUGIN_SLOTS {
             panel(&mut app, PanelMessage::AddPlugin(name.into()));
         }
@@ -819,10 +823,11 @@ mod panel {
         set_strategy(&mut app, BuiltInStrategy::EmaCross);
         let _ = app.update(Message::Key(Action::Backtest));
         panel(&mut app, PanelMessage::Resize(0.0));
-        let backtest = measure(&mut app);
+        panel(&mut app, PanelMessage::Test(TestKind::Build));
+        let build = measure(&mut app);
         panel(&mut app, PanelMessage::Test(TestKind::RandomBlocks));
         let blocks = measure(&mut app);
-        assert!(blocks > backtest, "{blocks} against {backtest}");
+        assert!(blocks > build, "{blocks} against {build}");
         assert!(app.panel().unwrap().height_in(900.0) >= blocks);
     }
 
@@ -1373,16 +1378,53 @@ mod panel {
     }
 
     #[test]
-    fn stock_settings_fold_away_and_the_panel_needs_less_room() {
+    fn settings_come_in_chapters_closed_until_opened() {
+        use persephone::backtest::Chapter;
         let mut app = ready_panel(TestKind::Backtest);
         panel(&mut app, PanelMessage::Resize(0.0));
+        let closed = measure(&mut app);
+        assert!(app.panel().unwrap().open_chapters.is_empty(), "all closed");
+        for heading in [
+            "Costs",
+            "Orders & fills",
+            "Exits",
+            "Position & account",
+            "Trading hours",
+            "Data & records",
+            "Plugins",
+        ] {
+            assert!(shows(&app, heading), "{heading}");
+        }
+        assert!(!shows(&app, "Slippage %"), "inside a closed chapter");
+        assert!(!shows(&app, "Stock settings"), "no master switch any more");
+        panel(&mut app, PanelMessage::Chapter(Chapter::Costs, true));
         let open = measure(&mut app);
-        panel(&mut app, PanelMessage::StockOpen(false));
-        let folded = measure(&mut app);
-        assert!(folded < open, "{folded} against {open}");
-        assert!(!app.tile_backtest(0).unwrap().stock_open);
-        // Folding away changes nothing about the backtest.
-        assert!(matches!(run_state(&app), Run::Done(_)));
+        assert!(open > closed, "{open} against {closed}");
+        assert!(shows(&app, "Slippage %"));
+        // A switch inside works without any master switch.
+        panel(&mut app, PanelMessage::Edit(Edit::SlippagePercent(true)));
+        assert!(app.tile_backtest(0).unwrap().slippage_percent.on);
+        assert!(shows(&app, "1 on"), "the heading counts it");
+        let (_, request) = app.backtest_request(0).unwrap();
+        assert!(
+            request.sim.slippage_percent > 0.0,
+            "and the backtest has it"
+        );
+        panel(&mut app, PanelMessage::Chapter(Chapter::Costs, false));
+        assert!(!shows(&app, "Slippage %"));
+        // Closing changes nothing about the backtest.
+        assert!(app.tile_backtest(0).unwrap().slippage_percent.on);
+    }
+
+    #[test]
+    fn optimize_keeps_its_variables_and_run_out_and_the_rest_in_its_options() {
+        use persephone::backtest::Chapter;
+        let mut app = ready_panel(TestKind::Optimize);
+        assert!(shows(&app, "Run"));
+        assert!(shows(&app, "Optimize options"));
+        assert!(!shows(&app, "Keep unseen"));
+        panel(&mut app, PanelMessage::Chapter(Chapter::TestOptions, true));
+        assert!(shows(&app, "Keep unseen"));
     }
 
     #[test]
@@ -1592,6 +1634,10 @@ mod panel {
     /// A panel set up with two markets on one account, the chart's and another.
     fn portfolio_panel() -> Persephone {
         let mut app = ready_panel(TestKind::Portfolio);
+        panel(
+            &mut app,
+            PanelMessage::Chapter(persephone::backtest::Chapter::Markets, true),
+        );
         let candles = (0..1_500u64)
             .map(|i| {
                 let p = 3_000.0 + 200.0 * (i as f64 / 30.0).cos();
@@ -1738,6 +1784,12 @@ mod panel {
         assert_eq!(sim.volume_warning_percent, 2.0);
         assert_eq!(sim.fill_warning_percent, 25.0);
         assert_eq!(sim.cash_interest_percent_per_year, Some(7.0));
+        for chapter in [
+            persephone::backtest::Chapter::Records,
+            persephone::backtest::Chapter::Costs,
+        ] {
+            panel(&mut app, PanelMessage::Chapter(chapter, true));
+        }
         assert!(shows(&app, "Warm-up"));
         assert!(shows(&app, "Cash interest"));
     }

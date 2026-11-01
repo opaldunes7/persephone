@@ -185,8 +185,16 @@ fn main() -> anyhow::Result<()> {
                 let _ = app.update(Message::Backtest(PanelMessage::SelectRun(run)));
             }
             '~' => {
-                // The stock settings folded away.
-                let _ = app.update(Message::Backtest(PanelMessage::StockOpen(false)));
+                // Every chapter of the settings open.
+                for chapter in [
+                    persephone::backtest::Chapter::TestOptions,
+                    persephone::backtest::Chapter::Costs,
+                    persephone::backtest::Chapter::Orders,
+                    persephone::backtest::Chapter::Exits,
+                    persephone::backtest::Chapter::Position,
+                ] {
+                    let _ = app.update(Message::Backtest(PanelMessage::Chapter(chapter, true)));
+                }
             }
             'g' | '#' => {
                 // The backtest's calendar: its years, or the busiest day and its first trade.
