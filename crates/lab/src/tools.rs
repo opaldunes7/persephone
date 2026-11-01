@@ -109,6 +109,8 @@ fn settings_schema() -> Value {
             "Send orders as limits: how far from the close they rest, and how many bars before they're cancelled. They fill only when price trades through them, by through_percent if given, standing in for the queue ahead.",
         ),
         "stop_loss_percent": section(number.clone(), "A stop this far from the entry, resting from the bar after it."),
+        "trailing_stop_percent": section(number.clone(), "A real stop this far from the best price since entry, moved at each close, so it only tightens. With stop_loss_percent too, whichever is nearer goes first."),
+        "decision_log": {"type": "boolean", "description": "Keep a row for each bar, read with get_decisions: what was asked, what was held, what the rules made of it, and why no order went out. Off by default, as it's large."},
         "take_profit_percent": section(number.clone(), "A target this far from the entry, resting from the bar after it."),
         "borrow_percent_per_year": section(number.clone(), "What borrowing costs a short, as a percentage of its value a year."),
         "impact_percent": section(number.clone(), "How far a market order fills worse when it's all of its bar's volume; it moves with the square root of its share."),
@@ -124,6 +126,7 @@ fn settings_schema() -> Value {
         "warm_up_bars": {"type": "integer", "description": "How many bars before `from` strategies warm up on. Default 500. Raise it for look-backs longer than that."},
         "hold_out_percent": {"type": "number", "description": "How much of the span an optimization with hold_out picks on, as a percentage. Default 70."},
         "walk_ratio": {"type": "number", "description": "How many times longer than its unseen stretch a walk-forward window picks on. Default 3. train_ratio on the call wins."},
+        "no_costs": {"type": "boolean", "description": "Nothing to pay at all: no fees, funding, slippage, spread, impact, borrowing or interest, whatever else says. stock: false leaves the market's own fees and funding on."},
         "compound": {"type": "boolean", "description": "Size positions from the account as it is now, rather than as it started."},
         "fill_timing": {"enum": ["close", "next_open"], "description": "When orders fill on the bars: at the close they were decided on, or at the next bar's open. next_open needs time bars, and can't go with latency or precision high."},
         "spread": section(whole.clone(), "Ticks of spread assumed for bars and trades."),
@@ -518,6 +521,98 @@ pub fn tools() -> Vec<Tool> {
             &["columns", "rows", "total", "succeeded", "failed"],
         ),
         job(
+            "run_shifted",
+            "A run's positions or a portfolio's weights moved along the span by random amounts, wrapping round, so what's held and for how long stay the same and only the timing is lost. If those do as well, the timing is worth nothing. Works on any run, of one market or a portfolio.",
+            vec![
+                RUN_ID,
+                opt("runs", "number", "How many shifts. Default 200."),
+                opt("seed", "number", "Which shifts; the same gives the same."),
+            ],
+            &[
+                "runs",
+                "actual_return",
+                "share_matching_return",
+                "median",
+                "low",
+                "high",
+                "return_chart",
+                "fall_chart",
+            ],
+        ),
+        job(
+            "run_portfolio_monte_carlo",
+            "A portfolio's account returns drawn again in blocks along its timeline, keeping how its markets moved together. Says how wide its result and worst fall could have been. Fills and costs aren't run again.",
+            vec![
+                RUN_ID,
+                opt("runs", "number", "How many draws. Default 1000."),
+                opt(
+                    "block_bars",
+                    "number",
+                    "How many bars a block is. Default 100. Longer keeps more of how returns follow each other.",
+                ),
+                opt(
+                    "ruin_percent",
+                    "number",
+                    "The fall counted as ruin. Default 50.",
+                ),
+                opt("seed", "number", "Which draws; the same gives the same."),
+                opt(
+                    "include_lines",
+                    "boolean",
+                    "Add up to 200 of the drawn lines. Costs more to read.",
+                ),
+            ],
+            &[
+                "runs",
+                "median",
+                "low",
+                "high",
+                "ruin_share",
+                "losing_share",
+                "return_chart",
+                "fall_chart",
+                "median_line",
+                "low_line",
+                "high_line",
+                "actual_line",
+            ],
+        ),
+        job(
+            "run_portfolio_walk_forward",
+            "Each window picks the best of the setups you give on its stretch, and trades it on the unseen one after, sliding along. The fair test of whether picking among portfolios helps. Setups can be anything run_portfolio takes, weight tables too.",
+            vec![
+                arg(
+                    "candidates",
+                    "list_or_path",
+                    "The setups: run_portfolio's arguments, each with a `label`, or a JSON file holding them. They should trade the same markets.",
+                ),
+                opt(
+                    "defaults",
+                    "object",
+                    "Arguments every setup shares, such as bars, from, to and settings. A setup's own win.",
+                ),
+                opt(
+                    "windows",
+                    "number",
+                    "How many times to slide along. Default 5.",
+                ),
+                opt(
+                    "train_ratio",
+                    "number",
+                    "How many times longer than its unseen stretch a window picks on. Default walk_ratio in settings, 3.",
+                ),
+                opt("pick_by", "string", "`return` (default) or `sharpe`."),
+            ],
+            &[
+                "windows",
+                "unseen_return",
+                "buy_and_hold_return",
+                "profitable_windows",
+                "deepest_fall",
+                "chart",
+            ],
+        ),
+        job(
             "run_backtests",
             "Many backtests in one call, in parallel: much quicker for an agent than one call each. Every run is saved, so all the tools that take a run_id work on them. One that fails doesn't stop the rest.",
             vec![
@@ -767,6 +862,22 @@ pub fn tools() -> Vec<Tool> {
                 LIMIT,
             ],
             &["columns", "rows", "next_cursor"],
+        ),
+        tool(
+            "get_decisions",
+            "A run's decision for each bar, in pages, if it ran with `decision_log` on: what the strategy asked for, what was held, what the trading rules made of it, what order went out, and why not if none did.",
+            vec![
+                RUN_ID,
+                opt("why", "string", "Only rows with this reason."),
+                opt(
+                    "wanted_only",
+                    "boolean",
+                    "Only bars where the strategy asked for something.",
+                ),
+                CURSOR,
+                LIMIT,
+            ],
+            &["columns", "rows", "next_cursor", "reasons"],
         ),
         tool(
             "get_portfolio",
@@ -1034,6 +1145,7 @@ impl Lab {
         // A portfolio's run has no one market's trades, and an empty answer would read as none made.
         if let Some(id) = args.get("run_id").and_then(Value::as_str)
             && !name.starts_with("get_portfolio")
+            && !matches!(name, "run_shifted" | "run_portfolio_monte_carlo")
             && self.is_portfolio_run(id)
         {
             return Err(format!(
@@ -1060,6 +1172,7 @@ impl Lab {
             "get_trades" => self.get_trades(args),
             "get_fills" => self.get_fills(args),
             "get_limit_orders" => self.get_limit_orders(args),
+            "get_decisions" => self.get_decisions(args),
             "get_portfolio" => self.get_portfolio(args),
             "get_portfolio_series" => self.get_portfolio_series(args),
             "get_portfolio_fills" => self.get_portfolio_fills(args),
@@ -1090,6 +1203,9 @@ impl Lab {
                     "run_backtests" => lab.run_backtests(&owned, job),
                     "run_portfolio" => lab.run_portfolio(&owned),
                     "run_portfolios" => lab.run_portfolios(&owned, job),
+                    "run_shifted" => lab.run_shifted(&owned, job),
+                    "run_portfolio_monte_carlo" => lab.run_portfolio_monte_carlo(&owned),
+                    "run_portfolio_walk_forward" => lab.run_portfolio_walk_forward(&owned, job),
                     "run_monte_carlo" => lab.run_monte_carlo(&owned, job),
                     "run_random_blocks" => lab.run_random_blocks(&owned, job),
                     "run_optimize" => lab.run_optimize(&owned, job),

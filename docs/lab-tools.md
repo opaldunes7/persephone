@@ -234,6 +234,41 @@ Many portfolios in one call, in parallel, to sweep weights, rebalancing or costs
 
 Returns: `columns`, `rows`, `total`, `succeeded`, `failed`
 
+## `run_shifted` *job*
+
+A run's positions or a portfolio's weights moved along the span by random amounts, wrapping round, so what's held and for how long stay the same and only the timing is lost. If those do as well, the timing is worth nothing. Works on any run, of one market or a portfolio.
+
+- `run_id` (string, required): A run, from run_backtest or list_runs.
+- `runs` (number): How many shifts. Default 200.
+- `seed` (number): Which shifts; the same gives the same.
+
+Returns: `runs`, `actual_return`, `share_matching_return`, `median`, `low`, `high`, `return_chart`, `fall_chart`
+
+## `run_portfolio_monte_carlo` *job*
+
+A portfolio's account returns drawn again in blocks along its timeline, keeping how its markets moved together. Says how wide its result and worst fall could have been. Fills and costs aren't run again.
+
+- `run_id` (string, required): A run, from run_backtest or list_runs.
+- `runs` (number): How many draws. Default 1000.
+- `block_bars` (number): How many bars a block is. Default 100. Longer keeps more of how returns follow each other.
+- `ruin_percent` (number): The fall counted as ruin. Default 50.
+- `seed` (number): Which draws; the same gives the same.
+- `include_lines` (boolean): Add up to 200 of the drawn lines. Costs more to read.
+
+Returns: `runs`, `median`, `low`, `high`, `ruin_share`, `losing_share`, `return_chart`, `fall_chart`, `median_line`, `low_line`, `high_line`, `actual_line`
+
+## `run_portfolio_walk_forward` *job*
+
+Each window picks the best of the setups you give on its stretch, and trades it on the unseen one after, sliding along. The fair test of whether picking among portfolios helps. Setups can be anything run_portfolio takes, weight tables too.
+
+- `candidates` (list_or_path, required): The setups: run_portfolio's arguments, each with a `label`, or a JSON file holding them. They should trade the same markets.
+- `defaults` (object): Arguments every setup shares, such as bars, from, to and settings. A setup's own win.
+- `windows` (number): How many times to slide along. Default 5.
+- `train_ratio` (number): How many times longer than its unseen stretch a window picks on. Default walk_ratio in settings, 3.
+- `pick_by` (string): `return` (default) or `sharpe`.
+
+Returns: `windows`, `unseen_return`, `buy_and_hold_return`, `profitable_windows`, `deepest_fall`, `chart`
+
 ## `run_backtests` *job*
 
 Many backtests in one call, in parallel: much quicker for an agent than one call each. Every run is saved, so all the tools that take a run_id work on them. One that fails doesn't stop the rest.
@@ -370,6 +405,18 @@ Every limit order a run sent, in pages, filled or not: what became of it, how fa
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
 Returns: `columns`, `rows`, `next_cursor`
+
+## `get_decisions`
+
+A run's decision for each bar, in pages, if it ran with `decision_log` on: what the strategy asked for, what was held, what the trading rules made of it, what order went out, and why not if none did.
+
+- `run_id` (string, required): A run, from run_backtest or list_runs.
+- `why` (string): Only rows with this reason.
+- `wanted_only` (boolean): Only bars where the strategy asked for something.
+- `cursor` (string): Where to carry on, from the last page's next_cursor.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
+
+Returns: `columns`, `rows`, `next_cursor`, `reasons`
 
 ## `get_portfolio`
 

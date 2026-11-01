@@ -60,6 +60,24 @@ pub struct WalkForward {
     pub starts: Vec<(usize, usize)>,
 }
 
+impl WalkForward {
+    /// The unseen stretches and the market's, one after another as if money stayed in, rather than each
+    /// from the same capital.
+    #[must_use]
+    pub fn compounded(&self) -> (f64, f64) {
+        let mut totals = (1.0, 1.0);
+        for picked in self
+            .windows
+            .iter()
+            .filter_map(|window| window.picked.as_ref())
+        {
+            totals.0 *= 1.0 + picked.unseen_return;
+            totals.1 *= 1.0 + picked.buy_and_hold_return;
+        }
+        (totals.0 - 1.0, totals.1 - 1.0)
+    }
+}
+
 /// The most points a stretch keeps for drawing.
 const LINE_POINTS: usize = 300;
 

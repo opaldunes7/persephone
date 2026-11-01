@@ -1894,6 +1894,16 @@ fn statistics<'a>(
             format!("{:+.2}%", held.return_ * 100.0),
             signed(held.return_),
         ));
+        let made = report
+            .equity
+            .last()
+            .map_or(0.0, |last| last / report.starting_balance - 1.0);
+        let over = made - held.return_after_funding;
+        rows.push((
+            "Over the market".into(),
+            format!("{:+.2}%", over * 100.0),
+            signed(over),
+        ));
         if held.return_after_funding != held.return_ {
             rows.push((
                 "After funding".into(),

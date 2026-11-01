@@ -513,6 +513,8 @@ The panel's stock settings go beyond market orders:
 - **Impact** makes market orders fill worse the larger they are against their bar's volume. It's a rough assumption.
 - **Volume limit** stops an order taking more than that share of a bar's volume. What's left goes out at the next closes, at their prices, so big positions take time to build and to leave. A resting limit fills no more than that share of each bar, and a stop takes that share and leaves the rest to the closes after.
 - **Range slip** makes market orders and stops pay a share of a bar's high to low, times how many times wider it is than usual. A bar 10 times the usual width costs 100 times a usual one, so wild markets cost what they should. It's a rough assumption.
+- **Trailing stop** follows the best price since entry, moved at each close, so it only tightens. **Decision log**, when on, adds a **Decisions** table to the Backtest tab: for each bar, what the strategy asked for, what was held, what went out, and why not.
+- **No costs**, beside Stock settings, takes off everything there is to pay, including a market's own fees and funding, which turning Stock off leaves on.
 - **Warn at** says how large an order against its bar, and how few limits filling, gets a warning. **Warm-up** is how many bars before the span strategies warm up on: raise it for longer look-backs. **Cash interest** charges a portfolio for cash below zero, a year's rate. Optimize's **Pick on %** and Walk-forward's **Ratio** set how a span is split into what's picked on and what's unseen. Range slip's **over** and Impact's **power** set how far back a usual bar is judged from and how steeply impact grows.
 - **Jitter** makes each order take a random time longer than the latency. An order sent at a close reaches the next bar anyway, so only fills on ticks can show it.
 - **Borrow a year** charges shorts on spot, which otherwise cost nothing to hold, unlike in reality.
@@ -534,7 +536,14 @@ Every run is kept where Lab keeps its runs. **Saved runs** goes back to one, inc
 - A market with no bar at some moment is valued at its last close, and can't trade until it has one.
 - **Margin %** is what positions need to stay open. When the account falls to it, judged at each market's worst in the bar, everything is sold at that close, whatever the volume limit, and trading stops. **Closest** says how near it came.
 - Exchanges' discounts for hedged books aren't modelled, so a hedge gets no margin relief.
-- Portfolios use market orders, at the closes they decide on, or at the next opens with **Fill at next open** on, which is the fairer test of a weight table. Limit orders, stops, Monte Carlo and walk-forward are for single markets for now, and paper and live trading don't run them.
+- Portfolios use market orders, at the closes they decide on, or at the next opens with **Fill at next open** on, which is the fairer test of a weight table. Limit orders and stops are for single markets for now, and paper and live trading don't run them.
+
+The chips over the settings ask whether a result is luck:
+
+- **Sweep** varies one thing, such as a weight, rebalancing or a cost, from **Min** to **Max** by **Step**, into a table with the best first.
+- **Shifted** moves the last run's book along the span by random amounts, wrapping round. It holds the same things for as long, and only the timing goes. **As good** near 50% means the timing added nothing. **Random entries** has the same test for one market, under **Shifted**.
+- **Monte Carlo** draws the last run's returns again in blocks of **Block** bars, keeping how the markets moved together, and shows the band 19 in 20 stayed inside.
+- **Walk-forward** picks the best of the sweep's values on each stretch, trades it on the unseen one after, and slides along. **Windows** and **Ratio** are Walk-forward's own, and Run shows the same chart and table.
 
 ## Exporting and importing
 

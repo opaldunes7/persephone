@@ -20,7 +20,7 @@ use persephone_core::{Candle, Side, UnixNanos, signal::Signal};
 
 use crate::{
     models::BarNow,
-    report::{LimitOutcome, NANOS_PER_YEAR, RawFill, RawLimit},
+    report::{Decision, LimitOutcome, NANOS_PER_YEAR, RawFill, RawLimit},
     settings::{LimitOrders, TradingRules},
 };
 
@@ -73,6 +73,12 @@ pub(crate) struct SignalStrategy {
     limit: Option<LimitOrders>,
     stop_loss: Option<f64>,
     take_profit: Option<f64>,
+    /// A stop this far under the best price since entry, as a percentage, and that price.
+    trailing: Option<f64>,
+    best_since_entry: f64,
+    /// Keeping a row for each bar, and what's known of this one so far.
+    log_decisions: bool,
+    now: Decision,
     /// The limit order resting now, if any.
     resting: Option<Resting>,
     /// The stop and target resting now.
@@ -145,6 +151,17 @@ impl SignalStrategy {
             limit: None,
             stop_loss: None,
             take_profit: None,
+            trailing: None,
+            best_since_entry: f64::NAN,
+            log_decisions: false,
+            now: Decision {
+                ts: 0,
+                wanted: None,
+                held: 0,
+                target: None,
+                order: 0.0,
+                why: "",
+            },
             resting: None,
             brackets: Brackets::default(),
             participation: None,
@@ -218,6 +235,18 @@ impl SignalStrategy {
         self.borrow_percent_per_year = borrow_percent_per_year.unwrap_or(0.0);
         self.watch_volume = impact_percent > 0.0;
         self.volume_warning = volume_warning_percent / 100.0;
+        self
+    }
+
+    /// Keeps a stop this far from the best price since entry, as a percentage.
+    pub(crate) fn trailing(mut self, percent: Option<f64>) -> Self {
+        self.trailing = percent;
+        self
+    }
+
+    /// Keeps a row for each bar.
+    pub(crate) fn logging_decisions(mut self, on: bool) -> Self {
+        self.log_decisions = on;
         self
     }
 
@@ -350,6 +379,7 @@ struct Resting {
 struct Brackets {
     stop: Option<ClientOrderId>,
     stop_qty: f64,
+    stop_level: f64,
     take: Option<ClientOrderId>,
     take_qty: f64,
 }
@@ -389,6 +419,8 @@ pub(crate) struct Missed {
     pub(crate) longest_work: usize,
     pub(crate) cut_short: usize,
     pub(crate) unfilled: f64,
+    /// A row for each bar, if asked for.
+    pub(crate) decisions: Vec<Decision>,
 }
 
 impl Missed {
@@ -485,6 +517,7 @@ nautilus_strategy!(SignalStrategy, {
             self.entry_price = f64::NAN;
         } else if before == 0.0 || before.is_sign_positive() != self.position.is_sign_positive() {
             self.entry_price = price;
+            self.best_since_entry = price;
         } else if self.position.abs() > before.abs() {
             // Added to, so it's what it all cost on average.
             self.entry_price =
@@ -619,12 +652,28 @@ impl DataActor for SignalStrategy {
         }
         self.last_candle = Some(candle);
         self.charge_holding(&candle);
-        // Bars are stamped with their close: the moment an order would go out.
-        if candle.ts <= self.trade_from {
-            return Ok(());
+        if self.position > 0.0 {
+            self.best_since_entry = self.best_since_entry.max(candle.high);
+        } else if self.position < 0.0 {
+            self.best_since_entry = self.best_since_entry.min(candle.low);
         }
-        self.decide(&candle, wanted)?;
-        self.keep_brackets(&candle)
+        self.now = Decision {
+            ts: candle.ts,
+            wanted,
+            held: self.held(),
+            target: None,
+            order: 0.0,
+            why: "warming up",
+        };
+        // Bars are stamped with their close: the moment an order would go out.
+        if candle.ts > self.trade_from {
+            self.decide(&candle, wanted)?;
+            self.keep_brackets(&candle)?;
+        }
+        if self.log_decisions {
+            self.missed.borrow_mut().decisions.push(self.now);
+        }
+        Ok(())
     }
 }
 
@@ -648,6 +697,12 @@ impl SignalStrategy {
         let lapsed = self.age_resting()?;
         let expected = self.expected();
         let target = self.rules.target(wanted, sign_of(expected), candle.ts);
+        self.now.target = target;
+        self.now.why = match (wanted, target) {
+            (None, None) => "nothing asked",
+            (Some(_), None) => "the rules held it back",
+            _ => "already there",
+        };
         // An exit that didn't fill as a limit still has to happen.
         let at_market =
             target.is_none() && lapsed.is_some() || target == lapsed && lapsed.is_some();
@@ -660,6 +715,7 @@ impl SignalStrategy {
         });
         // Stopping a live session closes the position; nothing new meanwhile.
         if candle.close <= 0.0 || self.is_exiting() {
+            self.now.why = "can't trade now";
             return Ok(());
         }
         // A different wish takes the place of what's still going out; otherwise, on it goes.
@@ -678,6 +734,7 @@ impl SignalStrategy {
         // A newer wish replaces what's resting; the same one leaves it be.
         if let Some(resting) = self.resting {
             if resting.target == target {
+                self.now.why = "its limit is still resting";
                 return Ok(());
             }
             self.end_resting(LimitOutcome::Replaced)?;
@@ -699,6 +756,7 @@ impl SignalStrategy {
         if qty.is_zero() {
             if size == 0.0 {
                 self.missed.borrow_mut().too_small(candle.ts);
+                self.now.why = "too small for the market's steps";
             }
             return Ok(());
         }
@@ -780,6 +838,12 @@ impl SignalStrategy {
         // Before it goes, as a refusal can come back straight away.
         self.in_flight
             .push((order.client_order_id(), delta.signum() * qty.as_f64()));
+        self.now.order = delta.signum() * qty.as_f64();
+        self.now.why = if limit.is_some() {
+            "a limit went out"
+        } else {
+            "an order went out"
+        };
         self.submit_order(order, None, None, None)
     }
 
@@ -848,6 +912,7 @@ impl SignalStrategy {
         self.missed.borrow_mut().unfilled = left.abs();
         if qty.is_zero() {
             // No volume to take on this bar; the next may have some.
+            self.now.why = "no volume to take on this bar";
             return Ok(());
         }
         if self.in_steps(left.abs() - qty.as_f64()) == 0.0 {
@@ -864,6 +929,8 @@ impl SignalStrategy {
             -qty.as_f64()
         };
         self.in_flight.push((order.client_order_id(), signed));
+        self.now.order = signed;
+        self.now.why = "part of an order went out";
         self.submit_order(order, None, None, None)
     }
 
@@ -972,6 +1039,21 @@ impl SignalStrategy {
         let bracket = self.brackets.stop == Some(order) || self.brackets.take == Some(order);
         if bracket {
             let stopped = self.brackets.stop == Some(order);
+            if self.log_decisions {
+                let row = Decision {
+                    ts: filled_at,
+                    wanted: None,
+                    held: self.held(),
+                    target: None,
+                    order: 0.0,
+                    why: if stopped {
+                        "a stop filled"
+                    } else {
+                        "a target filled"
+                    },
+                };
+                self.missed.borrow_mut().decisions.push(row);
+            }
             // Part of a target filled, and the rest of it still rests.
             if !stopped && self.position != 0.0 {
                 return;
@@ -1036,7 +1118,7 @@ impl SignalStrategy {
 
     /// Keeps a stop and a target on what's held, from the bar after it's entered.
     fn keep_brackets(&mut self, candle: &Candle) -> anyhow::Result<()> {
-        if self.stop_loss.is_none() && self.take_profit.is_none() {
+        if self.stop_loss.is_none() && self.take_profit.is_none() && self.trailing.is_none() {
             return Ok(());
         }
         let held = self.held();
@@ -1062,14 +1144,29 @@ impl SignalStrategy {
         } else {
             OrderSide::Buy
         };
-        let stop_at = self
+        let fixed = self
             .stop_loss
             .map(|percent| self.entry_price * (1.0 - side * percent / 100.0));
+        // Whichever is nearer the price is the one that matters.
+        let trail = self
+            .trailing
+            .map(|percent| self.best_since_entry * (1.0 - side * percent / 100.0));
+        let stop_at = match (fixed, trail) {
+            (Some(fixed), Some(trail)) => Some(if side > 0.0 {
+                fixed.max(trail)
+            } else {
+                fixed.min(trail)
+            }),
+            (one, other) => one.or(other),
+        };
         let take_at = self
             .take_profit
             .map(|percent| self.entry_price * (1.0 + side * percent / 100.0));
         // Already past the stop at this close, there's nothing to rest: out now.
-        if self.brackets.stop.is_none()
+        // A trailing stop's just moved here too, so it's the same.
+        let moved =
+            self.trailing.is_some() && stop_at.is_some_and(|at| at != self.brackets.stop_level);
+        if (self.brackets.stop.is_none() || moved)
             && stop_at.is_some_and(|at| (candle.close - at) * side <= 0.0)
         {
             self.cancel_brackets()?;
@@ -1082,6 +1179,8 @@ impl SignalStrategy {
                     return self.keep_working(candle, working);
                 }
             }
+            self.now.order = -side * qty.as_f64();
+            self.now.why = "past its stop at this close";
             let order = self.market_order(closing, qty, true);
             self.in_flight
                 .push((order.client_order_id(), -side * qty.as_f64()));
@@ -1092,11 +1191,9 @@ impl SignalStrategy {
             self.sliced(self.position.abs(), self.last_volume(candle.ts)),
             self.size_precision,
         );
-        if let Some(id) = self
-            .brackets
-            .stop
-            .filter(|_| !stop_qty.is_zero() && stop_qty.as_f64() != self.brackets.stop_qty)
-        {
+        if let Some(id) = self.brackets.stop.filter(|_| {
+            !stop_qty.is_zero() && (stop_qty.as_f64() != self.brackets.stop_qty || moved)
+        }) {
             self.brackets.stop = None;
             self.cancel_order(id, None, None)?;
         }
@@ -1129,6 +1226,7 @@ impl SignalStrategy {
             );
             self.brackets.stop = Some(order.client_order_id());
             self.brackets.stop_qty = stop_qty.as_f64();
+            self.brackets.stop_level = at;
             self.submit_order(order, None, None, None)?;
         }
         let Some(take) = take_at else {

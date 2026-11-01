@@ -194,7 +194,11 @@ fn check(request: &PortfolioRequest) -> Result<(), EngineError> {
             "the most of a bar's volume an order can take must be above 0% and at most 100%, not {share}%"
         )));
     }
-    if sim.limit.is_some() || sim.stop_loss_percent.is_some() || sim.take_profit_percent.is_some() {
+    if sim.limit.is_some()
+        || sim.stop_loss_percent.is_some()
+        || sim.take_profit_percent.is_some()
+        || sim.trailing_stop_percent.is_some()
+    {
         return Err(refuse(
             "a portfolio goes at the market for now: limit orders, stops and targets are for single markets",
         ));
@@ -708,8 +712,14 @@ fn build_report(
     let mut interest_paid = 0.0;
     if rate > 0.0 {
         for at in 1..times.len() {
-            let held: f64 = legs.iter().map(|leg: &LegReport| leg.values[at - 1]).sum();
-            let cash = equity[at - 1] - interest_paid - held;
+            // A perpetual isn't bought with cash: only what's bought outright can be a loan.
+            let held: f64 = legs
+                .iter()
+                .zip(funding)
+                .filter(|(_, rates)| rates.is_empty())
+                .map(|(leg, _)| leg.values[at - 1])
+                .sum();
+            let cash = equity[at - 1] - held;
             if cash < 0.0 {
                 let years = times[at].saturating_sub(times[at - 1]) as f64 / report::NANOS_PER_YEAR;
                 interest_paid += -cash * rate * years;
@@ -792,8 +802,9 @@ fn notes_of(
     // A little over is only fees on a position that took all the cash.
     if outcome.peak_margin_use > 1.05 {
         notes.push(warn(format!(
-            "At its most the book needed {:.0}% of the account in margin, which a venue wouldn't allow: it would have refused the orders or closed positions. Raise the leverage if that's really on offer, or lower the weights.",
-            outcome.peak_margin_use * 100.0
+            "At its most the book needed {:.0}% of the account in margin at a leverage of {}, which a venue wouldn't allow: it would have refused the orders or closed positions. Lower the weights, or use more leverage if that's really on offer.",
+            outcome.peak_margin_use * 100.0,
+            request.sim.leverage,
         )));
     }
     if last <= 0.0 {

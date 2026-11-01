@@ -1080,3 +1080,176 @@ fn what_gets_a_warning_can_be_set() {
             .any(|note| note.text.contains("limit orders filled"))
     );
 }
+
+fn trailing(percent: f64) -> SimSettings {
+    SimSettings {
+        trailing_stop_percent: Some(percent),
+        ..SimSettings::default()
+    }
+}
+
+#[test]
+fn a_trailing_stop_follows_the_best_price_and_fills_inside_a_bar() {
+    let bars = [
+        FLAT,
+        FLAT,
+        // Up to 110, so the stop moves to 99 at this close.
+        (100.0, 110.0, 100.0, 108.0),
+        // Through 99 in this bar.
+        (108.0, 108.0, 95.0, 96.0),
+        (96.0, 96.0, 96.0, 96.0),
+    ];
+    let report = run(&bars, &[(1, 1)], trailing(10.0), NO_FEES);
+    assert_eq!(report.fills.len(), 2, "{:?}", report.fills);
+    assert_eq!(report.fills[1].side, Side::Sell);
+    assert_eq!(report.fills[1].bar, 3);
+    assert!(
+        (report.fills[1].price - 99.0).abs() < 1e-9,
+        "{:?}",
+        report.fills[1]
+    );
+}
+
+#[test]
+fn a_trailing_stop_never_loosens_and_fills_at_the_open_on_a_gap() {
+    let bars = [
+        FLAT,
+        FLAT,
+        (100.0, 120.0, 100.0, 118.0),
+        // A fall that doesn't reach 108 leaves it there, not lower.
+        (118.0, 118.0, 110.0, 111.0),
+        // Opens at 100, under the 108 it's at.
+        (100.0, 101.0, 99.0, 100.0),
+        FLAT,
+    ];
+    let report = run(&bars, &[(1, 1)], trailing(10.0), NO_FEES);
+    assert_eq!(report.fills.len(), 2, "{:?}", report.fills);
+    assert_eq!(report.fills[1].bar, 4);
+    assert!(
+        (report.fills[1].price - 100.0).abs() < 1e-9,
+        "{:?}",
+        report.fills[1]
+    );
+}
+
+#[test]
+fn a_trailing_stop_on_a_short_mirrors_it_and_the_nearer_of_two_stops_goes_first() {
+    let bars = [
+        FLAT,
+        FLAT,
+        (100.0, 100.0, 90.0, 92.0),
+        (92.0, 105.0, 92.0, 104.0),
+        FLAT,
+    ];
+    let report = run(&bars, &[(1, -1)], trailing(10.0), NO_FEES);
+    assert_eq!(report.fills[1].side, Side::Buy);
+    assert_eq!(report.fills[1].bar, 3);
+    assert!(
+        (report.fills[1].price - 99.0).abs() < 1e-9,
+        "{:?}",
+        report.fills[1]
+    );
+
+    // Long at 100: a fixed stop at 98 is nearer than a trail at 90.
+    let both = SimSettings {
+        stop_loss_percent: Some(2.0),
+        ..trailing(10.0)
+    };
+    let bars = [FLAT, FLAT, (100.0, 101.0, 95.0, 96.0), FLAT];
+    let report = run(&bars, &[(1, 1)], both, NO_FEES);
+    assert!(
+        (report.fills[1].price - 98.0).abs() < 1e-9,
+        "{:?}",
+        report.fills
+    );
+}
+
+#[test]
+fn a_close_already_past_where_a_trail_would_go_gets_out_at_that_close() {
+    // The high of 120 puts it at 108, and that bar closed at 105.
+    let bars = [FLAT, FLAT, (100.0, 120.0, 100.0, 105.0), FLAT, FLAT];
+    let report = run(&bars, &[(1, 1)], trailing(10.0), NO_FEES);
+    assert_eq!(report.fills.len(), 2, "{:?}", report.fills);
+    assert_eq!(report.fills[1].bar, 2);
+    assert!(
+        (report.fills[1].price - 105.0).abs() < 1e-9,
+        "{:?}",
+        report.fills[1]
+    );
+}
+
+#[test]
+fn a_trailing_stop_respects_the_volume_limit() {
+    let bars = [
+        FLAT,
+        FLAT,
+        FLAT,
+        (100.0, 100.0, 80.0, 82.0),
+        close_at(81.0),
+        FLAT,
+    ];
+    let sim = SimSettings {
+        max_participation_percent: Some(0.5),
+        ..trailing(10.0)
+    };
+    let report = run(&bars, &[(1, 1)], sim, NO_FEES);
+    assert_eq!(
+        fills_of(&report),
+        vec![
+            (1, Side::Buy, 100.0, 50.0),
+            (2, Side::Buy, 100.0, 50.0),
+            // Flat bars reach 100.5, so 10% under that.
+            (3, Side::Sell, 90.45, 50.0),
+            (3, Side::Sell, 82.0, 50.0),
+        ],
+    );
+}
+
+#[test]
+fn a_decision_log_says_what_happened_on_every_bar() {
+    let bars = [FLAT, FLAT, FLAT, FLAT];
+    let sim = SimSettings {
+        decision_log: true,
+        ..SimSettings::default()
+    };
+    let report = run(&bars, &[(1, 1), (2, 1)], sim, NO_FEES);
+    let rows: Vec<(Option<i8>, i8, f64, &str)> = report
+        .decisions
+        .iter()
+        .map(|row| (row.wanted, row.held, row.order, row.why))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (None, 0, 0.0, "nothing asked"),
+            (Some(1), 0, 100.0, "an order went out"),
+            (Some(1), 1, 0.0, "already there"),
+            (None, 1, 0.0, "nothing asked"),
+        ]
+    );
+    assert!(
+        run(&bars, &[(1, 1)], SimSettings::default(), NO_FEES)
+            .decisions
+            .is_empty()
+    );
+}
+
+#[test]
+fn the_decision_log_says_when_a_stop_filled() {
+    let bars = [FLAT, FLAT, (100.0, 101.0, 90.0, 92.0), FLAT];
+    let sim = SimSettings {
+        decision_log: true,
+        stop_loss_percent: Some(5.0),
+        ..SimSettings::default()
+    };
+    let report = run(&bars, &[(1, 1)], sim, NO_FEES);
+    assert_eq!(report.fills.len(), 2);
+    assert!(
+        report
+            .decisions
+            .iter()
+            .any(|row| row.why == "a stop filled"),
+        "{:?}",
+        report.decisions
+    );
+}

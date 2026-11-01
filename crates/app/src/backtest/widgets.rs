@@ -523,6 +523,8 @@ impl canvas::Program<PanelMessage> for Distribution<'_> {
 /// lost shaded: what a walk-forward comes to, and when.
 pub struct WalkChart<'a> {
     pub found: &'a WalkForward,
+    /// What the line it's held against is.
+    pub market: &'static str,
 }
 
 impl canvas::Program<PanelMessage> for WalkChart<'_> {
@@ -624,7 +626,7 @@ impl canvas::Program<PanelMessage> for WalkChart<'_> {
         }
         for (content, color, x) in [
             ("% made unseen", EQUITY, 12.0),
-            ("Market, held in full", MARKET, 116.0),
+            (self.market, MARKET, 116.0),
         ] {
             frame.fill_text(Text {
                 content: content.to_owned(),
@@ -659,6 +661,110 @@ impl canvas::Program<PanelMessage> for WalkChart<'_> {
                     pane.width,
                 );
             }
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+/// What was made in each hour or weekday, above or below a line.
+pub struct BarsByTime {
+    pub title: &'static str,
+    pub values: Vec<f64>,
+    pub labels: &'static [&'static str],
+}
+
+impl BarsByTime {
+    #[must_use]
+    pub fn hours(values: Vec<f64>) -> Self {
+        Self {
+            title: "Made by hour started, UTC",
+            values,
+            labels: &[
+                "0", "", "", "", "", "", "6", "", "", "", "", "", "12", "", "", "", "", "", "18",
+                "", "", "", "", "",
+            ],
+        }
+    }
+
+    #[must_use]
+    pub fn weekdays(values: Vec<f64>) -> Self {
+        Self {
+            title: "Made by weekday started",
+            values,
+            labels: &["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+        }
+    }
+}
+
+impl canvas::Program<PanelMessage> for BarsByTime {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Vec<canvas::Geometry> {
+        let size = bounds.size();
+        let mut frame = Frame::new(renderer, size);
+        frame.fill_text(Text {
+            content: self.title.to_owned(),
+            position: Point::new(0.0, 6.0),
+            color: theme::TEXT_MUTED,
+            size: theme::TEXT_SIZE.into(),
+            align_y: alignment::Vertical::Center,
+            ..Text::default()
+        });
+        let (top, bottom) = (14.0, size.height - 12.0);
+        let most = self
+            .values
+            .iter()
+            .fold(0.0_f64, |most, value| most.max(value.abs()));
+        let middle = (top + bottom) / 2.0;
+        let reach = (bottom - top) / 2.0;
+        let slot = size.width / self.values.len().max(1) as f32;
+        frame.fill_rectangle(
+            Point::new(0.0, middle),
+            Size::new(size.width, 1.0),
+            theme::GRID_MAJOR,
+        );
+        for (at, value) in self.values.iter().enumerate() {
+            let x = at as f32 * slot;
+            if most > 0.0 {
+                let height = (value.abs() / most) as f32 * reach;
+                let y = if *value >= 0.0 {
+                    middle - height
+                } else {
+                    middle
+                };
+                let color = if *value >= 0.0 {
+                    theme::UP
+                } else {
+                    theme::DOWN
+                };
+                frame.fill_rectangle(
+                    Point::new(x + 1.0, y),
+                    Size::new((slot - 2.0).max(1.0), height),
+                    color,
+                );
+            }
+            if let Some(label) = self.labels.get(at).filter(|label| !label.is_empty()) {
+                frame.fill_text(Text {
+                    content: (*label).to_owned(),
+                    position: Point::new(x + 1.0, size.height - 6.0),
+                    color: theme::TEXT_MUTED,
+                    size: 10.0.into(),
+                    align_y: alignment::Vertical::Center,
+                    ..Text::default()
+                });
+            }
+        }
+        if let Some(at) = cursor.position_in(bounds)
+            && let Some(value) = self.values.get((at.x / slot) as usize)
+        {
+            hover_label(&mut frame, format!("{value:+.2}"), at.x, at.y, size.width);
         }
         vec![frame.into_geometry()]
     }
@@ -714,7 +820,16 @@ impl canvas::Program<PanelMessage> for Lines<'_> {
     ) -> Vec<canvas::Geometry> {
         let size = bounds.size();
         let mut frame = Frame::new(renderer, size);
-        let count = self.times.len();
+        // With no times given, it's bars along, as far as the longest line goes.
+        let count = if self.times.is_empty() {
+            self.lines
+                .iter()
+                .map(|(_, line, _)| line.len())
+                .max()
+                .unwrap_or(0)
+        } else {
+            self.times.len()
+        };
         let values = self
             .lines
             .iter()
@@ -753,7 +868,10 @@ impl canvas::Program<PanelMessage> for Lines<'_> {
             .filter(|p| p.x < pane.width && p.y < pane.height)
             && let Some(index) = pane.bar_at(at.x, count)
         {
-            let when = DateTime::from_nanos(self.times[index]);
+            let when = self.times.get(index).map_or_else(String::new, |&time| {
+                let when = DateTime::from_nanos(time);
+                format!("{} {}: ", when.date(), when.time())
+            });
             let read: Vec<String> = self
                 .lines
                 .iter()
@@ -763,7 +881,7 @@ impl canvas::Program<PanelMessage> for Lines<'_> {
                 .collect();
             hover_label(
                 &mut frame,
-                format!("{} {}: {}", when.date(), when.time(), read.join(", ")),
+                format!("{when}{}", read.join(", ")),
                 at.x,
                 at.y,
                 pane.width,

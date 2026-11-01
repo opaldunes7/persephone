@@ -131,6 +131,92 @@ pub struct Market {
     warm_up: u64,
 }
 
+/// What's needed to load a portfolio's markets and build runs of it, off the app's thread.
+struct PortfolioInputs {
+    setup: backtest::portfolio::PortfolioSetup,
+    settings: backtest::Settings,
+    trade_from: UnixNanos,
+    markets: Vec<Market>,
+    loaded: Vec<Option<MarketData>>,
+    strategies: Vec<Option<backtest::portfolio::LegStrategy>>,
+    store: Option<Store>,
+}
+
+impl PortfolioInputs {
+    fn leg_markets(&self) -> Result<Vec<backtest::portfolio::LegMarket>, String> {
+        self.markets
+            .iter()
+            .zip(&self.loaded)
+            .map(|(market, loaded)| {
+                let found = match loaded {
+                    Some(found) => found.clone(),
+                    None => fetch(market, self.store.as_ref())
+                        .map_err(|error| format!("{}: {error}", market.symbol))?,
+                };
+                Ok(backtest::portfolio::LegMarket {
+                    instrument: found.instrument,
+                    bars: market.bars,
+                    candles: found.data.candles.clone(),
+                    fees: found.fees,
+                    funding: found.funding,
+                })
+            })
+            .collect()
+    }
+
+    fn request(&self) -> Result<persephone_engine::PortfolioRequest, String> {
+        backtest::portfolio::request(
+            &self.setup,
+            self.leg_markets()?,
+            self.strategies.clone(),
+            &self.settings,
+            self.trade_from,
+        )
+    }
+
+    /// A run of each value of what's varied.
+    fn candidates(
+        &self,
+        vary: backtest::portfolio_tests::Vary,
+        values: &[f64],
+    ) -> Result<Vec<backtest::portfolio_tests::Candidate>, String> {
+        let markets = self.leg_markets()?;
+        let name = vary.name(&self.setup);
+        values
+            .iter()
+            .map(|&value| {
+                let (mut setup, mut settings) = (self.setup.clone(), self.settings.clone());
+                vary.apply(value, &mut setup, &mut settings);
+                Ok(backtest::portfolio_tests::Candidate {
+                    label: format!("{value:.4}")
+                        .trim_end_matches('0')
+                        .trim_end_matches('.')
+                        .to_owned(),
+                    values: vec![(name.clone(), value)],
+                    request: backtest::portfolio::request(
+                        &setup,
+                        markets.clone(),
+                        self.strategies.clone(),
+                        &settings,
+                        self.trade_from,
+                    )?,
+                })
+            })
+            .collect()
+    }
+}
+
+fn portfolio_workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .saturating_sub(1)
+        .max(1)
+}
+
+fn panel_entries(settings: &backtest::Settings) -> usize {
+    settings.entries as usize
+}
+
 /// One market's bars plus what the engine needs to trade it.
 #[derive(Clone, Debug)]
 pub struct MarketData {
@@ -395,6 +481,21 @@ pub enum Message {
     /// This many of an optimization's backtests are done: run, count.
     OptimizeProgress(u64, usize),
     OptimizeDone(u64, Result<Arc<backtest::optimize::OptimizeResult>, String>),
+    PortfolioProgress(u64, usize),
+    SweepDone(
+        u64,
+        Result<Arc<Vec<backtest::portfolio_tests::SweepRow>>, String>,
+    ),
+    SweepProgress(u64, usize),
+    PortfolioShiftedDone(u64, Result<Arc<backtest::positions::RandomEntries>, String>),
+    PortfolioShiftedProgress(u64, usize),
+    PortfolioWalkDone(
+        u64,
+        Result<Arc<backtest::walk_forward::WalkForward>, String>,
+    ),
+    PortfolioWalkProgress(u64, usize),
+    ShiftedDone(u64, Result<Arc<backtest::positions::RandomEntries>, String>),
+    ShiftedProgress(u64, usize),
     PortfolioDone(u64, Result<Arc<backtest::portfolio::PortfolioRun>, String>),
     WeightsRead(TileId, Result<serde_json::Value, String>),
     WalkForwardProgress(u64, usize),
@@ -913,7 +1014,7 @@ impl Persephone {
                 }
                 _ => None,
             },
-            funding: market.funding.clone(),
+            funding: settings.funding(market.funding.clone()),
         };
         Some((strategy.generation, request))
     }
@@ -1166,6 +1267,51 @@ impl Persephone {
                         Ok(friction) => Costs::Done(friction),
                         Err(error) => Costs::Failed(error),
                     };
+                }
+            }
+            Message::SweepProgress(run, count) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.portfolio_sweep.progress(run, count);
+                }
+            }
+            Message::SweepDone(run, result) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.portfolio_sweep.finish(run, result);
+                }
+            }
+            Message::PortfolioShiftedProgress(run, count) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.portfolio_shifted.progress(run, count);
+                }
+            }
+            Message::PortfolioShiftedDone(run, result) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.portfolio_shifted.finish(run, result);
+                }
+            }
+            Message::PortfolioWalkProgress(run, count) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.portfolio_walk.progress(run, count);
+                }
+            }
+            Message::PortfolioWalkDone(run, result) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.portfolio_walk.finish(run, result);
+                }
+            }
+            Message::ShiftedProgress(run, count) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.shifted.progress(run, count);
+                }
+            }
+            Message::ShiftedDone(run, result) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.shifted.finish(run, result);
+                }
+            }
+            Message::PortfolioProgress(run, count) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.portfolio.progress(run, count);
                 }
             }
             Message::PortfolioDone(run, result) => {
@@ -1436,6 +1582,7 @@ impl Persephone {
         if sim.limit.is_some()
             || sim.stop_loss_percent.is_some()
             || sim.take_profit_percent.is_some()
+            || sim.trailing_stop_percent.is_some()
             || sim.max_participation_percent.is_some()
         {
             return Some(
@@ -3647,6 +3794,303 @@ impl Persephone {
         );
     }
 
+    /// Running again, whichever of the Portfolio test's views is showing.
+    fn update_panel_portfolio_again(&mut self) -> Task<Message> {
+        match self.panel.as_ref().map(|panel| panel.tests.portfolio_view) {
+            Some(backtest::PortfolioView::Sweep | backtest::PortfolioView::WalkForward) => {
+                self.run_portfolio_candidates()
+            }
+            Some(backtest::PortfolioView::Shifted) => self.run_portfolio_shifted(),
+            Some(backtest::PortfolioView::MonteCarlo) => self.run_portfolio_monte_carlo(),
+            _ => self.run_portfolio_test(),
+        }
+    }
+
+    /// What's needed to load the panel's portfolio and build runs of it.
+    fn portfolio_inputs(&mut self) -> Result<PortfolioInputs, String> {
+        use backtest::portfolio;
+        let id = self.panel.as_ref().ok_or("There's no panel.")?.tile;
+        if let Some(problem) = self.test_problem(id) {
+            return Err(problem.message);
+        }
+        let tile = self.tiles.get(&id).ok_or("There's no chart.")?;
+        let setup = tile.backtest.portfolio.clone();
+        let settings = tile.backtest.clone();
+        let chart = tile.market.clone();
+        let chart_strategy = setup
+            .use_chart_strategy
+            .then(|| self.backtest_request(id))
+            .flatten()
+            .map(|(_, request)| (request.strategy, request.plugin));
+        let mut strategies = Vec::with_capacity(setup.legs.len());
+        for leg in &setup.legs {
+            strategies.push(match (&leg.strategy, &chart_strategy) {
+                (Some(written), _) => Some(
+                    self.written_strategy(written)
+                        .map_err(|error| format!("{}: {error}", leg.symbol))?,
+                ),
+                (None, Some(found)) if setup.weights.is_none() => Some(found.clone()),
+                _ => None,
+            });
+        }
+        let market_of = |leg: &portfolio::LegSetup| Market {
+            symbol: leg.symbol.clone(),
+            local: leg.venue.clone().or_else(|| chart.local.clone()),
+            ..chart.clone()
+        };
+        let markets: Vec<Market> = setup.legs.iter().map(market_of).collect();
+        let loaded = markets
+            .iter()
+            .map(|market| match self.bars.get(market) {
+                Some(Bars::Ready(found)) => Some(found.clone()),
+                _ => None,
+            })
+            .collect();
+        Ok(PortfolioInputs {
+            setup,
+            settings,
+            trade_from: chart.span.map_or(0, |(from, _)| from),
+            markets,
+            loaded,
+            strategies,
+            store: self.store.clone(),
+        })
+    }
+
+    /// Goes through the sweep's values, into a table or a walk-forward, as the panel's showing.
+    fn run_portfolio_candidates(&mut self) -> Task<Message> {
+        use backtest::{TestRun, portfolio_tests};
+        let walking = self.panel.as_ref().is_some_and(|panel| {
+            panel.tests.portfolio_view == backtest::PortfolioView::WalkForward
+        });
+        let fail = |app: &mut Self, message: String| {
+            if let Some(panel) = app.panel.as_mut() {
+                if walking {
+                    panel.tests.portfolio_walk = TestRun::Failed(message);
+                } else {
+                    panel.tests.portfolio_sweep = TestRun::Failed(message);
+                }
+            }
+            Task::none()
+        };
+        let inputs = match self.portfolio_inputs() {
+            Ok(inputs) => inputs,
+            Err(message) => return fail(self, message),
+        };
+        let values = match portfolio_tests::range_of(
+            inputs.settings.sweep_min,
+            inputs.settings.sweep_max,
+            inputs.settings.sweep_step,
+        ) {
+            Ok(values) => values,
+            Err(message) => return fail(self, message),
+        };
+        let Some(panel) = self.panel.as_mut() else {
+            return Task::none();
+        };
+        let vary = panel.tests.portfolio_vary;
+        let (windows, ratio, warm_up) = (
+            inputs.settings.windows as usize,
+            inputs.settings.walk_ratio,
+            inputs.settings.warm_up_bars as usize,
+        );
+        let run = backtest::next_run();
+        let flag = Arc::new(AtomicBool::new(false));
+        let total = if walking {
+            windows * (values.len() + 1)
+        } else {
+            values.len()
+        };
+        if walking {
+            panel.tests.portfolio_walk = TestRun::Running {
+                run,
+                done: 0,
+                total,
+                stop: backtest::StopOnDrop(Arc::clone(&flag)),
+            };
+        } else {
+            panel.tests.portfolio_sweep = TestRun::Running {
+                run,
+                done: 0,
+                total,
+                stop: backtest::StopOnDrop(Arc::clone(&flag)),
+            };
+        }
+        let stop = Arc::clone(&flag);
+        let build = move || inputs.candidates(vary, &values);
+        let workers = portfolio_workers();
+        if walking {
+            batch_task(
+                run,
+                move |progress| {
+                    portfolio_tests::WalkJob {
+                        candidates: build()?,
+                        windows,
+                        ratio,
+                        warm_up,
+                        pick_by: portfolio_tests::PickBy::Return,
+                        workers,
+                        stop,
+                    }
+                    .run(&|count| progress(count))
+                },
+                Message::PortfolioWalkProgress,
+                Message::PortfolioWalkDone,
+            )
+        } else {
+            batch_task(
+                run,
+                move |progress| {
+                    portfolio_tests::sweep(&build()?, workers, &stop, &|count| progress(count))
+                },
+                Message::SweepProgress,
+                Message::SweepDone,
+            )
+        }
+    }
+
+    /// The last portfolio run's book at other times.
+    fn run_portfolio_shifted(&mut self) -> Task<Message> {
+        use backtest::{TestRun, portfolio_tests};
+        let Some(found) = self
+            .panel
+            .as_ref()
+            .and_then(|panel| match &panel.tests.portfolio {
+                TestRun::Done(found) => Some(Arc::clone(found)),
+                _ => None,
+            })
+        else {
+            if let Some(panel) = self.panel.as_mut() {
+                panel.tests.portfolio_shifted =
+                    TestRun::Failed("Run the portfolio first, then this moves its book.".into());
+            }
+            return Task::none();
+        };
+        let inputs = match self.portfolio_inputs() {
+            Ok(inputs) => inputs,
+            Err(message) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.portfolio_shifted = TestRun::Failed(message);
+                }
+                return Task::none();
+            }
+        };
+        let Some(panel) = self.panel.as_mut() else {
+            return Task::none();
+        };
+        let run = backtest::next_run();
+        let runs = panel_entries(&inputs.settings);
+        let seed = panel.tests.seed;
+        let flag = Arc::new(AtomicBool::new(false));
+        panel.tests.portfolio_shifted = TestRun::Running {
+            run,
+            done: 0,
+            total: runs,
+            stop: backtest::StopOnDrop(Arc::clone(&flag)),
+        };
+        batch_task(
+            run,
+            move |progress| {
+                portfolio_tests::ShiftedPortfolioJob {
+                    report: Arc::new(found.report.clone()),
+                    request: inputs.request()?,
+                    from_index: found.from_index,
+                    runs,
+                    seed,
+                    workers: portfolio_workers(),
+                    stop: flag,
+                }
+                .run(&|count| progress(count))
+            },
+            Message::PortfolioShiftedProgress,
+            Message::PortfolioShiftedDone,
+        )
+    }
+
+    /// The last portfolio run's returns, drawn again in blocks.
+    fn run_portfolio_monte_carlo(&mut self) -> Task<Message> {
+        use backtest::{TestRun, portfolio_tests};
+        let Some(id) = self.panel.as_ref().map(|panel| panel.tile) else {
+            return Task::none();
+        };
+        let Some(settings) = self.tiles.get(&id).map(|tile| tile.backtest.clone()) else {
+            return Task::none();
+        };
+        let Some(panel) = self.panel.as_mut() else {
+            return Task::none();
+        };
+        let TestRun::Done(found) = &panel.tests.portfolio else {
+            panel.tests.portfolio_monte_carlo =
+                TestRun::Failed("Run the portfolio first, then this draws its returns.".into());
+            return Task::none();
+        };
+        panel.tests.portfolio_monte_carlo = match portfolio_tests::monte_carlo(
+            &found.report,
+            found.from_index,
+            settings.runs as usize,
+            settings.portfolio_block_bars as usize,
+            settings.ruin / 100.0,
+            panel.tests.seed,
+        ) {
+            Ok(drawn) => TestRun::Done(Arc::new(drawn)),
+            Err(message) => TestRun::Failed(message),
+        };
+        Task::none()
+    }
+
+    /// The backtest's own timing moved along, for one market.
+    fn run_shifted(&mut self) -> Task<Message> {
+        use backtest::{TestRun, portfolio_tests};
+        let Some(id) = self.panel.as_ref().map(|panel| panel.tile) else {
+            return Task::none();
+        };
+        let Some((_, request)) = self.backtest_request(id) else {
+            return Task::none();
+        };
+        let Some(tile) = self.tiles.get(&id) else {
+            return Task::none();
+        };
+        let Some(Run::Done(report)) = tile.strategy.as_ref().map(|strategy| &strategy.run) else {
+            if let Some(panel) = self.panel.as_mut() {
+                panel.tests.shifted = TestRun::Failed("Waiting for the backtest.".into());
+            }
+            return Task::none();
+        };
+        let report = Arc::clone(report);
+        let from_index = span_start(&request.candles, tile.market.span);
+        let runs = panel_entries(&tile.backtest);
+        let workers = self.test_workers(&request.strategy);
+        let Some(panel) = self.panel.as_mut() else {
+            return Task::none();
+        };
+        let seed = panel.tests.seed;
+        let run = backtest::next_run();
+        let flag = Arc::new(AtomicBool::new(false));
+        panel.tests.shifted = TestRun::Running {
+            run,
+            done: 0,
+            total: runs,
+            stop: backtest::StopOnDrop(Arc::clone(&flag)),
+        };
+        batch_task(
+            run,
+            move |progress| {
+                portfolio_tests::ShiftedJob {
+                    report,
+                    request,
+                    from_index,
+                    runs,
+                    seed,
+                    workers,
+                    stop: flag,
+                }
+                .run(&|count| progress(count))
+            },
+            Message::ShiftedProgress,
+            Message::ShiftedDone,
+        )
+    }
+
     /// Loads the markets and runs the portfolio set up on the panel's chart.
     fn run_portfolio_test(&mut self) -> Task<Message> {
         use backtest::{TestRun, portfolio};
@@ -3728,9 +4172,10 @@ impl Persephone {
             total: setup.legs.len(),
             stop: backtest::StopOnDrop(Arc::new(AtomicBool::new(false))),
         };
-        let go = move || {
+        let go = move |progress: &(dyn Fn(usize) + Sync)| {
             let mut markets = Vec::with_capacity(setup.legs.len());
-            for (leg, loaded) in setup.legs.iter().zip(loaded) {
+            for (at, (leg, loaded)) in setup.legs.iter().zip(loaded).enumerate() {
+                progress(at);
                 let market = Market {
                     symbol: leg.symbol.clone(),
                     local: leg.venue.clone().or_else(|| chart.local.clone()),
@@ -3763,11 +4208,9 @@ impl Persephone {
                     });
                 }
             }
-            Ok(Arc::new(found))
+            Ok(found)
         };
-        Task::perform(on_thread(go), move |result| {
-            Message::PortfolioDone(run, result)
-        })
+        batch_task(run, go, Message::PortfolioProgress, Message::PortfolioDone)
     }
 
     fn run_walk_forward(&mut self) -> Task<Message> {
@@ -3854,7 +4297,10 @@ impl Persephone {
             && let StrategyKind::Plugin(plugin) = &strategy.spec.kind
             && let Some(logic) = self.lab_logic.get(plugin)
             && let Some(warning) = figures::look_back_warning(
-                logic.look_back(strategy.spec.own_params()),
+                logic.look_back_on(
+                    strategy.spec.own_params(),
+                    tile.market.bars.timeframe().map_or(0, Timeframe::nanos),
+                ),
                 from_index,
                 candles.len(),
             )
@@ -4379,6 +4825,12 @@ impl Persephone {
                 panel.calendar.shown = shown;
                 panel.limits_shown = false;
             }
+            P::ShowDecisions(shown) => {
+                panel.decisions_shown = shown;
+                if shown {
+                    panel.limits_shown = false;
+                }
+            }
             P::ShowLimits(shown) => {
                 panel.limits_shown = shown;
                 panel.calendar.shown = false;
@@ -4451,7 +4903,7 @@ impl Persephone {
                     Some(backtest::TestKind::Optimize) => self.run_optimize(),
                     Some(backtest::TestKind::WalkForward) => self.run_walk_forward(),
                     Some(backtest::TestKind::RandomEntries) => self.run_random_entries(),
-                    Some(backtest::TestKind::Portfolio) => self.run_portfolio_test(),
+                    Some(backtest::TestKind::Portfolio) => self.update_panel_portfolio_again(),
                     _ => self.draw_monte_carlo(),
                 };
             }
@@ -4526,7 +4978,26 @@ impl Persephone {
                 if !self.apply_typed(id) {
                     return Task::none();
                 }
-                return self.run_portfolio_test();
+                return self.update_panel_portfolio_again();
+            }
+            P::PortfolioView(view) => panel.tests.portfolio_view = view,
+            P::PortfolioVary(choice) => panel.tests.portfolio_vary = choice.vary,
+            P::EntriesShifted(on) => panel.tests.entries_shifted = on,
+            P::RunShifted => {
+                if !self.apply_typed(id) {
+                    return Task::none();
+                }
+                return self.run_shifted();
+            }
+            P::StopShifted => {
+                panel.tests.shifted = backtest::TestRun::Idle;
+                return Task::none();
+            }
+            P::StopPortfolioTest => {
+                panel.tests.portfolio_sweep = backtest::TestRun::Idle;
+                panel.tests.portfolio_shifted = backtest::TestRun::Idle;
+                panel.tests.portfolio_walk = backtest::TestRun::Idle;
+                return Task::none();
             }
             P::StopPortfolio => {
                 panel.tests.portfolio = backtest::TestRun::Idle;
@@ -4748,6 +5219,23 @@ impl Persephone {
                 match tile.backtest.set(field, &text) {
                     Ok(()) => {
                         panel.inputs.retain(|(f, _)| *f != field);
+                        // What the Portfolio test's views read at Run, and no run depends on.
+                        if tile.backtest.test == backtest::TestKind::Portfolio
+                            && matches!(
+                                field,
+                                backtest::Field::Entries
+                                    | backtest::Field::Runs
+                                    | backtest::Field::Ruin
+                                    | backtest::Field::Windows
+                                    | backtest::Field::SweepMin
+                                    | backtest::Field::SweepMax
+                                    | backtest::Field::SweepStep
+                                    | backtest::Field::PortfolioBlock
+                            )
+                        {
+                            self.save();
+                            return Task::none();
+                        }
                         // The tests' own settings don't change the backtest they start from.
                         match field {
                             backtest::Field::Runs | backtest::Field::Ruin => {

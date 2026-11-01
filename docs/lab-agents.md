@@ -95,6 +95,8 @@ How a backtest works, which decides what its numbers mean.
   isn't realistic.
 - **`impact_percent`** is a rough assumption: market orders fill worse by it times the square root of the order's share of its bar's volume.
   `warnings` says when an order's over a tenth of its bar, where fills are fiction anyway.
+- **`trailing_stop_percent`** rests like `stop_loss_percent`, but follows the best price since entry, moved at each close, so it only tightens. Inside a bar it stays where the last close left it. If a close is already past where it would go, the
+  position goes at that close. It can't go with `fill_timing: "next_open"`, and portfolios refuse it. Logic trees can still write their own with `high_since_entry`, checked at closes.
 - **`max_participation_percent`** limits an order to that share of the volume of the bar just closed. What's left goes out at the next
   closes, at their prices, so `orders_worked`, `bars_to_fill_average`, `bars_to_fill_longest` and `unfilled_at_end` say how that went,
   and `warnings` says if a position never got there. A different wish replaces what's still to go and works from what's held. A resting
@@ -133,9 +135,9 @@ A strategy is `{"builtin": id}`, `{"plugin": id}`, `{"logic": tree}` or `{"posit
   the bar it was worked out from. With a table, a weight of 2 is twice the account, and needs `leverage` to match.
 - **Rebalancing** takes the whole book back to the weights `every_bars`, or when any leg is `drift_percent` points of the account away, skipping
   trades worth under `min_trade_value`. Rebalanced and table runs size from the account as it is now. Without either a leg stays as it was sized.
-  With costs off it can trade at other times, so on a run rebalancing on drift `gross_return` less `net_return` isn't just the costs:
+  With costs off it trades other sizes, and on drift at other times, so on these and on table runs `gross_return` less `net_return` isn't just the costs:
   `total_costs_paid` is what was really paid.
-- **Cash below zero** is free unless `cash_interest_percent_per_year` is set, which flatters weights adding up to over 1. `interest_paid` says what
+- **Cash below zero** on what's bought outright is free unless `cash_interest_percent_per_year` is set (perpetuals aren't bought with cash, and pay funding instead), which flatters weights adding up to over 1. `interest_paid` says what
   it came to, and it's in `total_costs_paid`. `warnings` says if the book needed well over the account in margin.
 - **A row before `from`** takes effect at the span's first bar, the last such row winning. Rows out of order are put in order. A row between
   closes waits for the next one. Rows after the last bar do nothing, and `warnings` says so.
@@ -150,15 +152,22 @@ A strategy is `{"builtin": id}`, `{"plugin": id}`, `{"logic": tree}` or `{"posit
   cut sooner than it really would. `warnings` says if the book ever needed more margin than the account had, which isn't refused here but a venue wouldn't allow. `peak_margin_use` and `closest_to_liquidation` say how near it came, the latter as a multiple of what was
   needed, so 1 is liquidated. Exchanges' discounts for hedged books aren't modelled, so a hedge gets no margin relief: those are venue-specific
   stress tables, and a rough version would flatter delta-neutral books.
+- **By time:** `by_hour` and `by_weekday` in a summary are what trades made by the UTC hour and weekday (Monday first) they started. They add up to everything trades made, and the app draws them in the Calendar view.
 - **Reading one.** `get_portfolio` has the summary, a table by leg, and `correlation`, which is of the markets' own returns, whichever way they're held, so a long and a short of markets moving together shows near +1. `get_portfolio_series` has equity, equal shares held,
   exposure, and each leg's value and what it's made at each moment. `get_portfolio_fills` has one leg's fills. `benchmark_return` is an equal
-  share of the capital held in each market from its first bar, with no funding taken off. `list_runs` and `compare_runs` include them, with `kind: "portfolio"`. The app saves its portfolio runs in the same place, so these tools read those too, and its Saved runs list shows these.
+  share of the capital held in each market from its first bar, with no funding taken off, and `benchmark_after_funding` with it taken off, which `excess_return` is
+  against. `weights_held_return` holds the weights asked for without rebalancing, funding paid, which is the fairer comparison for a long and short book. It's null when
+  strategies or a table that switches decide the positions, as there's then no one set of weights to hold. `list_runs` and `compare_runs` include them, with `kind: "portfolio"`. The app saves its portfolio runs in the same place, so these tools read those too, and its Saved runs list shows these.
 - **`fill_timing: "next_open"`** works as on one market: an order decided at a close goes at the next bar's open, with each leg at its own open at
   the same moment. A leg with no next bar waits for the close before one it has, as its last price isn't one anyone could trade at. Liquidation
   is then at the next open, gap and all, so an account can end below zero. This is the fair way to run a weight table: the delay between
   working out a weight and trading it often takes much of an edge.
+- **Is it luck?** `run_shifted` takes any run, of one market or a portfolio, and moves its positions or weights along the span, wrapping round, so what's held and for how long stay
+  the same and only the timing goes. `share_matching_return` near 0.5 means the timing added nothing. For a portfolio, its book becomes a table of weights, and `actual_return` there is that table run with no shift, as sizing
+  from weights isn't quite how a strategy sizes. A table run is already a table, so there it's the run itself. `run_portfolio_monte_carlo` draws the account's returns again in blocks along the timeline, keeping how the markets moved together. It doesn't run fills or costs again.
+  `run_portfolio_walk_forward` picks among `candidates` on each stretch and trades the pick on the unseen one after. A candidate of `{}` weights stays flat, and is picked when all else loses. In its answer `buy_and_hold_return` is equal shares of the markets, with no funding taken off. It and `unseen_return` add up each window from the same capital, and `unseen_compounded` and `buy_and_hold_compounded` run them one after another.
 - **What it doesn't do yet.** Market orders only: `limit`, stops and targets are for single
-  markets, and are refused. `precision: "high"` does nothing here, as portfolios fill on bars. Optimize, Monte Carlo, walk-forward and random entries don't take a portfolio, so
+  markets, and are refused. `precision: "high"` does nothing here, as portfolios fill on bars. `run_optimize`, `run_monte_carlo`, `run_walk_forward` and `run_random_entries` don't take a portfolio, so
   sweep with `run_portfolios`. A plugin can be a leg or write a weight table, but can't see several markets at once. All legs must be quoted in
   one currency and share time bars. Paper and live trading don't run them.
 - **A check on all of this:** one leg at weight 1 with its strategy comes out exactly as `run_backtest` does: its fills, equity, costs and figures.
@@ -184,9 +193,10 @@ Strategies as JSON, tested straight away with nothing to compile. `validate_logi
 - **Values:** a number; a bar's `open`, `high`, `low`, `close` or `volume`; a parameter as `"$name"`, from
   `params`; or an object below.
 - **Indicators:** `{"sma": {"of": value, "length": n}}`, and the same for `ema`, `rsi` (0 to 100),
-  `highest`, `lowest` (both include this bar), `roc` (percent change over n bars) and `zscore`. `of` is the
+  `highest`, `lowest` (both include this bar), `roc` (percent change over n bars), `zscore` and `stddev` (both over the window, as a population). `of` is the
   close unless given, and can be another indicator. `atr` only takes `length`.
-- **Other values:** `{"ago": {"of": value, "bars": n}}`, and `{"add": [a, b]}`, likewise `sub`, `mul`, `div`.
+- **Other values:** `{"ago": {"of": value, "bars": n}}`, `{"add": [a, b]}`, likewise `sub`, `mul`, `div`, `min` and `max`, and `{"abs": value}`.
+- **A longer timeframe:** `{"on": {"timeframe": "1d", "value": value}}` works the value out on bars of that timeframe, built from yours. A longer bar is only seen once it's over: at the close of your bar that ends it, or if that's missing, when the next bar comes. So `{"on": {"timeframe": "1d", "value": "close"}}` is yesterday's close all through today. Lengths inside count its own bars, so `sma` of 20 on `1d` needs 20 days, which `warm_up_bars` has to cover.
 - **Comparisons:** `gt`, `lt`, `ge`, `le`, `crosses_above`, `crosses_below`, each `[a, b]`.
 - **Combinations:** `and` and `or` take a list; `not` takes one rule.
 - **Not ready yet:** a value without enough history makes any comparison on it false.
@@ -274,6 +284,8 @@ an error.
 | `commission` | `{"percent": 0.1}` of each fill, `{"per-order": 1.5}` flat, or `{"rates": {"maker": 0.02, "taker": 0.05}}`, instead of the market's fee. A maker's can be below zero, for a rebate |
 | `limit` | `{"offset_percent": 0.05, "expires_bars": 3, "through_percent": 0.01}`: send orders as limits, `through_percent` being optional. See `backtests` |
 | `stop_loss_percent` | A real stop this far from the entry |
+| `trailing_stop_percent` | A real stop this far from the best price since entry, moved at each close. With `stop_loss_percent` too, whichever is nearer goes first. See `backtests` |
+| `decision_log` | `true` keeps a row for each bar, read with `get_decisions`: what was asked, what was held, what the rules made of it, and why no order went out |
 | `take_profit_percent` | A real target this far from the entry |
 | `borrow_percent_per_year` | What borrowing costs a short |
 | `impact_percent` | How far a market order fills worse at all of its bar's volume |
@@ -289,6 +301,9 @@ an error.
 | `warm_up_bars` | How many bars before `from` strategies warm up on. Default 500. Raise it for longer look-backs |
 | `hold_out_percent` | How much of the span an optimization with `hold_out` picks on. Default 70 |
 | `walk_ratio` | How many times longer than its unseen stretch a walk-forward window picks on. Default 3. `train_ratio` on the call wins |
+| `no_costs` | `true` means nothing to pay at all: no fees, funding, slippage, spread, impact, borrowing or interest, whatever else says. Unlike `stock: false`, it takes off a market's own fees and funding |
+| `sweep_min`, `sweep_max`, `sweep_step` | What the app's Portfolio Sweep and Walk-forward go through. Calls to `run_portfolios` and `run_portfolio_walk_forward` give their own setups |
+| `portfolio_block_bars` | How long a block is in the app's Portfolio Monte Carlo. `block_bars` on `run_portfolio_monte_carlo` is the same for calls |
 | `portfolio` | What the app's Portfolio test trades: legs, weights and rebalancing, as `run_portfolio` takes them. Calls to `run_portfolio` don't read it |
 | `slippage` | Ticks every market order fills worse. A tick is `10^-price_precision`, from `get_instrument` |
 | `slippage_percent` | Percent of the price every market order fills worse, on top of any in ticks: `0.01` is 1 basis point |
@@ -571,6 +586,10 @@ imports. API keys, what AI models a plugin may use, plugins' code and market dat
 | Random entries: both charts | `run_random_entries`' `return_chart` and `fall_chart` |
 | Portfolio: figures and the table by market | `get_portfolio` |
 | Portfolio: the account and exposure charts | `get_portfolio_series` |
+| Portfolio: Sweep | `run_portfolios` |
+| Portfolio: Shifted, and Random entries' Shifted | `run_shifted`'s `return_chart` and `fall_chart` |
+| Portfolio: Monte Carlo | `run_portfolio_monte_carlo` |
+| Portfolio: Walk-forward | `run_portfolio_walk_forward` |
 | A parameter sweep | `run_optimize`, or `run_backtests` across the values |
 | Export and Import buttons | `export_state`, `import_state` |
 | Backtest: Limits view, each order and how they compare | `get_limit_orders`, `summary.limit_summary` |

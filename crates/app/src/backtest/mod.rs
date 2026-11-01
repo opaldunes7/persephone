@@ -31,7 +31,8 @@ use persephone_engine::BacktestReport;
 use persephone_tiling::TileId;
 
 pub use persephone_research::{
-    Field, RunColumn, WARM_UP_BARS, calendar, figures, optimize, portfolio, positions, robustness,
+    Field, RunColumn, WARM_UP_BARS, calendar, figures, optimize, portfolio, portfolio_tests,
+    positions, robustness,
     settings::{
         self, BlockLength, Commission, Edit, FillTiming, OneWay, OptimizeSettings, Precision,
         ScoreBy, Section, SessionRule, Settings, TestKind, Variable, parse_time, time_text,
@@ -80,6 +81,7 @@ pub struct Panel {
     pub export_runs: bool,
     /// Showing each limit order in the backtest's pane.
     pub limits_shown: bool,
+    pub decisions_shown: bool,
     /// How the last export or import went, and whether it failed.
     pub notice: Option<(String, bool)>,
     /// The search for plugins to add: every kind not already on.
@@ -108,6 +110,16 @@ pub struct Tests {
     /// The leg whose fills show, and the runs saved to go back to.
     pub portfolio_leg: usize,
     pub saved_portfolios: Vec<portfolio::SavedPortfolio>,
+    /// Which of the Portfolio test's views is showing, and what its sweep varies.
+    pub portfolio_view: PortfolioView,
+    pub portfolio_vary: portfolio_tests::Vary,
+    pub portfolio_sweep: TestRun<Vec<portfolio_tests::SweepRow>>,
+    pub portfolio_shifted: TestRun<positions::RandomEntries>,
+    pub portfolio_monte_carlo: TestRun<portfolio_tests::PortfolioMonteCarlo>,
+    pub portfolio_walk: TestRun<walk_forward::WalkForward>,
+    /// Random entries moves the backtest's own timing rather than placing its trades afresh.
+    pub entries_shifted: bool,
+    pub shifted: TestRun<positions::RandomEntries>,
     /// The strategy's parameters before a result was applied, to go back to.
     pub original: Option<Vec<f64>>,
     /// The line picked on a Monte Carlo or Random blocks fan; one past the last for the backtest.
@@ -139,6 +151,14 @@ impl Default for Tests {
             portfolio: TestRun::Idle,
             portfolio_leg: 0,
             saved_portfolios: Vec::new(),
+            portfolio_view: PortfolioView::Run,
+            portfolio_vary: portfolio_tests::Vary::Scale,
+            portfolio_sweep: TestRun::Idle,
+            portfolio_shifted: TestRun::Idle,
+            portfolio_monte_carlo: TestRun::Idle,
+            portfolio_walk: TestRun::Idle,
+            entries_shifted: false,
+            shifted: TestRun::Idle,
             original: None,
             line: None,
             zoom: None,
@@ -231,6 +251,11 @@ impl Tests {
         self.walk_forward = TestRun::Idle;
         self.random_entries = TestRun::Idle;
         self.portfolio = TestRun::Idle;
+        self.portfolio_sweep = TestRun::Idle;
+        self.portfolio_shifted = TestRun::Idle;
+        self.portfolio_monte_carlo = TestRun::Idle;
+        self.portfolio_walk = TestRun::Idle;
+        self.shifted = TestRun::Idle;
         self.original = None;
     }
 
@@ -295,6 +320,7 @@ impl Panel {
             settings_height: 0.0,
             export_runs: false,
             limits_shown: false,
+            decisions_shown: false,
             notice: None,
             plugin_search: plugin_search(settings),
             tests: Tests::default(),
@@ -410,6 +436,12 @@ pub enum PanelMessage {
     StopPortfolio,
     PickWeights,
     LegStrategy(usize, LegChoice),
+    PortfolioView(PortfolioView),
+    PortfolioVary(VaryChoice),
+    EntriesShifted(bool),
+    RunShifted,
+    StopShifted,
+    StopPortfolioTest,
     PortfolioLeg(usize),
     ListPortfolios,
     OpenPortfolio(portfolio::SavedPortfolio),
@@ -449,6 +481,7 @@ pub enum PanelMessage {
     ShowCalendar(bool),
     /// Show each limit order rather than the equity curve or calendar.
     ShowLimits(bool),
+    ShowDecisions(bool),
     CalendarLevel(calendar::Level),
     /// Move the playhead to just before this trade opened, by its place in the backtest's trades.
     ReplayTrade(usize),
@@ -464,6 +497,30 @@ pub struct StrategyChoice {
 impl fmt::Display for StrategyChoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.name)
+    }
+}
+
+/// Which of the Portfolio test's views is showing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PortfolioView {
+    #[default]
+    Run,
+    Sweep,
+    Shifted,
+    MonteCarlo,
+    WalkForward,
+}
+
+/// What a portfolio's sweep can vary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VaryChoice {
+    pub label: String,
+    pub vary: portfolio_tests::Vary,
+}
+
+impl fmt::Display for VaryChoice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.label)
     }
 }
 

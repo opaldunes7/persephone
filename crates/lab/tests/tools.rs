@@ -150,6 +150,14 @@ fn calls(lab: &Arc<Lab>, dir: &std::path::Path) -> Vec<(&'static str, Value)> {
     fs::write(dir.join("drawings.ron"), "{\"BTCUSDT\": [Line((a: 1.5))]}").unwrap();
     let basket = json!({"legs": [{"symbol": "BTCUSDT", "venue": "TEST", "weight": 0.5}], "bars": "1h", "wait_seconds": 120});
     let portfolio = lab.dispatch("run_portfolio", &basket).unwrap();
+    let logged = lab
+        .dispatch(
+            "run_backtest",
+            &with(
+                json!({"strategy": ema(), "settings": {"decision_log": true}, "wait_seconds": 120}),
+            ),
+        )
+        .unwrap();
     let portfolio_id = portfolio["run_id"].clone();
     vec![
         ("run_portfolio", basket.clone()),
@@ -157,6 +165,23 @@ fn calls(lab: &Arc<Lab>, dir: &std::path::Path) -> Vec<(&'static str, Value)> {
             "run_portfolios",
             json!({"runs": [basket], "wait_seconds": 120}),
         ),
+        (
+            "run_shifted",
+            json!({"run_id": portfolio_id, "runs": 3, "wait_seconds": 120}),
+        ),
+        (
+            "run_portfolio_monte_carlo",
+            json!({"run_id": portfolio_id, "runs": 10, "wait_seconds": 60}),
+        ),
+        (
+            "run_portfolio_walk_forward",
+            json!({
+                "candidates": [{"legs": [{"symbol": "BTCUSDT", "venue": "TEST", "weight": 0.5}], "bars": "1h"}],
+                "windows": 2,
+                "wait_seconds": 120,
+            }),
+        ),
+        ("get_decisions", json!({"run_id": logged["run_id"]})),
         ("get_portfolio", json!({"run_id": portfolio_id})),
         (
             "get_portfolio_series",
@@ -4369,4 +4394,252 @@ fn a_run_saved_outside_lab_is_read_by_lab_and_lab_s_by_anyone() {
         .unwrap();
     assert_eq!(read["summary"]["label"], "App");
     assert_eq!(read["legs"][1]["symbol"], "BBBUSD");
+}
+
+#[test]
+fn no_costs_takes_off_everything_and_excess_and_by_time_add_up() {
+    let (lab, _dir) = lab();
+    let run = |settings: Value| {
+        lab.dispatch(
+            "run_backtest",
+            &with(json!({"strategy": ema(), "settings": settings, "wait_seconds": 120})),
+        )
+        .unwrap()
+    };
+    let costly = json!({
+        "commission": {"on": true, "value": {"percent": 0.1}},
+        "slippage_percent": {"on": true, "value": 0.05},
+        "range_slippage_percent": {"on": true, "value": 1},
+    });
+    let paying = run(costly.clone());
+    let mut free = costly;
+    free["no_costs"] = json!(true);
+    let free = run(free);
+    let plain = run(json!({"commission": {"on": true, "value": {"percent": 0}}}));
+    let net = |run: &Value| run["summary"]["net_return"].as_f64().unwrap();
+    assert!(net(&paying) < net(&free));
+    assert_eq!(free["summary"]["fees"].as_f64().unwrap(), 0.0);
+    assert!((net(&free) - net(&plain)).abs() < 1e-9);
+
+    let summary = &paying["summary"];
+    let excess = summary["excess_return"].as_f64().unwrap();
+    let market = summary["benchmark"]["return_after_funding"]
+        .as_f64()
+        .unwrap();
+    assert!((excess - (net(&paying) - market)).abs() < 1e-9);
+    let made: f64 =
+        summary["average_trade"].as_f64().unwrap() * summary["trades"].as_f64().unwrap();
+    for times in ["by_hour", "by_weekday"] {
+        let sum: f64 = summary[times]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .sum();
+        assert!((sum - made).abs() < 1e-6, "{times}: {sum} and {made}");
+    }
+    assert!(
+        lab.dispatch(
+            "run_backtests",
+            &json!({"runs": [with(json!({"strategy": ema()}))], "wait_seconds": 120})
+        )
+        .unwrap()["columns"]
+            .to_string()
+            .contains("excess_return")
+    );
+}
+
+#[test]
+fn a_portfolio_says_what_holding_its_weights_would_have_done() {
+    let lab = two_hand_markets();
+    let run = lab
+        .dispatch(
+            "run_portfolio",
+            &pair(json!({"rebalance": {"every_bars": 1}})),
+        )
+        .unwrap();
+    let summary = &run["summary"];
+    // Long A from 100 to 147, short B from 50 to 45.3, half each, with no funding here.
+    let held = summary["weights_held_return"].as_f64().unwrap();
+    let expected = 0.5 * (147.0 / 100.0 - 1.0) - 0.5 * (45.3 / 50.0 - 1.0);
+    assert!((held - expected).abs() < 1e-3, "{held} and {expected}");
+    assert_eq!(
+        summary["benchmark_after_funding"],
+        summary["benchmark_return"]
+    );
+    assert_eq!(summary["by_hour"].as_array().unwrap().len(), 24);
+
+    let by_strategy = lab
+        .dispatch(
+            "run_portfolio",
+            &json!({"legs": [{"symbol": "AAAUSD", "venue": "HAND", "weight": 1.0, "strategy": ema()}], "bars": "1h", "wait_seconds": 120}),
+        )
+        .unwrap();
+    assert!(by_strategy["summary"]["weights_held_return"].is_null());
+}
+
+#[test]
+fn nothing_is_said_to_be_downloading_once_it_is_done() {
+    let (lab, _source) = binance_lab();
+    lab.dispatch(
+        "get_bars",
+        &json!({"symbol": "BTCUSDT", "bars": "1h", "from": "2024-02-01", "to": "2024-02-03"}),
+    )
+    .unwrap();
+    assert_eq!(lab.cache.fetching(), None);
+}
+
+#[test]
+fn a_run_of_either_kind_can_be_shifted_and_a_portfolio_drawn_and_walked() {
+    let (lab, _dir) = lab();
+    let single = backtest(&lab, &ema());
+    let moved = lab
+        .dispatch(
+            "run_shifted",
+            &json!({"run_id": single["run_id"], "runs": 8, "wait_seconds": 120}),
+        )
+        .unwrap();
+    assert_eq!(moved["runs"], 8, "{moved}");
+    assert!(moved["share_matching_return"].as_f64().unwrap() <= 1.0);
+    let actual = moved["actual_return"].as_f64().unwrap();
+    assert!((actual - single["summary"]["net_return"].as_f64().unwrap()).abs() < 1e-9);
+
+    let lab = two_hand_markets();
+    let run = lab.dispatch("run_portfolio", &pair(json!({}))).unwrap();
+    let id = run["run_id"].clone();
+    let moved = lab
+        .dispatch(
+            "run_shifted",
+            &json!({"run_id": id, "runs": 6, "wait_seconds": 120}),
+        )
+        .unwrap();
+    assert_eq!(moved["runs"], 6, "{moved}");
+    assert!(moved["return_chart"]["counts"].is_array());
+
+    let drawn = lab
+        .dispatch(
+            "run_portfolio_monte_carlo",
+            &json!({"run_id": id, "runs": 50, "block_bars": 5, "seed": 1, "wait_seconds": 60}),
+        )
+        .unwrap();
+    assert_eq!(drawn["runs"], 50);
+    assert_eq!(drawn["block_bars"], 5);
+    assert!(drawn["low_line"].as_array().unwrap().len() > 1);
+    assert!(drawn["lines"].is_null());
+
+    let legs = |weight: f64| json!([{"symbol": "AAAUSD", "venue": "HAND", "weight": weight}]);
+    let walked = lab
+        .dispatch(
+            "run_portfolio_walk_forward",
+            &json!({
+                "candidates": [
+                    {"legs": legs(0.5), "label": "long"},
+                    {"legs": legs(-0.5), "label": "short"},
+                ],
+                "defaults": {"bars": "1h"},
+                "windows": 2,
+                "train_ratio": 1,
+                "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    // AAA only rises, so long's what's picked.
+    assert_eq!(walked["windows"][0]["label"], "long", "{walked}");
+    assert_eq!(walked["profitable_windows"], 2);
+
+    let wrong = lab
+        .dispatch(
+            "run_portfolio_walk_forward",
+            &json!({"candidates": [], "wait_seconds": 60}),
+        )
+        .unwrap_err();
+    assert!(wrong.contains("candidates"), "{wrong}");
+}
+
+#[test]
+fn decisions_and_a_trailing_stop_work_from_settings() {
+    let (lab, _dir) = lab();
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({
+                "strategy": ema(),
+                "settings": {
+                    "decision_log": true,
+                    "trailing_stop_percent": {"on": true, "value": 1},
+                },
+                "wait_seconds": 120,
+            })),
+        )
+        .unwrap();
+    let id = run["run_id"].clone();
+    let page = lab
+        .dispatch("get_decisions", &json!({"run_id": id, "limit": 3}))
+        .unwrap();
+    assert_eq!(page["rows"].as_array().unwrap().len(), 3);
+    assert!(
+        page["reasons"]["nothing asked"].as_u64().is_some(),
+        "{page}"
+    );
+    let sent = lab
+        .dispatch(
+            "get_decisions",
+            &json!({"run_id": id, "why": "an order went out"}),
+        )
+        .unwrap();
+    assert!(sent["total"].as_u64().unwrap() > 0);
+    let asked = lab
+        .dispatch("get_decisions", &json!({"run_id": id, "wanted_only": true}))
+        .unwrap();
+    assert!(
+        asked["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| !row[2].is_null())
+    );
+
+    let plain = backtest(&lab, &ema());
+    let wrong = lab
+        .dispatch("get_decisions", &json!({"run_id": plain["run_id"]}))
+        .unwrap_err();
+    assert!(wrong.contains("decision_log"), "{wrong}");
+}
+
+#[test]
+fn logic_can_use_what_was_added_from_lab_and_a_longer_timeframe_is_validated() {
+    let (lab, _dir) = lab();
+    let tree = json!({"logic": {
+        "name": "Above the daily average, when it's calm",
+        "long": {"and": [
+            {"gt": ["close", {"on": {"timeframe": "1d", "value": {"sma": {"length": 2}}}}]},
+            {"lt": [{"stddev": {"length": 10}}, {"max": [1000, {"abs": {"sub": ["close", "open"]}}]}]},
+        ]},
+        "flat": {"lt": ["close", {"on": {"timeframe": "1d", "value": "low"}}]},
+    }});
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({"strategy": tree, "wait_seconds": 120})),
+        )
+        .unwrap();
+    assert!(run["summary"]["fills"].as_u64().unwrap() > 0, "{run}");
+}
+
+#[test]
+fn a_long_look_back_on_a_longer_timeframe_is_warned_of_in_the_charts_bars() {
+    let (lab, _dir) = lab();
+    let tree = json!({"logic": {
+        "name": "Long on a long daily average",
+        "long": {"gt": ["close", {"on": {"timeframe": "1d", "value": {"sma": {"length": 300}}}}]},
+    }});
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({"strategy": tree, "wait_seconds": 120})),
+        )
+        .unwrap();
+    let warnings = run["summary"]["warnings"].to_string();
+    assert!(warnings.contains("look-back"), "{warnings}");
+    assert!(warnings.contains("7200"), "{warnings}");
 }

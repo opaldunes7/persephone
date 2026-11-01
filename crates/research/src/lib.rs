@@ -8,6 +8,7 @@ pub mod logic;
 pub mod market;
 pub mod optimize;
 pub mod portfolio;
+pub mod portfolio_tests;
 pub mod positions;
 pub mod results;
 pub mod robustness;
@@ -62,6 +63,11 @@ pub enum Field {
     RangeSlippage,
     LatencyJitter,
     LatencySeed,
+    TrailingStop,
+    SweepMin,
+    SweepMax,
+    SweepStep,
+    PortfolioBlock,
     RangeLookBack,
     ImpactExponent,
     VolumeWarning,
@@ -108,7 +114,11 @@ impl Field {
             TestKind::RandomEntries => matches!(self, Self::Entries),
             TestKind::Portfolio => matches!(
                 self,
-                Self::LegSymbol(_)
+                Self::SweepMin
+                    | Self::SweepMax
+                    | Self::SweepStep
+                    | Self::PortfolioBlock
+                    | Self::LegSymbol(_)
                     | Self::LegVenue(_)
                     | Self::LegWeight(_)
                     | Self::RebalanceEvery
@@ -129,6 +139,10 @@ impl Field {
                 | Self::Blocks
                 | Self::Windows
                 | Self::Entries
+                | Self::SweepMin
+                | Self::SweepMax
+                | Self::SweepStep
+                | Self::PortfolioBlock
                 | Self::HoldOutShare
                 | Self::WalkRatio
                 | Self::LegVenue(_)

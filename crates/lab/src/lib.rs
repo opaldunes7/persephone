@@ -6,6 +6,8 @@
 //! only keeps a log of every call. Three things it doesn't offer: API keys, placing orders (it's built
 //! without the engine's live trading), and deleting or overwriting your data.
 
+#![recursion_limit = "512"]
+
 pub mod cache;
 pub mod data;
 pub mod guide;

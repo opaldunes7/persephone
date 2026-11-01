@@ -5,7 +5,7 @@ use iced::widget::column;
 use super::*;
 
 /// Room over the calendar for the legend and the way back up.
-pub(super) const CALENDAR_TOP: f32 = 60.0;
+pub(super) const CALENDAR_TOP: f32 = 74.0;
 pub(super) const LEDGER_WIDTH: f32 = 500.0;
 pub(super) const CALENDAR_LABEL: f32 = 34.0;
 pub(super) const CALENDAR_TOTAL: f32 = 66.0;
@@ -289,6 +289,26 @@ pub(super) fn calendar_pane<'a>(
         })
         .width(Fill)
         .height(Fill);
+    let (by_hour, by_weekday) = persephone_research::figures::by_time(&calendar.trades);
+    if !matches!(level, Level::Day(..)) {
+        return column![
+            grid,
+            row![
+                canvas(BarsByTime::hours(by_hour)).width(Fill).height(64.0),
+                canvas(BarsByTime::weekdays(by_weekday))
+                    .width(FillPortion(1))
+                    .height(64.0),
+            ]
+            .spacing(16)
+            .padding(Padding {
+                right: 10.0,
+                bottom: 6.0,
+                left: 12.0,
+                ..Padding::ZERO
+            }),
+        ]
+        .into();
+    }
     if let Level::Day(year, month, day) = level {
         row![
             grid,

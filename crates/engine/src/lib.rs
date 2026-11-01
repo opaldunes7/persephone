@@ -51,7 +51,7 @@ pub use portfolio::{
     LegReport, PortfolioLeg, PortfolioReport, PortfolioRequest, Rebalance, run_portfolio,
     spawn_portfolio,
 };
-pub use report::{BacktestReport, Fill, LimitOrderRow, LimitOutcome};
+pub use report::{BacktestReport, Decision, Fill, LimitOrderRow, LimitOutcome};
 pub use settings::{Direction, LimitOrders, Session, SimSettings, TradingRules};
 
 use crate::{
@@ -165,7 +165,10 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
         }
     }
     if request.sim.next_open {
-        if request.sim.stop_loss_percent.is_some() || request.sim.take_profit_percent.is_some() {
+        if request.sim.stop_loss_percent.is_some()
+            || request.sim.take_profit_percent.is_some()
+            || request.sim.trailing_stop_percent.is_some()
+        {
             return Err(EngineError::InvalidRequest(
                 "stops and targets need to see inside a bar, which filling at the next open doesn't; pick one".into(),
             ));
@@ -201,6 +204,13 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
             "latency jitter can't go with filling at the next open or with limit orders; pick one"
                 .into(),
         ));
+    }
+    if let Some(trail) = request.sim.trailing_stop_percent
+        && !(trail > 0.0 && trail < 100.0)
+    {
+        return Err(EngineError::InvalidRequest(format!(
+            "a trailing stop must be above 0% and under 100%, not {trail}%"
+        )));
     }
     let mut engine = BacktestEngine::new(engine_config())?;
 
@@ -308,6 +318,8 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
             request.sim.volume_warning_percent,
         )
         .participating(request.sim.max_participation_percent)
+        .trailing(request.sim.trailing_stop_percent)
+        .logging_decisions(request.sim.decision_log)
         .slipping(Arc::new(range_costs))
         .compounding(request.sim.compound.then_some(request.starting_balance)),
     )?;
@@ -363,6 +375,7 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
     report.limit_orders = missed.limit_orders;
     report.limits_filled = missed.limits_filled;
     report.limit_log = report::limit_rows(&missed.limits, &request.candles, &closes);
+    report.decisions.clone_from(&missed.decisions);
     report.orders_worked = missed.orders_worked;
     report.bars_to_fill_longest = missed.longest_work;
     report.bars_to_fill_average = if missed.works_done > 0 {

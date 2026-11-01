@@ -3,12 +3,15 @@
 
 use std::collections::BTreeMap;
 
-use persephone_core::{Side, time::civil_from_days};
+use persephone_core::{
+    Side,
+    time::{DateTime, civil_from_days},
+};
 use persephone_engine::{
     BacktestReport, BacktestRequest, FeeRates, LimitOutcome, SimSettings, impact_share,
 };
 
-use crate::robustness::round_trips;
+use crate::robustness::{RoundTrip, round_trips};
 
 const NANOS_PER_DAY: u64 = 86_400_000_000_000;
 
@@ -313,6 +316,22 @@ pub fn market_equity(capital: f64, share: f64, first: f64, close: f64) -> f64 {
     capital * (1.0 + share * (close / first - 1.0))
 }
 
+/// What trades made by the UTC hour and the weekday (Monday first) they started, adding up to all they
+/// made.
+#[must_use]
+pub fn by_time(trades: &[RoundTrip]) -> (Vec<f64>, Vec<f64>) {
+    let mut hours = vec![0.0; 24];
+    let mut weekdays = vec![0.0; 7];
+    for trade in trades {
+        let at = DateTime::from_nanos(trade.entry_ts);
+        hours[at.hour as usize % 24] += trade.profit;
+        // 1970-01-01 was a Thursday.
+        let day = trade.entry_ts / NANOS_PER_DAY + 3;
+        weekdays[(day % 7) as usize] += trade.profit;
+    }
+    (hours, weekdays)
+}
+
 /// How many bars a chart of a spread has, in the app and from Lab alike.
 pub const HISTOGRAM_BINS: usize = 40;
 
@@ -461,6 +480,37 @@ impl RunFigures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn by_hour_and_weekday_add_up_to_all_that_was_made() {
+        let trade = |entry_ts, profit| RoundTrip {
+            long: true,
+            qty: 1.0,
+            entry_ts,
+            entry_bar: 0,
+            entry_price: 1.0,
+            exit_ts: entry_ts,
+            exit_bar: 0,
+            exit_price: 1.0,
+            profit,
+            fees: 0.0,
+            open: false,
+        };
+        // 2024-01-01 09:30 was a Monday, and 2024-01-06 23:00 a Saturday.
+        let monday = 1_704_101_400_000_000_000;
+        let saturday = 1_704_582_000_000_000_000;
+        let (hours, weekdays) = by_time(&[
+            trade(monday, 5.0),
+            trade(saturday, -2.0),
+            trade(monday, 1.0),
+        ]);
+        assert_eq!(hours[9], 6.0);
+        assert_eq!(hours[23], -2.0);
+        assert_eq!(weekdays[0], 6.0);
+        assert_eq!(weekdays[5], -2.0);
+        assert_eq!(hours.iter().sum::<f64>(), 4.0);
+        assert_eq!(weekdays.iter().sum::<f64>(), 4.0);
+    }
 
     #[test]
     fn a_histogram_counts_everything_even_at_its_top_edge() {

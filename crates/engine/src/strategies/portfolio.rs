@@ -238,9 +238,21 @@ impl PortfolioStrategy {
                 paid += -leg.position * step.candle.open * borrow / 100.0 * years;
             }
         }
-        let cash = self.settings.starting_balance + self.cash;
-        if cash < 0.0 {
-            paid += -cash * self.settings.interest_percent_per_year / 100.0 * years;
+        // As the report works it out: the account at the last close, less what's bought outright. A
+        // perpetual isn't bought with cash, so it's no loan.
+        if let Some(before) = at.checked_sub(1)
+            && self.settings.interest_percent_per_year > 0.0
+        {
+            let bought: f64 = (0..self.legs.len())
+                .filter(|&index| self.legs[index].funding.is_empty())
+                .filter_map(|index| {
+                    Some(self.legs[index].position * self.step_of(index, before)?.candle.close)
+                })
+                .sum();
+            let cash = self.account(before) - bought;
+            if cash < 0.0 {
+                paid += -cash * self.settings.interest_percent_per_year / 100.0 * years;
+            }
         }
         self.cash -= paid;
         self.last_step = Some(self.times[at]);

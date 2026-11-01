@@ -224,18 +224,41 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
             .color(theme::TEXT_MUTED),
         );
     }
-    let stock_title = stock_title.push(
-        container(tip(
-            toggler(stock)
+    let stock_title = stock_title
+        .push(tip(
+            toggler(settings.no_costs)
+                .label("No costs")
                 .size(15)
-                .on_toggle(|on| PanelMessage::Edit(Edit::Stock(on)))
+                .text_size(HINT)
+                .on_toggle(|on| PanelMessage::Edit(Edit::NoCosts(on)))
                 .style(switch_style),
-            "Off turns all the stock settings off at once, for an ideal run to compare against.",
+            "Nothing to pay at all: no fees, funding or cost settings. Stock off leaves a market's own fees and funding on; this doesn't.",
             None,
         ))
-        .align_right(Fill),
-    );
+        .push(
+            container(tip(
+                toggler(stock)
+                    .size(15)
+                    .on_toggle(|on| PanelMessage::Edit(Edit::Stock(on)))
+                    .style(switch_style),
+                "Off turns all the stock settings off at once, for an ideal run to compare against.",
+                None,
+            ))
+            .align_right(Fill),
+        );
 
+    let entries_mode = |shifted: bool| -> Element<'a, PanelMessage> {
+        tip(
+            toggler(shifted)
+                .label("Shifted")
+                .size(14)
+                .text_size(HINT)
+                .on_toggle(PanelMessage::EntriesShifted)
+                .style(switch_style),
+            "Off places the trades at random, holding each as long. On keeps all the backtest's positions in order and moves them along the span, wrapping round, so only their timing goes.",
+            None,
+        )
+    };
     // Which test is in the bar over the panel; these are its own settings.
     let boxed = |label: &'a str,
                  field: Field,
@@ -502,8 +525,125 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                     "A JSON file of [[time, {\"BTCUSDT\": 0.5, \"ETHUSDT\": -0.5}], ...]. Each row states the whole book as signed shares of the account, from that bar's close.".to_owned(),
                 ),
             };
+            let chip_of = |label: &'a str, view: PortfolioView, what: &'a str| {
+                tip(
+                    button(text(label).size(HINT).center())
+                        .padding([2, 7])
+                        .on_press(PanelMessage::PortfolioView(view))
+                        .style(move |_, status| chip(panel.tests.portfolio_view == view, status)),
+                    what,
+                    None,
+                )
+            };
+            let view = panel.tests.portfolio_view;
+            let chips = row![
+                chip_of("Run", PortfolioView::Run, "One run of this book."),
+                chip_of("Sweep", PortfolioView::Sweep, "Vary one thing from Min to Max by Step, into a table with the best first."),
+                chip_of("Shifted", PortfolioView::Shifted, "The last run's book moved along the span by random amounts. If those do as well, its timing is worth nothing."),
+                chip_of("Monte Carlo", PortfolioView::MonteCarlo, "The last run's returns drawn again in blocks, keeping how the markets moved together."),
+                chip_of("Walk-forward", PortfolioView::WalkForward, "Each window picks the best of the sweep's values on its stretch, and trades it on the unseen one after."),
+            ]
+            .spacing(3);
+            let mut vary_choices = vec![
+                VaryChoice { label: Vary::Scale.name(setup), vary: Vary::Scale },
+                VaryChoice { label: Vary::RebalanceEvery.name(setup), vary: Vary::RebalanceEvery },
+                VaryChoice { label: Vary::RebalanceDrift.name(setup), vary: Vary::RebalanceDrift },
+                VaryChoice { label: Vary::SlippagePercent.name(setup), vary: Vary::SlippagePercent },
+                VaryChoice { label: Vary::Leverage.name(setup), vary: Vary::Leverage },
+            ];
+            for at in 0..setup.legs.len() {
+                let vary = Vary::Weight(at);
+                vary_choices.push(VaryChoice { label: vary.name(setup), vary });
+            }
+            let vary_selected = VaryChoice {
+                label: panel.tests.portfolio_vary.name(setup),
+                vary: panel.tests.portfolio_vary,
+            };
+            let test_run = |busy: bool, done: bool, what: &str| {
+                if busy {
+                    action("Cancel", false, Some(PanelMessage::StopPortfolioTest), "Stop it; what it has so far is dropped.".to_owned())
+                } else {
+                    action("Run", !done, can_run.then_some(PanelMessage::RunPortfolio), run_or(what))
+                }
+            };
+            let busy_or_done = |busy: bool, done: bool| (busy, done);
+            let sweep_row = |busy_done: (bool, bool), what: &'static str| -> Element<'a, PanelMessage> {
+                row![
+                    pick_list(vary_choices.clone(), Some(vary_selected.clone()), PanelMessage::PortfolioVary)
+                        .text_size(HINT)
+                        .padding([3, 6])
+                        .width(130.0)
+                        .style(|_, status| list_style(status))
+                        .menu_style(|_| list_menu_style()),
+                    small("Min", Field::SweepMin, "Where the sweep starts."),
+                    small("Max", Field::SweepMax, "Where it ends."),
+                    small("Step", Field::SweepStep, "How far between values."),
+                    container(test_run(busy_done.0, busy_done.1, what)).align_right(Fill),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center)
+                .into()
+            };
+            let running = |run: bool, done: bool| busy_or_done(run, done);
+            let extra: Option<Element<'a, PanelMessage>> = match view {
+                PortfolioView::Run => None,
+                PortfolioView::Sweep => Some(sweep_row(
+                    running(matches!(panel.tests.portfolio_sweep, TestRun::Running { .. }), matches!(panel.tests.portfolio_sweep, TestRun::Done(_))),
+                    "Run every value. With a table of weights, weights can't be varied.",
+                )),
+                PortfolioView::WalkForward => Some(
+                    column![
+                        sweep_row(
+                            running(matches!(panel.tests.portfolio_walk, TestRun::Running { .. }), matches!(panel.tests.portfolio_walk, TestRun::Done(_))),
+                            "Pick among these values on each stretch, and trade the pick on the unseen one after.",
+                        ),
+                        row![
+                            small("Windows", Field::Windows, "How many times to slide along."),
+                            small("Ratio", Field::WalkRatio, "How many times longer than its unseen stretch each window picks on."),
+                        ]
+                        .spacing(6),
+                    ]
+                    .spacing(4)
+                    .into(),
+                ),
+                PortfolioView::Shifted => Some(
+                    row![
+                        small("Runs", Field::Entries, "How many times to move it along."),
+                        container(test_run(
+                            matches!(panel.tests.portfolio_shifted, TestRun::Running { .. }),
+                            matches!(panel.tests.portfolio_shifted, TestRun::Done(_)),
+                            "Move the last run's book along the span, that many times.",
+                        ))
+                        .align_right(Fill),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center)
+                    .into(),
+                ),
+                PortfolioView::MonteCarlo => Some(
+                    row![
+                        small("Runs", Field::Runs, "How many times to draw."),
+                        small("Ruin %", Field::Ruin, "The fall counted as ruin."),
+                        small("Block", Field::PortfolioBlock, "How many bars a block is. Longer keeps more of how returns follow each other."),
+                        container(test_run(
+                            false,
+                            matches!(panel.tests.portfolio_monte_carlo, TestRun::Done(_)),
+                            "Draw the last run's returns again in blocks.",
+                        ))
+                        .align_right(Fill),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center)
+                    .into(),
+                ),
+            };
+            let mut below = column![chips].spacing(5);
+            if let Some(extra) = extra {
+                below = below.push(extra);
+            }
             Some(
                 column![
+                    below,
                     legs,
                     row![
                         saved,
@@ -526,12 +666,49 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                         small("Drift", Field::RebalanceDrift, "Go back to the weights when a leg is this many points of the account away. Blank never does."),
                         small("Min", Field::RebalanceMinTrade, "Trades worth less than this aren't made, so small changes don't pay fees for nothing."),
                         small("Margin %", Field::Maintenance, "What a position needs to stay open, as a percentage of its value. Everything is liquidated at once when the account falls to it, whatever the volume limit."),
-                        container(run).align_right(Fill),
+                        container(if view == PortfolioView::Run { run } else { Space::new().into() }).align_right(Fill),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
                 ]
                 .spacing(5)
+                .into(),
+            )
+        }
+        TestKind::RandomEntries if panel.tests.entries_shifted => {
+            let run = match &panel.tests.shifted {
+                TestRun::Running { .. } => action(
+                    "Cancel",
+                    false,
+                    Some(PanelMessage::StopShifted),
+                    "Stop these runs; what they've found so far is dropped.".to_owned(),
+                ),
+                TestRun::Done(_) => action(
+                    "Run again",
+                    false,
+                    can_run.then_some(PanelMessage::RunShifted),
+                    run_or("Move it by other amounts. Otherwise the same inputs give the same results."),
+                ),
+                _ => action(
+                    "Run",
+                    true,
+                    can_run.then_some(PanelMessage::RunShifted),
+                    run_or("Backtest the same positions moved along the span, that many times over."),
+                ),
+            };
+            Some(
+                row![
+                    entries_mode(true),
+                    boxed(
+                        "Runs",
+                        Field::Entries,
+                        "",
+                        "How many times to move it along. Press Enter to apply.",
+                    ),
+                    container(run).align_right(Fill),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center)
                 .into(),
             )
         }
@@ -558,6 +735,7 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
             };
             Some(
                 row![
+                    entries_mode(false),
                     boxed(
                         "Runs",
                         Field::Entries,
@@ -787,6 +965,8 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
     const WARNINGS: &str = "Warn when an order's over this share of its bar's volume, with Impact on, or when fewer than this share of limit orders fill.";
     const WARM_UP: &str = "How many bars before the span strategies warm up on. Raise it for look-backs longer than this. Press Enter to load them.";
     const CASH_INTEREST: &str = "What cash below zero costs in a portfolio, as a percentage a year. Without it, a book holding more than the account borrows free.";
+    const TRAILING: &str = "A real stop this far from the best price since entry, moved at each close, so it only tightens. With Stop loss too, whichever is nearer goes first.";
+    const DECISIONS: &str = "Keep a row for each bar: what the strategy asked for, what was held, what went out, and why not. Shows as Decisions over the results.";
     const JITTER: &str = "How much longer than the latency orders take on average, drawn for each order. Most are quick and a few slow. Only fills on ticks can show it.";
     const SEED: &str = "Which draws of jitter a run uses, so it can be repeated.";
     const BORROW: &str = "What borrowing costs a short, as a percentage of its value a year. Perpetuals pay funding instead.";
@@ -922,6 +1102,22 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                 STOP,
                 None,
             ),
+        ),
+        line(
+            switch(settings.trailing_stop_percent.on, Edit::TrailingStop, TRAILING),
+            name("Trailing stop", TRAILING),
+            tip(
+                row![input(Field::TrailingStop, 54.0), unit("%")]
+                    .spacing(3)
+                    .align_y(Alignment::Center),
+                TRAILING,
+                None,
+            ),
+        ),
+        line(
+            switch(settings.decision_log, Edit::DecisionLog, DECISIONS),
+            name("Decision log", DECISIONS),
+            Space::new().into(),
         ),
         line(
             switch(settings.take_profit_percent.on, Edit::TakeProfit, TARGET),

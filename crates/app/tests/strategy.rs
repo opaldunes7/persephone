@@ -1655,6 +1655,208 @@ mod panel {
     }
 
     #[test]
+    fn a_table_of_weights_loads_runs_and_what_is_wrong_with_one_is_said() {
+        let mut app = portfolio_panel();
+        let good = serde_json::json!([
+            [Timeframe::H1.nanos() * 10, {"BTCUSDT": 0.25, "ETHUSDT": -0.25}],
+            [Timeframe::H1.nanos() * 20, {"ETHUSDT": 0.5}],
+        ]);
+        let _ = app.update(Message::WeightsRead(
+            0,
+            Err("That isn't JSON: expected value".into()),
+        ));
+        let _ = app.update(Message::WeightsRead(
+            0,
+            Ok(serde_json::json!([[0, {"XRPUSDT": 1.0}]])),
+        ));
+        assert!(shows(&app, "Load weights"), "neither was taken");
+        let _ = app.update(Message::WeightsRead(0, Ok(good)));
+        assert!(shows(&app, "A table of 2 rows"));
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        let persephone::backtest::TestRun::Done(found) = &app.panel().unwrap().tests.portfolio
+        else {
+            panic!("{:?}", app.panel().unwrap().tests.portfolio);
+        };
+        // BTC goes flat at the second row, as it leaves it out.
+        assert_eq!(found.report.legs[0].fills.len(), 2);
+        assert_eq!(found.report.legs[1].fills.len(), 2);
+        panel(&mut app, PanelMessage::Edit(Edit::ClearWeights));
+        assert!(shows(&app, "Load weights"));
+    }
+
+    #[test]
+    fn saved_runs_come_back_as_they_were() {
+        // Runs are kept beside results, as `<data>/lab/runs`.
+        let data = results_dir();
+        let dir = data.join("lab").join("results");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = portfolio_panel();
+        let _ = app.use_results_dir(dir);
+        panel(&mut app, PanelMessage::ListPortfolios);
+        assert!(app.panel().unwrap().tests.saved_portfolios.is_empty());
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        let persephone::backtest::TestRun::Done(ran) = &app.panel().unwrap().tests.portfolio else {
+            panic!("{:?}", app.panel().unwrap().tests.portfolio);
+        };
+        let ran = Arc::clone(ran);
+        panel(&mut app, PanelMessage::ListPortfolios);
+        let saved = app.panel().unwrap().tests.saved_portfolios.clone();
+        assert_eq!(saved.len(), 1);
+        assert!(saved[0].name.contains("BTCUSDT"), "{}", saved[0].name);
+        panel(&mut app, PanelMessage::Edit(Edit::AddLeg));
+        run_task(&mut app, PanelMessage::OpenPortfolio(saved[0].clone()));
+        let persephone::backtest::TestRun::Done(back) = &app.panel().unwrap().tests.portfolio
+        else {
+            panic!("{:?}", app.panel().unwrap().tests.portfolio);
+        };
+        for (a, b) in back.report.equity.iter().zip(&ran.report.equity) {
+            assert!((a - b).abs() < 1e-6, "{a} and {b}");
+        }
+        assert_eq!(
+            back.report.legs[1].fills.len(),
+            ran.report.legs[1].fills.len()
+        );
+        assert_eq!(back.figures.correlation.len(), 2);
+        assert!(shows(&app, "Moved with"));
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[test]
+    fn no_costs_takes_everything_off_a_portfolio_too_and_the_panel_says_how_it_compares() {
+        let mut app = portfolio_panel();
+        panel(&mut app, PanelMessage::Edit(Edit::Commission(true)));
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        let persephone::backtest::TestRun::Done(paying) = &app.panel().unwrap().tests.portfolio
+        else {
+            panic!("{:?}", app.panel().unwrap().tests.portfolio);
+        };
+        assert!(paying.report.fees > 0.0);
+        assert!(paying.figures.weights_held_return.is_some());
+        assert!(shows(&app, "By year"));
+        panel(&mut app, PanelMessage::Edit(Edit::NoCosts(true)));
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        let persephone::backtest::TestRun::Done(free) = &app.panel().unwrap().tests.portfolio
+        else {
+            panic!("{:?}", app.panel().unwrap().tests.portfolio);
+        };
+        assert_eq!(free.report.fees, 0.0);
+    }
+
+    #[test]
+    fn a_portfolio_sweeps_shifts_draws_and_walks_from_the_panel() {
+        use persephone::backtest::{PortfolioView, TestRun};
+        let mut app = portfolio_panel();
+        run_task(&mut app, PanelMessage::RunPortfolio);
+
+        panel(&mut app, PanelMessage::PortfolioView(PortfolioView::Sweep));
+        for (field, value) in [
+            (Field::SweepMin, "0.5"),
+            (Field::SweepMax, "1"),
+            (Field::SweepStep, "0.25"),
+        ] {
+            panel(&mut app, PanelMessage::Input(field, value.into()));
+            panel(&mut app, PanelMessage::Submit(field));
+        }
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        let TestRun::Done(rows) = &app.panel().unwrap().tests.portfolio_sweep else {
+            panic!("{:?}", app.panel().unwrap().tests.portfolio_sweep);
+        };
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].net_return >= rows[2].net_return);
+        assert!(shows(&app, "Turnover"));
+
+        panel(
+            &mut app,
+            PanelMessage::PortfolioView(PortfolioView::Shifted),
+        );
+        panel(&mut app, PanelMessage::Input(Field::Entries, "6".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Entries));
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        let TestRun::Done(moved) = &app.panel().unwrap().tests.portfolio_shifted else {
+            panic!("{:?}", app.panel().unwrap().tests.portfolio_shifted);
+        };
+        assert_eq!(moved.runs, 6);
+        assert!(shows(&app, "As good"));
+
+        panel(
+            &mut app,
+            PanelMessage::PortfolioView(PortfolioView::MonteCarlo),
+        );
+        panel(
+            &mut app,
+            PanelMessage::Input(Field::PortfolioBlock, "24".into()),
+        );
+        panel(&mut app, PanelMessage::Submit(Field::PortfolioBlock));
+        let _ = app.update(Message::Backtest(PanelMessage::RunPortfolio));
+        let TestRun::Done(drawn) = &app.panel().unwrap().tests.portfolio_monte_carlo else {
+            panic!("{:?}", app.panel().unwrap().tests.portfolio_monte_carlo);
+        };
+        assert_eq!(drawn.block_bars, 24);
+        assert!(shows(&app, "Ruin"));
+
+        panel(
+            &mut app,
+            PanelMessage::PortfolioView(PortfolioView::WalkForward),
+        );
+        panel(&mut app, PanelMessage::Input(Field::Windows, "2".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Windows));
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        let TestRun::Done(walked) = &app.panel().unwrap().tests.portfolio_walk else {
+            panic!("{:?}", app.panel().unwrap().tests.portfolio_walk);
+        };
+        assert_eq!(walked.windows.len(), 2);
+        assert!(shows(&app, "Unseen"));
+    }
+
+    #[test]
+    fn asking_for_a_test_of_the_last_run_before_there_is_one_says_so() {
+        use persephone::backtest::{PortfolioView, TestRun};
+        let mut app = portfolio_panel();
+        panel(
+            &mut app,
+            PanelMessage::PortfolioView(PortfolioView::MonteCarlo),
+        );
+        let _ = app.update(Message::Backtest(PanelMessage::RunPortfolio));
+        assert!(matches!(
+            app.panel().unwrap().tests.portfolio_monte_carlo,
+            TestRun::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn random_entries_can_move_the_backtests_own_timing_instead() {
+        let mut app = ready_panel(TestKind::RandomEntries);
+        panel(&mut app, PanelMessage::EntriesShifted(true));
+        panel(&mut app, PanelMessage::Input(Field::Entries, "6".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Entries));
+        run_task(&mut app, PanelMessage::RunShifted);
+        let persephone::backtest::TestRun::Done(found) = &app.panel().unwrap().tests.shifted else {
+            panic!("{:?}", app.panel().unwrap().tests.shifted);
+        };
+        assert_eq!(found.runs, 6);
+        assert!(shows(&app, "As good"));
+    }
+
+    #[test]
+    fn a_trailing_stop_and_the_decision_log_are_set_and_shown_from_the_panel() {
+        let mut app = ready_panel(TestKind::Backtest);
+        panel(&mut app, PanelMessage::Edit(Edit::TrailingStop(true)));
+        panel(
+            &mut app,
+            PanelMessage::Input(Field::TrailingStop, "4".into()),
+        );
+        panel(&mut app, PanelMessage::Submit(Field::TrailingStop));
+        panel(&mut app, PanelMessage::Edit(Edit::DecisionLog(true)));
+        let sim = app.backtest_request(0).unwrap().1.sim;
+        assert_eq!(sim.trailing_stop_percent, Some(4.0));
+        assert!(sim.decision_log);
+        finish_backtest(&mut app);
+        assert!(shows(&app, "Decisions"));
+        panel(&mut app, PanelMessage::ShowDecisions(true));
+        assert!(shows(&app, "Why"));
+    }
+
+    #[test]
     fn a_portfolio_with_nothing_in_it_says_what_to_do_and_a_removed_leg_takes_its_typing() {
         let mut app = ready_panel(TestKind::Portfolio);
         assert!(app.test_problem(0).is_some());

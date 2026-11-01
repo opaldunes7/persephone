@@ -198,6 +198,27 @@ pub struct BarCache {
     /// that aren't here wait on it, and find they've been fetched.
     markets: Mutex<HashMap<String, Arc<Entry>>>,
     uses: Mutex<u64>,
+    /// What's being downloaded now, for a job's status to say.
+    fetching: Mutex<Option<Fetching>>,
+}
+
+/// Clears what's being downloaded when dropped.
+struct Saying<'a>(&'a Mutex<Option<Fetching>>);
+
+impl Drop for Saying<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut fetching) = self.0.lock() {
+            *fetching = None;
+        }
+    }
+}
+
+/// A download under way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fetching {
+    pub symbol: String,
+    pub pages_done: usize,
+    pub pages: usize,
 }
 
 impl BarCache {
@@ -209,6 +230,19 @@ impl BarCache {
             funding_lock: Mutex::new(()),
             markets: Mutex::default(),
             uses: Mutex::new(0),
+            fetching: Mutex::default(),
+        }
+    }
+
+    /// What's being downloaded now, if anything.
+    #[must_use]
+    pub fn fetching(&self) -> Option<Fetching> {
+        self.fetching.lock().ok()?.clone()
+    }
+
+    fn say_fetching(&self, now: Option<Fetching>) {
+        if let Ok(mut fetching) = self.fetching.lock() {
+            *fetching = now;
         }
     }
 
@@ -420,11 +454,24 @@ impl BarCache {
             missing(&market.covered, start, end)
         };
         let step = SAVE_EVERY_BARS.saturating_mul(timeframe.nanos());
+        let pages_in_all: usize = gaps
+            .iter()
+            .map(|&(from, to)| pages_of(from, to, timeframe).len())
+            .sum();
+        let mut pages_done = 0;
+        // However this ends, it's no longer downloading.
+        let _done = Saying(&self.fetching);
         for (gap_start, gap_end) in gaps {
             let mut at = gap_start;
             while at < gap_end {
                 let until = gap_end.min(at.saturating_add(step));
                 let pages = pages_of(at, until, timeframe);
+                self.say_fetching(Some(Fetching {
+                    symbol: symbol.to_owned(),
+                    pages_done,
+                    pages: pages_in_all,
+                }));
+                pages_done += pages.len();
                 let stop = AtomicBool::new(false);
                 let results = pool(&pages, FETCHERS, &stop, &|| {}, &|&(from, to)| {
                     let fetched = self.source.klines(symbol, timeframe, from, to);

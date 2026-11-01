@@ -51,7 +51,7 @@ const LISTED_RUNS: usize = 20;
 const LISTED_VALUES: usize = 50;
 /// The most backtests `run_backtests` takes in one call.
 const MAX_BACKTESTS: usize = 5_000;
-const BATCH_COLUMNS: [&str; 29] = [
+const BATCH_COLUMNS: [&str; 30] = [
     "index",
     "run_id",
     "label",
@@ -63,6 +63,7 @@ const BATCH_COLUMNS: [&str; 29] = [
     "fees",
     "final_equity",
     "buy_and_hold_return",
+    "excess_return",
     "sharpe",
     "profit_factor",
     "exposure",
@@ -113,7 +114,7 @@ pub fn build_request(
     fill_bars: Option<Arc<Vec<Candle>>>,
 ) -> Result<BacktestRequest, String> {
     let high = settings.precision == Precision::High;
-    let funding = market.funding;
+    let funding = settings.funding(market.funding);
     Ok(BacktestRequest {
         fees: settings.fees(market.fees),
         ticks: market.ticks.filter(|_| high),
@@ -216,6 +217,7 @@ fn summary_of(
     let gains: f64 = trades.iter().map(|t| t.profit.max(0.0)).sum();
     let losses: f64 = trades.iter().map(|t| (-t.profit).max(0.0)).sum();
     let winners = trades.iter().filter(|t| t.profit > 0.0).count();
+    let (by_hour, by_weekday) = figures::by_time(&trades);
     let last = report
         .equity
         .last()
@@ -247,6 +249,10 @@ fn summary_of(
         "exposure": figures::exposure(report, from_index),
         "average_trade": (!trades.is_empty()).then(|| profit / trades.len() as f64),
         "by_year": figures::by_year(report, from_index, bars),
+        "by_hour": by_hour,
+        "by_weekday": by_weekday,
+        "excess_return": figures::benchmark(report.starting_balance, bars, from_index, funding)
+            .map(|held| last / report.starting_balance - 1.0 - held.return_after_funding),
         "warnings": warnings_of(report),
     })
 }
@@ -322,9 +328,54 @@ fn walk_chart(found: &WalkForward) -> Value {
 
 /// A spread as the app's panel draws it: the range, how many lie in each equal step across it, and
 /// where the backtest's own figure lies.
-fn histogram_json(values: &[f64], actual: f64) -> Value {
+pub(crate) fn histogram_json(values: &[f64], actual: f64) -> Value {
     let found = figures::Histogram::of(values, figures::HISTOGRAM_BINS, actual);
     json!({"from": found.lo, "to": found.hi, "counts": found.counts, "actual": actual})
+}
+
+/// A walk-forward's answer, for one market or a portfolio.
+pub(crate) fn walk_answer(found: &WalkForward) -> Value {
+    let rows: Vec<Value> = found
+        .windows
+        .iter()
+        .map(|window| {
+            let mut row = json!({
+                "train_from": time_text(window.train_from),
+                "test_from": time_text(window.test_from),
+                "test_to": time_text(window.test_to),
+                "status": "nothing-to-pick",
+            });
+            if let Some(picked) = &window.picked {
+                let values: Map<String, Value> = picked
+                    .values
+                    .iter()
+                    .map(|(name, value)| (name.clone(), json!(value)))
+                    .collect();
+                row["label"] = json!(picked.label);
+                row["buy_and_hold_return"] = json!(picked.buy_and_hold_return);
+                row["values"] = Value::Object(values);
+                row["picked_score"] = json!(picked.score);
+                row["unseen_return"] = json!(picked.unseen_return);
+                row["fell"] = json!(picked.fell);
+                row["trades"] = json!(picked.trades);
+                row["status"] = json!("tested");
+            }
+            row
+        })
+        .collect();
+    json!({
+        "windows": rows,
+        "unseen_return": found.unseen_return,
+        "unseen_compounded": found.compounded().0,
+        "buy_and_hold_compounded": found.compounded().1,
+        "buy_and_hold_return": found.buy_and_hold_return,
+        "profitable_windows": found.profitable_windows,
+        "deepest_fall": found.deepest_fall,
+        "trades": found.trades,
+        "train_bars": found.train_bars,
+        "test_bars": found.test_bars,
+        "chart": walk_chart(found),
+    })
 }
 
 /// A page whose rows are objects, so has no columns to name.
@@ -336,11 +387,11 @@ fn named_rows(mut page: Value) -> Value {
 }
 
 /// How many bars a logic tree needs before all its rules are ready. Nothing else says.
-fn look_back_of(args: &Value, params: &[f64]) -> usize {
+fn look_back_of(args: &Value, params: &[f64], chart_bar: u64) -> usize {
     args["strategy"]
         .get("logic")
         .map_or(0, |_| match StrategyRef::parse(&args["strategy"]) {
-            Ok(StrategyRef::Logic(logic)) => logic.look_back(params),
+            Ok(StrategyRef::Logic(logic)) => logic.look_back_on(params, chart_bar),
             _ => 0,
         })
 }
@@ -358,7 +409,7 @@ fn map_from(value: &Value) -> BTreeMap<String, f64> {
 }
 
 /// A report read back from its file: all that the tools built on a run need.
-fn report_from(run: &Value) -> BacktestReport {
+pub(crate) fn report_from(run: &Value) -> BacktestReport {
     let numbers = |name: &str| -> Vec<f64> {
         run[name].as_array().map_or_else(Vec::new, |values| {
             values
@@ -417,6 +468,7 @@ fn report_from(run: &Value) -> BacktestReport {
         total_positions: run["total_positions"].as_u64().unwrap_or(0) as usize,
         limit_orders: run["summary"]["limit_orders"].as_u64().unwrap_or(0) as usize,
         limits_filled: run["summary"]["limits_filled"].as_u64().unwrap_or(0) as usize,
+        decisions: Vec::new(),
         orders_worked: run["summary"]["orders_worked"].as_u64().unwrap_or(0) as usize,
         bars_to_fill_average: run["summary"]["bars_to_fill_average"]
             .as_f64()
@@ -566,7 +618,7 @@ impl Lab {
     }
 
     /// Everything a backtest of what a call asks for needs.
-    fn prepare(&self, args: &Value) -> Result<(BacktestRequest, usize, String), String> {
+    pub(crate) fn prepare(&self, args: &Value) -> Result<(BacktestRequest, usize, String), String> {
         let market_args = MarketArgs::parse(args)?;
         let settings = settings_of(args)?;
         if settings.fill_timing == FillTiming::NextOpen && settings.precision == Precision::High {
@@ -626,7 +678,11 @@ impl Lab {
         let (request, from_index, name) = self.prepare(args)?;
         let times: Vec<u64> = request.candles.iter().map(|c| c.ts).collect();
         let bars: Vec<(u64, f64)> = request.candles.iter().map(|c| (c.ts, c.close)).collect();
-        let look_back = look_back_of(args, request.strategy.own_params());
+        let look_back = look_back_of(
+            args,
+            request.strategy.own_params(),
+            request.bars.timeframe().map_or(0, Timeframe::nanos),
+        );
         let market_share = request.strategy.size_fraction() * request.sim.leverage;
         let funding = request.funding.as_deref().cloned().unwrap_or_default();
         let fills_on = if request.sim.next_open {
@@ -740,6 +796,9 @@ impl Lab {
                 order.filled,
             ])).collect::<Vec<_>>(),
             "market_share": market_share,
+            "decisions": report.decisions.iter().map(|row| json!([
+                row.ts, time_text(row.ts), row.wanted, row.held, row.target, row.order, row.why,
+            ])).collect::<Vec<_>>(),
             "fills": report.fills.iter().map(|f| json!([
                 f.ts, f.bar, if f.side == Side::Buy { "buy" } else { "sell" }, f.price, f.qty, f.fee, f.maker, f.range_slip,
             ])).collect::<Vec<_>>(),
@@ -904,6 +963,7 @@ impl Lab {
                     summary["fees"],
                     summary["final_equity"],
                     summary["buy_and_hold_return"],
+                    summary["excess_return"],
                     summary["sharpe"],
                     summary["profit_factor"],
                     summary["exposure"],
@@ -1078,6 +1138,43 @@ impl Lab {
             DEFAULT_ROWS,
             |i| rows[i].clone(),
         ))
+    }
+
+    pub(crate) fn get_decisions(&self, args: &Value) -> Result<Value, String> {
+        let run = self.load_run(text(args, "run_id")?)?;
+        let empty = Vec::new();
+        let all = run["decisions"].as_array().unwrap_or(&empty);
+        if all.is_empty() {
+            return Err(
+                "That run kept no decisions. Run it with `decision_log: true` in `settings`."
+                    .into(),
+            );
+        }
+        let wanted = args.get("why").and_then(Value::as_str);
+        let wanted_only = args
+            .get("wanted_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let rows: Vec<&Value> = all
+            .iter()
+            .filter(|row| wanted.is_none_or(|why| row[6] == why))
+            .filter(|row| !wanted_only || (!row[2].is_null() && row[6] != "warming up"))
+            .collect();
+        let mut reasons = BTreeMap::new();
+        for row in all {
+            *reasons
+                .entry(row[6].as_str().unwrap_or_default().to_owned())
+                .or_insert(0_u64) += 1;
+        }
+        let mut page = page_of(
+            &["ts", "time", "wanted", "held", "target", "order", "why"],
+            rows.len(),
+            args,
+            DEFAULT_ROWS,
+            |at| rows[at].clone(),
+        );
+        page["reasons"] = json!(reasons);
+        Ok(page)
     }
 
     pub(crate) fn get_fills(&self, args: &Value) -> Result<Value, String> {
@@ -1499,44 +1596,7 @@ impl Lab {
         };
         job.total.store(batch.total(), Ordering::Relaxed);
         let found = batch.run(&|done| job.done.store(done, Ordering::Relaxed))?;
-        let rows: Vec<Value> = found
-            .windows
-            .iter()
-            .map(|window| {
-                let mut row = json!({
-                    "train_from": time_text(window.train_from),
-                    "test_from": time_text(window.test_from),
-                    "test_to": time_text(window.test_to),
-                    "status": "nothing-to-pick",
-                });
-                if let Some(picked) = &window.picked {
-                    let values: Map<String, Value> = picked
-                        .values
-                        .iter()
-                        .map(|(name, value)| (name.clone(), json!(value)))
-                        .collect();
-                    row["buy_and_hold_return"] = json!(picked.buy_and_hold_return);
-                    row["values"] = Value::Object(values);
-                    row["picked_score"] = json!(picked.score);
-                    row["unseen_return"] = json!(picked.unseen_return);
-                    row["fell"] = json!(picked.fell);
-                    row["trades"] = json!(picked.trades);
-                    row["status"] = json!("tested");
-                }
-                row
-            })
-            .collect();
-        Ok(json!({
-            "windows": rows,
-            "unseen_return": found.unseen_return,
-            "buy_and_hold_return": found.buy_and_hold_return,
-            "profitable_windows": found.profitable_windows,
-            "deepest_fall": found.deepest_fall,
-            "trades": found.trades,
-            "train_bars": found.train_bars,
-            "test_bars": found.test_bars,
-            "chart": walk_chart(&found),
-        }))
+        Ok(walk_answer(&found))
     }
 
     pub(crate) fn run_optimize(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {

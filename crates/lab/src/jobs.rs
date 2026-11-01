@@ -168,8 +168,23 @@ impl Lab {
                 }
                 Ok(value)
             }
-            Some(Err(_)) | None => status(&id, &job),
+            Some(Err(_)) | None => self.status_now(&id, &job),
         }
+    }
+
+    /// How a job's going, and what it's downloading if it's waiting on that.
+    fn status_now(&self, id: &str, job: &Job) -> Result<Value, String> {
+        let mut answer = status(id, job)?;
+        if answer["status"] == "running"
+            && let Some(fetching) = self.cache.fetching()
+        {
+            answer["fetching"] = json!({
+                "symbol": fetching.symbol,
+                "pages_done": fetching.pages_done,
+                "pages": fetching.pages,
+            });
+        }
+        Ok(answer)
     }
 
     pub(crate) fn get_job(&self, args: &Value) -> Result<Value, String> {
@@ -177,7 +192,7 @@ impl Lab {
         let job = self.jobs.lock().ok().and_then(|jobs| jobs.get(id).cloned());
         if let Some(job) = job {
             job.wait(wait_of(args, 0.0));
-            return status(id, &job);
+            return self.status_now(id, &job);
         }
         check_id(id)?;
         let file = self.paths.lab().join("jobs").join(format!("{id}.json"));

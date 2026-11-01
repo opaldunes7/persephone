@@ -25,7 +25,9 @@ use persephone_engine::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{figures, market::MarketBars, positions::Positions, settings::Settings};
+use crate::{
+    figures, market::MarketBars, positions::Positions, robustness::round_trips, settings::Settings,
+};
 
 /// What a position needs to stay open unless told otherwise, as a percentage of its value: about what
 /// Binance asks of the smallest positions in the biggest markets.
@@ -254,7 +256,7 @@ pub fn request(
                 strategy,
                 plugin,
                 weight: leg.weight,
-                funding: market.funding,
+                funding: settings.funding(market.funding),
             }
         })
         .collect();
@@ -311,6 +313,15 @@ pub struct PortfolioFigures {
     /// An equal share of the capital held in each market from its first bar in the span.
     pub benchmark_return: f64,
     pub benchmark: Vec<f64>,
+    /// That after a perpetual's funding, which is what holding one really made.
+    pub benchmark_after_funding: f64,
+    /// The weights asked for, held to the end and never rebalanced, with funding paid. `None` when
+    /// strategies or a table that switches decide the positions, as there are no one set of weights to
+    /// hold. Fair for long and short books, which equal shares isn't.
+    pub weights_held_return: Option<f64>,
+    /// What trades made by the hour and weekday they started, across the legs.
+    pub by_hour: Vec<f64>,
+    pub by_weekday: Vec<f64>,
     /// How each market's returns moved with each other's, bar by bar, where both had a bar.
     pub correlation: Vec<Vec<Option<f64>>>,
 }
@@ -408,6 +419,11 @@ pub fn written(run: &PortfolioRun, run_id: &str, created: u64, args: &Value) -> 
         "sharpe": figures.sharpe,
         "by_year": figures.by_year.iter().map(|(year, made)| (year.to_string(), json!(made))).collect::<serde_json::Map<_, _>>(),
         "benchmark_return": figures.benchmark_return,
+        "benchmark_after_funding": figures.benchmark_after_funding,
+        "weights_held_return": figures.weights_held_return,
+        "excess_return": figures.net_return - figures.benchmark_after_funding,
+        "by_hour": figures.by_hour,
+        "by_weekday": figures.by_weekday,
         "fees": report.fees,
         "funding_paid": report.funding_paid,
         "borrow_paid": report.borrow_paid,
@@ -666,6 +682,10 @@ fn from_written(run: &Value) -> PortfolioRun {
                     .collect()
             }),
         benchmark_return: summary["benchmark_return"].as_f64().unwrap_or(0.0),
+        benchmark_after_funding: summary["benchmark_after_funding"].as_f64().unwrap_or(0.0),
+        weights_held_return: summary["weights_held_return"].as_f64(),
+        by_hour: numbers(&summary["by_hour"]),
+        by_weekday: numbers(&summary["by_weekday"]),
         benchmark: numbers(&run["benchmark"]),
         correlation: run["correlation"].as_array().map_or_else(Vec::new, |rows| {
             rows.iter()
@@ -713,6 +733,22 @@ impl PortfolioFigures {
             .collect();
         let whole = as_backtest(report);
         let benchmark = benchmark(report, from_index);
+        let equal = vec![1.0 / report.legs.len().max(1) as f64; report.legs.len()];
+        let (mut by_hour, mut by_weekday) = (vec![0.0; 24], vec![0.0; 7]);
+        for leg in &report.legs {
+            // A leg's own account, from nothing, as what it's made is all that's asked.
+            let (hours, weekdays) = figures::by_time(&round_trips(&BacktestReport {
+                fills: leg.fills.clone(),
+                equity: leg.contribution.clone(),
+                ..BacktestReport::default()
+            }));
+            for (total, part) in by_hour.iter_mut().zip(hours) {
+                *total += part;
+            }
+            for (total, part) in by_weekday.iter_mut().zip(weekdays) {
+                *total += part;
+            }
+        }
         Self {
             net_return: report.net_return(),
             gross_return: free.map(PortfolioReport::net_return),
@@ -723,6 +759,12 @@ impl PortfolioFigures {
                 .last()
                 .map_or(0.0, |last| last / report.starting_balance - 1.0),
             benchmark,
+            benchmark_after_funding: held_return(report, request, from_index, &equal)
+                .unwrap_or(0.0),
+            weights_held_return: first_weights(request)
+                .and_then(|weights| held_return(report, request, from_index, &weights)),
+            by_hour,
+            by_weekday,
             correlation: correlation(report, from_index),
         }
     }
@@ -777,6 +819,53 @@ fn benchmark(report: &PortfolioReport, from_index: usize) -> Vec<f64> {
                 .sum()
         })
         .collect()
+}
+
+/// The weights first asked for, if the book is given by weights.
+fn first_weights(request: &PortfolioRequest) -> Option<Vec<f64>> {
+    if let Some(table) = &request.weights {
+        // A table that switches has no one set of weights: which row came first says nothing.
+        let first = table.first()?;
+        return table
+            .iter()
+            .all(|row| row.1 == first.1)
+            .then(|| first.1.clone());
+    }
+    request
+        .legs
+        .iter()
+        .all(|leg| leg.strategy.is_none())
+        .then(|| request.legs.iter().map(|leg| leg.weight).collect())
+}
+
+/// What these shares of the capital came to, held from each market's first bar in the span, as a share
+/// of the capital, with what funding took as each fell due.
+fn held_return(
+    report: &PortfolioReport,
+    request: &PortfolioRequest,
+    from_index: usize,
+    weights: &[f64],
+) -> Option<f64> {
+    let mut total = 0.0;
+    for ((leg, asked), weight) in report.legs.iter().zip(&request.legs).zip(weights) {
+        let Some(first) = (from_index..leg.real.len()).find(|&at| leg.real[at]) else {
+            continue;
+        };
+        let start = *leg.closes.get(first)?;
+        if start <= 0.0 {
+            continue;
+        }
+        total += weight * (leg.closes.last()? / start - 1.0);
+        for &(when, rate) in asked.funding.as_deref().map_or(&[][..], Vec::as_slice) {
+            let at = report.times.partition_point(|time| *time <= when);
+            if at > first
+                && let Some(close) = leg.closes.get(at - 1)
+            {
+                total -= weight * close / start * rate;
+            }
+        }
+    }
+    Some(total)
 }
 
 fn correlation(report: &PortfolioReport, from_index: usize) -> Vec<Vec<Option<f64>>> {
@@ -897,6 +986,10 @@ mod tests {
                 by_year: BTreeMap::from([(2024, 0.01)]),
                 benchmark_return: 0.5,
                 benchmark: vec![1_000.0, 1_500.0],
+                benchmark_after_funding: 0.4,
+                weights_held_return: Some(0.3),
+                by_hour: vec![1.0; 24],
+                by_weekday: vec![2.0; 7],
                 correlation: vec![vec![Some(1.0)]],
             },
             from_index: 1,
@@ -928,6 +1021,9 @@ mod tests {
         assert_eq!(back.figures.by_year, run.figures.by_year);
         assert_eq!(back.figures.correlation, run.figures.correlation);
         assert_eq!(back.figures.sharpe, run.figures.sharpe);
+        assert_eq!(back.figures.benchmark_after_funding, 0.4);
+        assert_eq!(back.figures.weights_held_return, Some(0.3));
+        assert_eq!(back.figures.by_weekday, vec![2.0; 7]);
         assert_eq!(back.opens, run.opens);
         assert!(back.next_open && back.friction);
         fs::remove_dir_all(dir).unwrap();

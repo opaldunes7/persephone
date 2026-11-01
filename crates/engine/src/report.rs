@@ -59,6 +59,8 @@ pub struct BacktestReport {
     pub bars_to_fill_longest: usize,
     /// What was still to go when the run ended, in the base currency.
     pub unfilled_at_end: f64,
+    /// A row for each bar, if asked for.
+    pub decisions: Vec<Decision>,
     /// What funding came to, positive when it cost, and what borrowing for shorts cost.
     pub funding_paid: f64,
     pub borrow_paid: f64,
@@ -135,6 +137,7 @@ pub(crate) fn build(
         bars_to_fill_average: 0.0,
         bars_to_fill_longest: 0,
         unfilled_at_end: 0.0,
+        decisions: Vec::new(),
         funding_paid,
         borrow_paid,
         limit_log: Vec::new(),
@@ -173,6 +176,22 @@ pub(crate) fn assign_bars(raw: &[RawFill], closes: &[UnixNanos], next_open: bool
             }
         })
         .collect()
+}
+
+/// One bar's decision, from the strategy's wish to the order it did or didn't make.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Decision {
+    /// The bar's close.
+    pub ts: UnixNanos,
+    /// What the strategy asked for, if anything.
+    pub wanted: Option<i8>,
+    /// What was held going in, and what the trading rules made of the wish.
+    pub held: i8,
+    pub target: Option<i8>,
+    /// What went out, signed, if anything.
+    pub order: f64,
+    /// Why, in a word or two.
+    pub why: &'static str,
 }
 
 /// What became of a limit order.

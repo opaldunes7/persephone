@@ -14,12 +14,14 @@ use persephone_research::figures::LimitSummary;
 
 use super::{
     BlockLength, BlockRun, Commission, Edit, Field, FillTiming, LegChoice, NO_VARIABLE, OneWay,
-    OptimizeRun, Panel, PanelMessage, Precision, RunColumn, ScoreBy, Settings, StrategyChoice,
-    TestKind, TestRun,
+    OptimizeRun, Panel, PanelMessage, PortfolioView, Precision, RunColumn, ScoreBy, Settings,
+    StrategyChoice, TestKind, TestRun, VaryChoice,
     calendar::{Calendar, Level, Total, days_in_month, weeks},
     optimize::{OptimizeResult, Outcome},
     portfolio::{PortfolioRun, SavedPortfolio},
+    portfolio_tests::{PortfolioMonteCarlo, SweepRow, Vary},
     positions::ONE_TRADE,
+    positions::RandomEntries,
     progress,
     robustness::Problem,
     robustness::percentile,
@@ -31,8 +33,8 @@ use super::{
     walk_forward::WalkForward,
     widgets::heat,
     widgets::{
-        Distribution, Edge, Equity, Fan, Glyph, HeatScale, Icon, Landscape, Lines, RunsTable, Span,
-        Speed, WalkChart, leg_color, percent,
+        BarsByTime, Distribution, Edge, Equity, Fan, Glyph, HeatScale, Icon, Landscape, Lines,
+        RunsTable, Span, Speed, WalkChart, leg_color, percent,
     },
 };
 
@@ -268,7 +270,20 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                     None,
                 ));
             }
-            if panel.limits_shown && !report.limit_log.is_empty() {
+            if !report.decisions.is_empty() {
+                let shown = panel.decisions_shown;
+                heading = heading.push(tip(
+                    button(text("Decisions").size(HINT).center())
+                        .padding([2, 7])
+                        .on_press(PanelMessage::ShowDecisions(!shown))
+                        .style(move |_, status| chip(shown, status)),
+                    "Each bar's decision: what the strategy asked for, what was held, what went out, and why not.",
+                    None,
+                ));
+            }
+            if panel.decisions_shown && !report.decisions.is_empty() {
+                decisions_table(report)
+            } else if panel.limits_shown && !report.limit_log.is_empty() {
                 limit_orders_table(report)
             } else if view.shown {
                 let last = info.candles.last().map_or(0, |c| c.ts);
@@ -386,6 +401,190 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                 Space::new().width(Fill).height(Fill).into()
             }
         },
+        (_, TestKind::Portfolio) if panel.tests.portfolio_view == PortfolioView::Sweep => {
+            match &panel.tests.portfolio_sweep {
+                TestRun::Done(rows) => {
+                    let name = panel.tests.portfolio_vary.name(&info.settings.portfolio);
+                    note = Some(muted(format!(
+                        "{} values of {name}, best first.",
+                        rows.len()
+                    )));
+                    portfolio_sweep_table(rows)
+                }
+                TestRun::Running { done, total, .. } => {
+                    note = Some(muted(format!("Running {done} of {total}…")));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+                TestRun::Failed(message) => {
+                    note = Some(text(message.as_str()).size(SMALL).color(theme::DOWN));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+                TestRun::Idle => {
+                    note = Some(muted(
+                        "Pick what to vary and its range, then press Run.".to_owned(),
+                    ));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+            }
+        }
+        (_, TestKind::Portfolio) if panel.tests.portfolio_view == PortfolioView::Shifted => {
+            match &panel.tests.portfolio_shifted {
+                TestRun::Done(found) => {
+                    heading = heading
+                        .push(figure("This book", percent(found.actual_return), up_or_down(found.actual_return), "This book as a table of weights, unmoved: what the moved ones are held against."))
+                        .push(figure("Median", percent(found.median), up_or_down(found.median), "The return half the moved ones beat."))
+                        .push(figure("As good", format!("{:.0}%", found.share_matching_return * 100.0), theme::TEXT, "The share of moved ones that returned at least as much. Near 50% means the timing added nothing."))
+                        .push(figure("As safe", format!("{:.0}%", found.share_matching_fall * 100.0), theme::TEXT, "The share of moved ones that fell no further."));
+                    note = Some(muted(if found.trades < 2 {
+                        SHIFTED_ONE.to_owned()
+                    } else {
+                        format!(
+                            "{} changes moved along the span {} times. 19 in 20 returned {} to {}.",
+                            found.trades,
+                            found.runs,
+                            percent(found.low),
+                            percent(found.high),
+                        )
+                    }));
+                    shifted_charts(found)
+                }
+                TestRun::Running { done, total, .. } => {
+                    note = Some(muted(format!("Running {done} of {total}…")));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+                TestRun::Failed(message) => {
+                    note = Some(text(message.as_str()).size(SMALL).color(theme::DOWN));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+                TestRun::Idle => {
+                    note = Some(muted(
+                        "Press Run to move the last run's book along the span.".to_owned(),
+                    ));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+            }
+        }
+        (_, TestKind::Portfolio) if panel.tests.portfolio_view == PortfolioView::MonteCarlo => {
+            match &panel.tests.portfolio_monte_carlo {
+                TestRun::Done(found) => {
+                    heading = heading
+                        .push(figure(
+                            "This run",
+                            percent(found.actual_return),
+                            up_or_down(found.actual_return),
+                            "What the run itself returned.",
+                        ))
+                        .push(figure(
+                            "Median",
+                            percent(found.median),
+                            up_or_down(found.median),
+                            "The return half the draws beat.",
+                        ))
+                        .push(figure(
+                            "Losing",
+                            format!("{:.0}%", found.losing_share * 100.0),
+                            theme::TEXT,
+                            "The share of draws that lost money.",
+                        ))
+                        .push(figure(
+                            "Ruin",
+                            format!("{:.0}%", found.ruin_share * 100.0),
+                            theme::TEXT,
+                            "The share of draws that fell past the ruin level.",
+                        ));
+                    note = Some(muted(format!(
+                        "Its returns drawn {} times in blocks of {} bars. 19 in 20 returned {} to {}.",
+                        found.runs,
+                        found.block_bars,
+                        percent(found.low),
+                        percent(found.high),
+                    )));
+                    row![
+                        container(
+                            canvas(portfolio_band(found, info.settings.capital))
+                                .width(Fill)
+                                .height(Fill)
+                        )
+                        .padding(Padding {
+                            top: WALK_TOP,
+                            ..Padding::ZERO
+                        })
+                        .width(FillPortion(3))
+                        .height(Fill),
+                        canvas(Distribution {
+                            title: "How far each fell at worst",
+                            values: &found.falls,
+                            actual: found.actual_fell,
+                            band: None,
+                            median: percentile(&found.falls, 0.5),
+                        })
+                        .width(FillPortion(2))
+                        .height(Fill),
+                    ]
+                    .into()
+                }
+                TestRun::Failed(message) => {
+                    note = Some(text(message.as_str()).size(SMALL).color(theme::DOWN));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+                _ => {
+                    note = Some(muted(
+                        "Press Run to draw the last run's returns again.".to_owned(),
+                    ));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+            }
+        }
+        (_, TestKind::Portfolio) if panel.tests.portfolio_view == PortfolioView::WalkForward => {
+            match &panel.tests.portfolio_walk {
+                TestRun::Done(found) => {
+                    heading = heading
+                        .push(figure("Unseen", percent(found.unseen_return), up_or_down(found.unseen_return), "What the unseen stretches returned, added up. None of it was used to pick."))
+                        .push(figure("Equal shares", percent(found.buy_and_hold_return), up_or_down(found.buy_and_hold_return), "Equal shares of the markets over the same stretches, added up, with no funding taken off."))
+                        .push(figure("Profitable", format!("{} of {}", found.profitable_windows, found.windows.len()), theme::TEXT, "How many unseen stretches made money."))
+                        .push(figure("Worst fall", format!("{:.1}%", found.deepest_fall * 100.0), theme::TEXT, "The deepest fall from a peak in any unseen stretch."));
+                    note = Some(muted(format!(
+                        "Each window picks on {} bars, then is tested on the next {}. Each starts from the same capital. One after another, that's {} against {}.",
+                        found.train_bars,
+                        found.test_bars,
+                        percent(found.compounded().0),
+                        percent(found.compounded().1),
+                    )));
+                    row![
+                        container(
+                            canvas(WalkChart {
+                                found,
+                                market: "Market, held in full"
+                            })
+                            .width(Fill)
+                            .height(Fill)
+                        )
+                        .padding(Padding {
+                            top: WALK_TOP,
+                            ..Padding::ZERO
+                        })
+                        .width(Fill)
+                        .height(Fill),
+                        walk_forward_table(found, "Equal"),
+                    ]
+                    .into()
+                }
+                TestRun::Running { done, total, .. } => {
+                    note = Some(muted(format!("Running {done} of {total}…")));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+                TestRun::Failed(message) => {
+                    note = Some(text(message.as_str()).size(SMALL).color(theme::DOWN));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+                TestRun::Idle => {
+                    note = Some(muted(
+                        "Pick what to vary and its range, then press Run.".to_owned(),
+                    ));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+            }
+        }
         (_, TestKind::Portfolio) => match &panel.tests.portfolio {
             TestRun::Done(found) => {
                 let figures = &found.figures;
@@ -459,11 +658,14 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                 ]
                 .into()
             }
-            TestRun::Running { total, .. } => {
+            TestRun::Running { done, total, .. } => {
                 note = Some(muted(if *total == 0 {
                     "Reading the saved run…".to_owned()
                 } else {
-                    format!("Loading {total} markets and running them…")
+                    match info.settings.portfolio.legs.get(*done) {
+                        Some(leg) => format!("Loading {}, {} of {total}…", leg.symbol, done + 1),
+                        None => "Running them…".to_owned(),
+                    }
                 }));
                 Space::new().width(Fill).height(Fill).into()
             }
@@ -508,18 +710,28 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                             "The deepest fall from a peak in any unseen stretch.",
                         ));
                     note = Some(muted(format!(
-                        "Each window picks on {} bars, then is tested on the next {}. Each starts from the same capital.",
-                        found.train_bars, found.test_bars,
+                        "Each window picks on {} bars, then is tested on the next {}. Each starts from the same capital. One after another, that's {} against {}.",
+                        found.train_bars,
+                        found.test_bars,
+                        percent(found.compounded().0),
+                        percent(found.compounded().1),
                     )));
                     row![
-                        container(canvas(WalkChart { found }).width(Fill).height(Fill))
-                            .padding(Padding {
-                                top: WALK_TOP,
-                                ..Padding::ZERO
+                        container(
+                            canvas(WalkChart {
+                                found,
+                                market: "Equal shares, held"
                             })
                             .width(Fill)
-                            .height(Fill),
-                        walk_forward_table(found),
+                            .height(Fill)
+                        )
+                        .padding(Padding {
+                            top: WALK_TOP,
+                            ..Padding::ZERO
+                        })
+                        .width(Fill)
+                        .height(Fill),
+                        walk_forward_table(found, "Market"),
                     ]
                     .into()
                 }
@@ -541,6 +753,47 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                             "Pick a variable and its range, then press Run.".to_owned(),
                         ));
                     }
+                    Space::new().width(Fill).height(Fill).into()
+                }
+            }
+        }
+        (Status::Done(_), TestKind::RandomEntries) if panel.tests.entries_shifted => {
+            match &panel.tests.shifted {
+                TestRun::Done(found) => {
+                    heading = heading
+                        .push(figure("Backtest", percent(found.actual_return), up_or_down(found.actual_return), "What the backtest itself returned."))
+                        .push(figure("Median", percent(found.median), up_or_down(found.median), "The return half the moved ones beat."))
+                        .push(figure("As good", format!("{:.0}%", found.share_matching_return * 100.0), theme::TEXT, "The share of moved ones that returned at least as much. Near 50% means the timing added nothing."))
+                        .push(figure("As safe", format!("{:.0}%", found.share_matching_fall * 100.0), theme::TEXT, "The share of moved ones that fell no further."));
+                    note = Some(muted(if found.trades < 2 {
+                        SHIFTED_ONE.to_owned()
+                    } else {
+                        format!(
+                            "{} changes moved along the span {} times. 19 in 20 returned {} to {}.",
+                            found.trades,
+                            found.runs,
+                            percent(found.low),
+                            percent(found.high),
+                        )
+                    }));
+                    shifted_charts(found)
+                }
+                TestRun::Running { done, total, .. } => {
+                    note = Some(muted(format!("Running backtest {done} of {total}…")));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+                TestRun::Failed(message) => {
+                    note = Some(
+                        text(message.as_str())
+                            .size(theme::TEXT_SIZE)
+                            .color(theme::DOWN),
+                    );
+                    Space::new().width(Fill).height(Fill).into()
+                }
+                TestRun::Idle => {
+                    note = Some(muted(
+                        "Press Run to move this backtest's positions along the span.".to_owned(),
+                    ));
                     Space::new().width(Fill).height(Fill).into()
                 }
             }
@@ -1100,6 +1353,199 @@ fn limit_orders_table(report: &BacktestReport) -> Element<'_, PanelMessage> {
     .into()
 }
 
+/// What's said when there's little timing to move.
+const SHIFTED_ONE: &str =
+    "It only changed once, so moving it says almost nothing about its timing.";
+
+/// Each bar's decision, those where something was asked or sent first being what's worth reading.
+fn decisions_table(report: &BacktestReport) -> Element<'_, PanelMessage> {
+    let cell = |value: String, width: f32, color: Color| {
+        text(value)
+            .size(SMALL)
+            .width(width)
+            .color(color)
+            .font(iced::Font::MONOSPACE)
+    };
+    let way = |position: Option<i8>| match position {
+        Some(1) => "long",
+        Some(-1) => "short",
+        Some(_) => "flat",
+        None => "—",
+    };
+    let mut rows = column![row![
+        cell("Closed".into(), 150.0, theme::TEXT_MUTED),
+        cell("Asked".into(), 60.0, theme::TEXT_MUTED),
+        cell("Held".into(), 60.0, theme::TEXT_MUTED),
+        cell("Rules".into(), 60.0, theme::TEXT_MUTED),
+        cell("Order".into(), 100.0, theme::TEXT_MUTED),
+        cell("Why".into(), 280.0, theme::TEXT_MUTED),
+    ]]
+    .spacing(3);
+    let worth: Vec<_> = report
+        .decisions
+        .iter()
+        .filter(|row| row.wanted.is_some() || row.order != 0.0)
+        .collect();
+    for decision in worth.iter().take(LIMIT_ROWS) {
+        let at = DateTime::from_nanos(decision.ts);
+        rows = rows.push(row![
+            cell(format!("{} {}", at.date(), at.time()), 150.0, theme::TEXT),
+            cell(way(decision.wanted).to_owned(), 60.0, theme::TEXT),
+            cell(way(Some(decision.held)).to_owned(), 60.0, theme::TEXT),
+            cell(way(decision.target).to_owned(), 60.0, theme::TEXT),
+            cell(
+                if decision.order == 0.0 {
+                    "—".to_owned()
+                } else {
+                    format!("{:+}", decision.order)
+                },
+                100.0,
+                theme::TEXT,
+            ),
+            cell(decision.why.to_owned(), 280.0, theme::TEXT_MUTED),
+        ]);
+    }
+    if worth.len() > LIMIT_ROWS {
+        rows = rows.push(cell(
+            format!(
+                "And {} more. `get_decisions` in Lab has them all.",
+                worth.len() - LIMIT_ROWS
+            ),
+            500.0,
+            theme::TEXT_MUTED,
+        ));
+    }
+    scrollable(rows.padding(Padding {
+        top: WALK_TOP,
+        right: 12.0,
+        bottom: 8.0,
+        left: 12.0,
+    }))
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+/// A book moved along its span: what those returned and how far they fell.
+fn shifted_charts(found: &RandomEntries) -> Element<'_, PanelMessage> {
+    row![
+        canvas(Distribution {
+            title: "What the moved ones returned",
+            values: &found.returns,
+            actual: found.actual_return,
+            band: Some((found.low, found.high)),
+            median: found.median,
+        })
+        .width(FillPortion(3))
+        .height(Fill),
+        canvas(Distribution {
+            title: "How far each fell at worst",
+            values: &found.falls,
+            actual: found.actual_fell,
+            band: None,
+            median: percentile(&found.falls, 0.5),
+        })
+        .width(FillPortion(2))
+        .height(Fill),
+    ]
+    .into()
+}
+
+/// A sweep's values, best first.
+fn portfolio_sweep_table(rows: &[SweepRow]) -> Element<'_, PanelMessage> {
+    let cell = |value: String, width: f32, color: Color| {
+        text(value)
+            .size(SMALL)
+            .width(width)
+            .color(color)
+            .font(iced::Font::MONOSPACE)
+    };
+    let mut lines = column![row![
+        cell("Value".into(), 92.0, theme::TEXT_MUTED),
+        cell("Return".into(), 76.0, theme::TEXT_MUTED),
+        cell("Sharpe".into(), 66.0, theme::TEXT_MUTED),
+        cell("Fell".into(), 66.0, theme::TEXT_MUTED),
+        cell("Turnover".into(), 76.0, theme::TEXT_MUTED),
+        cell("Margin".into(), 66.0, theme::TEXT_MUTED),
+        cell("".into(), 90.0, theme::TEXT_MUTED),
+    ]]
+    .spacing(3);
+    for found in rows {
+        let color = if found.net_return >= 0.0 {
+            theme::UP
+        } else {
+            theme::DOWN
+        };
+        lines = lines.push(row![
+            cell(found.label.clone(), 92.0, theme::TEXT),
+            cell(percent(found.net_return), 76.0, color),
+            cell(
+                found
+                    .sharpe
+                    .map_or("—".to_owned(), |sharpe| format!("{sharpe:.2}")),
+                66.0,
+                theme::TEXT
+            ),
+            cell(format!("{:.1}%", found.fell * 100.0), 66.0, theme::TEXT),
+            cell(format!("{:.1}×", found.turnover), 76.0, theme::TEXT),
+            cell(
+                format!("{:.0}%", found.peak_margin_use * 100.0),
+                66.0,
+                theme::TEXT
+            ),
+            cell(
+                if found.liquidated {
+                    "liquidated".into()
+                } else {
+                    String::new()
+                },
+                90.0,
+                theme::DOWN
+            ),
+        ]);
+    }
+    iced::widget::scrollable(lines.padding(Padding {
+        top: WALK_TOP,
+        right: 12.0,
+        bottom: 8.0,
+        left: 12.0,
+    }))
+    .width(Fill)
+    .height(Fill)
+    .into()
+}
+
+/// Where a portfolio's draws stayed, with the run's own.
+fn portfolio_band(found: &PortfolioMonteCarlo, capital: f64) -> Lines<'_> {
+    Lines {
+        lines: vec![
+            (
+                "Low".to_owned(),
+                found.low_line.as_slice(),
+                theme::TEXT_MUTED,
+            ),
+            (
+                "High".to_owned(),
+                found.high_line.as_slice(),
+                theme::TEXT_MUTED,
+            ),
+            (
+                "Median".to_owned(),
+                found.median_line.as_slice(),
+                leg_color(1),
+            ),
+            (
+                "This run".to_owned(),
+                found.actual_line.as_slice(),
+                theme::TEXT_BRIGHT,
+            ),
+        ],
+        times: &[],
+        start: capital,
+        format: |value| format!("{value:.0}"),
+    }
+}
+
 /// The account, what equal shares would have done, and what each leg has made.
 fn portfolio_equity(found: &PortfolioRun) -> Lines<'_> {
     let report = &found.report;
@@ -1238,6 +1684,21 @@ fn portfolio_table(found: &PortfolioRun, picked: usize) -> Element<'_, PanelMess
         398.0,
         theme::TEXT_MUTED,
     ));
+    let figures = &found.figures;
+    rows = rows.push(cell(
+        format!(
+            "Equal shares after funding {}. {}",
+            percent(figures.benchmark_after_funding),
+            figures
+                .weights_held_return
+                .map_or(String::new(), |held| format!(
+                    "These weights held {}.",
+                    percent(held)
+                )),
+        ),
+        398.0,
+        theme::TEXT_MUTED,
+    ));
     let mut years = column![cell("By year".into(), 112.0, theme::TEXT_MUTED)].spacing(3);
     for (year, made) in &found.figures.by_year {
         years = years.push(row![
@@ -1250,6 +1711,24 @@ fn portfolio_table(found: &PortfolioRun, picked: usize) -> Element<'_, PanelMess
         ]);
     }
     rows = rows.push(Space::new().height(8)).push(years);
+    rows = rows.push(
+        container(
+            canvas(BarsByTime::hours(figures.by_hour.clone()))
+                .width(Fill)
+                .height(Fill),
+        )
+        .width(398.0)
+        .height(64.0),
+    );
+    rows = rows.push(
+        container(
+            canvas(BarsByTime::weekdays(figures.by_weekday.clone()))
+                .width(Fill)
+                .height(Fill),
+        )
+        .width(398.0)
+        .height(64.0),
+    );
     for note in report.notes.iter().filter(|note| !note.warning) {
         rows = rows.push(
             text(note.text.as_str())
@@ -1315,7 +1794,7 @@ fn portfolio_table(found: &PortfolioRun, picked: usize) -> Element<'_, PanelMess
 }
 
 /// Each window of a walk-forward: what it picked, and how that did on what it hadn't seen.
-fn walk_forward_table(found: &WalkForward) -> Element<'_, PanelMessage> {
+fn walk_forward_table<'a>(found: &'a WalkForward, market: &str) -> Element<'a, PanelMessage> {
     let day = |ts: UnixNanos| DateTime::from_nanos(ts).date();
     let cell = |value: String, width: f32, color: Color| {
         text(value)
@@ -1328,7 +1807,7 @@ fn walk_forward_table(found: &WalkForward) -> Element<'_, PanelMessage> {
         cell("From".into(), 84.0, theme::TEXT_MUTED),
         cell("Picked".into(), 92.0, theme::TEXT_MUTED),
         cell("Return".into(), 66.0, theme::TEXT_MUTED),
-        cell("Market".into(), 66.0, theme::TEXT_MUTED),
+        cell(market.to_owned(), 66.0, theme::TEXT_MUTED),
         cell("Fell".into(), 50.0, theme::TEXT_MUTED),
         cell("Trades".into(), 46.0, theme::TEXT_MUTED),
     ]]

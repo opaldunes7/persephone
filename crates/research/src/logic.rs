@@ -11,8 +11,9 @@
 //!
 //! A value is a number, a bar's field (`open`, `high`, `low`, `close`, `volume`), something about
 //! now (`position`, `entry_price`, `bars_held`, `hour`, `weekday`), a parameter (`$name`), or an
-//! object: an indicator (`sma`, `ema`, `rsi`, `atr`, `highest`, `lowest`, `roc`,
-//! `zscore`), an earlier value (`ago`), or arithmetic (`add`, `sub`, `mul`, `div`). A rule compares
+//! object: an indicator (`sma`, `ema`, `rsi`, `atr`, `highest`, `lowest`, `roc`, `zscore`,
+//! `stddev`), an earlier value (`ago`), arithmetic (`add`, `sub`, `mul`, `div`, `min`, `max`, `abs`),
+//! or a value on a longer timeframe (`on`), which is only seen once that timeframe's bar has closed. A rule compares
 //! values (`gt`, `lt`, `ge`, `le`, `crosses_above`, `crosses_below`) or combines rules (`and`, `or`,
 //! `not`).
 //!
@@ -27,7 +28,7 @@ use std::{
 };
 
 use persephone_core::{
-    Candle,
+    Candle, Timeframe, UnixNanos,
     indicator::Param,
     signal::{Signal, SignalFactory},
     strategy::{StrategyInfo, StrategyKind, StrategySpec},
@@ -56,10 +57,10 @@ pub const FIELDS: [&str; 12] = [
     "hour",
     "weekday",
 ];
-pub const INDICATORS: [&str; 8] = [
-    "sma", "ema", "rsi", "atr", "highest", "lowest", "roc", "zscore",
+pub const INDICATORS: [&str; 9] = [
+    "sma", "ema", "rsi", "atr", "highest", "lowest", "roc", "zscore", "stddev",
 ];
-pub const OPERATIONS: [&str; 5] = ["ago", "add", "sub", "mul", "div"];
+pub const OPERATIONS: [&str; 9] = ["ago", "add", "sub", "mul", "div", "min", "max", "abs", "on"];
 pub const COMPARISONS: [&str; 6] = ["gt", "lt", "ge", "le", "crosses_above", "crosses_below"];
 pub const COMBINATIONS: [&str; 3] = ["and", "or", "not"];
 
@@ -85,6 +86,12 @@ enum Expr {
         bars: Amount,
     },
     Arithmetic(Arithmetic, Box<Self>, Box<Self>),
+    Abs(Box<Self>),
+    /// A value worked out on bars of a longer timeframe, read only once they've closed.
+    On {
+        timeframe: Timeframe,
+        value: Box<Self>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +136,7 @@ enum IndicatorKind {
     Lowest,
     Roc,
     Zscore,
+    Stddev,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +145,8 @@ enum Arithmetic {
     Sub,
     Mul,
     Div,
+    Min,
+    Max,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,6 +266,7 @@ impl Parser<'_> {
             "lowest" => Some(IndicatorKind::Lowest),
             "roc" => Some(IndicatorKind::Roc),
             "zscore" => Some(IndicatorKind::Zscore),
+            "stddev" => Some(IndicatorKind::Stddev),
             _ => None,
         };
         if let Some(kind) = kind {
@@ -266,11 +277,31 @@ impl Parser<'_> {
             "sub" => Some(Arithmetic::Sub),
             "mul" => Some(Arithmetic::Mul),
             "div" => Some(Arithmetic::Div),
+            "min" => Some(Arithmetic::Min),
+            "max" => Some(Arithmetic::Max),
             _ => None,
         };
         if let Some(arithmetic) = arithmetic {
             let (a, b) = self.pair(inner, &here)?;
             return Ok(Expr::Arithmetic(arithmetic, Box::new(a), Box::new(b)));
+        }
+        if key == "abs" {
+            return Ok(Expr::Abs(Box::new(self.expr(inner, &here)?)));
+        }
+        if key == "on" {
+            let fields = fields_of(inner, &here, &["timeframe", "value"])?;
+            let given = required(fields, "timeframe", &here)?;
+            let timeframe = given
+                .as_str()
+                .and_then(|text| text.parse::<Timeframe>().ok())
+                .ok_or_else(|| {
+                    format!("{here}.timeframe: expected a timeframe such as 4h or 1d, not {given}")
+                })?;
+            let value = self.expr(required(fields, "value", &here)?, &deeper(&here, "value"))?;
+            return Ok(Expr::On {
+                timeframe,
+                value: Box::new(value),
+            });
         }
         if key == "ago" {
             let fields = fields_of(inner, &here, &["of", "bars"])?;
@@ -539,6 +570,12 @@ impl Logic {
     /// About how many bars it takes for every rule to be ready, with these parameters.
     #[must_use]
     pub fn look_back(&self, params: &[f64]) -> usize {
+        self.look_back_on(params, 0)
+    }
+
+    /// The same, counted in bars this long, as a longer timeframe's bars are made of several.
+    #[must_use]
+    pub fn look_back_on(&self, params: &[f64], chart_bar: u64) -> usize {
         let values: BTreeMap<&str, f64> = self
             .params
             .iter()
@@ -548,7 +585,7 @@ impl Logic {
         [&self.long, &self.short, &self.flat]
             .into_iter()
             .flatten()
-            .map(|rule| rule.look_back(&values))
+            .map(|rule| rule.look_back(&values, chart_bar))
             .max()
             .unwrap_or(0)
     }
@@ -587,33 +624,43 @@ impl SignalFactory for Logic {
 }
 
 impl Rule {
-    fn look_back(&self, values: &BTreeMap<&str, f64>) -> usize {
+    fn look_back(&self, values: &BTreeMap<&str, f64>, chart_bar: u64) -> usize {
         match self {
             Self::Compare(comparison, a, b) => {
                 let crossing = matches!(
                     comparison,
                     Comparison::CrossesAbove | Comparison::CrossesBelow
                 );
-                a.look_back(values).max(b.look_back(values)) + usize::from(crossing)
+                a.look_back(values, chart_bar)
+                    .max(b.look_back(values, chart_bar))
+                    + usize::from(crossing)
             }
             Self::And(rules) | Self::Or(rules) => rules
                 .iter()
-                .map(|rule| rule.look_back(values))
+                .map(|rule| rule.look_back(values, chart_bar))
                 .max()
                 .unwrap_or(0),
-            Self::Not(rule) => rule.look_back(values),
+            Self::Not(rule) => rule.look_back(values, chart_bar),
         }
     }
 }
 
 impl Expr {
-    fn look_back(&self, values: &BTreeMap<&str, f64>) -> usize {
+    fn look_back(&self, values: &BTreeMap<&str, f64>, chart_bar: u64) -> usize {
         let bars = |given: &Amount| amount(given, values).max(0.0) as usize;
         match self {
             Self::Number(_) | Self::Field(_) => 0,
-            Self::Indicator { of, length, .. } => of.look_back(values) + bars(length),
-            Self::Ago { of, bars: back } => of.look_back(values) + bars(back),
-            Self::Arithmetic(_, a, b) => a.look_back(values).max(b.look_back(values)),
+            Self::Indicator { of, length, .. } => of.look_back(values, chart_bar) + bars(length),
+            Self::Ago { of, bars: back } => of.look_back(values, chart_bar) + bars(back),
+            Self::Arithmetic(_, a, b) => a
+                .look_back(values, chart_bar)
+                .max(b.look_back(values, chart_bar)),
+            Self::Abs(of) => of.look_back(values, chart_bar),
+            // In its own bars: how many of the chart's that is depends on the chart.
+            Self::On { value, timeframe } => {
+                let per_bar = timeframe.nanos().checked_div(chart_bar).unwrap_or(1).max(1) as usize;
+                value.look_back(values, chart_bar).saturating_mul(per_bar)
+            }
         }
     }
 }
@@ -648,6 +695,14 @@ enum LiveExpr {
         bars: usize,
     },
     Arithmetic(Arithmetic, Box<Self>, Box<Self>),
+    Abs(Box<Self>),
+    On {
+        timeframe: Timeframe,
+        value: Box<Self>,
+        /// The longer bar so far, and when it closes.
+        forming: Option<(Candle, UnixNanos)>,
+        last: f64,
+    },
 }
 
 impl LiveExpr {
@@ -670,14 +725,15 @@ impl LiveExpr {
                         window: VecDeque::new(),
                         size: period + 1,
                     },
-                    IndicatorKind::Highest | IndicatorKind::Lowest | IndicatorKind::Zscore => {
-                        Self::Window {
-                            kind: *kind,
-                            of,
-                            window: VecDeque::new(),
-                            size: period,
-                        }
-                    }
+                    IndicatorKind::Highest
+                    | IndicatorKind::Lowest
+                    | IndicatorKind::Zscore
+                    | IndicatorKind::Stddev => Self::Window {
+                        kind: *kind,
+                        of,
+                        window: VecDeque::new(),
+                        size: period,
+                    },
                 }
             }
             Expr::Ago { of, bars } => Self::Ago {
@@ -690,6 +746,13 @@ impl LiveExpr {
                 Box::new(Self::new(a, values)?),
                 Box::new(Self::new(b, values)?),
             ),
+            Expr::Abs(of) => Self::Abs(Box::new(Self::new(of, values)?)),
+            Expr::On { timeframe, value } => Self::On {
+                timeframe: *timeframe,
+                value: Box::new(Self::new(value, values)?),
+                forming: None,
+                last: f64::NAN,
+            },
         })
     }
 
@@ -757,7 +820,54 @@ impl LiveExpr {
                     Arithmetic::Mul => a * b,
                     Arithmetic::Div if b == 0.0 => f64::NAN,
                     Arithmetic::Div => a / b,
+                    Arithmetic::Min if a.is_nan() || b.is_nan() => f64::NAN,
+                    Arithmetic::Min => a.min(b),
+                    Arithmetic::Max if a.is_nan() || b.is_nan() => f64::NAN,
+                    Arithmetic::Max => a.max(b),
                 }
+            }
+            Self::Abs(of) => of.next(now).abs(),
+            Self::On {
+                timeframe,
+                value,
+                forming,
+                last,
+            } => {
+                // A bar's stamped with its close, so one closing on the boundary is the last in
+                // the longer bar ending there.
+                let inside = now.bar.ts.saturating_sub(1);
+                let closes = timeframe.close_time(inside);
+                // A longer bar is seen when it's over: when a chart bar closes on its end, or the
+                // first bar after it arrives if data's missing there, and never sooner.
+                if let Some((bar, due)) = forming
+                    && closes != *due
+                {
+                    *last = value.next(&Now { bar, ..*now });
+                    *forming = None;
+                }
+                match forming {
+                    Some((bar, _)) => {
+                        bar.high = bar.high.max(now.bar.high);
+                        bar.low = bar.low.min(now.bar.low);
+                        bar.close = now.bar.close;
+                        bar.volume += now.bar.volume;
+                    }
+                    None => {
+                        *forming = Some((
+                            Candle {
+                                ts: closes,
+                                ..*now.bar
+                            },
+                            closes,
+                        ));
+                    }
+                }
+                if now.bar.ts >= closes
+                    && let Some((bar, _)) = forming.take()
+                {
+                    *last = value.next(&Now { bar: &bar, ..*now });
+                }
+                *last
             }
         }
     }
@@ -785,6 +895,12 @@ fn windowed(kind: IndicatorKind, window: &VecDeque<f64>) -> f64 {
             } else {
                 (window[window.len() - 1] - mean) / variance.sqrt()
             }
+        }
+        // Over the window itself, as `zscore` works it out.
+        IndicatorKind::Stddev => {
+            let count = window.len() as f64;
+            let mean = window.iter().sum::<f64>() / count;
+            (window.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / count).sqrt()
         }
         IndicatorKind::Sma | IndicatorKind::Ema | IndicatorKind::Rsi | IndicatorKind::Atr => {
             f64::NAN
@@ -928,14 +1044,109 @@ impl Signal for Running {
 
 #[cfg(test)]
 mod tests {
-    use persephone_core::{
-        Timeframe,
-        indicator::{BuiltIn, IndicatorKind as Kind, IndicatorSpec},
-    };
+    use persephone_core::indicator::{BuiltIn, IndicatorKind as Kind, IndicatorSpec};
     use persephone_engine::indicators::compute;
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn abs_min_max_and_stddev_work_out_by_hand() {
+        let at = |closes: &[f64]| -> Vec<Candle> {
+            closes
+                .iter()
+                .enumerate()
+                .map(|(i, &close)| Candle {
+                    ts: (i as u64 + 1) * Timeframe::H1.nanos(),
+                    open: close,
+                    high: close,
+                    low: close,
+                    close,
+                    volume: 1.0,
+                })
+                .collect()
+        };
+        let bars = at(&[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
+        let last = |expr: Value| *values(&expr, &bars).last().unwrap();
+        // The textbook's: a mean of 5 and a standard deviation of 2.
+        assert_eq!(last(json!({"stddev": {"length": 8}})), 2.0);
+        assert!(values(&json!({"stddev": {"length": 8}}), &bars)[6].is_nan());
+        assert_eq!(last(json!({"abs": {"sub": [3, "close"]}})), 6.0);
+        assert_eq!(last(json!({"min": [3, "close"]})), 3.0);
+        assert_eq!(last(json!({"max": [3, "close"]})), 9.0);
+        assert!(
+            values(
+                &json!({"max": [3, {"ago": {"of": "close", "bars": 100}}]}),
+                &bars
+            )[0]
+            .is_nan()
+        );
+    }
+
+    #[test]
+    fn a_longer_timeframe_is_only_seen_once_its_bar_has_closed() {
+        let hour = Timeframe::H1.nanos();
+        // Two days of hourly bars, each closing at its hour number.
+        let bars: Vec<Candle> = (1..=48)
+            .map(|h: u64| Candle {
+                ts: h * hour,
+                open: h as f64 - 1.0,
+                high: h as f64,
+                low: h as f64 - 1.0,
+                close: h as f64,
+                volume: 1.0,
+            })
+            .collect();
+        let on = json!({"on": {"timeframe": "1d", "value": "close"}});
+        let seen = values(&on, &bars);
+        // Nothing until the first day's over, at its last bar's close, and that day's close until
+        // the next day's over, however the hours inside it go.
+        assert!(seen[..23].iter().all(|value| value.is_nan()), "{seen:?}");
+        assert_eq!(seen[23], 24.0);
+        assert!(seen[24..47].iter().all(|value| *value == 24.0), "{seen:?}");
+        assert_eq!(seen[47], 48.0);
+        // The whole day's range, not just its last hour's.
+        let high = json!({"on": {"timeframe": "1d", "value": "high"}});
+        assert_eq!(values(&high, &bars)[47], 48.0);
+        let low = json!({"on": {"timeframe": "1d", "value": "low"}});
+        assert_eq!(values(&low, &bars)[47], 24.0);
+        let volume = json!({"on": {"timeframe": "1d", "value": "volume"}});
+        assert_eq!(values(&volume, &bars)[23], 24.0);
+        // An indicator on it counts its own bars, and sees nothing of the day under way.
+        let average = json!({"on": {"timeframe": "1d", "value": {"sma": {"length": 2}}}});
+        let seen = values(&average, &bars);
+        assert!(seen[46].is_nan());
+        assert_eq!(seen[47], 36.0);
+    }
+
+    #[test]
+    fn a_longer_bar_with_its_last_hour_missing_is_seen_when_the_next_bar_comes() {
+        let hour = Timeframe::H1.nanos();
+        let bar = |h: u64| Candle {
+            ts: h * hour,
+            open: h as f64,
+            high: h as f64,
+            low: h as f64,
+            close: h as f64,
+            volume: 1.0,
+        };
+        // No bar closes at hour 24, so the day is only known to be over at hour 26.
+        let bars: Vec<Candle> = (1..=22).chain(26..=27).map(bar).collect();
+        let on = json!({"on": {"timeframe": "1d", "value": "close"}});
+        let seen = values(&on, &bars);
+        assert!(seen[21].is_nan());
+        assert_eq!(seen[22], 22.0);
+        assert_eq!(seen[23], 22.0);
+    }
+
+    #[test]
+    fn a_timeframe_that_isnt_one_is_said() {
+        let wrong = Logic::parse(&json!({
+            "long": {"gt": [{"on": {"timeframe": "soon", "value": "close"}}, 1]},
+        }))
+        .unwrap_err();
+        assert!(wrong.contains("timeframe"), "{wrong}");
+    }
 
     fn bars(count: usize) -> Vec<Candle> {
         (0..count)

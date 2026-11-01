@@ -34,6 +34,10 @@ pub struct Settings {
     /// A stop and a target, as percentages from the entry, resting while a position's held.
     pub stop_loss_percent: Section<f64>,
     pub take_profit_percent: Section<f64>,
+    /// A stop that follows the best price since entry, as a percentage.
+    pub trailing_stop_percent: Section<f64>,
+    /// Keep a row for each bar: what was asked, what was held, and why no order went out.
+    pub decision_log: bool,
     /// What borrowing costs a short, as a percentage of its value a year.
     pub borrow_percent_per_year: Section<f64>,
     /// How far a market order fills worse, as a percentage, when it's all of its bar's volume.
@@ -65,6 +69,13 @@ pub struct Settings {
     /// How much longer orders take on average, drawn for each, and which draws those are.
     pub latency_jitter: Section<u32>,
     pub latency_seed: u32,
+    /// Nothing to pay at all: no fees, funding or cost settings, whatever else says.
+    pub no_costs: bool,
+    /// What the Portfolio test's sweep runs through, and how long Monte Carlo's blocks are.
+    pub sweep_min: f64,
+    pub sweep_max: f64,
+    pub sweep_step: f64,
+    pub portfolio_block_bars: u32,
     /// The markets the Portfolio test trades together.
     pub portfolio: crate::portfolio::PortfolioSetup,
     pub leverage: Section<f64>,
@@ -112,6 +123,8 @@ impl Default for Settings {
                 through_percent: 0.0,
             }),
             stop_loss_percent: Section::off(2.0),
+            trailing_stop_percent: Section::off(3.0),
+            decision_log: false,
             take_profit_percent: Section::off(4.0),
             borrow_percent_per_year: Section::off(10.0),
             impact_percent: Section::off(1.0),
@@ -129,6 +142,11 @@ impl Default for Settings {
             latency: Section::off(100),
             latency_jitter: Section::off(50),
             latency_seed: 0,
+            no_costs: false,
+            sweep_min: 0.1,
+            sweep_max: 1.0,
+            sweep_step: 0.1,
+            portfolio_block_bars: 100,
             portfolio: crate::portfolio::PortfolioSetup::default(),
             leverage: Section::off(2.0),
             direction: Section::off(OneWay::LongOnly),
@@ -429,6 +447,9 @@ pub enum Edit {
     RemoveLeg(usize),
     LegsUseStrategy(bool),
     CashInterest(bool),
+    NoCosts(bool),
+    TrailingStop(bool),
+    DecisionLog(bool),
     ClearWeights,
     Spread(bool),
     Latency(bool),
@@ -497,6 +518,9 @@ impl Settings {
             }
             Edit::LegsUseStrategy(on) => self.portfolio.use_chart_strategy = on,
             Edit::CashInterest(on) => self.cash_interest_percent_per_year.on = on,
+            Edit::NoCosts(on) => self.no_costs = on,
+            Edit::TrailingStop(on) => self.trailing_stop_percent.on = on,
+            Edit::DecisionLog(on) => self.decision_log = on,
             Edit::ClearWeights => self.portfolio.weights = None,
             Edit::Spread(on) => self.spread.on = on,
             Edit::Latency(on) => self.latency.on = on,
@@ -534,6 +558,7 @@ impl Settings {
             Field::LimitBars => self.limit.value.expires_bars.to_string(),
             Field::LimitThrough => trim(self.limit.value.through_percent),
             Field::StopLoss => trim(self.stop_loss_percent.value),
+            Field::TrailingStop => trim(self.trailing_stop_percent.value),
             Field::TakeProfit => trim(self.take_profit_percent.value),
             Field::Borrow => trim(self.borrow_percent_per_year.value),
             Field::Impact => trim(self.impact_percent.value),
@@ -541,6 +566,10 @@ impl Settings {
             Field::RangeSlippage => trim(self.range_slippage_percent.value),
             Field::LatencyJitter => self.latency_jitter.value.to_string(),
             Field::LatencySeed => self.latency_seed.to_string(),
+            Field::SweepMin => trim(self.sweep_min),
+            Field::SweepMax => trim(self.sweep_max),
+            Field::SweepStep => trim(self.sweep_step),
+            Field::PortfolioBlock => self.portfolio_block_bars.to_string(),
             Field::RangeLookBack => self.range_look_back.to_string(),
             Field::ImpactExponent => trim(self.impact_exponent),
             Field::VolumeWarning => trim(self.volume_warning_percent),
@@ -670,6 +699,15 @@ impl Settings {
             }
             Field::LatencyJitter => self.latency_jitter.value = whole(600_000, "Jitter")?,
             Field::LatencySeed => self.latency_seed = whole(u32::MAX, "The seed")?,
+            Field::TrailingStop => {
+                self.trailing_stop_percent.value = number(0.01, 99.0, "A trailing stop")?;
+            }
+            Field::SweepMin => self.sweep_min = number(-1e6, 1e6, "Min")?,
+            Field::SweepMax => self.sweep_max = number(-1e6, 1e6, "Max")?,
+            Field::SweepStep => self.sweep_step = number(1e-6, 1e6, "Step")?,
+            Field::PortfolioBlock => {
+                self.portfolio_block_bars = whole(1_000_000, "A block's length")?.max(1);
+            }
             Field::RangeLookBack => {
                 self.range_look_back = whole(100_000, "Bars to look back")?.max(1);
             }
@@ -767,6 +805,7 @@ impl Settings {
             + self.slippage_percent.on as usize
             + self.limit.on as usize
             + self.stop_loss_percent.on as usize
+            + self.trailing_stop_percent.on as usize
             + self.take_profit_percent.on as usize
             + self.borrow_percent_per_year.on as usize
             + self.impact_percent.on as usize
@@ -790,6 +829,9 @@ impl Settings {
     /// The fee rates fills pay: a set percentage, or the market's own.
     #[must_use]
     pub fn fees(&self, market: FeeRates) -> FeeRates {
+        if self.no_costs {
+            return FeeRates::ZERO;
+        }
         match self.on(&self.commission) {
             Some(Commission::Percent(percent)) => FeeRates {
                 maker: percent / 100.0,
@@ -805,7 +847,7 @@ impl Settings {
 
     #[must_use]
     pub fn sim(&self) -> SimSettings {
-        SimSettings {
+        let sim = SimSettings {
             fee_per_order: match self.on(&self.commission) {
                 Some(Commission::PerOrder(fee)) => Some(*fee),
                 _ => None,
@@ -823,6 +865,8 @@ impl Settings {
                 through_percent: limit.through_percent,
             }),
             stop_loss_percent: self.on(&self.stop_loss_percent).copied(),
+            trailing_stop_percent: self.on(&self.trailing_stop_percent).copied(),
+            decision_log: self.decision_log,
             take_profit_percent: self.on(&self.take_profit_percent).copied(),
             borrow_percent_per_year: self.on(&self.borrow_percent_per_year).copied(),
             impact_percent: self.on(&self.impact_percent).copied().unwrap_or(0.0),
@@ -838,7 +882,21 @@ impl Settings {
                 .unwrap_or(0.0),
             latency_jitter_ms: self.on(&self.latency_jitter).copied().unwrap_or(0),
             latency_seed: u64::from(self.latency_seed),
+        };
+        if self.no_costs {
+            crate::figures::free_sim(&sim)
+        } else {
+            sim
         }
+    }
+
+    /// A perpetual's funding, unless there's nothing to pay.
+    #[must_use]
+    pub fn funding(
+        &self,
+        rates: Option<std::sync::Arc<Vec<(UnixNanos, f64)>>>,
+    ) -> Option<std::sync::Arc<Vec<(UnixNanos, f64)>>> {
+        rates.filter(|_| !self.no_costs)
     }
 
     /// The inverting, direction and session rules, for backtests and live trading alike.

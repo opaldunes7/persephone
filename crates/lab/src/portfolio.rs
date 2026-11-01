@@ -6,6 +6,7 @@ use std::{fs, sync::Arc, sync::atomic::Ordering};
 use persephone_engine::PortfolioRequest;
 use persephone_research::{
     portfolio::{self, LegSetup, PortfolioSetup, RebalanceSetup},
+    portfolio_tests::{self, Candidate, PickBy, ShiftedJob, ShiftedPortfolioJob, WalkJob},
     robustness::pool,
 };
 use serde_json::{Value, json};
@@ -13,22 +14,23 @@ use serde_json::{Value, json};
 use crate::{
     Lab,
     data::MarketArgs,
-    jobs::Job,
+    jobs::{Job, check_id},
     new_id, now_ms,
-    runs::settings_of,
+    runs::{histogram_json, report_from, settings_of, walk_answer},
     time_text,
     tools::{check_args, limit_of, page_of, text, tools},
 };
 
 const DEFAULT_ROWS: usize = 100;
 const MOST_RUNS: usize = 5_000;
-const COLUMNS: [&str; 17] = [
+const COLUMNS: [&str; 18] = [
     "index",
     "run_id",
     "label",
     "net_return",
     "gross_return",
     "total_costs_paid",
+    "excess_return",
     "fees",
     "funding_paid",
     "max_drawdown",
@@ -120,6 +122,13 @@ fn weights_of(args: &Value) -> Result<Option<Value>, String> {
     }
 }
 
+fn workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .saturating_sub(1)
+        .max(1)
+}
+
 impl Lab {
     fn prepare_portfolio(&self, args: &Value) -> Result<PortfolioRequest, String> {
         let weights = weights_of(args)?;
@@ -206,10 +215,7 @@ impl Lab {
                 Ok(Value::Object(call))
             })
             .collect::<Result<_, String>>()?;
-        let workers = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .saturating_sub(1)
-            .max(1);
+        let workers = workers();
         job.total.store(calls.len(), Ordering::Relaxed);
         let all = tools();
         let tool = all
@@ -255,6 +261,7 @@ impl Lab {
                     summary["net_return"],
                     summary["gross_return"],
                     summary["total_costs_paid"],
+                    summary["excess_return"],
                     summary["fees"],
                     summary["funding_paid"],
                     summary["max_drawdown"],
@@ -285,6 +292,180 @@ impl Lab {
             "not_run": not_run,
             "first_error": first_error,
         }))
+    }
+
+    /// The same run's book at other times, for a portfolio or one market.
+    pub(crate) fn run_shifted(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {
+        let id = text(args, "run_id")?;
+        let run = self.load_run(id)?;
+        let draws = args
+            .get("runs")
+            .and_then(Value::as_u64)
+            .unwrap_or(200)
+            .clamp(1, MOST_RUNS as u64) as usize;
+        let seed = args.get("seed").and_then(Value::as_u64).unwrap_or(0);
+        job.total.store(draws, Ordering::Relaxed);
+        let progress = |done| job.done.store(done, Ordering::Relaxed);
+        let found = if run["kind"] == "portfolio" {
+            let saved = portfolio::load_saved(&self.paths.lab().join("runs"), id)?;
+            ShiftedPortfolioJob {
+                report: Arc::new(saved.report),
+                request: self.prepare_portfolio(&run["request"])?,
+                from_index: saved.from_index,
+                runs: draws,
+                seed,
+                workers: workers(),
+                stop: Arc::clone(&job.stop),
+            }
+            .run(&progress)?
+        } else {
+            let (request, from_index, _) = self.prepare(&run["request"])?;
+            ShiftedJob {
+                report: Arc::new(report_from(&run)),
+                request,
+                from_index,
+                runs: draws,
+                seed,
+                workers: workers(),
+                stop: Arc::clone(&job.stop),
+            }
+            .run(&progress)?
+        };
+        Ok(json!({
+            "runs": found.runs,
+            "changes": found.trades,
+            "warning": (found.trades < 2).then_some("It only changed once, so moving it says almost nothing about its timing."),
+            "actual_return": found.actual_return,
+            "actual_fell": found.actual_fell,
+            "share_matching_return": found.share_matching_return,
+            "share_matching_fall": found.share_matching_fall,
+            "median": found.median,
+            "low": found.low,
+            "high": found.high,
+            "return_chart": histogram_json(&found.returns, found.actual_return),
+            "fall_chart": histogram_json(&found.falls, found.actual_fell),
+        }))
+    }
+
+    /// A portfolio's account returns, drawn again in blocks.
+    pub(crate) fn run_portfolio_monte_carlo(&self, args: &Value) -> Result<Value, String> {
+        let saved = self.saved_portfolio(args)?;
+        let number =
+            |name: &str, default: u64| args.get(name).and_then(Value::as_u64).unwrap_or(default);
+        let found = portfolio_tests::monte_carlo(
+            &saved.report,
+            saved.from_index,
+            number("runs", 1_000).clamp(1, 100_000) as usize,
+            number("block_bars", 100) as usize,
+            args.get("ruin_percent")
+                .and_then(Value::as_f64)
+                .unwrap_or(50.0)
+                / 100.0,
+            number("seed", 0),
+        )?;
+        let mut answer = json!({
+            "runs": found.runs,
+            "block_bars": found.block_bars,
+            "actual_return": found.actual_return,
+            "actual_fell": found.actual_fell,
+            "median": found.median,
+            "low": found.low,
+            "high": found.high,
+            "ruin_share": found.ruin_share,
+            "losing_share": found.losing_share,
+            "share_matching_return": found.returns.iter().filter(|r| **r >= found.actual_return).count() as f64 / found.runs.max(1) as f64,
+            "return_chart": histogram_json(&found.returns, found.actual_return),
+            "fall_chart": histogram_json(&found.falls, found.actual_fell),
+            "stride": found.stride,
+            "median_line": found.median_line,
+            "low_line": found.low_line,
+            "high_line": found.high_line,
+            "actual_line": found.actual_line,
+        });
+        if args
+            .get("include_lines")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            answer["lines"] = json!(found.lines);
+        }
+        Ok(answer)
+    }
+
+    /// Picking among setups on one stretch, and trading the pick on the unseen one after.
+    pub(crate) fn run_portfolio_walk_forward(
+        &self,
+        args: &Value,
+        job: &Arc<Job>,
+    ) -> Result<Value, String> {
+        let from_file = match args.get("candidates").and_then(Value::as_str) {
+            Some(path) => {
+                let read = fs::read_to_string(path)
+                    .map_err(|e| format!("`candidates`: couldn't read {path}: {e}"))?;
+                Some(
+                    serde_json::from_str::<Value>(&read)
+                        .map_err(|e| format!("`candidates`: {path} isn't JSON: {e}"))?,
+                )
+            }
+            None => None,
+        };
+        let items = from_file
+            .as_ref()
+            .or_else(|| args.get("candidates"))
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty())
+            .ok_or(
+                "`candidates` should be a list of run_portfolio's arguments, or a JSON file's path",
+            )?;
+        let shared = args.get("defaults").and_then(Value::as_object);
+        let mut candidates = Vec::with_capacity(items.len());
+        for (at, item) in items.iter().enumerate() {
+            let own = item
+                .as_object()
+                .ok_or_else(|| format!("`candidates`: {item} isn't an object"))?;
+            let mut call = shared.cloned().unwrap_or_default();
+            call.extend(own.clone());
+            let call = Value::Object(call);
+            candidates.push(Candidate {
+                label: call
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| format!("Setup {}", at + 1), ToOwned::to_owned),
+                values: Vec::new(),
+                request: self.prepare_portfolio(&call)?,
+            });
+        }
+        let settings = settings_of(&Value::Object(shared.cloned().unwrap_or_default()))?;
+        let walk = WalkJob {
+            candidates,
+            windows: args
+                .get("windows")
+                .and_then(Value::as_u64)
+                .unwrap_or(5)
+                .max(1) as usize,
+            ratio: args
+                .get("train_ratio")
+                .and_then(Value::as_f64)
+                .filter(|ratio| *ratio > 0.0)
+                .unwrap_or(settings.walk_ratio),
+            warm_up: settings.warm_up_bars as usize,
+            pick_by: match args.get("pick_by").and_then(Value::as_str) {
+                None | Some("return") => PickBy::Return,
+                Some("sharpe") => PickBy::Sharpe,
+                Some(other) => return Err(format!("`pick_by`: `{other}` isn't return or sharpe")),
+            },
+            workers: workers(),
+            stop: Arc::clone(&job.stop),
+        };
+        job.total.store(walk.total(), Ordering::Relaxed);
+        let found = walk.run(&|done| job.done.store(done, Ordering::Relaxed))?;
+        Ok(walk_answer(&found))
+    }
+
+    fn saved_portfolio(&self, args: &Value) -> Result<portfolio::PortfolioRun, String> {
+        let id = text(args, "run_id")?;
+        check_id(id)?;
+        portfolio::load_saved(&self.paths.lab().join("runs"), id)
     }
 
     fn load_portfolio(&self, args: &Value) -> Result<Arc<Value>, String> {

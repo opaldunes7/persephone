@@ -760,20 +760,36 @@ fn cash_below_zero_pays_interest_by_hand_and_none_above_it() {
     borrowed.sim.cash_interest_percent_per_year = Some(10.0);
     let report = run(&borrowed);
     let hour = 100_000.0 * 0.1 / YEAR_HOURS;
+    // Just over three hours' worth, as interest unpaid goes on the loan.
     assert!(
-        (report.interest_paid - 3.0 * hour).abs() < 0.01,
+        report.interest_paid > 3.0 * hour,
         "{}",
         report.interest_paid
     );
     assert!(
-        (report.equity[3] - (100_000.0 - 3.0 * hour)).abs() < 0.01,
-        "{:?}",
-        report.equity
+        report.interest_paid < 3.0 * hour * 1.001,
+        "{}",
+        report.interest_paid
+    );
+    let left = report.equity[3];
+    assert!(
+        (left - (100_000.0 - report.interest_paid)).abs() < 1e-6,
+        "{left}"
     );
 
     let mut funded = request(vec![holding("AAAUSDT", &[100.0; 4], 0.5)]);
     funded.sim.cash_interest_percent_per_year = Some(10.0);
     assert_eq!(run(&funded).interest_paid, 0.0);
+}
+
+#[test]
+fn a_perpetual_is_no_loan_so_it_pays_funding_and_not_interest() {
+    let mut perp = holding("AAAUSDT-PERP", &[100.0; 4], 2.0);
+    perp.funding = Some(Arc::new(vec![(START + HOUR, 0.0)]));
+    let mut asked = request(vec![perp]);
+    asked.sim.leverage = 3.0;
+    asked.sim.cash_interest_percent_per_year = Some(10.0);
+    assert_eq!(run(&asked).interest_paid, 0.0);
 }
 
 #[test]
