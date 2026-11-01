@@ -346,14 +346,16 @@ Returns: `runs`, `trades`, `actual_return`, `share_matching_return`, `share_matc
 
 Picks the best values on one stretch, tests them on the next, unseen, and slides along, giving what they did where they hadn't been picked. Returns and falls are fractions. `headline` is the fair comparison: the unseen windows compounded one after another against buy_and_hold_whole, the market held once over the same span. `unseen_return` and `buy_and_hold_return` add up windows each started from the same capital, so they aren't what an account would have made.
 
-- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional "params": {"name": value}.
+- `strategy` (object): As run_backtest takes. Not needed with `candidates`, which give the strategies instead.
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
 - `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
 - `from` (time): Start, in UTC: 2024-01-31 or 2024-01-31 09:30.
 - `to` (time): End (not included), in UTC.
 - `settings` (object): Costs and rules, as in run_backtest; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
-- `variables` (array, required): One or two of {"name", "min", "max", "step"}.
+- `variables` (array): One or two of {"name", "min", "max", "step"}: each window picks the best of their values. Give this or `candidates`.
+- `candidates` (array): Strategies to pick among instead of values, each as `strategy` takes or as {"label": "...", "strategy": {...}}: each window backtests every one on its picking stretch and trades the best on the unseen one. `strategy` isn't needed with these. The answer's `picks` says how often each was picked (for `variables`, each value that was).
+- `pick_by` (string): With `candidates`: `return` (the default) or `sharpe` on the picking stretch.
 - `windows` (integer): How many unseen stretches. Default 5.
 - `train_ratio` (number): How many times longer each picking stretch is than its unseen one. Default 3.
 - `score` (string): What to pick by: backtest (the default) or monte-carlo.
@@ -362,7 +364,7 @@ Picks the best values on one stretch, tests them on the next, unseen, and slides
 - `seed` (integer): Default 0.
 - `variants_tried` (integer): How many variants you've tried in all, counting every setting, rule, span and market before this call as well as the values here. Each deflated Sharpe ratio counts the larger of this and the values here, and `variants_tried` says which. Default: the values here.
 
-Returns: `windows`, `unseen_return`, `profitable_windows`, `deepest_fall`, `trades`, `buy_and_hold_compounded`, `buy_and_hold_return`, `buy_and_hold_whole`, `chart`, `test_bars`, `train_bars`, `unseen_compounded`, `warning`, `unseen_sharpe`, `headline`, `variants_tried`
+Returns: `windows`, `unseen_return`, `profitable_windows`, `deepest_fall`, `trades`, `buy_and_hold_compounded`, `buy_and_hold_return`, `buy_and_hold_whole`, `chart`, `test_bars`, `train_bars`, `unseen_compounded`, `warning`, `unseen_sharpe`, `headline`, `picks`, `variants_tried`
 
 ## `run_optimize` *job*
 

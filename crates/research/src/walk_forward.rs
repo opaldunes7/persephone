@@ -6,14 +6,53 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use persephone_core::{Candle, UnixNanos};
+use persephone_core::{Candle, UnixNanos, signal::SignalFactory, strategy::StrategySpec};
 use persephone_engine::BacktestRequest;
 
 use crate::{
     optimize::{Grid, OptimizeJob, Outcome, rank},
-    robustness::{backtest, round_trips},
+    portfolio_tests::PickBy,
+    robustness::{backtest, pool, round_trips},
     settings::ScoreBy,
 };
+
+/// One of the strategies a walk-forward can pick among, in place of a grid of values.
+#[derive(Clone)]
+pub struct StrategyChoice {
+    pub label: String,
+    pub strategy: StrategySpec,
+    /// Makes its signal, when it isn't a built-in.
+    pub plugin: Option<Arc<dyn SignalFactory>>,
+}
+
+/// What each window picks among: a grid of one strategy's values, or several strategies.
+#[derive(Clone)]
+pub enum Choices {
+    Grid(Grid),
+    /// Each picked by `PickBy` on the picking stretch.
+    Strategies(Vec<StrategyChoice>, PickBy),
+}
+
+impl Choices {
+    /// How many there are to try in each window.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        match self {
+            Self::Grid(grid) => grid.cells(),
+            Self::Strategies(list, _) => list.len(),
+        }
+    }
+}
+
+/// What a window picked, ready to trade on its unseen stretch.
+struct Choice {
+    request: BacktestRequest,
+    values: Vec<(String, f64)>,
+    label: String,
+    score: Option<f64>,
+    sharpe: Option<f64>,
+    deflated: Option<f64>,
+}
 
 /// How many windows to make unless asked, and how many times longer each one's picking stretch is
 /// than its unseen one.
@@ -107,7 +146,7 @@ pub struct WalkForwardJob {
     pub candles: Vec<Candle>,
     /// Where the span starts in `candles`.
     pub from: usize,
-    pub grid: Grid,
+    pub choices: Choices,
     pub score: ScoreBy,
     pub windows: usize,
     pub ratio: f64,
@@ -142,7 +181,126 @@ impl WalkForwardJob {
     /// How many backtests it comes to.
     #[must_use]
     pub fn total(&self) -> usize {
-        self.windows * (self.grid.cells() + 1)
+        self.windows * (self.choices.count() + 1)
+    }
+
+    /// The best of the grid on a picking stretch, by the score asked for.
+    fn pick_in_grid(
+        &self,
+        grid: &Grid,
+        picking: BacktestRequest,
+        candles: Vec<Candle>,
+        progress: &(impl Fn(usize) + Sync),
+    ) -> Result<Option<Choice>, String> {
+        let batch = OptimizeJob {
+            request: picking,
+            candles,
+            grid: grid.clone(),
+            score: self.score,
+            split: None,
+            blocks: Vec::new(),
+            warm_up: self.warm_up,
+            runs: self.runs,
+            ruin_at: self.ruin_at,
+            seed: self.seed,
+            trials: self.trials,
+            workers: self.workers,
+            stop: Arc::clone(&self.stop),
+        };
+        let found = batch.run(progress)?;
+        let scores: Vec<Option<f64>> = found.outcomes.iter().map(Outcome::score).collect();
+        let Some(&(cell, _)) = rank(&scores, grid.width()).first() else {
+            return Ok(None);
+        };
+        let mut request = self.request.clone();
+        for (index, value) in grid.values_of(cell) {
+            request.strategy.set_param(index, value)?;
+        }
+        let mut values = grid.values_of(cell).into_iter().map(|(_, value)| value);
+        let mut named = Vec::new();
+        if let Some(value) = values.next() {
+            named.push((grid.first.name.clone(), value));
+        }
+        if let (Some(second), Some(value)) = (&grid.second, values.next()) {
+            named.push((second.name.clone(), value));
+        }
+        Ok(Some(Choice {
+            request,
+            values: named,
+            label: grid.label(cell),
+            score: scores[cell],
+            sharpe: found.sharpes.get(cell).copied().flatten(),
+            deflated: found.deflated_sharpe,
+        }))
+    }
+
+    /// The best of several strategies on a picking stretch, each backtested on it alone.
+    fn pick_among(
+        &self,
+        list: &[StrategyChoice],
+        pick_by: PickBy,
+        picking: &BacktestRequest,
+        candles: &[Candle],
+        progress: &(impl Fn(usize) + Sync),
+    ) -> Result<Option<Choice>, String> {
+        let times: Vec<u64> = candles.iter().map(|c| c.ts).collect();
+        let warmed = times.partition_point(|&ts| ts < picking.trade_from);
+        let with = |choice: &StrategyChoice| {
+            let mut request = picking.clone();
+            request.strategy = choice.strategy.clone();
+            request.plugin = choice.plugin.clone();
+            request
+        };
+        let done = AtomicUsize::new(0);
+        let results = pool(
+            list,
+            self.workers,
+            &self.stop,
+            &|| progress(done.fetch_add(1, Ordering::Relaxed) + 1),
+            &|choice| {
+                let mut request = with(choice);
+                request.candles = candles.to_vec();
+                backtest(request).map(|report| {
+                    let capital = report.starting_balance;
+                    let returned = report.equity.last().copied().unwrap_or(capital) / capital - 1.0;
+                    let daily = crate::figures::run_daily_returns(&report, warmed, &times);
+                    (returned, crate::figures::sharpe_of_daily(&daily), daily)
+                })
+            },
+        );
+        if self.stop.load(Ordering::Relaxed) {
+            return Err("Stopped.".into());
+        }
+        let measured = results
+            .into_iter()
+            .map(|result| result.transpose())
+            .collect::<Result<Vec<_>, String>>()?;
+        let score = |at: usize| {
+            let (returned, sharpe, _) = measured[at].as_ref()?;
+            match pick_by {
+                PickBy::Return => Some(*returned),
+                PickBy::Sharpe => *sharpe,
+            }
+        };
+        // The best, the first listed winning a tie.
+        let Some(best) = (0..list.len())
+            .filter(|&at| score(at).is_some())
+            .reduce(|best, at| if score(at) > score(best) { at } else { best })
+        else {
+            return Ok(None);
+        };
+        let sharpes: Vec<f64> = measured.iter().flatten().filter_map(|m| m.1).collect();
+        let (_, sharpe, daily) = measured[best].as_ref().ok_or("A pick that didn't run")?;
+        Ok(Some(Choice {
+            request: with(&list[best]),
+            values: Vec::new(),
+            label: list[best].label.clone(),
+            score: score(best),
+            sharpe: *sharpe,
+            deflated: sharpe.and_then(|sharpe| {
+                crate::figures::deflated_sharpe_of(sharpe, &sharpes, self.trials, daily)
+            }),
+        }))
     }
 
     /// # Errors
@@ -168,39 +326,32 @@ impl WalkForwardJob {
             let warm_from = train_start.saturating_sub(self.warm_up);
             let mut picking = self.request.clone();
             picking.trade_from = candles[train_start].ts;
-            let batch = OptimizeJob {
-                request: picking,
-                candles: candles[warm_from..train_end].to_vec(),
-                grid: self.grid.clone(),
-                score: self.score,
-                split: None,
-                blocks: Vec::new(),
-                warm_up: self.warm_up,
-                runs: self.runs,
-                ruin_at: self.ruin_at,
-                seed: self.seed,
-                trials: self.trials,
-                workers: self.workers,
-                stop: Arc::clone(&self.stop),
-            };
             let before = finished.load(Ordering::Relaxed);
-            let found = batch.run(&|done| progress(before + done))?;
-            finished.store(before + self.grid.cells(), Ordering::Relaxed);
-            let scores: Vec<Option<f64>> = found.outcomes.iter().map(Outcome::score).collect();
+            let tick = |done| progress(before + done);
+            let chosen = match &self.choices {
+                Choices::Grid(grid) => {
+                    self.pick_in_grid(grid, picking, candles[warm_from..train_end].to_vec(), &tick)?
+                }
+                Choices::Strategies(list, pick_by) => self.pick_among(
+                    list,
+                    *pick_by,
+                    &picking,
+                    &candles[warm_from..train_end],
+                    &tick,
+                )?,
+            };
+            finished.store(before + self.choices.count(), Ordering::Relaxed);
             let mut row = Window {
                 train_from: candles[train_start].ts,
                 test_from: candles[train_end].ts,
                 test_to: candles[test_end - 1].ts,
                 picked: None,
             };
-            let Some(&(cell, _)) = rank(&scores, self.grid.width()).first() else {
+            let Some(chosen) = chosen else {
                 rows.push(row);
                 continue;
             };
-            let mut trying = self.request.clone();
-            for (index, value) in self.grid.values_of(cell) {
-                trying.strategy.set_param(index, value)?;
-            }
+            let mut trying = chosen.request.clone();
             trying.candles = candles[train_end.saturating_sub(self.warm_up)..test_end].to_vec();
             trying.trade_from = candles[train_end].ts;
             let times: Vec<u64> = trying.candles.iter().map(|c| c.ts).collect();
@@ -229,28 +380,16 @@ impl WalkForwardJob {
             profitable += usize::from(unseen > 0.0);
             let fell = report.max_drawdown.abs();
             deepest = deepest.max(fell);
-            let mut values = self
-                .grid
-                .values_of(cell)
-                .into_iter()
-                .map(|(_, value)| value);
-            let mut named = Vec::new();
-            if let Some(value) = values.next() {
-                named.push((self.grid.first.name.clone(), value));
-            }
-            if let (Some(second), Some(value)) = (&self.grid.second, values.next()) {
-                named.push((second.name.clone(), value));
-            }
             row.picked = Some(Picked {
-                values: named,
-                label: self.grid.label(cell),
-                score: scores[cell],
+                values: chosen.values,
+                label: chosen.label,
+                score: chosen.score,
                 unseen_return: unseen,
                 buy_and_hold_return: held,
                 fell,
                 trades: made,
-                picked_sharpe: found.sharpes.get(cell).copied().flatten(),
-                deflated_sharpe: found.deflated_sharpe,
+                picked_sharpe: chosen.sharpe,
+                deflated_sharpe: chosen.deflated,
             });
             rows.push(row);
         }

@@ -500,7 +500,11 @@ Optimize tries a range of one or two parameters, by the names `describe_strategy
   `run_portfolio_walk_forward` take `variants_tried` too: the batches give the deflated ratio for their top row,
   and the walk-forwards for each window's pick.
 
-Walk-forward picks the best values on a stretch, tests them on the next, unseen, and slides along.
+Walk-forward picks the best values on a stretch, tests them on the next, unseen, and slides along. Give it
+`candidates` instead of `variables` to pick among whole strategies: each window backtests every one on its picking
+stretch, picks the best by `pick_by` (`return`, the default, or `sharpe`), and trades it on the unseen stretch. Each
+is a strategy as `strategy` takes, or `{"label": "...", "strategy": {...}}`; `strategy` itself isn't needed then.
+`picks` says how often each was picked, and `variants_tried` counts them unless you give more.
 
 ```json
 {"tool": "run_walk_forward", "args": {

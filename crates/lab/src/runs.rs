@@ -24,6 +24,7 @@ use persephone_research::{
     figures,
     market::{MAX_FINE_BARS, MarketBars, fine_bars},
     optimize::{Grid, OptimizeJob, Outcome, split_at},
+    portfolio_tests::PickBy,
     positions::{ONE_TRADE, Positions, RandomEntriesJob},
     results::{StrategyRef, with_params},
     robustness::{
@@ -31,7 +32,9 @@ use persephone_research::{
         monte_carlo_compounding, pick_blocks, pnl_by_trade, pool, round_trips,
     },
     settings::{BlockLength, FillTiming, OptimizeSettings, Precision, ScoreBy, Settings, Variable},
-    walk_forward::{RATIO, WINDOWS, WalkForward, WalkForwardJob, stretches},
+    walk_forward::{
+        Choices, RATIO, StrategyChoice, WINDOWS, WalkForward, WalkForwardJob, stretches,
+    },
 };
 use serde_json::{Map, Value, json};
 
@@ -1688,13 +1691,54 @@ impl Lab {
     /// Picks values on one stretch, tests them on the next, and slides along. Every unseen stretch
     /// starts from the same capital, as there's no compounding, so their returns add up.
     pub(crate) fn run_walk_forward(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {
-        let (mut request, _, _) = self.prepare(args)?;
-        let workers = self.workers_for(&request.strategy);
-        let chosen = optimize_choice(args, false)?;
-        if chosen.score == ScoreBy::RandomBlocks {
-            return Err("`score`: walk-forward takes backtest or monte-carlo".into());
+        let listed = self.strategy_choices(args)?;
+        // The bars, settings and costs come from the call as for any backtest; with candidates, the
+        // first stands in for the strategy until each window picks.
+        let mut asked = args.clone();
+        if let Some((_, first)) = listed.as_ref().and_then(|list| list.first())
+            && args.get("strategy").is_none()
+        {
+            asked["strategy"] = first.clone();
         }
-        let grid = Grid::build(&chosen, &request.strategy.info.params)?;
+        let (mut request, _, _) = self.prepare(&asked)?;
+        let (choices, score, workers) = match listed {
+            Some(list) => {
+                if args.get("variables").is_some() {
+                    return Err("Give `variables` or `candidates`, not both.".into());
+                }
+                let pick_by = match args.get("pick_by").and_then(Value::as_str) {
+                    None | Some("return") => PickBy::Return,
+                    Some("sharpe") => PickBy::Sharpe,
+                    Some(other) => {
+                        return Err(format!("`pick_by`: `{other}` isn't return or sharpe"));
+                    }
+                };
+                let list: Vec<StrategyChoice> =
+                    list.into_iter().map(|(choice, _)| choice).collect();
+                let workers = list
+                    .iter()
+                    .map(|choice| self.workers_for(&choice.strategy))
+                    .min()
+                    .unwrap_or(1);
+                (
+                    Choices::Strategies(list, pick_by),
+                    ScoreBy::Backtest,
+                    workers,
+                )
+            }
+            None => {
+                let chosen = optimize_choice(args, false)?;
+                if chosen.score == ScoreBy::RandomBlocks {
+                    return Err("`score`: walk-forward takes backtest or monte-carlo".into());
+                }
+                let grid = Grid::build(&chosen, &request.strategy.info.params)?;
+                (
+                    Choices::Grid(grid),
+                    chosen.score,
+                    self.workers_for(&request.strategy),
+                )
+            }
+        };
         let candles = std::mem::take(&mut request.candles);
         request.ticks = None;
         request.fill_bars = None;
@@ -1707,14 +1751,20 @@ impl Lab {
             .unwrap_or(settings_of(args).map_or(RATIO, |settings| settings.walk_ratio));
         stretches(candles.len().saturating_sub(from), windows, ratio)?;
         let warm_up = settings_of(args)?.warm_up_bars as usize;
-        let warning = stretch_look_back_warning(args, &request, warm_up);
-        let trials = variants_tried(args).max(grid.cells() as u64);
+        let warning = stretch_look_back_warning(&asked, &request, warm_up);
+        let trials = variants_tried(args).max(choices.count() as u64);
+        let labels: Option<Vec<String>> = match &choices {
+            Choices::Strategies(list, _) => {
+                Some(list.iter().map(|choice| choice.label.clone()).collect())
+            }
+            Choices::Grid(_) => None,
+        };
         let batch = WalkForwardJob {
             request,
             candles,
             from,
-            grid,
-            score: chosen.score,
+            choices,
+            score,
             windows,
             ratio,
             warm_up,
@@ -1733,7 +1783,78 @@ impl Lab {
         let found = batch.run(&|done| job.done.store(done, Ordering::Relaxed))?;
         let mut answer = walk_answer(&found, trials);
         answer["warning"] = json!(warning);
+        // How often each candidate was picked, in the order given; for a grid, each value picked.
+        let picked: Vec<&str> = found
+            .windows
+            .iter()
+            .filter_map(|window| window.picked.as_ref().map(|p| p.label.as_str()))
+            .collect();
+        let labels = labels.unwrap_or_else(|| {
+            let mut seen: Vec<String> = Vec::new();
+            for label in &picked {
+                if !seen.iter().any(|known| known == label) {
+                    seen.push((*label).to_owned());
+                }
+            }
+            seen
+        });
+        let picks: Map<String, Value> = labels
+            .iter()
+            .map(|label| {
+                let count = picked.iter().filter(|p| **p == label.as_str()).count();
+                (label.clone(), json!(count))
+            })
+            .collect();
+        answer["picks"] = Value::Object(picks);
         Ok(answer)
+    }
+
+    /// `candidates`, if given: each a strategy as `strategy` takes, or `{"label", "strategy"}`,
+    /// resolved, with the strategy as given.
+    fn strategy_choices(
+        &self,
+        args: &Value,
+    ) -> Result<Option<Vec<(StrategyChoice, Value)>>, String> {
+        let Some(items) = args.get("candidates") else {
+            return Ok(None);
+        };
+        let items = items
+            .as_array()
+            .filter(|items| !items.is_empty())
+            .ok_or("`candidates` should be a list of strategies, as `strategy` takes")?;
+        let mut seen = std::collections::HashSet::new();
+        items
+            .iter()
+            .enumerate()
+            .map(|(at, item)| {
+                let mut strategy = item.clone();
+                let label = strategy
+                    .as_object_mut()
+                    .and_then(|object| object.remove("label"))
+                    .and_then(|label| label.as_str().map(ToOwned::to_owned))
+                    .unwrap_or_else(|| format!("Candidate {}", at + 1));
+                if let Some(inner) = strategy.get("strategy").cloned() {
+                    strategy = inner;
+                }
+                if !seen.insert(label.clone()) {
+                    return Err(format!(
+                        "`candidates`: `{label}` is the label of two of them"
+                    ));
+                }
+                let (spec, plugin) = self
+                    .resolve(&strategy)
+                    .map_err(|e| format!("`candidates`: item {at}: {e}"))?;
+                Ok((
+                    StrategyChoice {
+                        label,
+                        strategy: spec,
+                        plugin,
+                    },
+                    strategy,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()
+            .map(Some)
     }
 
     pub(crate) fn run_optimize(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {

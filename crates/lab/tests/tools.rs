@@ -1229,6 +1229,88 @@ fn variants_tried_before_a_call_lower_its_deflated_sharpe_ratio() {
 }
 
 #[test]
+fn a_walk_forward_can_pick_among_strategies() {
+    let (lab, _dir) = lab();
+    let candidates = json!([
+        {"label": "fast", "strategy": {"builtin": "ema-cross", "params": {"Fast": 5, "Slow": 20}}},
+        {"label": "slow", "strategy": {"builtin": "ema-cross", "params": {"Fast": 20, "Slow": 60}}},
+        {"builtin": "rsi-reversion"},
+    ]);
+    let answer = lab
+        .dispatch(
+            "run_walk_forward",
+            &with(json!({
+                "candidates": candidates, "windows": 3, "train_ratio": 2, "from": "2024-01-02",
+                "wait_seconds": 240,
+            })),
+        )
+        .unwrap();
+    let windows = answer["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 3);
+    assert_eq!(
+        answer["variants_tried"], 3,
+        "the candidates, unless told more"
+    );
+    let picks = answer["picks"].as_object().unwrap();
+    assert_eq!(
+        picks.keys().collect::<Vec<_>>(),
+        ["Candidate 3", "fast", "slow"],
+        "{picks:?}"
+    );
+    let picked: u64 = picks.values().map(|count| count.as_u64().unwrap()).sum();
+    assert_eq!(picked, 3, "{answer}");
+    let strategy_of = |label: &str| match label {
+        "fast" => candidates[0]["strategy"].clone(),
+        "slow" => candidates[1]["strategy"].clone(),
+        _ => candidates[2].clone(),
+    };
+    for window in windows {
+        let at = |name: &str| window[name].as_str().unwrap().to_owned();
+        // Each picked the best of them on its picking stretch, as backtests of that stretch say.
+        let mut best = (f64::MIN, String::new());
+        for label in ["fast", "slow", "Candidate 3"] {
+            let run = lab
+                .dispatch(
+                    "run_backtest",
+                    &with(json!({
+                        "strategy": strategy_of(label), "from": at("train_from"),
+                        "to": at("test_from"), "wait_seconds": 240,
+                    })),
+                )
+                .unwrap();
+            let returned = run["summary"]["net_return"].as_f64().unwrap();
+            if returned > best.0 {
+                best = (returned, label.to_owned());
+            }
+        }
+        assert_eq!(window["label"], best.1.as_str(), "{window}");
+        assert!((window["picked_score"].as_f64().unwrap() - best.0).abs() < 1e-9);
+        // And traded it on the unseen stretch, as a backtest of that stretch does.
+        let run = lab
+            .dispatch(
+                "run_backtest",
+                &with(json!({
+                    "strategy": strategy_of(&best.1), "from": at("test_from"),
+                    "to": next_hour(&at("test_to")), "wait_seconds": 240,
+                })),
+            )
+            .unwrap();
+        let unseen = window["unseen_return"].as_f64().unwrap();
+        let alone = run["summary"]["net_return"].as_f64().unwrap();
+        assert!((unseen - alone).abs() < 1e-9, "{unseen} against {alone}");
+    }
+
+    let both = lab.dispatch(
+        "run_walk_forward",
+        &with(json!({
+            "candidates": candidates, "variables": [{"name": "Fast", "min": 3, "max": 9, "step": 3}],
+            "wait_seconds": 60,
+        })),
+    );
+    assert!(both.unwrap_err().contains("not both"));
+}
+
+#[test]
 fn binance_pages_join_up_and_stop_at_the_last_closed_bar() {
     let (lab, _source) = binance_lab();
     let mut got = Vec::new();

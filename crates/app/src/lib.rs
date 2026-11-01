@@ -3780,7 +3780,7 @@ impl Persephone {
             request,
             candles,
             from,
-            grid,
+            choices: walk_forward::Choices::Grid(grid),
             score: chosen.score,
             windows: settings.windows as usize,
             ratio: settings.walk_ratio,

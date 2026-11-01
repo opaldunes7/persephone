@@ -223,6 +223,17 @@ fn test_args() -> Vec<Arg> {
     args
 }
 
+/// A walk-forward's: as a test's, but with `candidates` standing in for the strategy.
+fn walk_args() -> Vec<Arg> {
+    let mut args = test_args();
+    args[0] = opt(
+        "strategy",
+        "object",
+        "As run_backtest takes. Not needed with `candidates`, which give the strategies instead.",
+    );
+    args
+}
+
 fn with(mut args: Vec<Arg>, more: &[Arg]) -> Vec<Arg> {
     args.extend_from_slice(more);
     args
@@ -843,12 +854,22 @@ pub fn tools() -> Vec<Tool> {
             "run_walk_forward",
             "Picks the best values on one stretch, tests them on the next, unseen, and slides along, giving what they did where they hadn't been picked. Returns and falls are fractions. `headline` is the fair comparison: the unseen windows compounded one after another against buy_and_hold_whole, the market held once over the same span. `unseen_return` and `buy_and_hold_return` add up windows each started from the same capital, so they aren't what an account would have made.",
             with(
-                test_args(),
+                walk_args(),
                 &[
-                    arg(
+                    opt(
                         "variables",
                         "array",
-                        "One or two of {\"name\", \"min\", \"max\", \"step\"}.",
+                        "One or two of {\"name\", \"min\", \"max\", \"step\"}: each window picks the best of their values. Give this or `candidates`.",
+                    ),
+                    opt(
+                        "candidates",
+                        "array",
+                        "Strategies to pick among instead of values, each as `strategy` takes or as {\"label\": \"...\", \"strategy\": {...}}: each window backtests every one on its picking stretch and trades the best on the unseen one. `strategy` isn't needed with these. The answer's `picks` says how often each was picked (for `variables`, each value that was).",
+                    ),
+                    opt(
+                        "pick_by",
+                        "string",
+                        "With `candidates`: `return` (the default) or `sharpe` on the picking stretch.",
                     ),
                     opt(
                         "windows",
@@ -895,6 +916,7 @@ pub fn tools() -> Vec<Tool> {
                 "warning",
                 "unseen_sharpe",
                 "headline",
+                "picks",
                 "variants_tried",
             ],
         ),
