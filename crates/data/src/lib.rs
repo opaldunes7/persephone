@@ -4,4 +4,5 @@
 pub mod archive;
 pub mod binance;
 pub mod import;
+pub mod news;
 pub mod store;

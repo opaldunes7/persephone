@@ -45,12 +45,16 @@ arrow-schema = "60"
 bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 csv = "1"
+# RSS and Atom, for the news sidebar.
+feed-rs = "2.4"
 dirs = "6"
 flate2 = "1"
 iced = { version = "0.14", features = ["advanced", "canvas", "wgpu"] }
 jiff = "0.2"
 log = "0.4"
 notify = "8"
+# Opening a headline's link in the browser.
+opener = "0.8"
 # Tick store files: Parquet with ZSTD, without the parts of Arrow we don't use.
 parquet = { version = "60", default-features = false, features = ["arrow", "zstd"] }
 ron = "0.10"
