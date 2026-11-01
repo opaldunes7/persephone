@@ -25,6 +25,9 @@ pub struct Saved {
     /// The other workspaces.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub others: Vec<SavedWorkspace>,
+    /// The news sidebar: open or not, its width and what it lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub news: Option<crate::news::NewsSaved>,
 }
 
 /// A workspace that wasn't on screen.
@@ -205,6 +208,7 @@ mod tests {
         Saved {
             workspace: 1,
             others: Vec::new(),
+            news: None,
             layout,
             tiles: vec![
                 SavedTile {

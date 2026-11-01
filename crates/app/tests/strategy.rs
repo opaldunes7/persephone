@@ -3057,6 +3057,7 @@ mod panel {
             &Saved {
                 workspace: 1,
                 others: Vec::new(),
+                news: None,
                 layout: Layout::new(),
                 tiles: vec![SavedTile {
                     id: 0,

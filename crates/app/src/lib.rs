@@ -22,6 +22,7 @@ pub mod live;
 mod local;
 pub mod menu;
 mod motion;
+pub mod news;
 pub mod persist;
 pub mod plugins;
 mod studies;
@@ -406,6 +407,8 @@ pub struct Persephone {
     lab_logic: HashMap<String, Arc<Logic>>,
     /// Trees built on charts' Build tabs, by their kind (`logic-…`), ready to run.
     draft_logic: HashMap<String, Arc<Logic>>,
+    /// The news sidebar, and the headlines collected.
+    news: news::News,
     /// Lists of positions Lab has saved, by the same kind of name.
     lab_positions: HashMap<String, Positions>,
     /// What's loaded from `plugin_dir`.
@@ -533,6 +536,7 @@ pub enum Message {
     ),
     /// A run's trades, found again for the panel's inspection drawer.
     Inspected(u64, Result<Arc<backtest::trades::Ledger>, String>),
+    News(news::NewsMessage),
 }
 
 impl Persephone {
@@ -560,6 +564,9 @@ impl Persephone {
         }
         let plugins = app.reload_plugins(Duration::ZERO);
         app.results_dir = plugins::lab_results_dir();
+        if let Some(data) = dirs::data_dir() {
+            app.news.use_root(data.join("persephone"));
+        }
         let results = app.load_lab_results();
         (app, Task::batch([loads, plugins, results]))
     }
@@ -592,6 +599,7 @@ impl Persephone {
         let drawings_path = save_path.as_ref().map(|p| p.with_file_name("drawings.ron"));
         let workspace = saved.as_ref().map_or(1, |s| s.workspace);
         let others = saved.as_ref().map_or_else(Vec::new, |s| s.others.clone());
+        let news_saved = saved.as_ref().and_then(|s| s.news.clone());
         let mut app = Self {
             layout: saved.map_or_else(Layout::new, |s| s.layout),
             tiles: BTreeMap::new(),
@@ -610,6 +618,7 @@ impl Persephone {
             lab_results: Vec::new(),
             lab_logic: HashMap::new(),
             draft_logic: HashMap::new(),
+            news: news::News::default(),
             lab_positions: HashMap::new(),
             plugins: Arc::default(),
             reloading: false,
@@ -632,6 +641,7 @@ impl Persephone {
             launched: Instant::now(),
             panel: None,
         };
+        app.news = news::News::from_saved(news_saved);
         app.refresh_local_markets();
         let mut loads: Vec<_> = tiles
             .into_iter()
@@ -701,6 +711,7 @@ impl Persephone {
             lab_results: Vec::new(),
             lab_logic: HashMap::new(),
             draft_logic: HashMap::new(),
+            news: news::News::default(),
             lab_positions: HashMap::new(),
             plugins: Arc::default(),
             reloading: false,
@@ -1481,6 +1492,7 @@ impl Persephone {
                 }
             }
             Message::Inspected(run, result) => self.inspected(run, result),
+            Message::News(message) => return self.on_news(message),
             Message::LabResultsChanged => return self.load_lab_results(),
             Message::PluginsChanged => {
                 if !self.reloading {
@@ -1782,6 +1794,7 @@ impl Persephone {
                 true
             }
             Action::Backtest => return self.toggle_panel(self.layout.focused()),
+            Action::News => return self.on_news(news::NewsMessage::Toggle),
             Action::Workspace(number) => return self.switch_workspace(number),
             Action::MoveToWorkspace(number) => return self.move_to_workspace(number),
         };
@@ -2622,6 +2635,7 @@ impl Persephone {
                 self.save();
             }
             MenuMessage::OpenBacktest => return self.open_panel(id),
+            MenuMessage::News => return self.on_news(news::NewsMessage::Toggle),
             MenuMessage::GoLive(mode) => {
                 self.popup = Some(popup);
                 return self.go_live(id, mode);
@@ -5511,7 +5525,7 @@ impl Persephone {
         Rect::new(
             0.0,
             top,
-            self.window.width,
+            (self.window.width - self.news.width(self.window.width)).max(0.0),
             (self.window.height - top).max(0.0),
         )
     }
@@ -5557,6 +5571,7 @@ impl Persephone {
             layout: self.layout.clone(),
             tiles: saved_tiles(&self.tiles),
             workspace: self.workspace,
+            news: Some(self.news.saved.clone()),
             others: self
                 .stash
                 .iter()
@@ -5613,6 +5628,13 @@ impl Persephone {
         }
         if self.is_animating() {
             subscriptions.push(window::frames().map(Message::Tick));
+        }
+        if self.news.polling()
+            && let Some(root) = &self.news.root
+        {
+            subscriptions.push(Subscription::run_with(root.clone(), |root: &PathBuf| {
+                news::poll(root)
+            }));
         }
         Subscription::batch(subscriptions)
     }
@@ -5793,6 +5815,20 @@ impl Persephone {
                 )
                 .width(self.window.width)
                 .height(height))
+                .into(),
+            );
+        }
+
+        // The news sidebar, down the right under the panel.
+        let news_width = self.news.width(self.window.width);
+        if news_width > 0.0 {
+            let top = self.panel_height();
+            layers.push(
+                pin(container(self.news_view())
+                    .width(news_width)
+                    .height(self.window.height - top))
+                .x(self.window.width - news_width)
+                .y(top)
                 .into(),
             );
         }

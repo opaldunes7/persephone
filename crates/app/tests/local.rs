@@ -252,6 +252,7 @@ fn saved_layouts_remember_local_markets() {
         &Saved {
             workspace: 1,
             others: Vec::new(),
+            news: None,
             layout: Layout::new(),
             tiles: vec![SavedTile {
                 id: 0,
@@ -527,6 +528,7 @@ fn saved_layouts_keep_spans_and_backtest_settings() {
         &Saved {
             workspace: 1,
             others: Vec::new(),
+            news: None,
             layout: Layout::new(),
             tiles: vec![SavedTile {
                 id: 0,

@@ -1,0 +1,295 @@
+//! The news sidebar: headlines from public feeds down the window's right edge, opened from a
+//! chart's right-click menu or Ctrl+N. Live, it shows the latest; while a backtest plays back,
+//! only what had been published by the playhead, so it never gives away what came next.
+
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use iced::futures::{SinkExt, Stream, StreamExt, channel::mpsc};
+use persephone_core::UnixNanos;
+use persephone_data::news::{FeedClient, Headline, NewsStore, feeds};
+use serde::{Deserialize, Serialize};
+
+use crate::Message;
+
+pub mod view;
+
+/// How often the feeds are read.
+const EVERY: Duration = Duration::from_secs(5 * 60);
+/// The sidebar's narrowest and widest, and what it opens at.
+pub const MIN_WIDTH: f32 = 220.0;
+pub const MAX_WIDTH: f32 = 520.0;
+pub const DEFAULT_WIDTH: f32 = 300.0;
+/// What the charts keep, however wide the sidebar's dragged.
+const CHARTS_ROOM: f32 = 400.0;
+
+/// Which headlines the sidebar lists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Filter {
+    #[default]
+    All,
+    /// Those naming the focused chart's market.
+    Market,
+    /// The economy and regulators.
+    Macro,
+}
+
+/// The sidebar as it's saved with the layout.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NewsSaved {
+    pub open: bool,
+    pub width: f32,
+    /// Read the feeds even while it's closed, so the history has no gaps.
+    pub collecting: bool,
+    pub filter: Filter,
+}
+
+impl Default for NewsSaved {
+    fn default() -> Self {
+        Self {
+            open: false,
+            width: DEFAULT_WIDTH,
+            collecting: true,
+            filter: Filter::All,
+        }
+    }
+}
+
+/// What the sidebar asks for.
+#[derive(Clone, Debug)]
+pub enum NewsMessage {
+    Toggle,
+    Filter(Filter),
+    Collecting(bool),
+    /// Read the feeds now.
+    Refresh,
+    /// The feeds' headlines, and what couldn't be read.
+    Fetched(Arc<Vec<Headline>>, Vec<String>),
+    /// The sidebar's left edge dragged to this x.
+    Width(f32),
+    /// Go to this headline's time on the chart, by its id.
+    Pick(String),
+    /// Open this link in the browser.
+    Open(String),
+}
+
+/// The sidebar's state, and every headline collected.
+#[derive(Debug, Default)]
+pub struct News {
+    pub saved: NewsSaved,
+    /// Where headlines are kept; `None` keeps them only in memory, as in tests.
+    pub root: Option<PathBuf>,
+    pub store: NewsStore,
+    /// When the feeds were last read, and those that couldn't be.
+    pub fetched_at: Option<UnixNanos>,
+    pub failures: Vec<String>,
+    /// The headline last picked or clicked on a chart, lit in the list.
+    pub lit: Option<String>,
+}
+
+impl News {
+    #[must_use]
+    pub fn from_saved(saved: Option<NewsSaved>) -> Self {
+        Self {
+            saved: saved.unwrap_or_default(),
+            ..Self::default()
+        }
+    }
+
+    /// Reads the headlines kept under `root`, and keeps new ones there from now on.
+    pub fn use_root(&mut self, root: PathBuf) {
+        self.store = NewsStore::open(&root);
+        self.root = Some(root);
+    }
+
+    /// How wide the sidebar is in a window `window` wide; 0 while it's closed.
+    #[must_use]
+    pub fn width(&self, window: f32) -> f32 {
+        if !self.saved.open {
+            return 0.0;
+        }
+        self.saved
+            .width
+            .clamp(MIN_WIDTH, MAX_WIDTH)
+            .min((window - CHARTS_ROOM).max(0.0))
+    }
+
+    /// Whether the feeds should be read now.
+    #[must_use]
+    pub fn polling(&self) -> bool {
+        self.root.is_some() && (self.saved.open || self.saved.collecting)
+    }
+
+    /// Adds what the feeds had, keeping it on disk.
+    pub fn fetched(&mut self, found: &[Headline], failures: Vec<String>, now: UnixNanos) {
+        if let Err(error) = self.store.add(found.to_vec()) {
+            eprintln!("persephone: couldn't keep the headlines: {error}");
+        }
+        self.fetched_at = Some(now);
+        self.failures = failures;
+    }
+
+    /// The headline with this id.
+    #[must_use]
+    pub fn headline(&self, id: &str) -> Option<&Headline> {
+        self.store.all().iter().find(|headline| headline.id == id)
+    }
+}
+
+/// Reads every feed now, off the app's thread.
+pub fn fetch_now(root: PathBuf) -> iced::Task<Message> {
+    iced::Task::perform(
+        async move {
+            std::thread::spawn(move || read_feeds(&root))
+                .join()
+                .unwrap_or_else(|_| (Vec::new(), vec!["The feed reader stopped.".into()]))
+        },
+        |(found, failed)| Message::News(NewsMessage::Fetched(Arc::new(found), failed)),
+    )
+}
+
+fn read_feeds(root: &std::path::Path) -> (Vec<Headline>, Vec<String>) {
+    match FeedClient::new() {
+        Ok(client) => client.fetch_all(&feeds(root)),
+        Err(error) => (Vec::new(), vec![error]),
+    }
+}
+
+/// Reads the feeds every few minutes, as long as it's subscribed to.
+pub fn poll(root: &std::path::Path) -> impl Stream<Item = Message> + use<> {
+    let root = root.to_path_buf();
+    iced::stream::channel(4, async move |mut output: mpsc::Sender<Message>| {
+        let (tx, mut rx) = mpsc::unbounded();
+        // The network is slow and blocking, so it's read on a thread of its own, which stops once
+        // nothing's listening.
+        std::thread::spawn(move || {
+            loop {
+                let (found, failed) = read_feeds(&root);
+                if tx.unbounded_send((found, failed)).is_err() {
+                    break;
+                }
+                std::thread::sleep(EVERY);
+                if tx.is_closed() {
+                    break;
+                }
+            }
+        });
+        while let Some((found, failed)) = rx.next().await {
+            let message = Message::News(NewsMessage::Fetched(Arc::new(found), failed));
+            if output.send(message).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+fn now() -> UnixNanos {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as UnixNanos)
+}
+
+impl crate::Persephone {
+    /// What the focused chart's market is called in headlines, and the name to put on its chip.
+    fn market_words(&self) -> (Vec<String>, String) {
+        let symbol = self
+            .tiles
+            .get(&self.layout.focused())
+            .map_or("BTCUSDT", |tile| tile.market.symbol.as_str());
+        let words = persephone_data::news::market_words(symbol);
+        let chip = words.first().cloned().unwrap_or_else(|| "Market".into());
+        (words, chip)
+    }
+
+    /// The playhead's time, while a backtest is played back.
+    fn news_replay_time(&self) -> Option<UnixNanos> {
+        self.panel.as_ref().and_then(|panel| panel.playback.at)
+    }
+
+    pub(crate) fn news_view(&self) -> iced::Element<'_, Message> {
+        let (words, chip) = self.market_words();
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        view::sidebar(&self.news, self.news_replay_time(), &words, &chip, now())
+    }
+
+    pub(crate) fn on_news(&mut self, message: NewsMessage) -> iced::Task<Message> {
+        match message {
+            NewsMessage::Toggle => {
+                self.news.saved.open = !self.news.saved.open;
+                self.relayout(true);
+                self.save();
+                // Opened for the first time this session: read the feeds now, not in 5 minutes.
+                if self.news.saved.open
+                    && self.news.fetched_at.is_none()
+                    && let Some(root) = self.news.root.clone()
+                {
+                    return fetch_now(root);
+                }
+            }
+            NewsMessage::Filter(filter) => {
+                self.news.saved.filter = filter;
+                self.save();
+            }
+            NewsMessage::Collecting(on) => {
+                self.news.saved.collecting = on;
+                self.save();
+            }
+            NewsMessage::Refresh => {
+                if let Some(root) = self.news.root.clone() {
+                    return fetch_now(root);
+                }
+            }
+            NewsMessage::Fetched(found, failures) => {
+                self.news.fetched(&found, failures, now());
+            }
+            NewsMessage::Width(x) => {
+                self.news.saved.width = (self.window.width - x).clamp(MIN_WIDTH, MAX_WIDTH);
+                self.relayout(false);
+                self.save();
+            }
+            NewsMessage::Pick(id) => {
+                let Some(at) = self.news.headline(&id).map(|h| h.published) else {
+                    return iced::Task::none();
+                };
+                self.news.lit = Some(id);
+                // Replaying: the playhead goes there, as far as the span allows. Otherwise the
+                // focused chart shows that time.
+                if self.news_replay_time().is_some() {
+                    return self.on_panel(crate::backtest::PanelMessage::Seek(at));
+                }
+                let focused = self.layout.focused();
+                if let Some(chart) = self.tiles.get_mut(&focused).and_then(|t| t.chart.as_mut()) {
+                    let candles = &chart.data().candles;
+                    let bar = candles
+                        .partition_point(|c| c.ts <= at)
+                        .saturating_sub(1)
+                        .min(candles.len().saturating_sub(1));
+                    chart.show_bar(bar + 10);
+                }
+            }
+            NewsMessage::Open(link) => {
+                if !link.is_empty() {
+                    std::thread::spawn(move || {
+                        if let Err(error) = opener::open_browser(&link) {
+                            eprintln!("persephone: couldn't open {link}: {error}");
+                        }
+                    });
+                }
+            }
+        }
+        iced::Task::none()
+    }
+
+    /// The news sidebar's state. For tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn news(&self) -> &News {
+        &self.news
+    }
+
+    /// Keeps headlines under `root` rather than the data folder. For tests.
+    #[doc(hidden)]
+    pub fn use_news_root(&mut self, root: PathBuf) {
+        self.news.use_root(root);
+    }
+}

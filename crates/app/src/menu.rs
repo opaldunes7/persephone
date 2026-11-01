@@ -276,7 +276,7 @@ impl Popup {
         match self {
             Self::Menu {
                 page: Page::Root, ..
-            } => 217.0 + extra,
+            } => 239.0 + extra,
             Self::SymbolSearch { .. } => 60.0 + extra,
             Self::Timeframes { .. } => 180.0 + extra,
             Self::Menu {
@@ -363,6 +363,8 @@ pub enum MenuMessage {
     Show(Active, bool),
     /// Open the backtest panel for the tile.
     OpenBacktest,
+    /// Open the news sidebar, or close it.
+    News,
     /// Trade the tile's strategy on live bars, or stop.
     GoLive(LiveMode),
     StopLive,
@@ -728,6 +730,7 @@ fn root<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
         item("Strategy", strategy, MenuMessage::Open(Page::Strategies)),
         item("Draw", "›", MenuMessage::Open(Page::Draw)),
         item("Backtest", backtest_shortcut(), MenuMessage::OpenBacktest),
+        item("News", news_shortcut(), MenuMessage::News),
         item(
             "Symbol",
             tile.symbol,
@@ -1657,6 +1660,14 @@ fn amount(value: f64) -> String {
     match trimmed {
         "+" | "-" | "+0" | "-0" => "0".into(),
         other => other.to_owned(),
+    }
+}
+
+const fn news_shortcut() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌃N"
+    } else {
+        "Ctrl+N"
     }
 }
 

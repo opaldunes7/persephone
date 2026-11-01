@@ -19,6 +19,7 @@ anyhow.workspace = true
 dirs.workspace = true
 iced.workspace = true
 notify.workspace = true
+opener.workspace = true
 rfd.workspace = true
 ron.workspace = true
 serde.workspace = true

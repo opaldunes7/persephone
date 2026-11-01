@@ -13,6 +13,7 @@
 //! | Ctrl+T                 | toggle split direction     |
 //! | Ctrl+F                 | fullscreen                 |
 //! | Ctrl+B                 | backtest panel, open/close |
+//! | Ctrl+N                 | news sidebar, open/close   |
 //! | Ctrl+1…9               | switch workspace           |
 //! | Ctrl+Shift+1…9         | move chart to workspace    |
 
@@ -33,6 +34,8 @@ pub enum Action {
     Fullscreen,
     /// Open the backtest panel on the focused chart, or close it.
     Backtest,
+    /// Open the news sidebar, or close it.
+    News,
     /// Show workspace 1 to 9.
     Workspace(u8),
     /// Move the focused chart to workspace 1 to 9.
@@ -74,6 +77,7 @@ pub fn action(key: Physical, modifiers: Modifiers, repeat: bool) -> Option<Actio
             Code::KeyT => Action::ToggleSplit,
             Code::KeyF => Action::Fullscreen,
             Code::KeyB => Action::Backtest,
+            Code::KeyN => Action::News,
             _ => return None,
         },
     };
@@ -120,6 +124,7 @@ mod tests {
         assert_eq!(press(Code::Enter, ctrl), Some(Action::NewTile));
         assert_eq!(press(Code::KeyQ, ctrl), Some(Action::CloseTile));
         assert_eq!(press(Code::KeyB, ctrl), Some(Action::Backtest));
+        assert_eq!(press(Code::KeyN, ctrl), Some(Action::News));
         assert_eq!(
             press(Code::KeyH, ctrl),
             Some(Action::Focus(Direction::Left))
