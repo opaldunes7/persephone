@@ -623,14 +623,22 @@ it wider or narrower (220 to 520 pixels, always leaving the charts 400). It's sa
   **Macro** (the Fed, the SEC, and rates, inflation, hacks, failures and the like). The bar beside
   each headline says how much it may matter: red for market-moving, amber for naming this market,
   grey otherwise. It's a rough rule on the words, not a judgement.
-- **Clicking a headline** takes the playhead there in a replay, or the focused chart otherwise.
+- **Clicking a headline** puts its bar in the middle of the chart, the playhead's in a replay
+  (the playhead goes there too) or the focused one otherwise, and lights its mark: a bigger diamond,
+  ringed, with a line up through the bars and its title above. It's marked even if the filter
+  wouldn't mark it on its own. One from before the chart's first bar says so instead.
   **↗** opens it in the browser.
 - **On the charts:** while the sidebar's open, each chart marks the headlines that matter to it with
   a small diamond along the bottom of its price pane, on the bar each came out in, and none past a
   playhead. Hover one for its title; click it to find it in the sidebar.
 - **History:** every headline is kept in `news/headlines.jsonl` in the data folder, so a history
-  builds up. Feeds only carry their last few dozen items, so there's nothing from before you started:
-  a replay of an older span shows none, and says so. **Keep collecting** reads the feeds while the
+  builds up. Feeds only carry their last few dozen items, so on their own there's nothing from
+  before you started. **Older headlines** fills that in for the focused chart's bars from GDELT's
+  free archive of the world's news, back to 2017: the most relevant 250 a fortnight naming its
+  market, and 250 on rates, inflation, the Fed and regulation. GDELT asks for one request every 5
+  seconds, so a year takes about 4 minutes; it says how far it's got, and **Stop** stops it. Each
+  fortnight is searched once (the one still going is searched again next time), noted in
+  `news/searched.txt`. GDELT's time is when it first saw an article, never before it came out. **Keep collecting** reads the feeds while the
   sidebar's closed too, so there are no gaps. It turns on the first time you open the sidebar, and
   stays as you set it; nothing is fetched until then.
 - **Times** are when each headline's publisher put it out, which can be after the news first broke.

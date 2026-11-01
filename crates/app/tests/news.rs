@@ -206,6 +206,17 @@ fn replaying_shows_only_what_was_out_by_the_playhead_and_a_click_moves_it() {
     let at = app.panel().unwrap().playback.at.unwrap();
     assert!(at.abs_diff(300 * HOUR + HOUR / 2) <= HOUR, "{at}");
     assert_eq!(app.news().lit.as_deref(), Some("h300"));
+    // And the chart being played back shows that bar in its middle, its mark lit, even once
+    // time has moved on.
+    settle(&mut app);
+    let chart = app.tile_chart(0).unwrap();
+    assert_eq!(chart.lit_event(), Some("h300"));
+    let width = app.tile_rect(0).unwrap().width - persephone_chart::PRICE_AXIS_WIDTH;
+    assert!(
+        (chart.middle_bar(width) - 300.0).abs() < 1.5,
+        "{}",
+        chart.middle_bar(width)
+    );
 
     // The chips filter: the market's, or the economy's.
     news(&mut app, NewsMessage::Filter(Filter::Market));
@@ -289,5 +300,151 @@ fn nothing_is_fetched_until_the_sidebar_is_first_opened() {
     news(&mut app, NewsMessage::Toggle);
     news(&mut app, NewsMessage::Toggle);
     assert!(!app.news().polling(), "and left off as set");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// 500 hourly bars from 2024-01-01, so GDELT's archive covers them.
+fn app_in_2024() -> Persephone {
+    const START: u64 = 1_704_067_200_000_000_000;
+    let candles = (0..500u64)
+        .map(|i| {
+            let p = 40_000.0 + 500.0 * (i as f64 / 30.0).sin();
+            Candle {
+                ts: START + i * HOUR,
+                open: p,
+                high: p + 20.0,
+                low: p - 20.0,
+                close: p,
+                volume: 1.0,
+            }
+        })
+        .collect();
+    Persephone::preloaded(
+        ChartData::new("BTCUSDT", "BINANCE", Timeframe::H1, 2, candles),
+        Size::new(1400.0, 900.0),
+    )
+}
+
+#[test]
+fn picking_any_headline_centres_its_mark_and_lights_it() {
+    let mut app = app();
+    let root = dir("pick");
+    app.use_news_root(root.clone());
+    // One the chart wouldn't mark on its own: neither market-moving nor naming the market.
+    let quiet = headline(700, "A gallery opens downtown");
+    news(
+        &mut app,
+        NewsMessage::Fetched(Arc::new(vec![quiet.clone()]), Vec::new()),
+    );
+    news(&mut app, NewsMessage::Toggle);
+    settle(&mut app);
+    assert!(app.tile_chart(0).unwrap().events().is_empty());
+    news(&mut app, NewsMessage::Pick(quiet.id.clone()));
+    let chart = app.tile_chart(0).unwrap();
+    assert_eq!(
+        chart.events().len(),
+        1,
+        "picked, it's marked whatever the filter"
+    );
+    assert_eq!(chart.lit_event(), Some(quiet.id.as_str()));
+    let width = app.tile_rect(0).unwrap().width - persephone_chart::PRICE_AXIS_WIDTH;
+    let bar = chart.bar_of_time(quiet.published).unwrap();
+    assert_eq!(bar, 700);
+    assert!(
+        (chart.middle_bar(width) - bar as f64).abs() < 1.0,
+        "in the middle: {} against {bar}",
+        chart.middle_bar(width)
+    );
+    assert_eq!(app.news().note, None);
+
+    // A click on a mark lights it on the chart too.
+    let other = headline(300, "Fed holds rates");
+    news(
+        &mut app,
+        NewsMessage::Fetched(Arc::new(vec![other.clone()]), Vec::new()),
+    );
+    let _ = app.update(Message::Chart(
+        0,
+        ChartMessage::EventClicked {
+            id: other.id.clone(),
+        },
+    ));
+    assert_eq!(app.tile_chart(0).unwrap().lit_event(), Some("h300"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_headline_from_before_the_chart_says_so() {
+    let mut app = app_in_2024();
+    let root = dir("before");
+    app.use_news_root(root.clone());
+    let early = Headline {
+        published: 1_600_000_000_000_000_000,
+        ..headline(0, "Bitcoin in 2020")
+    };
+    news(
+        &mut app,
+        NewsMessage::Fetched(Arc::new(vec![early.clone()]), Vec::new()),
+    );
+    news(&mut app, NewsMessage::Toggle);
+    news(&mut app, NewsMessage::Pick(early.id));
+    let note = app.news().note.clone().unwrap();
+    assert!(
+        note.contains("before this chart's first bar, 2024-01-01"),
+        "{note}"
+    );
+    assert!(shows(&app, &note));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn older_headlines_are_searched_for_over_the_charts_bars_once() {
+    use persephone::news::History;
+    let mut app = app_in_2024();
+    let root = dir("history");
+    app.use_news_root(root.clone());
+    news(&mut app, NewsMessage::Toggle);
+    assert!(shows(&app, "Older headlines"));
+    news(&mut app, NewsMessage::FetchHistory);
+    // 500 hours is three fortnights on GDELT's grid here: the market's and the economy's each.
+    let History::Running { total, .. } = app.news().history else {
+        panic!("{:?}", app.news().history);
+    };
+    assert_eq!(total, 6);
+    assert!(shows(
+        &app,
+        "Reading older headlines: 0 of 6 searches, 0 found…"
+    ));
+    // What a search would bring back, as the reader hands it over.
+    let found = Headline {
+        published: 1_704_067_200_000_000_000 + 30 * HOUR,
+        ..headline(0, "Bitcoin ETF approval nears")
+    };
+    let key = persephone_data::news::NewsStore::search_key("(btc OR bitcoin)", 0);
+    news(
+        &mut app,
+        NewsMessage::HistoryFound(Arc::new(vec![found.clone()]), key.clone(), 1, 1),
+    );
+    news(&mut app, NewsMessage::HistoryEnded);
+    assert!(matches!(
+        app.news().history,
+        History::Finished {
+            added: 1,
+            nothing_left: false
+        }
+    ));
+    assert!(
+        app.news().store.searched(&key),
+        "a stretch long over isn't searched again"
+    );
+    assert!(
+        app.tile_chart(0)
+            .unwrap()
+            .events()
+            .iter()
+            .any(|mark| mark.id == found.id),
+        "and it's marked"
+    );
+    assert!(shows(&app, "Added 1 older headlines from GDELT."));
     std::fs::remove_dir_all(root).unwrap();
 }

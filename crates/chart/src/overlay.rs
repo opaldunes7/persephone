@@ -863,6 +863,8 @@ fn draw_event_marks(
     hovered: Option<Point>,
 ) {
     let mut hovered_title = None;
+    let mut lit_title = None;
+    let mut lit_color = EVENT_MARKET;
     for event in chart.events() {
         let Some(point) = event_point(chart, price, event.ts) else {
             continue;
@@ -872,6 +874,12 @@ fn draw_event_marks(
         } else {
             EVENT_MARKET
         };
+        // The one picked in the sidebar is drawn last, over any others on its bar.
+        if chart.lit_event() == Some(event.id.as_str()) {
+            lit_title = Some((point, event.title.as_str()));
+            lit_color = color;
+            continue;
+        }
         let diamond = Path::new(|b| {
             b.move_to(Point::new(point.x, point.y - 4.5));
             b.line_to(Point::new(point.x + 4.5, point.y));
@@ -886,7 +894,35 @@ fn draw_event_marks(
             hovered_title = Some((point, event.title.as_str()));
         }
     }
-    if let Some((point, title)) = hovered_title {
+    // The picked one: a line up through the bars, and a bigger diamond, ringed.
+    if let Some((point, _)) = lit_title {
+        let color = lit_color;
+        let line = Path::line(
+            Point::new(point.x, price.offset),
+            Point::new(point.x, price.offset + price.height),
+        );
+        frame.stroke(
+            &line,
+            Stroke::default()
+                .with_color(Color { a: 0.55, ..color })
+                .with_width(1.0),
+        );
+        let big = Path::new(|b| {
+            b.move_to(Point::new(point.x, point.y - 7.5));
+            b.line_to(Point::new(point.x + 7.5, point.y));
+            b.line_to(Point::new(point.x, point.y + 7.5));
+            b.line_to(Point::new(point.x - 7.5, point.y));
+            b.close();
+        });
+        frame.fill(&big, color);
+        frame.stroke(
+            &big,
+            Stroke::default()
+                .with_color(theme::TEXT_BRIGHT)
+                .with_width(1.5),
+        );
+    }
+    if let Some((point, title)) = hovered_title.or(lit_title) {
         // Kept to a line; the sidebar has it whole.
         let shown: String = if title.chars().count() > 80 {
             title.chars().take(79).chain(std::iter::once('…')).collect()

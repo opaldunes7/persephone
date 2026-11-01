@@ -364,7 +364,8 @@ What every number means, the same everywhere.
   only beats the market by holding more of it shows a beta over 1.
 - **`get_news`** reads the headlines the app has collected from public feeds, newest first, by `from`/`to`,
   `query` and the least `importance`, judged against a `symbol` as the sidebar does. Lab fetches none itself, and there are
-  none before `collected_since`. A headline's time is when it was published, which can be after the news broke, so don't
+  none before `collected_since`, unless the app's **Older headlines** has fetched earlier ones from GDELT's
+  archive for a chart's span (their `source` is the site's domain). A headline's time is when it was published, which can be after the news broke, so don't
   treat it as a signal to the second.
 - **`fills_on`** in a summary says how orders filled: `bars`, `ticks`, `minute_bars` or `next_open`.
 - **`get_equity`'s `market`** is the app's market line: what holding the market with a position the run's size would be

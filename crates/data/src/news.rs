@@ -1,8 +1,10 @@
-//! Headlines from public RSS and Atom feeds, kept on disk as they arrive so a history builds up.
+//! Headlines from public RSS and Atom feeds, kept on disk as they arrive so a history builds up,
+//! and older ones from GDELT's archive of the world's news, which goes back to 2017.
 //!
-//! Feeds only carry their last few dozen items, so there's nothing from before collecting began,
-//! and an item's time is when its publisher put it out, which can be after the news first broke.
-//! Good for seeing what was being said around a bar, not for trading on to the second.
+//! Feeds only carry their last few dozen items, so on their own there's nothing from before
+//! collecting began. An item's time is when its publisher put it out, or for GDELT when GDELT
+//! first saw it, which can be after the news first broke, never before. Good for seeing what was
+//! being said around a bar, not for trading on to the second.
 
 use std::{
     collections::HashSet,
@@ -12,7 +14,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use persephone_core::UnixNanos;
+use persephone_core::{
+    UnixNanos,
+    time::{civil_from_days, days_from_civil},
+};
 use serde::{Deserialize, Serialize};
 
 /// Public feeds that need no key: crypto news, and the Fed's and the SEC's own releases.
@@ -229,6 +234,146 @@ pub fn parse_feed(text: &[u8], url: &str, seen: UnixNanos) -> Result<Vec<Headlin
         .collect())
 }
 
+/// GDELT's article search: the world's news back to 2017, free and needing no key.
+pub const GDELT: &str = "https://api.gdeltproject.org/api/v2/doc/doc";
+/// GDELT asks for no more than one request every 5 seconds.
+pub const GDELT_PAUSE: Duration = Duration::from_secs(5);
+/// When its archive begins: 1 January 2017.
+pub const GDELT_FROM: UnixNanos = 1_483_228_800_000_000_000;
+/// How long a stretch one request covers. It gives the most relevant 250 in it.
+pub const HISTORY_DAYS: u64 = 14;
+const HISTORY_RECORDS: &str = "250";
+const NANOS_PER_DAY: u64 = 86_400_000_000_000;
+/// What's searched for the economy and regulators.
+pub const MACRO_QUERY: &str = "(\"federal reserve\" OR fomc OR \"interest rates\" OR inflation OR \"rate cut\" OR \"rate hike\" OR \"crypto regulation\")";
+
+/// What's searched for a market called by `words`: the names it goes by, in English. GDELT
+/// refuses words under three letters, so those are left out.
+#[must_use]
+pub fn market_query(words: &[&str]) -> Option<String> {
+    let terms: Vec<String> = words
+        .iter()
+        .filter(|word| word.chars().count() >= 3)
+        .map(|word| {
+            if word.contains(' ') {
+                format!("\"{}\"", word.to_lowercase())
+            } else {
+                word.to_lowercase()
+            }
+        })
+        .collect();
+    match terms.len() {
+        0 => None,
+        1 => Some(terms[0].clone()),
+        _ => Some(format!("({})", terms.join(" OR "))),
+    }
+}
+
+/// The stretches GDELT is asked about to cover `[from, to)`, each `HISTORY_DAYS` long and
+/// starting on a fixed grid from `GDELT_FROM`, so one fetched once is known by its start.
+#[must_use]
+pub fn history_stretches(from: UnixNanos, to: UnixNanos) -> Vec<(UnixNanos, UnixNanos)> {
+    let step = HISTORY_DAYS * NANOS_PER_DAY;
+    let from = from.max(GDELT_FROM);
+    if to <= from {
+        return Vec::new();
+    }
+    let mut at = GDELT_FROM + (from - GDELT_FROM) / step * step;
+    let mut stretches = Vec::new();
+    while at < to {
+        stretches.push((at, at + step));
+        at += step;
+    }
+    stretches
+}
+
+/// `YYYYMMDDHHMMSS`, as GDELT takes times.
+fn gdelt_time(at: UnixNanos) -> String {
+    let seconds = at / 1_000_000_000;
+    let (year, month, day) = civil_from_days((seconds / 86_400) as i64);
+    let of_day = seconds % 86_400;
+    format!(
+        "{year:04}{month:02}{day:02}{:02}{:02}{:02}",
+        of_day / 3_600,
+        of_day / 60 % 60,
+        of_day % 60
+    )
+}
+
+/// `20240105T123000Z`, as GDELT gives when it saw an article.
+fn parse_gdelt_time(text: &str) -> Option<UnixNanos> {
+    let digits: String = text.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() != 14 {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| digits[range].parse::<u64>().ok();
+    let days = days_from_civil(
+        number(0..4)? as i64,
+        number(4..6)? as u32,
+        number(6..8)? as u32,
+    );
+    let seconds = u64::try_from(days).ok()? * 86_400
+        + number(8..10)? * 3_600
+        + number(10..12)? * 60
+        + number(12..14)?;
+    Some(seconds * 1_000_000_000)
+}
+
+#[derive(Deserialize)]
+struct GdeltAnswer {
+    #[serde(default)]
+    articles: Vec<GdeltArticle>,
+}
+
+#[derive(Deserialize)]
+struct GdeltArticle {
+    url: String,
+    #[serde(default)]
+    title: String,
+    seendate: String,
+    #[serde(default)]
+    domain: String,
+}
+
+/// GDELT's answer to an article search, as headlines. It answers `{}` when there are none, and a
+/// line of text when it refuses the search.
+///
+/// # Errors
+///
+/// Returns what GDELT said when it isn't an answer.
+pub fn parse_gdelt(text: &[u8], seen: UnixNanos) -> Result<Vec<Headline>, String> {
+    let answer: GdeltAnswer = serde_json::from_slice(text).map_err(|_| {
+        let said = String::from_utf8_lossy(text);
+        format!(
+            "GDELT: {}",
+            said.trim().chars().take(200).collect::<String>()
+        )
+    })?;
+    Ok(answer
+        .articles
+        .into_iter()
+        .filter_map(|article| {
+            let title = article
+                .title
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let published = parse_gdelt_time(&article.seendate)?.min(seen);
+            (!title.is_empty()).then(|| Headline {
+                published,
+                seen,
+                official: ["federalreserve.gov", "sec.gov"]
+                    .iter()
+                    .any(|host| article.domain.ends_with(host)),
+                source: article.domain,
+                title,
+                id: article.url.clone(),
+                link: article.url,
+            })
+        })
+        .collect())
+}
+
 /// Reads feeds over the network.
 pub struct FeedClient {
     http: reqwest::blocking::Client,
@@ -263,6 +408,38 @@ impl FeedClient {
         parse_feed(&body, url, now())
     }
 
+    /// What GDELT has for `query` published in `[from, to)`, the most relevant first. Ask no more
+    /// than once every `GDELT_PAUSE`.
+    ///
+    /// # Errors
+    ///
+    /// Returns what went wrong.
+    pub fn history(
+        &self,
+        query: &str,
+        from: UnixNanos,
+        to: UnixNanos,
+    ) -> Result<Vec<Headline>, String> {
+        let query = format!("{query} sourcelang:english");
+        let body = self
+            .http
+            .get(GDELT)
+            .query(&[
+                ("query", query.as_str()),
+                ("mode", "artlist"),
+                ("format", "json"),
+                ("sort", "hybridrel"),
+                ("maxrecords", HISTORY_RECORDS),
+                ("startdatetime", gdelt_time(from).as_str()),
+                ("enddatetime", gdelt_time(to).as_str()),
+            ])
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .and_then(reqwest::blocking::Response::bytes)
+            .map_err(|e| format!("GDELT: {e}"))?;
+        parse_gdelt(&body, now())
+    }
+
     /// Every feed's headlines, and what went wrong with any that couldn't be read.
     #[must_use]
     pub fn fetch_all(&self, urls: &[String]) -> (Vec<Headline>, Vec<String>) {
@@ -295,6 +472,16 @@ pub fn feeds(root: &Path) -> Vec<String> {
     }
 }
 
+/// One search of GDELT's history still to make.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistorySearch {
+    pub query: String,
+    pub from: UnixNanos,
+    pub to: UnixNanos,
+    /// What it's known by once made.
+    pub key: String,
+}
+
 /// Every headline collected so far, oldest first, kept in `news/headlines.jsonl` under the data
 /// folder, one a line, only ever added to.
 #[derive(Debug, Default)]
@@ -302,6 +489,8 @@ pub struct NewsStore {
     path: Option<PathBuf>,
     headlines: Vec<Headline>,
     known: HashSet<String>,
+    /// The history searches already made, by what was searched and the stretch's start.
+    searched: HashSet<String>,
 }
 
 impl NewsStore {
@@ -319,7 +508,52 @@ impl NewsStore {
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
         store.merge_in(read);
+        store.searched = fs::read_to_string(Self::searched_path(&path))
+            .unwrap_or_default()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect();
         store
+    }
+
+    fn searched_path(headlines: &Path) -> PathBuf {
+        headlines.with_file_name("searched.txt")
+    }
+
+    /// The key a history search is known by.
+    #[must_use]
+    pub fn search_key(query: &str, from: UnixNanos) -> String {
+        format!("{from} {query}")
+    }
+
+    /// Whether this search of the history has been made already.
+    #[must_use]
+    pub fn searched(&self, key: &str) -> bool {
+        self.searched.contains(key)
+    }
+
+    /// Notes a search of the history as made, so it isn't made again.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if it can't be written; it's kept in memory regardless.
+    pub fn mark_searched(&mut self, key: String) -> Result<(), String> {
+        if !self.searched.insert(key.clone()) {
+            return Ok(());
+        }
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(Self::searched_path(path))
+            .map_err(|e| e.to_string())?;
+        file.write_all(format!("{key}\n").as_bytes())
+            .map_err(|e| e.to_string())
     }
 
     /// A store kept only in memory, for tests.
@@ -405,6 +639,33 @@ impl NewsStore {
         let start = self.headlines.partition_point(|h| h.published < from);
         let end = self.headlines.partition_point(|h| h.published < to);
         &self.headlines[start..end.max(start)]
+    }
+
+    /// The history searches still to make for a market searched for by `query` over `[from, to)`:
+    /// each stretch's search for the market and for the economy, unless made already. Stretches
+    /// that end after `now` aren't counted as made, as more may still come in.
+    #[must_use]
+    pub fn searches_left(
+        &self,
+        query: Option<&str>,
+        from: UnixNanos,
+        to: UnixNanos,
+    ) -> Vec<HistorySearch> {
+        let mut left = Vec::new();
+        for (start, end) in history_stretches(from, to) {
+            for query in query.into_iter().chain(std::iter::once(MACRO_QUERY)) {
+                let key = Self::search_key(query, start);
+                if !self.searched(&key) {
+                    left.push(HistorySearch {
+                        query: query.to_owned(),
+                        from: start,
+                        to: end,
+                        key,
+                    });
+                }
+            }
+        }
+        left
     }
 
     /// When the first headline here was published, if there is one: nothing's known before it.
@@ -529,6 +790,68 @@ mod tests {
         // Read back from disk, the same.
         let back = NewsStore::open(&dir);
         assert_eq!(back.all(), store.all());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    const GDELT_ANSWER: &str = r#"{"articles": [
+        {"url": "https://news.example/a", "url_mobile": "", "title": "Bitcoin  slides as  Fed holds",
+         "seendate": "20240105T123000Z", "socialimage": "", "domain": "news.example",
+         "language": "English", "sourcecountry": "United States"},
+        {"url": "https://www.federalreserve.gov/x", "title": "FOMC statement",
+         "seendate": "20240131T190000Z", "domain": "federalreserve.gov"},
+        {"url": "https://news.example/blank", "title": "", "seendate": "20240105T123000Z"}
+    ]}"#;
+
+    #[test]
+    fn gdelts_answers_read_as_headlines_at_when_it_saw_them() {
+        let found = parse_gdelt(GDELT_ANSWER.as_bytes(), SEEN).unwrap();
+        assert_eq!(found.len(), 2, "the blank title is left out");
+        assert_eq!(found[0].title, "Bitcoin slides as Fed holds");
+        // 2024-01-05 12:30:00 UTC.
+        assert_eq!(found[0].published, 1_704_457_800_000_000_000);
+        assert_eq!(found[0].source, "news.example");
+        assert_eq!(found[0].id, "https://news.example/a");
+        assert!(found[1].official && !found[0].official);
+        assert!(parse_gdelt(b"{}", SEEN).unwrap().is_empty(), "none found");
+        let refused = parse_gdelt(b"The specified phrase is too short.", SEEN).unwrap_err();
+        assert!(refused.contains("too short"), "{refused}");
+        assert_eq!(gdelt_time(1_704_457_800_000_000_000), "20240105123000");
+    }
+
+    #[test]
+    fn history_is_searched_in_stretches_and_each_only_once() {
+        let words = market_words("BTCUSDT");
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        assert_eq!(market_query(&words).as_deref(), Some("(btc OR bitcoin)"));
+        assert_eq!(market_query(&["OP"]), None, "too short for GDELT");
+        let day = NANOS_PER_DAY;
+        // Thirty days from 2024-01-01: three stretches on the grid, the first starting before.
+        let from = 1_704_067_200_000_000_000;
+        let stretches = history_stretches(from, from + 30 * day);
+        assert_eq!(stretches.len(), 3, "{stretches:?}");
+        assert!(stretches[0].0 <= from && stretches[0].1 > from);
+        assert_eq!((stretches[0].0 - GDELT_FROM) % (HISTORY_DAYS * day), 0);
+        assert!(
+            history_stretches(0, GDELT_FROM).is_empty(),
+            "nothing before 2017"
+        );
+
+        let dir = std::env::temp_dir().join(format!("persephone-searched-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = NewsStore::open(&dir);
+        let left = store.searches_left(Some("bitcoin"), from, from + 30 * day);
+        assert_eq!(
+            left.len(),
+            6,
+            "the market's and the economy's, each stretch"
+        );
+        store.mark_searched(left[0].key.clone()).unwrap();
+        let back = NewsStore::open(&dir);
+        assert_eq!(
+            back.searches_left(Some("bitcoin"), from, from + 30 * day)
+                .len(),
+            5
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

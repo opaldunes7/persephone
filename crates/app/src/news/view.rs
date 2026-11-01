@@ -10,7 +10,7 @@ use persephone_chart::theme;
 use persephone_core::{UnixNanos, time::DateTime};
 use persephone_data::news::{Headline, Importance};
 
-use super::{Filter, News, NewsMessage};
+use super::{Filter, History, News, NewsMessage};
 use crate::Message;
 
 /// The list's id, for scrolling it to a headline.
@@ -205,14 +205,62 @@ pub fn sidebar<'a>(
                 }),
         );
     }
+    // Older headlines, from GDELT's archive, for the focused chart's bars.
+    let history: Element<'a, Message> = match &news.history {
+        History::Running {
+            done, total, added, ..
+        } => row![
+            text(format!(
+                "Reading older headlines: {done} of {total} searches, {added} found…"
+            ))
+            .size(HINT)
+            .color(theme::TEXT_MUTED)
+            .width(Fill),
+            chip("Stop", false, NewsMessage::StopHistory),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into(),
+        History::Failed(error) => row![
+            text(error.clone())
+                .size(HINT)
+                .color(theme::DOWN)
+                .width(Fill),
+            chip("Try again", false, NewsMessage::FetchHistory),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into(),
+        idle => {
+            let said = match idle {
+                History::Finished {
+                    nothing_left: true, ..
+                } => "This chart's span has been searched already.".to_owned(),
+                History::Finished { added, .. } => {
+                    format!("Added {added} older headlines from GDELT.")
+                }
+                _ => "Older headlines for this chart's bars, back to 2017, from GDELT.".to_owned(),
+            };
+            row![
+                chip("Older headlines", false, NewsMessage::FetchHistory),
+                text(said).size(HINT).color(theme::TEXT_MUTED).width(Fill),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .into()
+        }
+    };
     // Why the list is short or empty, plainly.
     let mut notes = column![].spacing(2);
+    if let Some(note) = &news.note {
+        notes = notes.push(text(note.clone()).size(HINT).color(theme::TEXT_MUTED));
+    }
     if headlines.is_empty() {
         let said = match (news.store.since(), replay) {
             (None, _) if news.root.is_none() => "Headlines aren't kept on this system.".to_owned(),
             (None, _) => "Nothing yet: the feeds are read every 5 minutes.".to_owned(),
             (Some(since), Some(_)) => format!(
-                "Nothing by the playhead. Headlines are only known from {}, when collecting began: feeds carry their last few dozen items only.",
+                "Nothing by the playhead. Headlines are only known from {}: feeds carry their last few dozen items, and Older headlines fetches earlier ones.",
                 when(since)
             ),
             (Some(_), None) => "Nothing matches this filter.".to_owned(),
@@ -248,6 +296,7 @@ pub fn sidebar<'a>(
         heading,
         text(status).size(HINT).color(theme::TEXT_MUTED),
         filters,
+        history,
         notes,
         scrollable(list).id(list_id()).height(Fill),
         footer,

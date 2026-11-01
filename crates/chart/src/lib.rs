@@ -202,6 +202,8 @@ pub struct ChartState {
     trades: Option<Trades>,
     /// Headlines marked along the bottom of the price pane, by time.
     events: Vec<EventMark>,
+    /// The headline picked in the sidebar, by id, drawn larger with a line through the chart.
+    lit_event: Option<String>,
     viewport: Viewport,
     grid_cache: canvas::Cache,
     /// A time hovered on another chart, shown as a crosshair line here.
@@ -261,6 +263,7 @@ impl ChartState {
             studies_generation: next_id(),
             trades: None,
             events: Vec::new(),
+            lit_event: None,
             grid_cache: canvas::Cache::new(),
             linked: None,
             drawings: Arc::new(Vec::new()),
@@ -468,6 +471,37 @@ impl ChartState {
     #[must_use]
     pub fn events(&self) -> &[EventMark] {
         &self.events
+    }
+
+    /// Lights the headline mark with this id (or none), so it stands out from the rest.
+    pub fn light_event(&mut self, id: Option<String>) {
+        if id != self.lit_event {
+            self.lit_event = id;
+            self.grid_cache.clear();
+        }
+    }
+
+    #[must_use]
+    pub fn lit_event(&self) -> Option<&str> {
+        self.lit_event.as_deref()
+    }
+
+    /// Puts the bar `ts` falls in at the middle of a plot `plot_width` pixels wide, at the zoom
+    /// it has. `false`, leaving the view as it was, if `ts` is before the first bar.
+    pub fn center_on_time(&mut self, ts: UnixNanos, plot_width: f32) -> bool {
+        let Some(bar) = self.bar_of_time(ts) else {
+            return false;
+        };
+        let half = f64::from(plot_width.max(1.0)) / self.viewport.spacing / 2.0;
+        self.viewport.right = bar as f64 + half.max(viewport::RIGHT_MARGIN_BARS);
+        self.grid_cache.clear();
+        true
+    }
+
+    /// The bar at the middle of a plot `plot_width` pixels wide, as shown now.
+    #[must_use]
+    pub fn middle_bar(&self, plot_width: f32) -> f64 {
+        self.viewport.right - f64::from(plot_width) / self.viewport.spacing / 2.0
     }
 
     /// The bar `ts` falls in, counting from the first, if it's within the bars.
