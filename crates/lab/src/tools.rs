@@ -983,6 +983,17 @@ pub fn tools() -> Vec<Tool> {
             &["columns", "rows", "next_cursor", "total"],
         ),
         tool(
+            "get_portfolio_trades",
+            "A portfolio run's trades, flat to flat, across every leg in the order they opened, or one leg's, in pages. profit is in the quote currency after fees; return_percent is of the starting capital, position_return_percent of what the trade put in. One still open at the end counts at its last close; funding and borrowing are the leg's, not any one trade's.",
+            vec![
+                RUN_ID,
+                opt("symbol", "string", "Only this leg's."),
+                CURSOR,
+                LIMIT,
+            ],
+            &["columns", "rows", "next_cursor", "total", "profit"],
+        ),
+        tool(
             "get_equity",
             "A run's equity at each bar's close, in pages, beside what holding the market with a position of the same size would be worth: the line the app draws.",
             vec![RUN_ID, CURSOR, LIMIT],
@@ -1263,6 +1274,7 @@ impl Lab {
             "get_portfolio" => self.get_portfolio(args),
             "get_portfolio_series" => self.get_portfolio_series(args),
             "get_portfolio_fills" => self.get_portfolio_fills(args),
+            "get_portfolio_trades" => self.get_portfolio_trades(args),
             "get_equity" => self.get_equity(args),
             "get_returns" => self.get_returns(args),
             "get_calendar" => self.get_calendar(args),

@@ -191,6 +191,7 @@ fn calls(lab: &Arc<Lab>, dir: &std::path::Path) -> Vec<(&'static str, Value)> {
             "get_portfolio_fills",
             json!({"run_id": portfolio_id, "symbol": "BTCUSDT"}),
         ),
+        ("get_portfolio_trades", json!({"run_id": portfolio_id})),
         ("get_guide", json!({"topic": "units"})),
         ("get_settings", json!({})),
         ("list_markets", json!({})),
@@ -4168,6 +4169,38 @@ fn a_portfolio_runs_from_tools_and_every_part_of_it_can_be_read() {
         )
         .unwrap();
     assert_eq!(fills["rows"][0][2], "sell");
+
+    // One trade a leg, long A and short B, both still open: with no funding, borrowing or
+    // interest here, they come to what the account made.
+    let trades = lab
+        .dispatch("get_portfolio_trades", &json!({"run_id": id}))
+        .unwrap();
+    assert_eq!(trades["total"], 2, "{trades}");
+    let markets: Vec<&Value> = trades["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| &row[1])
+        .collect();
+    assert!(markets.contains(&&json!("AAAUSD")) && markets.contains(&&json!("BBBUSD")));
+    let made = summary["final_equity"].as_f64().unwrap() - 100_000.0;
+    let profit = trades["profit"].as_f64().unwrap();
+    assert!((profit - made).abs() < 1e-6, "{profit} against {made}");
+    let shorts = lab
+        .dispatch(
+            "get_portfolio_trades",
+            &json!({"run_id": id, "symbol": "bbbusd"}),
+        )
+        .unwrap();
+    assert_eq!(shorts["total"], 1);
+    assert_eq!(shorts["rows"][0][2], "short");
+    assert!(
+        lab.dispatch(
+            "get_portfolio_trades",
+            &json!({"run_id": id, "symbol": "XXX"})
+        )
+        .is_err()
+    );
 
     // A backtest's readers say it isn't one of theirs, and the other way about.
     let wrong = lab

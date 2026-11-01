@@ -13,6 +13,7 @@ pub mod positions;
 pub mod results;
 pub mod robustness;
 pub mod settings;
+pub mod trades;
 pub mod walk_forward;
 
 use self::settings::TestKind;

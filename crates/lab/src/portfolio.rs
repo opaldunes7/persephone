@@ -10,6 +10,7 @@ use persephone_research::{
     portfolio::{self, LegSetup, PortfolioSetup, RebalanceSetup},
     portfolio_tests::{self, Candidate, PickBy, ShiftedJob, ShiftedPortfolioJob, WalkJob},
     robustness::pool,
+    trades::Ledger,
 };
 use serde_json::{Value, json};
 
@@ -565,6 +566,68 @@ impl Lab {
             }
             Value::Array(row)
         }))
+    }
+
+    pub(crate) fn get_portfolio_trades(&self, args: &Value) -> Result<Value, String> {
+        self.load_portfolio(args)?;
+        let run = self.saved_portfolio(args)?;
+        let mut ledger = Ledger::from_portfolio(&run);
+        if let Some(symbol) = args.get("symbol").and_then(Value::as_str) {
+            let symbol = symbol.to_uppercase();
+            if !run.report.legs.iter().any(|leg| leg.symbol == symbol) {
+                return Err(format!(
+                    "`symbol`: {symbol} isn't one of this run's markets"
+                ));
+            }
+            ledger.rows.retain(|row| row.symbol == symbol);
+        }
+        let mut page = page_of(
+            &[
+                "trade",
+                "market",
+                "side",
+                "opened",
+                "opened_ts",
+                "closed",
+                "closed_ts",
+                "size",
+                "entry_price",
+                "exit_price",
+                "profit",
+                "return_percent",
+                "position_return_percent",
+                "fees",
+            ],
+            ledger.rows.len(),
+            args,
+            DEFAULT_ROWS,
+            |at| {
+                let row = &ledger.rows[at];
+                let trip = &row.trip;
+                json!([
+                    at + 1,
+                    row.symbol,
+                    if trip.long { "long" } else { "short" },
+                    time_text(trip.entry_ts),
+                    trip.entry_ts,
+                    if trip.open {
+                        "open".to_owned()
+                    } else {
+                        time_text(trip.exit_ts)
+                    },
+                    (!trip.open).then_some(trip.exit_ts),
+                    trip.qty,
+                    trip.entry_price,
+                    (!trip.open).then_some(trip.exit_price),
+                    trip.profit,
+                    row.return_on_capital * 100.0,
+                    row.return_on_position * 100.0,
+                    trip.fees,
+                ])
+            },
+        );
+        page["profit"] = json!(ledger.profit());
+        Ok(page)
     }
 
     pub(crate) fn get_portfolio_fills(&self, args: &Value) -> Result<Value, String> {

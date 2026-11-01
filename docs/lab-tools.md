@@ -449,6 +449,17 @@ A portfolio run's fills for one leg, in pages.
 
 Returns: `columns`, `rows`, `next_cursor`, `total`
 
+## `get_portfolio_trades`
+
+A portfolio run's trades, flat to flat, across every leg in the order they opened, or one leg's, in pages. profit is in the quote currency after fees; return_percent is of the starting capital, position_return_percent of what the trade put in. One still open at the end counts at its last close; funding and borrowing are the leg's, not any one trade's.
+
+- `run_id` (string, required): A run, from run_backtest or list_runs.
+- `symbol` (string): Only this leg's.
+- `cursor` (string): Where to carry on, from the last page's next_cursor.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
+
+Returns: `columns`, `rows`, `next_cursor`, `total`, `profit`
+
 ## `get_equity`
 
 A run's equity at each bar's close, in pages, beside what holding the market with a position of the same size would be worth: the line the app draws.
