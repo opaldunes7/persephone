@@ -367,7 +367,7 @@ on the chart's bars.
   that made money where it was picked but lost on the unseen bars shows in orange, and is likely
   only fit to the past.
 
-Under the results, **Best's Sharpe … Deflated for N tried** puts a number on the luck: the deflated
+Under the results, **Best's Sharpe … Deflated for N tried here** puts a number on the luck: the deflated
 Sharpe ratio, the chance the best's true Sharpe ratio is above nothing, allowing for how many values
 were tried, how much their Sharpe ratios differed, and how far its daily returns were from normal.
 Under 95% is weak evidence. It counts only this grid, so ideas you tried before aren't in it.

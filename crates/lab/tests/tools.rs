@@ -1172,6 +1172,63 @@ fn a_batch_run_keeps_the_defaults_it_doesnt_set_itself() {
 }
 
 #[test]
+fn variants_tried_before_a_call_lower_its_deflated_sharpe_ratio() {
+    let (lab, _dir) = lab();
+    let runs = json!([
+        {"strategy": {"builtin": "ema-cross", "params": {"Fast": 5, "Slow": 20, "Size %": 100}}},
+        {"strategy": {"builtin": "ema-cross", "params": {"Fast": 8, "Slow": 30, "Size %": 100}}},
+        {"strategy": {"builtin": "ema-cross", "params": {"Fast": 12, "Slow": 40, "Size %": 100}}},
+    ]);
+    let batch = |more: Value| {
+        let mut args = json!({"defaults": market(), "runs": runs, "wait_seconds": 120});
+        for (key, value) in more.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        lab.dispatch("run_backtests", &args).unwrap()
+    };
+    let own = batch(json!({}));
+    assert_eq!(own["variants_tried"], 3);
+    let said_less = batch(json!({"variants_tried": 1}));
+    assert_eq!(said_less["variants_tried"], 3, "never fewer than ran");
+    assert_eq!(said_less["deflated_sharpe"], own["deflated_sharpe"]);
+    let after = batch(json!({"variants_tried": 135}));
+    assert_eq!(after["variants_tried"], 135);
+    let (own, after) = (
+        own["deflated_sharpe"].as_f64().unwrap(),
+        after["deflated_sharpe"].as_f64().unwrap(),
+    );
+    assert!(after < own, "{after} against {own}");
+
+    // So does Optimize's, over the same grid.
+    let optimize = |more: Value| {
+        let mut args = with(json!({
+            "strategy": {"builtin": "rsi-reversion"},
+            "variables": [{"name": "Length", "min": 6, "max": 24, "step": 6}],
+            "wait_seconds": 240,
+        }));
+        for (key, value) in more.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        lab.dispatch("run_optimize", &args).unwrap()
+    };
+    let grid = optimize(json!({}));
+    let said = optimize(json!({"variants_tried": 135}));
+    assert_eq!(
+        (
+            grid["variants_tried"].clone(),
+            said["variants_tried"].clone()
+        ),
+        (json!(4), json!(135))
+    );
+    assert!(
+        said["deflated_sharpe"].as_f64().unwrap() < grid["deflated_sharpe"].as_f64().unwrap(),
+        "{} against {}",
+        said["deflated_sharpe"],
+        grid["deflated_sharpe"]
+    );
+}
+
+#[test]
 fn binance_pages_join_up_and_stop_at_the_last_closed_bar() {
     let (lab, _source) = binance_lab();
     let mut got = Vec::new();
@@ -2234,6 +2291,7 @@ fn walk_forward_picks_only_on_what_came_before_what_it_tests() {
         assert_eq!(window["values"], alone["top"][0]["values"], "{window}");
         // Fast at 3, 6, 9 and 12 is four tried, and the best's Sharpe ratio is deflated for it.
         assert_eq!(alone["variants_tried"], 4);
+        assert_eq!(answer["variants_tried"], 4);
         let picked = alone["top"][0]["sharpe"].as_f64();
         let deflated = alone["deflated_sharpe"].as_f64();
         assert_eq!(picked.is_some(), deflated.is_some(), "{alone}");

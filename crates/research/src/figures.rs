@@ -196,8 +196,13 @@ pub fn deflated_sharpe(
 
 /// The deflated Sharpe ratio of a run picked from others, from annualised Sharpe ratios as runs
 /// report them and the picked run's daily returns.
+///
+/// `trials` is how many variants it was picked from, if more than `tried` holds: the ones tried
+/// before this call count too. With fewer than two in `tried` to see how much they differ, their
+/// spread is taken as what chance alone gives a Sharpe ratio over this many days, 1 / (days - 1),
+/// as if none of them had any skill.
 #[must_use]
-pub fn deflated_sharpe_of(picked: f64, tried: &[f64], daily: &[f64]) -> Option<f64> {
+pub fn deflated_sharpe_of(picked: f64, tried: &[f64], trials: u64, daily: &[f64]) -> Option<f64> {
     let per_day = 365.0_f64.sqrt();
     let count = daily.len() as f64;
     if daily.len() < 2 {
@@ -219,12 +224,12 @@ pub fn deflated_sharpe_of(picked: f64, tried: &[f64], daily: &[f64]) -> Option<f
     let trial_variance = if tried.len() > 1 {
         tried.iter().map(|s| (s - trial_mean).powi(2)).sum::<f64>() / (tried.len() - 1) as f64
     } else {
-        0.0
+        1.0 / (count - 1.0)
     };
     deflated_sharpe(
         picked / per_day,
         trial_variance,
-        tried.len().max(1) as u64,
+        trials.max(tried.len() as u64).max(1),
         daily.len(),
         skew,
         kurtosis,
@@ -924,6 +929,48 @@ mod tests {
         assert!(more < fewer);
         assert!((normal_quantile(0.975) - 1.959_964).abs() < 1e-6);
         assert!((normal_cdf(1.959_964) - 0.975).abs() < 1e-6);
+    }
+
+    #[test]
+    fn variants_tried_before_count_toward_the_deflated_sharpe_ratio() {
+        // A year of daily returns, a little skewed, from a fixed pattern.
+        let daily: Vec<f64> = (0..365)
+            .map(|day| 0.001 + 0.01 * ((day * 37 % 101) as f64 / 101.0 - 0.5))
+            .collect();
+        let count = daily.len() as f64;
+        let mean = daily.iter().sum::<f64>() / count;
+        let moment = |p: i32| daily.iter().map(|r| (r - mean).powi(p)).sum::<f64>() / count;
+        let (skew, kurtosis) = (
+            moment(3) / moment(2).powf(1.5),
+            moment(4) / moment(2).powi(2),
+        );
+        let per_day = 365.0_f64.sqrt();
+        let tried = [1.5, 1.0, 0.5];
+        let mean_tried = tried.iter().sum::<f64>() / 3.0 / per_day;
+        let variance = tried
+            .iter()
+            .map(|s| (s / per_day - mean_tried).powi(2))
+            .sum::<f64>()
+            / 2.0;
+        let by_hand =
+            |trials| deflated_sharpe(1.5 / per_day, variance, trials, 365, skew, kurtosis).unwrap();
+        let own = deflated_sharpe_of(1.5, &tried, 0, &daily).unwrap();
+        assert!((own - by_hand(3)).abs() < 1e-12);
+        assert_eq!(
+            deflated_sharpe_of(1.5, &tried, 2, &daily),
+            Some(own),
+            "never fewer"
+        );
+        let after_135 = deflated_sharpe_of(1.5, &tried, 135, &daily).unwrap();
+        assert!((after_135 - by_hand(135)).abs() < 1e-12);
+        assert!(after_135 < own, "{after_135} against {own}");
+
+        // One run alone, said to be the best of many: chance's spread over a year of days.
+        let alone = deflated_sharpe_of(1.5, &[1.5], 135, &daily).unwrap();
+        let chance = deflated_sharpe(1.5 / per_day, 1.0 / 364.0, 135, 365, skew, kurtosis).unwrap();
+        assert!((alone - chance).abs() < 1e-12);
+        let one = deflated_sharpe_of(1.5, &[1.5], 1, &daily).unwrap();
+        assert!(alone < one);
     }
 
     #[test]

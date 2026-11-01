@@ -637,7 +637,7 @@ pub fn sweep(
     if let Some((best, daily)) = rows.first_mut() {
         best.deflated_sharpe = best
             .sharpe
-            .and_then(|sharpe| figures::deflated_sharpe_of(sharpe, &tried, daily));
+            .and_then(|sharpe| figures::deflated_sharpe_of(sharpe, &tried, 0, daily));
     }
     Ok(rows.into_iter().map(|(row, _)| row).collect())
 }
@@ -657,6 +657,9 @@ pub struct WalkJob {
     pub ratio: f64,
     pub warm_up: usize,
     pub pick_by: PickBy,
+    /// How many variants each pick is made from, if more than the candidates: those tried before
+    /// count too, for its deflated Sharpe ratio. 0 counts only the candidates.
+    pub trials: u64,
     pub workers: usize,
     pub stop: Arc<AtomicBool>,
 }
@@ -794,7 +797,7 @@ impl WalkJob {
                         trades: fills,
                         picked_sharpe: sharpes[at],
                         deflated_sharpe: sharpes[at].and_then(|sharpe| {
-                            figures::deflated_sharpe_of(sharpe, &tried, &dailies[at])
+                            figures::deflated_sharpe_of(sharpe, &tried, self.trials, &dailies[at])
                         }),
                     })
                 }
@@ -1082,6 +1085,7 @@ mod tests {
             ratio: 1.0,
             warm_up: 0,
             pick_by: PickBy::Return,
+            trials: 0,
             workers: 2,
             stop: Arc::default(),
         }
@@ -1128,6 +1132,7 @@ mod tests {
             ratio: 1.0,
             warm_up: 0,
             pick_by: PickBy::Return,
+            trials: 0,
             workers: 2,
             stop: Arc::default(),
         }

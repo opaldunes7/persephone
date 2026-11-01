@@ -131,12 +131,12 @@ pub(super) fn results(
         );
         list = list.push(tip(
             text(format!(
-                "Best's Sharpe {sharpe:.2}. Deflated for {} tried: {deflated}",
+                "Best's Sharpe {sharpe:.2}. Deflated for {} tried here: {deflated}",
                 grid.cells()
             ))
             .size(HINT)
             .color(theme::TEXT_MUTED),
-            "The deflated Sharpe ratio: the chance the best's true Sharpe ratio is above nothing, allowing for how many values were tried, how much their Sharpe ratios differed, and how far its daily returns were from normal. Under 95% is weak evidence.",
+            "The deflated Sharpe ratio: the chance the best's true Sharpe ratio is above nothing, allowing for how many values were tried, how much their Sharpe ratios differed, and how far its daily returns were from normal. Under 95% is weak evidence. It counts only the values tried here: anything you tried before makes it lower still.",
             None,
         ));
     }

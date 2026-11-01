@@ -1981,7 +1981,7 @@ fn walk_forward_table<'a>(
         cell("Trades".into(), 46.0, theme::TEXT_MUTED),
         tip(
             cell("Deflated".into(), 60.0, theme::TEXT_MUTED),
-            "Where it was picked: the chance its Sharpe ratio there was more than luck, for having been the best of all the values tried.",
+            "Where it was picked: the chance its Sharpe ratio there was more than luck, for having been the best of all the values tried here. Anything you tried before makes it lower still.",
             None,
         ),
     ]]

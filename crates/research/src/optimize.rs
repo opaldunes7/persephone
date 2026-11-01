@@ -331,6 +331,9 @@ pub struct OptimizeJob {
     pub runs: u32,
     pub ruin_at: f64,
     pub seed: u64,
+    /// How many variants the best is picked from, if more than the grid's: those tried before
+    /// count too, for its deflated Sharpe ratio. 0 counts only the grid.
+    pub trials: u64,
     pub workers: usize,
     pub stop: Arc<AtomicBool>,
 }
@@ -427,7 +430,12 @@ impl OptimizeJob {
         // The best's Sharpe ratio, made fair for being the best of all that were tried.
         let tried: Vec<f64> = sharpes.iter().flatten().copied().collect();
         let deflated_sharpe = top.first().and_then(|best| {
-            crate::figures::deflated_sharpe_of(sharpes[best.cell]?, &tried, &dailies[best.cell])
+            crate::figures::deflated_sharpe_of(
+                sharpes[best.cell]?,
+                &tried,
+                self.trials,
+                &dailies[best.cell],
+            )
         });
         Ok(OptimizeResult {
             sharpes,

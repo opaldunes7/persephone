@@ -3395,6 +3395,7 @@ impl Persephone {
             runs: settings.runs,
             ruin_at: settings.ruin / 100.0,
             seed: panel.tests.seed,
+            trials: 0,
             workers,
             stop: Arc::clone(&stop),
         };
@@ -3775,6 +3776,7 @@ impl Persephone {
             runs: settings.runs,
             ruin_at: settings.ruin / 100.0,
             seed: panel.tests.seed,
+            trials: 0,
             workers,
             stop: Arc::clone(&stop),
         };
@@ -4000,6 +4002,7 @@ impl Persephone {
                         ratio,
                         warm_up,
                         pick_by: portfolio_tests::PickBy::Return,
+                        trials: 0,
                         workers,
                         stop,
                     }

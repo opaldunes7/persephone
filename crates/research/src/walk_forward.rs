@@ -115,6 +115,9 @@ pub struct WalkForwardJob {
     pub runs: u32,
     pub ruin_at: f64,
     pub seed: u64,
+    /// How many variants the best is picked from, if more than the grid's: those tried before
+    /// count too, for its deflated Sharpe ratio. 0 counts only the grid.
+    pub trials: u64,
     pub workers: usize,
     pub stop: Arc<AtomicBool>,
 }
@@ -176,6 +179,7 @@ impl WalkForwardJob {
                 runs: self.runs,
                 ruin_at: self.ruin_at,
                 seed: self.seed,
+                trials: self.trials,
                 workers: self.workers,
                 stop: Arc::clone(&self.stop),
             };

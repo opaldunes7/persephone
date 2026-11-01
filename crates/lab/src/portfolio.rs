@@ -297,6 +297,7 @@ impl Lab {
             .iter()
             .filter_map(|(_, run)| run["summary"]["sharpe"].as_f64())
             .collect();
+        let trials = crate::runs::variants_tried(args).max(done as u64);
         let deflated = succeeded.first().and_then(|(_, best)| {
             let picked = best["summary"]["sharpe"].as_f64()?;
             let saved =
@@ -311,7 +312,7 @@ impl Lab {
                     .skip(saved.from_index)
                     .map(|(&time, &equity)| (time, equity)),
             );
-            figures::deflated_sharpe_of(picked, &sharpes, &daily)
+            figures::deflated_sharpe_of(picked, &sharpes, trials, &daily)
         });
         Ok(json!({
             "columns": COLUMNS,
@@ -321,7 +322,7 @@ impl Lab {
             "failed": errors,
             "not_run": not_run,
             "first_error": first_error,
-            "variants_tried": done,
+            "variants_tried": trials,
             "deflated_sharpe": deflated,
         }))
     }
@@ -505,6 +506,7 @@ impl Lab {
                 .filter(|ratio| *ratio > 0.0)
                 .unwrap_or(settings.walk_ratio),
             warm_up: settings.warm_up_bars as usize,
+            trials: crate::runs::variants_tried(args),
             pick_by: match args.get("pick_by").and_then(Value::as_str) {
                 None | Some("return") => PickBy::Return,
                 Some("sharpe") => PickBy::Sharpe,
@@ -514,8 +516,9 @@ impl Lab {
             stop: Arc::clone(&job.stop),
         };
         job.total.store(walk.total(), Ordering::Relaxed);
+        let trials = crate::runs::variants_tried(args).max(walk.candidates.len() as u64);
         let found = walk.run(&|done| job.done.store(done, Ordering::Relaxed))?;
-        Ok(walk_answer(&found))
+        Ok(walk_answer(&found, trials))
     }
 
     fn saved_portfolio(&self, args: &Value) -> Result<portfolio::PortfolioRun, String> {

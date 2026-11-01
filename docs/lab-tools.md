@@ -244,6 +244,7 @@ Many portfolios in one call, in parallel, to sweep weights, rebalancing or costs
 
 - `runs` (list_or_path, required): A list of arguments as run_portfolio takes, or a JSON file holding one.
 - `defaults` (object): Arguments every run shares. A run's own win: `settings` merge key by key, and so do `strategy.params` for the same strategy; a different strategy keeps only the defaults' `Size %`.
+- `variants_tried` (integer): How many variants you've tried in all, counting every setting, rule, span and market before this call as well as the runs in it. The deflated Sharpe ratio counts the larger of this and the runs here, and `variants_tried` says which. Default: the runs here.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
 Returns: `columns`, `rows`, `total`, `succeeded`, `failed`, `first_error`, `not_run`, `deflated_sharpe`, `variants_tried`
@@ -280,9 +281,10 @@ Each window picks the best of the setups you give on its stretch, and trades it 
 - `defaults` (object): Arguments every setup shares, such as bars, from, to and settings. A setup's own win: `settings` merge key by key, and so do `strategy.params` for the same strategy; a different strategy keeps only the defaults' `Size %`.
 - `windows` (number): How many times to slide along. Default 5.
 - `train_ratio` (number): How many times longer than its unseen stretch a window picks on. Default walk_ratio in settings, 3.
+- `variants_tried` (integer): How many variants you've tried in all, counting every setting, rule, span and market before this call as well as the runs in it. The deflated Sharpe ratio counts the larger of this and the runs here, and `variants_tried` says which. Default: the runs here.
 - `pick_by` (string): `return` (default) or `sharpe`.
 
-Returns: `windows`, `unseen_return`, `buy_and_hold_return`, `profitable_windows`, `deepest_fall`, `chart`, `buy_and_hold_compounded`, `buy_and_hold_whole`, `test_bars`, `trades`, `train_bars`, `unseen_compounded`, `unseen_sharpe`, `headline`
+Returns: `windows`, `unseen_return`, `buy_and_hold_return`, `profitable_windows`, `deepest_fall`, `chart`, `buy_and_hold_compounded`, `buy_and_hold_whole`, `test_bars`, `trades`, `train_bars`, `unseen_compounded`, `unseen_sharpe`, `headline`, `variants_tried`
 
 ## `run_backtests` *job*
 
@@ -290,6 +292,7 @@ Many backtests in one call, in parallel: much quicker for an agent than one call
 
 - `runs` (list_or_path, required): A list of arguments as run_backtest takes, up to 5,000, or a JSON file holding one.
 - `defaults` (object): Arguments every run shares, such as bars, from, to and settings. A run's own win: `settings` merge key by key, and so do `strategy.params` for the same strategy; a different strategy keeps only the defaults' `Size %`.
+- `variants_tried` (integer): How many variants you've tried in all, counting every setting, rule, span and market before this call as well as the runs in it. The deflated Sharpe ratio counts the larger of this and the runs here, and `variants_tried` says which. Default: the runs here.
 - `limit` (integer): How many runs to list, best return first. Default 100.
 
 Returns: `columns`, `rows`, `total`, `succeeded`, `failed`, `not_run`, `first_error`, `deflated_sharpe`, `variants_tried`, `warnings`
@@ -357,8 +360,9 @@ Picks the best values on one stretch, tests them on the next, unseen, and slides
 - `runs` (integer): For monte-carlo: how many draws. Default 1,000.
 - `ruin_percent` (number): For monte-carlo. Default 50.
 - `seed` (integer): Default 0.
+- `variants_tried` (integer): How many variants you've tried in all, counting every setting, rule, span and market before this call as well as the values here. Each deflated Sharpe ratio counts the larger of this and the values here, and `variants_tried` says which. Default: the values here.
 
-Returns: `windows`, `unseen_return`, `profitable_windows`, `deepest_fall`, `trades`, `buy_and_hold_compounded`, `buy_and_hold_return`, `buy_and_hold_whole`, `chart`, `test_bars`, `train_bars`, `unseen_compounded`, `warning`, `unseen_sharpe`, `headline`
+Returns: `windows`, `unseen_return`, `profitable_windows`, `deepest_fall`, `trades`, `buy_and_hold_compounded`, `buy_and_hold_return`, `buy_and_hold_whole`, `chart`, `test_bars`, `train_bars`, `unseen_compounded`, `warning`, `unseen_sharpe`, `headline`, `variants_tried`
 
 ## `run_optimize` *job*
 
@@ -379,6 +383,7 @@ Backtests a range of one or two parameters, scored by return, Monte Carlo or ran
 - `runs` (integer): For monte-carlo: how many draws. Default 1,000.
 - `ruin_percent` (number): For monte-carlo. Default 50.
 - `seed` (integer): Default 0.
+- `variants_tried` (integer): How many variants you've tried in all, counting every setting, rule, span and market before this call as well as the values here. Each deflated Sharpe ratio counts the larger of this and the values here, and `variants_tried` says which. Default: the values here.
 - `limit` (integer): How many values to list, best first. Default 50.
 
 Returns: `values`, `total`, `top`, `on_edge`, `held_out`, `backtests`, `chart`, `held_out_buy_and_hold`, `warning`, `deflated_sharpe`, `variants_tried`

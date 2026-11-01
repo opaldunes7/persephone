@@ -486,8 +486,12 @@ Optimize tries a range of one or two parameters, by the names `describe_strategy
 - **`deflated_sharpe`** is the chance the best's true Sharpe ratio is above nothing, given that it's the best of
   `variants_tried`: Bailey and López de Prado's deflated Sharpe ratio, which allows for how many were tried, how much their
   Sharpe ratios (`sharpe` on each value) differed, how many days it ran and how far its daily returns were from normal.
-  Under 0.95 is weak evidence. It counts only this grid: count what else you tried yourself. Not given when scoring on
-  random blocks. `run_backtests` and `run_portfolios` give it for their top row, with every run counted as a try.
+  Under 0.95 is weak evidence. Give `variants_tried`, counting everything you tried before this call as well, and it
+  counts that many, or the grid if that's more; the answer's `variants_tried` says which it used. Their spread is
+  still the grid's, and with only one run to go on it's the spread chance alone gives a Sharpe ratio over that many
+  days. Not given when scoring on random blocks. `run_backtests`, `run_portfolios`, `run_walk_forward` and
+  `run_portfolio_walk_forward` take `variants_tried` too: the batches give the deflated ratio for their top row,
+  and the walk-forwards for each window's pick.
 
 Walk-forward picks the best values on a stretch, tests them on the next, unseen, and slides along.
 

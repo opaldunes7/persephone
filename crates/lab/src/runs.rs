@@ -341,7 +341,7 @@ pub(crate) fn histogram_json(values: &[f64], actual: f64) -> Value {
 }
 
 /// A walk-forward's answer, for one market or a portfolio.
-pub(crate) fn walk_answer(found: &WalkForward) -> Value {
+pub(crate) fn walk_answer(found: &WalkForward, variants_tried: u64) -> Value {
     let rows: Vec<Value> = found
         .windows
         .iter()
@@ -393,6 +393,7 @@ pub(crate) fn walk_answer(found: &WalkForward) -> Value {
         "trades": found.trades,
         "train_bars": found.train_bars,
         "test_bars": found.test_bars,
+        "variants_tried": variants_tried,
         "chart": walk_chart(found),
     })
 }
@@ -408,7 +409,12 @@ fn named_rows(mut page: Value) -> Value {
 /// How many bars a logic tree needs before all its rules are ready. Nothing else says.
 /// The best of a batch's Sharpe ratio, deflated for having been picked from all of them, worked out
 /// from its saved run. `sharpes` are every run's.
-pub(crate) fn batch_deflated_sharpe(picked: f64, best: &Value, sharpes: &[f64]) -> Option<f64> {
+pub(crate) fn batch_deflated_sharpe(
+    picked: f64,
+    best: &Value,
+    sharpes: &[f64],
+    trials: u64,
+) -> Option<f64> {
     let from = best["from_index"].as_u64().unwrap_or(0) as usize;
     let times: Vec<u64> = best["times"]
         .as_array()?
@@ -417,7 +423,7 @@ pub(crate) fn batch_deflated_sharpe(picked: f64, best: &Value, sharpes: &[f64]) 
         .collect();
     let report = report_from(best);
     let daily = figures::run_daily_returns(&report, from, &times);
-    figures::deflated_sharpe_of(picked, sharpes, &daily)
+    figures::deflated_sharpe_of(picked, sharpes, trials, &daily)
 }
 
 /// How many variants the run being tested was picked from, as said, or 1.
@@ -1074,15 +1080,16 @@ impl Lab {
             Value::Array(row)
         }));
         rows.truncate(limit_of(args, DEFAULT_ROWS));
-        // The top row, made fair for being the best of all that ran.
+        // The top row, made fair for being the best of all that ran, and of all tried before.
         let sharpes: Vec<f64> = succeeded
             .iter()
             .filter_map(|(_, run)| run["summary"]["sharpe"].as_f64())
             .collect();
+        let trials = variants_tried(args).max(done as u64);
         let deflated = succeeded.first().and_then(|(_, best)| {
             let picked = best["summary"]["sharpe"].as_f64()?;
             let saved = self.load_run(best["run_id"].as_str()?).ok()?;
-            batch_deflated_sharpe(picked, &saved, &sharpes)
+            batch_deflated_sharpe(picked, &saved, &sharpes, trials)
         });
         Ok(json!({
             "columns": BATCH_COLUMNS.as_slice(),
@@ -1092,7 +1099,7 @@ impl Lab {
             "failed": errors,
             "not_run": not_run,
             "first_error": first_error,
-            "variants_tried": done,
+            "variants_tried": trials,
             "deflated_sharpe": deflated,
             "warnings": warnings,
         }))
@@ -1684,6 +1691,7 @@ impl Lab {
         stretches(candles.len().saturating_sub(from), windows, ratio)?;
         let warm_up = settings_of(args)?.warm_up_bars as usize;
         let warning = stretch_look_back_warning(args, &request, warm_up);
+        let trials = variants_tried(args).max(grid.cells() as u64);
         let batch = WalkForwardJob {
             request,
             candles,
@@ -1700,12 +1708,13 @@ impl Lab {
                 .unwrap_or(50.0)
                 / 100.0,
             seed: number(args, "seed", 0),
+            trials,
             workers,
             stop: Arc::clone(&job.stop),
         };
         job.total.store(batch.total(), Ordering::Relaxed);
         let found = batch.run(&|done| job.done.store(done, Ordering::Relaxed))?;
-        let mut answer = walk_answer(&found);
+        let mut answer = walk_answer(&found, trials);
         answer["warning"] = json!(warning);
         Ok(answer)
     }
@@ -1772,6 +1781,7 @@ impl Lab {
                 .unwrap_or(50.0)
                 / 100.0,
             seed,
+            trials: variants_tried(args),
             workers,
             stop: Arc::clone(&job.stop),
         };
@@ -1831,7 +1841,7 @@ impl Lab {
             "held_out": found.held_out,
             "held_out_buy_and_hold": held_out_market,
             "backtests": total,
-            "variants_tried": found.grid.cells(),
+            "variants_tried": variants_tried(args).max(found.grid.cells() as u64),
             "deflated_sharpe": found.deflated_sharpe,
             "warning": warning,
         }))

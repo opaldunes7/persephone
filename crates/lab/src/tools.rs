@@ -547,6 +547,11 @@ pub fn tools() -> Vec<Tool> {
                     "object",
                     "Arguments every run shares. A run's own win: `settings` merge key by key, and so do `strategy.params` for the same strategy; a different strategy keeps only the defaults' `Size %`.",
                 ),
+                opt(
+                    "variants_tried",
+                    "integer",
+                    "How many variants you've tried in all, counting every setting, rule, span and market before this call as well as the runs in it. The deflated Sharpe ratio counts the larger of this and the runs here, and `variants_tried` says which. Default: the runs here.",
+                ),
                 LIMIT,
             ],
             &[
@@ -658,6 +663,11 @@ pub fn tools() -> Vec<Tool> {
                     "number",
                     "How many times longer than its unseen stretch a window picks on. Default walk_ratio in settings, 3.",
                 ),
+                opt(
+                    "variants_tried",
+                    "integer",
+                    "How many variants you've tried in all, counting every setting, rule, span and market before this call as well as the runs in it. The deflated Sharpe ratio counts the larger of this and the runs here, and `variants_tried` says which. Default: the runs here.",
+                ),
                 opt("pick_by", "string", "`return` (default) or `sharpe`."),
             ],
             &[
@@ -675,6 +685,7 @@ pub fn tools() -> Vec<Tool> {
                 "unseen_compounded",
                 "unseen_sharpe",
                 "headline",
+                "variants_tried",
             ],
         ),
         job(
@@ -690,6 +701,11 @@ pub fn tools() -> Vec<Tool> {
                     "defaults",
                     "object",
                     "Arguments every run shares, such as bars, from, to and settings. A run's own win: `settings` merge key by key, and so do `strategy.params` for the same strategy; a different strategy keeps only the defaults' `Size %`.",
+                ),
+                opt(
+                    "variants_tried",
+                    "integer",
+                    "How many variants you've tried in all, counting every setting, rule, span and market before this call as well as the runs in it. The deflated Sharpe ratio counts the larger of this and the runs here, and `variants_tried` says which. Default: the runs here.",
                 ),
                 opt(
                     "limit",
@@ -855,6 +871,11 @@ pub fn tools() -> Vec<Tool> {
                     ),
                     opt("ruin_percent", "number", "For monte-carlo. Default 50."),
                     opt("seed", "integer", "Default 0."),
+                    opt(
+                        "variants_tried",
+                        "integer",
+                        "How many variants you've tried in all, counting every setting, rule, span and market before this call as well as the values here. Each deflated Sharpe ratio counts the larger of this and the values here, and `variants_tried` says which. Default: the values here.",
+                    ),
                 ],
             ),
             &[
@@ -873,6 +894,7 @@ pub fn tools() -> Vec<Tool> {
                 "warning",
                 "unseen_sharpe",
                 "headline",
+                "variants_tried",
             ],
         ),
         job(
@@ -913,6 +935,11 @@ pub fn tools() -> Vec<Tool> {
                     ),
                     opt("ruin_percent", "number", "For monte-carlo. Default 50."),
                     opt("seed", "integer", "Default 0."),
+                    opt(
+                        "variants_tried",
+                        "integer",
+                        "How many variants you've tried in all, counting every setting, rule, span and market before this call as well as the values here. Each deflated Sharpe ratio counts the larger of this and the values here, and `variants_tried` says which. Default: the values here.",
+                    ),
                     opt(
                         "limit",
                         "integer",
