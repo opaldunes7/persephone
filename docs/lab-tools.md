@@ -61,13 +61,13 @@ Returns: `columns`, `rows`, `next_cursor`, `total`, `collected_since`
 
 ## `get_history_range`
 
-When a market's history starts and ends.
+When a market's history starts and ends: the opens of its first and last closed bars, and when that last bar closed.
 
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
 - `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
 
-Returns: `first`, `last`, `first_ts`, `last_ts`
+Returns: `first`, `last`, `last_close`, `first_ts`, `last_ts`, `last_close_ts`
 
 ## `get_bars`
 
@@ -243,7 +243,7 @@ Returns: `run_id`, `summary`
 Many portfolios in one call, in parallel, to sweep weights, rebalancing or costs. Every run is saved. One that fails doesn't stop the rest.
 
 - `runs` (list_or_path, required): A list of arguments as run_portfolio takes, or a JSON file holding one.
-- `defaults` (object): Arguments every run shares. A run's own win.
+- `defaults` (object): Arguments every run shares. A run's own win: `settings` merge key by key, and so do `strategy.params` for the same strategy; a different strategy keeps only the defaults' `Size %`.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
 Returns: `columns`, `rows`, `total`, `succeeded`, `failed`, `first_error`, `not_run`, `deflated_sharpe`, `variants_tried`
@@ -274,25 +274,25 @@ Returns: `runs`, `median`, `low`, `high`, `ruin_share`, `losing_share`, `return_
 
 ## `run_portfolio_walk_forward` *job*
 
-Each window picks the best of the setups you give on its stretch, and trades it on the unseen one after, sliding along. The fair test of whether picking among portfolios helps. Setups can be anything run_portfolio takes, weight tables too.
+Each window picks the best of the setups you give on its stretch, and trades it on the unseen one after, sliding along. The fair test of whether picking among portfolios helps. Setups can be anything run_portfolio takes, weight tables too. `headline` is the fair comparison: the unseen windows compounded one after another against buy_and_hold_whole, the market held once over the same span. `unseen_return` and `buy_and_hold_return` add up windows each started from the same capital, so they aren't what an account would have made.
 
 - `candidates` (list_or_path, required): The setups: run_portfolio's arguments, each with a `label`, or a JSON file holding them. They should trade the same markets.
-- `defaults` (object): Arguments every setup shares, such as bars, from, to and settings. A setup's own win.
+- `defaults` (object): Arguments every setup shares, such as bars, from, to and settings. A setup's own win: `settings` merge key by key, and so do `strategy.params` for the same strategy; a different strategy keeps only the defaults' `Size %`.
 - `windows` (number): How many times to slide along. Default 5.
 - `train_ratio` (number): How many times longer than its unseen stretch a window picks on. Default walk_ratio in settings, 3.
 - `pick_by` (string): `return` (default) or `sharpe`.
 
-Returns: `windows`, `unseen_return`, `buy_and_hold_return`, `profitable_windows`, `deepest_fall`, `chart`, `buy_and_hold_compounded`, `buy_and_hold_whole`, `test_bars`, `trades`, `train_bars`, `unseen_compounded`, `unseen_sharpe`
+Returns: `windows`, `unseen_return`, `buy_and_hold_return`, `profitable_windows`, `deepest_fall`, `chart`, `buy_and_hold_compounded`, `buy_and_hold_whole`, `test_bars`, `trades`, `train_bars`, `unseen_compounded`, `unseen_sharpe`, `headline`
 
 ## `run_backtests` *job*
 
 Many backtests in one call, in parallel: much quicker for an agent than one call each. Every run is saved, so all the tools that take a run_id work on them. One that fails doesn't stop the rest.
 
 - `runs` (list_or_path, required): A list of arguments as run_backtest takes, up to 5,000, or a JSON file holding one.
-- `defaults` (object): Arguments every run shares, such as bars, from, to and settings. A run's own win.
+- `defaults` (object): Arguments every run shares, such as bars, from, to and settings. A run's own win: `settings` merge key by key, and so do `strategy.params` for the same strategy; a different strategy keeps only the defaults' `Size %`.
 - `limit` (integer): How many runs to list, best return first. Default 100.
 
-Returns: `columns`, `rows`, `total`, `succeeded`, `failed`, `not_run`, `first_error`, `deflated_sharpe`, `variants_tried`
+Returns: `columns`, `rows`, `total`, `succeeded`, `failed`, `not_run`, `first_error`, `deflated_sharpe`, `variants_tried`, `warnings`
 
 ## `run_monte_carlo` *job*
 
@@ -341,7 +341,7 @@ Returns: `runs`, `trades`, `actual_return`, `share_matching_return`, `share_matc
 
 ## `run_walk_forward` *job*
 
-Picks the best values on one stretch, tests them on the next, unseen, and slides along, giving what they did where they hadn't been picked. Returns and falls are fractions.
+Picks the best values on one stretch, tests them on the next, unseen, and slides along, giving what they did where they hadn't been picked. Returns and falls are fractions. `headline` is the fair comparison: the unseen windows compounded one after another against buy_and_hold_whole, the market held once over the same span. `unseen_return` and `buy_and_hold_return` add up windows each started from the same capital, so they aren't what an account would have made.
 
 - `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional "params": {"name": value}.
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
@@ -358,7 +358,7 @@ Picks the best values on one stretch, tests them on the next, unseen, and slides
 - `ruin_percent` (number): For monte-carlo. Default 50.
 - `seed` (integer): Default 0.
 
-Returns: `windows`, `unseen_return`, `profitable_windows`, `deepest_fall`, `trades`, `buy_and_hold_compounded`, `buy_and_hold_return`, `buy_and_hold_whole`, `chart`, `test_bars`, `train_bars`, `unseen_compounded`, `warning`, `unseen_sharpe`
+Returns: `windows`, `unseen_return`, `profitable_windows`, `deepest_fall`, `trades`, `buy_and_hold_compounded`, `buy_and_hold_return`, `buy_and_hold_whole`, `chart`, `test_bars`, `train_bars`, `unseen_compounded`, `warning`, `unseen_sharpe`, `headline`
 
 ## `run_optimize` *job*
 

@@ -219,9 +219,7 @@ impl Lab {
                 let own = item
                     .as_object()
                     .ok_or_else(|| format!("`runs`: {item} isn't an object"))?;
-                let mut call = shared.cloned().unwrap_or_default();
-                call.extend(own.clone());
-                Ok(Value::Object(call))
+                Ok(crate::tools::merge_call(shared, own))
             })
             .collect::<Result<_, String>>()?;
         let workers = workers();
@@ -452,14 +450,35 @@ impl Lab {
                 "`candidates` should be a list of run_portfolio's arguments, or a JSON file's path",
             )?;
         let shared = args.get("defaults").and_then(Value::as_object);
-        let mut candidates = Vec::with_capacity(items.len());
-        for (at, item) in items.iter().enumerate() {
-            let own = item
-                .as_object()
-                .ok_or_else(|| format!("`candidates`: {item} isn't an object"))?;
-            let mut call = shared.cloned().unwrap_or_default();
-            call.extend(own.clone());
-            let call = Value::Object(call);
+        let mut calls = items
+            .iter()
+            .map(|item| {
+                let own = item
+                    .as_object()
+                    .ok_or_else(|| format!("`candidates`: {item} isn't an object"))?;
+                Ok(crate::tools::merge_call(shared, own))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        // A candidate naming no markets, as `{"weights": {}}` to stay flat, trades the first
+        // named ones.
+        let has_legs = |call: &Value| {
+            call.get("legs")
+                .and_then(Value::as_array)
+                .is_some_and(|legs| !legs.is_empty())
+        };
+        if let Some(legs) = calls
+            .iter()
+            .find(|call| has_legs(call))
+            .map(|call| call["legs"].clone())
+        {
+            for call in calls.iter_mut().filter(|call| !has_legs(call)) {
+                call["legs"] = legs.clone();
+            }
+        }
+        // The stretches are worked out once, from the first candidate's settings.
+        let settings = settings_of(&calls[0])?;
+        let mut candidates = Vec::with_capacity(calls.len());
+        for (at, call) in calls.into_iter().enumerate() {
             candidates.push(Candidate {
                 label: call
                     .get("label")
@@ -471,7 +490,6 @@ impl Lab {
                     .map_err(|e| format!("`candidates`: item {at}: {e}"))?,
             });
         }
-        let settings = settings_of(&Value::Object(shared.cloned().unwrap_or_default()))?;
         let walk = WalkJob {
             candidates,
             windows: args

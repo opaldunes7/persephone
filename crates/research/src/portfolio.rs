@@ -419,7 +419,7 @@ fn gross_gap_warning(run: &PortfolioRun) -> Option<String> {
     let gap = (gross - figures.net_return) * capital;
     ((gap - figures.costs_paid).abs() > 0.1 * figures.costs_paid).then(|| {
         format!(
-            "Before costs less after is {gap:.2}, but the costs paid were {:.2}. The run without costs traded other sizes, as its account grew differently, so the gap isn't only costs: `total_costs_paid` is what was really paid.",
+            "Before costs less after is {gap:.2}, but the costs paid were {:.2}. That's compounding, usually: legs are sized from the account, and the run without costs had a bigger account to size from, so it traded bigger and its gains grew on themselves. The gap isn't only costs: `total_costs_paid` is what was really paid.",
             figures.costs_paid
         )
     })

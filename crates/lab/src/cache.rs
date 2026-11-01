@@ -60,6 +60,15 @@ pub trait BarSource: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// When the market's first `timeframe` bar opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if it can't be found out.
+    fn first_bar(&self, symbol: &str, _timeframe: Timeframe) -> Result<UnixNanos, String> {
+        Err(format!("this source can't say when {symbol} began"))
+    }
+
     /// The time now.
     fn now(&self) -> UnixNanos {
         SystemTime::now()
@@ -113,6 +122,12 @@ impl BarSource for Binance {
     ) -> Result<Vec<(UnixNanos, f64)>, String> {
         self.client()?
             .funding(symbol, start, end)
+            .map_err(|e| format!("{e:#}"))
+    }
+
+    fn first_bar(&self, symbol: &str, timeframe: Timeframe) -> Result<UnixNanos, String> {
+        self.client()?
+            .first_bar_time(symbol, timeframe)
             .map_err(|e| format!("{e:#}"))
     }
 }
@@ -250,6 +265,15 @@ impl BarCache {
     #[must_use]
     pub fn now(&self) -> UnixNanos {
         self.source.now()
+    }
+
+    /// When the market's first `timeframe` bar opened, by the source.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if it can't be found out.
+    pub fn first_bar(&self, symbol: &str, timeframe: Timeframe) -> Result<UnixNanos, String> {
+        self.source.first_bar(symbol, timeframe)
     }
 
     /// When the bar still forming began: nothing from here on is final.

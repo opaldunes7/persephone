@@ -372,7 +372,15 @@ pub(crate) fn walk_answer(found: &WalkForward) -> Value {
             row
         })
         .collect();
+    let (unseen_compounded, _) = found.compounded();
     json!({
+        // The fair comparison first: what an account would have made, against the market held.
+        "headline": {
+            "unseen_compounded": unseen_compounded,
+            "buy_and_hold_whole": found.buy_and_hold_whole,
+            "beat_market_by": unseen_compounded - found.buy_and_hold_whole,
+            "unseen_sharpe": found.unseen_sharpe,
+        },
         "windows": rows,
         "unseen_return": found.unseen_return,
         "unseen_compounded": found.compounded().0,
@@ -967,16 +975,19 @@ impl Lab {
                 let own = item
                     .as_object()
                     .ok_or_else(|| format!("`runs`: {item} isn't an object"))?;
-                let mut call = shared.cloned().unwrap_or_default();
-                call.extend(own.clone());
-                Ok(Value::Object(call))
+                Ok(crate::tools::merge_call(shared, own))
             })
             .collect::<Result<_, String>>()?;
-        // One at a time if any of them is a strategy in a process of its own.
-        let workers = calls
+        let specs: Vec<Option<StrategySpec>> = calls
             .iter()
-            .filter_map(|call| self.resolve(call.get("strategy")?).ok())
-            .map(|(spec, _)| self.workers_for(&spec))
+            .map(|call| Some(self.resolve(call.get("strategy")?).ok()?.0))
+            .collect();
+        let warnings: Vec<String> = size_mismatch(&specs).into_iter().collect();
+        // One at a time if any of them is a strategy in a process of its own.
+        let workers = specs
+            .iter()
+            .flatten()
+            .map(|spec| self.workers_for(spec))
             .min()
             .unwrap_or(1);
         let all = tools();
@@ -1083,6 +1094,7 @@ impl Lab {
             "first_error": first_error,
             "variants_tried": done,
             "deflated_sharpe": deflated,
+            "warnings": warnings,
         }))
     }
 
@@ -1901,4 +1913,37 @@ fn monte_carlo_json(
         answer["run_rows"] = json!(rows);
     }
     Ok(answer)
+}
+
+/// A batch whose runs trade different sizes, said plainly: their returns aren't comparable.
+fn size_mismatch(specs: &[Option<StrategySpec>]) -> Option<String> {
+    let mut sizes: Vec<(f64, Vec<usize>)> = Vec::new();
+    for (index, spec) in specs.iter().enumerate() {
+        let Some(spec) = spec else { continue };
+        let size = spec.size_fraction() * 100.0;
+        match sizes
+            .iter_mut()
+            .find(|(known, _)| (known - size).abs() < 1e-9)
+        {
+            Some((_, runs)) => runs.push(index),
+            None => sizes.push((size, vec![index])),
+        }
+    }
+    if sizes.len() < 2 {
+        return None;
+    }
+    let groups: Vec<String> = sizes
+        .iter()
+        .map(|(size, runs)| {
+            let shown: Vec<String> = runs.iter().take(8).map(ToString::to_string).collect();
+            let more = if runs.len() > 8 { ", ..." } else { "" };
+            format!("{size}% (runs {}{more})", shown.join(", "))
+        })
+        .collect();
+    Some(format!(
+        "These runs don't all trade the same Size %: {}. Their returns aren't comparable; set \
+         `Size %` in `defaults.strategy.params` (a run with a strategy of its own keeps it unless \
+         it sets its own).",
+        groups.join("; ")
+    ))
 }

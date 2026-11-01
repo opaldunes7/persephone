@@ -988,6 +988,10 @@ impl BarSource for FakeBinance {
             .collect())
     }
 
+    fn first_bar(&self, _symbol: &str, _timeframe: Timeframe) -> Result<u64, String> {
+        Ok(START)
+    }
+
     fn now(&self) -> u64 {
         START + HOURS * HOUR + HOUR / 2
     }
@@ -1045,6 +1049,125 @@ fn backtests_of_binance_markets_repeat_exactly_without_asking_again() {
         source.requests.load(Ordering::Relaxed),
         5,
         "one download, of 5,000 bars at 1,000 a request"
+    );
+}
+
+#[test]
+fn a_binance_history_ends_on_its_last_closed_bar_not_the_clock() {
+    let (lab, _source) = binance_lab();
+    let range = lab
+        .dispatch(
+            "get_history_range",
+            &json!({"symbol": "BTCUSDT", "bars": "1h"}),
+        )
+        .unwrap();
+    assert_eq!(range["first_ts"], START);
+    // Half an hour into a bar: the last closed one opened an hour before that one.
+    let last = START + (HOURS - 1) * HOUR;
+    assert_eq!(range["last_ts"], last, "{range}");
+    assert_eq!(range["last_close_ts"], last + HOUR);
+    // And it's the bar a backtest ends on.
+    let run = lab
+        .dispatch(
+            "run_backtest",
+            &json!({"symbol": "BTCUSDT", "bars": "1h", "strategy": ema(), "wait_seconds": 120}),
+        )
+        .unwrap();
+    assert_eq!(run["summary"]["last_bar"], range["last"]);
+    let four = lab
+        .dispatch(
+            "get_history_range",
+            &json!({"symbol": "BTCUSDT", "bars": "4h"}),
+        )
+        .unwrap();
+    assert_eq!(four["last_ts"].as_u64().unwrap() % (4 * HOUR), 0, "{four}");
+}
+
+#[test]
+fn a_batch_run_keeps_the_defaults_it_doesnt_set_itself() {
+    let (lab, _dir) = lab();
+    let fees = json!({"on": true, "value": {"percent": 0.5}});
+    let slip = json!({"on": true, "value": 0.05});
+    let sized = json!({"builtin": "ema-cross", "params": {"Fast": 5, "Slow": 20, "Size %": 100}});
+    let batch = lab
+        .dispatch(
+            "run_backtests",
+            &json!({
+                "defaults": with(json!({"settings": {"commission": fees}, "strategy": sized})),
+                "runs": [
+                    {"settings": {"slippage_percent": slip}},
+                    {"strategy": tree()},
+                    {"strategy": {"params": {"Fast": 8}}},
+                ],
+                "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    assert_eq!(batch["succeeded"], 3, "{batch}");
+    assert_eq!(batch["warnings"], json!([]), "all at 100%");
+    let net_of = |index: u64| {
+        let columns = batch["columns"].as_array().unwrap();
+        let at = |name: &str| columns.iter().position(|c| c == name).unwrap();
+        let row = batch["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row[0] == index)
+            .unwrap();
+        (row[at("net_return")].clone(), row[at("fees")].clone())
+    };
+    let alone = |args: Value| {
+        let run = lab.dispatch("run_backtest", &with(args)).unwrap();
+        (
+            run["summary"]["net_return"].clone(),
+            run["summary"]["fees"].clone(),
+        )
+    };
+    // Its own slippage, and the defaults' fees.
+    assert_eq!(
+        net_of(0),
+        alone(json!({
+            "strategy": sized, "settings": {"commission": fees, "slippage_percent": slip},
+            "wait_seconds": 120,
+        }))
+    );
+    // Another strategy keeps the defaults' size.
+    let mut sized_tree = tree();
+    sized_tree["params"] = json!({"Size %": 100});
+    assert_eq!(
+        net_of(1),
+        alone(
+            json!({"strategy": sized_tree, "settings": {"commission": fees}, "wait_seconds": 120})
+        )
+    );
+    // The same strategy's own params change only what they name.
+    assert_eq!(
+        net_of(2),
+        alone(json!({
+            "strategy": {"builtin": "ema-cross", "params": {"Fast": 8, "Slow": 20, "Size %": 100}},
+            "settings": {"commission": fees},
+            "wait_seconds": 120,
+        }))
+    );
+
+    // Runs that trade different sizes are told so.
+    let mixed = lab
+        .dispatch(
+            "run_backtests",
+            &json!({
+                "defaults": market(),
+                "runs": [
+                    {"strategy": ema()},
+                    {"strategy": {"builtin": "ema-cross", "params": {"Fast": 5, "Slow": 20, "Size %": 50}}},
+                ],
+                "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    let warning = mixed["warnings"][0].as_str().unwrap();
+    assert!(
+        warning.contains("10% (runs 0)") && warning.contains("50% (runs 1)"),
+        "{warning}"
     );
 }
 
@@ -4671,6 +4794,14 @@ fn a_run_of_either_kind_can_be_shifted_and_a_portfolio_drawn_and_walked() {
     // AAA only rises, so long's what's picked.
     assert_eq!(walked["windows"][0]["label"], "long", "{walked}");
     assert_eq!(walked["profitable_windows"], 2);
+    // The fair comparison comes first.
+    let headline = &walked["headline"];
+    assert_eq!(headline["unseen_compounded"], walked["unseen_compounded"]);
+    assert_eq!(headline["buy_and_hold_whole"], walked["buy_and_hold_whole"]);
+    assert_eq!(headline["unseen_sharpe"], walked["unseen_sharpe"]);
+    let by = headline["unseen_compounded"].as_f64().unwrap()
+        - headline["buy_and_hold_whole"].as_f64().unwrap();
+    assert!((headline["beat_market_by"].as_f64().unwrap() - by).abs() < 1e-12);
 
     // A literal `{}` table stays flat, and beats a candidate that loses.
     let flat_or_short = lab
@@ -4679,7 +4810,7 @@ fn a_run_of_either_kind_can_be_shifted_and_a_portfolio_drawn_and_walked() {
             &json!({
                 "candidates": [
                     {"legs": legs(-0.5), "label": "short"},
-                    {"legs": legs(0.0), "weights": {}, "label": "flat"},
+                    {"weights": {}, "label": "flat"},
                 ],
                 "defaults": {"bars": "1h"},
                 "windows": 2,

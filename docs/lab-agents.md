@@ -136,7 +136,8 @@ A strategy is `{"builtin": id}`, `{"plugin": id}`, `{"logic": tree}` or `{"posit
 - **Rebalancing** takes the whole book back to the weights `every_bars`, or when any leg is `drift_percent` points of the account away, skipping
   trades worth under `min_trade_value`. Rebalanced and table runs size from the account as it is now. Without either a leg stays as it was sized.
   With costs off it trades other sizes, and on drift at other times, so on these and on table runs `gross_return` less `net_return` isn't just the costs:
-  `total_costs_paid` is what was really paid. `warnings` says so on any run where the two differ by more than a tenth.
+  `total_costs_paid` is what was really paid. `warnings` says so on any run where the two differ by more than a tenth. Compounding is the usual cause:
+  without costs the account is bigger, so legs sized from it trade bigger and the gains grow on themselves.
 - **Cash below zero** on what's bought outright is free unless `cash_interest_percent_per_year` is set (perpetuals aren't bought with cash, and pay funding instead), which flatters weights adding up to over 1. `interest_paid` says what
   it came to, and it's in `total_costs_paid`. Interest not paid goes on the loan, as on a margin account, so it compounds every bar: a year at 5% on
   a loan that stays the same costs about 5.13% of it, not 5%. A market is a perpetual when it's given funding (a `-PERP` symbol), even if no
@@ -167,7 +168,7 @@ A strategy is `{"builtin": id}`, `{"plugin": id}`, `{"logic": tree}` or `{"posit
 - **Is it luck?** `run_shifted` takes any run, of one market or a portfolio, and moves its positions or weights along the span, wrapping round, so what's held and for how long stay
   the same and only the timing goes. `share_matching_return` near 0.5 means the timing added nothing. For a portfolio, its book becomes a table of weights, and `actual_return` there is that table run with no shift, as sizing
   from weights isn't quite how a strategy sizes. A table run is already a table, so there it's the run itself. `run_portfolio_monte_carlo` draws the account's returns again in blocks along the timeline, keeping how the markets moved together. It doesn't run fills or costs again.
-  `run_portfolio_walk_forward` picks among `candidates` on each stretch and trades the pick on the unseen one after. A candidate with `"weights": {}` stays flat, and is picked when all else loses. A candidate that can't be run stops the call, saying which `item` it is. In its answer `buy_and_hold_return` is equal shares of the markets, with no funding taken off. It and `unseen_return` add up each window from the same capital, and `unseen_compounded` and `buy_and_hold_compounded` run them one after another. `buy_and_hold_whole` is equal shares held once from the first unseen bar to the last, with no gaps between windows: the market to beat.
+  `run_portfolio_walk_forward` picks among `candidates` on each stretch and trades the pick on the unseen one after. A candidate with `"weights": {}` stays flat, and is picked when all else loses; one naming no `legs` takes the first candidate's. Candidates merge with `defaults` as `run_portfolios`' runs do, and the stretches are worked out from the first candidate's `walk_ratio` and `warm_up_bars`. A candidate that can't be run stops the call, saying which `item` it is. In its answer `buy_and_hold_return` is equal shares of the markets, with no funding taken off. It and `unseen_return` add up each window from the same capital, and `unseen_compounded` and `buy_and_hold_compounded` run them one after another. `buy_and_hold_whole` is equal shares held once from the first unseen bar to the last, with no gaps between windows: the market to beat. `headline` puts `unseen_compounded` beside it.
 - **What it doesn't do yet.** Market orders only: `limit`, stops and targets are for single
   markets, and are refused. `precision: "high"` does nothing here, as portfolios fill on bars. `run_optimize`, `run_monte_carlo`, `run_walk_forward` and `run_random_entries` don't take a portfolio, so
   sweep with `run_portfolios`. A plugin can be a leg or write a weight table, but can't see several markets at once. All legs must be quoted in
@@ -429,7 +430,10 @@ parallel and answers in one table, best return first, which saves a model turn f
 }}
 ```
 
-Each run's own arguments override `defaults`. `index` in a row is the run's place in your list. One that fails
+Each run's own arguments override `defaults`, key by key in `settings`: a run giving only `slippage_percent`
+keeps the defaults' `commission`. Its `strategy` merges its `params` with the defaults' when it's the same
+strategy or names none, and a different strategy keeps the defaults' `Size %`, so no run quietly falls to the
+10% default. If the runs still trade different `Size %`, `warnings` names which. `index` in a row is the run's place in your list. One that fails
 doesn't stop the others: `error` says why, and `failed` and `first_error` report it. It lists 100 unless
 `limit` says otherwise, and all are saved, so `get_report`, `get_trades` and the rest work on any `run_id`.
 
@@ -495,7 +499,9 @@ Walk-forward picks the best values on a stretch, tests them on the next, unseen,
 }}
 ```
 
-Each of `windows` says what it picked, its `unseen_return`, and the market's `buy_and_hold_return` over it. The
+`headline` is the comparison to read first: `unseen_compounded` (the unseen stretches traded one after another,
+as an account would) against `buy_and_hold_whole` (the market held once over them), `beat_market_by` the
+difference, and `unseen_sharpe`. Each of `windows` says what it picked, its `unseen_return`, and the market's `buy_and_hold_return` over it. The
 top-level `unseen_return` and `buy_and_hold_return` add them up, as each stretch starts from the same capital, and so change with
 how many windows there are. `unseen_compounded` and `buy_and_hold_compounded` run them one after another, and
 `buy_and_hold_whole` holds the market once over all the unseen bars. `warning` says if a logic tree looks back further than

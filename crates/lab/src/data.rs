@@ -6,7 +6,7 @@ use std::{
     io::{BufWriter, Write as _},
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
@@ -15,7 +15,7 @@ use parquet::arrow::ArrowWriter;
 use persephone_core::{BarSpec, Candle, Timeframe, UnixNanos, tick::Ticks};
 use persephone_data::{
     archive,
-    binance::{BinanceClient, check_range, is_perp},
+    binance::{check_range, is_perp},
     import::{self, MarketOptions, Overrides},
 };
 use persephone_engine::FeeRates;
@@ -88,12 +88,6 @@ impl MarketArgs {
         self.from
             .map(|from| (from, self.to.unwrap_or(UnixNanos::MAX)))
     }
-}
-
-fn now_nanos() -> UnixNanos {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as UnixNanos)
 }
 
 fn error_text(error: anyhow::Error) -> String {
@@ -335,6 +329,8 @@ impl Lab {
 
     pub(crate) fn get_history_range(&self, args: &Value) -> Result<Value, String> {
         let market = MarketArgs::parse(args)?;
+        // `last` is the last closed bar's open, for local markets and Binance alike (a tick
+        // market's is its last trade), and `last_close` is when that bar closed.
         let (first, last) = match &market.venue {
             Some(venue) => self
                 .store
@@ -344,16 +340,25 @@ impl Lab {
             None => {
                 let timeframe = market.timeframe()?;
                 (
-                    BinanceClient::new()
-                        .and_then(|client| client.first_bar_time(&market.symbol, timeframe))
-                        .map_err(error_text)?,
-                    now_nanos(),
+                    self.cache.first_bar(&market.symbol, timeframe)?,
+                    self.cache
+                        .forming(timeframe)
+                        .saturating_sub(timeframe.nanos()),
                 )
             }
         };
-        Ok(
-            json!({"first": time_text(first), "last": time_text(last), "first_ts": first, "last_ts": last}),
-        )
+        let last_close = market
+            .bars
+            .timeframe()
+            .map_or(last, |timeframe| last.saturating_add(timeframe.nanos()));
+        Ok(json!({
+            "first": time_text(first),
+            "last": time_text(last),
+            "last_close": time_text(last_close),
+            "first_ts": first,
+            "last_ts": last,
+            "last_close_ts": last_close,
+        }))
     }
 
     /// Exactly the bars asked for, with no warm-up: at most `limit` from `from`, when given.

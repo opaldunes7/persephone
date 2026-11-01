@@ -2,7 +2,7 @@
 
 use std::{fs::OpenOptions, io::Write as _, sync::Arc};
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{Lab, now_ms};
 
@@ -317,9 +317,17 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "get_history_range",
-            "When a market's history starts and ends.",
+            "When a market's history starts and ends: the opens of its first and last closed bars, \
+             and when that last bar closed.",
             vec![SYMBOL, VENUE, BARS],
-            &["first", "last", "first_ts", "last_ts"],
+            &[
+                "first",
+                "last",
+                "last_close",
+                "first_ts",
+                "last_ts",
+                "last_close_ts",
+            ],
         ),
         tool(
             "get_bars",
@@ -536,7 +544,7 @@ pub fn tools() -> Vec<Tool> {
                 opt(
                     "defaults",
                     "object",
-                    "Arguments every run shares. A run's own win.",
+                    "Arguments every run shares. A run's own win: `settings` merge key by key, and so do `strategy.params` for the same strategy; a different strategy keeps only the defaults' `Size %`.",
                 ),
                 LIMIT,
             ],
@@ -627,7 +635,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         job(
             "run_portfolio_walk_forward",
-            "Each window picks the best of the setups you give on its stretch, and trades it on the unseen one after, sliding along. The fair test of whether picking among portfolios helps. Setups can be anything run_portfolio takes, weight tables too.",
+            "Each window picks the best of the setups you give on its stretch, and trades it on the unseen one after, sliding along. The fair test of whether picking among portfolios helps. Setups can be anything run_portfolio takes, weight tables too. `headline` is the fair comparison: the unseen windows compounded one after another against buy_and_hold_whole, the market held once over the same span. `unseen_return` and `buy_and_hold_return` add up windows each started from the same capital, so they aren't what an account would have made.",
             vec![
                 arg(
                     "candidates",
@@ -637,7 +645,7 @@ pub fn tools() -> Vec<Tool> {
                 opt(
                     "defaults",
                     "object",
-                    "Arguments every setup shares, such as bars, from, to and settings. A setup's own win.",
+                    "Arguments every setup shares, such as bars, from, to and settings. A setup's own win: `settings` merge key by key, and so do `strategy.params` for the same strategy; a different strategy keeps only the defaults' `Size %`.",
                 ),
                 opt(
                     "windows",
@@ -665,6 +673,7 @@ pub fn tools() -> Vec<Tool> {
                 "train_bars",
                 "unseen_compounded",
                 "unseen_sharpe",
+                "headline",
             ],
         ),
         job(
@@ -679,7 +688,7 @@ pub fn tools() -> Vec<Tool> {
                 opt(
                     "defaults",
                     "object",
-                    "Arguments every run shares, such as bars, from, to and settings. A run's own win.",
+                    "Arguments every run shares, such as bars, from, to and settings. A run's own win: `settings` merge key by key, and so do `strategy.params` for the same strategy; a different strategy keeps only the defaults' `Size %`.",
                 ),
                 opt(
                     "limit",
@@ -697,6 +706,7 @@ pub fn tools() -> Vec<Tool> {
                 "first_error",
                 "deflated_sharpe",
                 "variants_tried",
+                "warnings",
             ],
         ),
         job(
@@ -813,7 +823,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         job(
             "run_walk_forward",
-            "Picks the best values on one stretch, tests them on the next, unseen, and slides along, giving what they did where they hadn't been picked. Returns and falls are fractions.",
+            "Picks the best values on one stretch, tests them on the next, unseen, and slides along, giving what they did where they hadn't been picked. Returns and falls are fractions. `headline` is the fair comparison: the unseen windows compounded one after another against buy_and_hold_whole, the market held once over the same span. `unseen_return` and `buy_and_hold_return` add up windows each started from the same capital, so they aren't what an account would have made.",
             with(
                 test_args(),
                 &[
@@ -861,6 +871,7 @@ pub fn tools() -> Vec<Tool> {
                 "unseen_compounded",
                 "warning",
                 "unseen_sharpe",
+                "headline",
             ],
         ),
         job(
@@ -1384,6 +1395,85 @@ pub(crate) fn page(columns: &[&str], rows: Vec<Value>, args: &Value, default: us
         "total": total,
         "next_cursor": (end < total).then(|| end.to_string()),
     })
+}
+
+/// A batch item's call: the batch's `defaults` with the item's own keys on top.
+///
+/// `settings` merge setting by setting, and within one, `on` apart from `value`, so an item's own
+/// slippage keeps the defaults' commission. So does `strategy` when it's the same strategy, or
+/// names none of its own: its `params` are then merged one by one. A different strategy keeps
+/// only the defaults' `Size %`, which every strategy has, so a batch doesn't quietly fall back to
+/// the 10% default for some runs.
+pub(crate) fn merge_call(defaults: Option<&Map<String, Value>>, own: &Map<String, Value>) -> Value {
+    let mut call = defaults.cloned().unwrap_or_default();
+    for (key, value) in own {
+        let merged = match (key.as_str(), call.get(key)) {
+            ("settings", Some(shared)) => merged(shared, value, 2),
+            ("strategy", Some(shared)) => merged_strategy(shared, value),
+            _ => value.clone(),
+        };
+        call.insert(key.clone(), merged);
+    }
+    Value::Object(call)
+}
+
+/// `own` laid over `shared`: objects merge key by key, `depth` levels down, and below that, or
+/// for anything but two objects, `own` replaces. A value such as `{"percent": 0.1}` is one
+/// choice, so it's never mixed with another.
+fn merged(shared: &Value, own: &Value, depth: usize) -> Value {
+    match (shared, own) {
+        (Value::Object(shared), Value::Object(own)) if depth > 0 => {
+            let mut out = shared.clone();
+            for (key, value) in own {
+                let value = match out.get(key) {
+                    Some(old) => merged(old, value, depth - 1),
+                    None => value.clone(),
+                };
+                out.insert(key.clone(), value);
+            }
+            Value::Object(out)
+        }
+        _ => own.clone(),
+    }
+}
+
+/// The keys that say which strategy it is.
+const STRATEGY_KINDS: [&str; 4] = ["builtin", "plugin", "logic", "positions"];
+
+fn merged_strategy(shared: &Value, own: &Value) -> Value {
+    let (Some(shared), Some(own_object)) = (shared.as_object(), own.as_object()) else {
+        return own.clone();
+    };
+    let kind_of = |object: &Map<String, Value>| -> Vec<(String, Value)> {
+        object
+            .iter()
+            .filter(|(key, _)| STRATEGY_KINDS.contains(&key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    };
+    let own_kind = kind_of(own_object);
+    if own_kind.is_empty() || own_kind == kind_of(shared) {
+        let mut out = shared.clone();
+        for (key, value) in own_object {
+            let value = match (key.as_str(), out.get(key)) {
+                ("params", Some(old)) => merged(old, value, 1),
+                _ => value.clone(),
+            };
+            out.insert(key.clone(), value);
+        }
+        return Value::Object(out);
+    }
+    let mut out = own_object.clone();
+    let size = persephone_core::strategy::SIZE.name.as_ref();
+    if let Some(given) = shared.get("params").and_then(|params| params.get(size)) {
+        let params = out
+            .entry("params")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Some(params) = params.as_object_mut() {
+            params.entry(size).or_insert_with(|| given.clone());
+        }
+    }
+    Value::Object(out)
 }
 
 /// One page of `total` rows, building only those on it.
