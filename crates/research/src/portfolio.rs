@@ -325,6 +325,12 @@ pub struct PortfolioFigures {
     pub by_year_compounded: BTreeMap<i64, Option<f64>>,
     /// An equal share of the capital held in each market from its first bar in the span.
     pub benchmark_return: f64,
+    /// That line's Sharpe ratio and deepest fall, worked out as the run's are, with no funding.
+    pub benchmark_sharpe: Option<f64>,
+    pub benchmark_max_drawdown: f64,
+    /// What it made each year, as `by_year` and `by_year_compounded` are.
+    pub benchmark_by_year: BTreeMap<i64, f64>,
+    pub benchmark_by_year_compounded: BTreeMap<i64, Option<f64>>,
     pub benchmark: Vec<f64>,
     /// That after a perpetual's funding, which is what holding one really made.
     pub benchmark_after_funding: f64,
@@ -485,6 +491,11 @@ pub fn written(run: &PortfolioRun, run_id: &str, created: u64, args: &Value) -> 
         "liquidated_at": report.liquidated_at.map(time_text),
         "warnings": warnings,
     });
+    // The market's own risk and years, beside the run's. Apart, as the list above is long.
+    summary["benchmark_sharpe"] = json!(figures.benchmark_sharpe);
+    summary["benchmark_max_drawdown"] = json!(figures.benchmark_max_drawdown);
+    summary["benchmark_by_year"] = json!(figures.benchmark_by_year);
+    summary["benchmark_by_year_compounded"] = json!(figures.benchmark_by_year_compounded);
     if let Some(label) = args.get("label") {
         summary["label"] = label.clone();
     }
@@ -758,6 +769,13 @@ fn from_written(run: &Value) -> PortfolioRun {
             },
         ),
         benchmark_return: summary["benchmark_return"].as_f64().unwrap_or(0.0),
+        benchmark_sharpe: summary["benchmark_sharpe"].as_f64(),
+        benchmark_max_drawdown: summary["benchmark_max_drawdown"].as_f64().unwrap_or(0.0),
+        benchmark_by_year: years_of(&summary["benchmark_by_year"])
+            .into_iter()
+            .filter_map(|(year, made)| Some((year, made?)))
+            .collect(),
+        benchmark_by_year_compounded: years_of(&summary["benchmark_by_year_compounded"]),
         benchmark_after_funding: summary["benchmark_after_funding"].as_f64().unwrap_or(0.0),
         weights_held_return: summary["weights_held_return"].as_f64(),
         by_hour: numbers(&summary["by_hour"]),
@@ -780,6 +798,16 @@ fn from_written(run: &Value) -> PortfolioRun {
         friction: !summary["total_costs_paid"].is_null(),
         next_open: summary["fills_on"] == "next_open",
     }
+}
+
+/// A saved summary's figures by year, as written.
+fn years_of(saved: &Value) -> BTreeMap<i64, Option<f64>> {
+    saved.as_object().map_or_else(BTreeMap::new, |years| {
+        years
+            .iter()
+            .filter_map(|(year, made)| Some((year.parse().ok()?, made.as_f64())))
+            .collect()
+    })
 }
 
 /// As a backtest's report, for the figures that read one.
@@ -826,6 +854,14 @@ impl PortfolioFigures {
             }
         }
         let costs = cost_breakdown(report, request);
+        let start = report.starting_balance;
+        let held = || {
+            opens
+                .iter()
+                .zip(&benchmark)
+                .skip(from_index)
+                .map(|(&time, &value)| (time, value))
+        };
         Self {
             net_return: report.net_return(),
             gross_return: free.map(PortfolioReport::net_return),
@@ -846,6 +882,10 @@ impl PortfolioFigures {
             benchmark_return: benchmark
                 .last()
                 .map_or(0.0, |last| last / report.starting_balance - 1.0),
+            benchmark_sharpe: figures::line_sharpe(start, held()),
+            benchmark_max_drawdown: figures::line_drawdown(held().map(|(_, value)| value)),
+            benchmark_by_year: figures::line_by_year(start, held()),
+            benchmark_by_year_compounded: figures::line_by_year_compounded(start, held()),
             benchmark,
             benchmark_after_funding: held_return(report, request, from_index, &equal)
                 .unwrap_or(0.0),
@@ -1091,6 +1131,10 @@ mod tests {
                 by_year: BTreeMap::from([(2024, 0.01)]),
                 by_year_compounded: BTreeMap::from([(2024, Some(0.01)), (2025, None)]),
                 benchmark_return: 0.5,
+                benchmark_sharpe: Some(0.7),
+                benchmark_max_drawdown: 0.25,
+                benchmark_by_year: BTreeMap::from([(2024, 0.5)]),
+                benchmark_by_year_compounded: BTreeMap::from([(2024, Some(0.5)), (2025, None)]),
                 benchmark: vec![1_000.0, 1_500.0],
                 benchmark_after_funding: 0.4,
                 weights_held_return: Some(0.3),

@@ -1956,9 +1956,15 @@ fn statistics<'a>(
                 .map_or_else(String::new, |r| {
                     format!(" ({:+.2}% on the year)", r * 100.0)
                 });
+            let market = figures
+                .benchmark_by_year_compounded
+                .get(year)
+                .copied()
+                .flatten()
+                .map_or_else(String::new, |r| format!(", market {:+.2}%", r * 100.0));
             rows.push((
                 year.to_string(),
-                format!("{:+.2}%{on_the_year}", made * 100.0),
+                format!("{:+.2}%{on_the_year}{market}", made * 100.0),
                 signed(*made),
             ));
         }

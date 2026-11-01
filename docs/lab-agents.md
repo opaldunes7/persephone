@@ -374,6 +374,10 @@ What every number means, the same everywhere.
 - **`by_year`** is what each UTC year added, as a fraction of the starting capital, so the years add up to `net_return`.
   **`by_year_compounded`** is each year's return on what the account held going into it, so the years compound to `net_return`; it's
   what a year really returned once earlier years grew or shrank the account. `null` for a year that began with nothing left.
+  **`benchmark_by_year`** and **`benchmark_by_year_compounded`** are the same for the market held from the first close that
+  could trade (equal shares for a portfolio), with no funding taken off, so each year can be set beside the market's. A
+  portfolio's summary also has **`benchmark_sharpe`** and **`benchmark_max_drawdown`**, that line's Sharpe ratio and deepest
+  fall worked out as the run's are, as one market's `benchmark` has `sharpe` and `max_drawdown`.
 - **`return_percent`** on a trade is a percentage of the starting capital, even with `compound`, so add them up rather
   than compounding them.
 - **Times:** `ts` is nanoseconds since 1970, and `time` is `YYYY-MM-DD HH:MM`. All are UTC.

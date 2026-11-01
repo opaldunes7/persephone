@@ -4561,6 +4561,24 @@ fn one_market_as_a_portfolio_reads_as_its_backtest_does() {
         (x.as_f64().unwrap() - y.as_f64().unwrap()).abs() < 1e-9,
         "{x} and {y}"
     );
+    // The market's risk and years beside them, worked out alike for one market and a portfolio.
+    let near = |x: &Value, y: &Value| (x.as_f64().unwrap() - y.as_f64().unwrap()).abs() < 1e-9;
+    let held = &a["benchmark"];
+    assert!(near(&held["sharpe"], &b["benchmark_sharpe"]), "{held} {b}");
+    assert!(near(&held["max_drawdown"], &b["benchmark_max_drawdown"]));
+    for years in ["benchmark_by_year", "benchmark_by_year_compounded"] {
+        let (x, y) = (&a[years]["2024"], &b[years]["2024"]);
+        assert!(near(x, y), "{years}: {x} and {y}");
+    }
+    // A year of the market, compounded, is what holding it made.
+    let compounded = a["benchmark_by_year_compounded"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|year| 1.0 + year.as_f64().unwrap())
+        .product::<f64>()
+        - 1.0;
+    assert!((compounded - held["return"].as_f64().unwrap()).abs() < 1e-9);
 }
 
 fn backtest_with(lab: &Arc<Lab>, settings: &Value) -> Value {

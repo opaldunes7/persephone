@@ -639,6 +639,18 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                         "Return for the ups and downs taken, from daily returns over the span.",
                     ))
                     .push(figure(
+                        "Market risk",
+                        format!(
+                            "{} · {:.1}%",
+                            figures
+                                .benchmark_sharpe
+                                .map_or("—".to_owned(), |sharpe| format!("{sharpe:.2}")),
+                            figures.benchmark_max_drawdown * 100.0
+                        ),
+                        theme::TEXT_MUTED,
+                        "Equal shares' Sharpe ratio, then their deepest fall, worked out as the run's are: the risk the market took for its return, to set beside the run's.",
+                    ))
+                    .push(figure(
                         "Beta",
                         figures.beta.map_or("—".to_owned(), |beta| format!("{beta:.2}")),
                         theme::TEXT,
@@ -1840,6 +1852,7 @@ fn portfolio_table(
         cell("By year".into(), 112.0, theme::TEXT_MUTED),
         cell("Of capital".into(), 76.0, theme::TEXT_MUTED),
         cell("On the year".into(), 90.0, theme::TEXT_MUTED),
+        cell("Equal shares".into(), 96.0, theme::TEXT_MUTED),
     ]]
     .spacing(3);
     let sign = |value: f64| if value >= 0.0 { theme::UP } else { theme::DOWN };
@@ -1850,6 +1863,12 @@ fn portfolio_table(
             .get(year)
             .copied()
             .flatten();
+        let market = found
+            .figures
+            .benchmark_by_year_compounded
+            .get(year)
+            .copied()
+            .flatten();
         years = years.push(row![
             cell(year.to_string(), 112.0, theme::TEXT),
             cell(percent(*made), 76.0, sign(*made)),
@@ -1857,6 +1876,11 @@ fn portfolio_table(
                 compounded.map_or_else(|| "–".into(), percent),
                 90.0,
                 compounded.map_or(theme::TEXT_MUTED, sign)
+            ),
+            cell(
+                market.map_or_else(|| "–".into(), percent),
+                96.0,
+                theme::TEXT_MUTED
             ),
         ]);
     }

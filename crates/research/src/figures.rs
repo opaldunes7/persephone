@@ -43,12 +43,7 @@ pub fn benchmark(
 ) -> Option<Benchmark> {
     let span = bars.get(from_index..)?;
     let first = span.first().map(|(_, close)| *close).filter(|c| *c > 0.0)?;
-    let mut peak = 0.0_f64;
-    let mut fall = 0.0_f64;
-    for &(_, close) in span {
-        peak = peak.max(close);
-        fall = fall.max(1.0 - close / peak);
-    }
+    let fall = line_drawdown(span.iter().map(|&(_, close)| close));
     // As a share of the capital: the position's value when each falls due, times its rate.
     let paid: f64 = funding
         .iter()
@@ -360,15 +355,13 @@ pub fn by_year(
     from_index: usize,
     bars: &[(u64, f64)],
 ) -> BTreeMap<i64, f64> {
-    let capital = report.starting_balance;
-    let mut years = BTreeMap::new();
-    let mut before = capital;
-    for (&(ts, _), &equity) in bars.iter().zip(&report.equity).skip(from_index) {
-        let (year, _, _) = civil_from_days((ts / NANOS_PER_DAY) as i64);
-        *years.entry(year).or_insert(0.0) += (equity - before) / capital;
-        before = equity;
-    }
-    years
+    line_by_year(
+        report.starting_balance,
+        bars.iter()
+            .zip(&report.equity)
+            .skip(from_index)
+            .map(|(&(ts, _), &equity)| (ts, equity)),
+    )
 }
 
 /// What each UTC year returned on what the account held going into it, so they compound to the net
@@ -379,16 +372,76 @@ pub fn by_year_compounded(
     from_index: usize,
     bars: &[(u64, f64)],
 ) -> BTreeMap<i64, Option<f64>> {
-    let mut years: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
-    let mut before = report.starting_balance;
-    for (&(ts, _), &equity) in bars.iter().zip(&report.equity).skip(from_index) {
+    line_by_year_compounded(
+        report.starting_balance,
+        bars.iter()
+            .zip(&report.equity)
+            .skip(from_index)
+            .map(|(&(ts, _), &equity)| (ts, equity)),
+    )
+}
+
+/// What each UTC year added to a line of values starting from `start`, as a fraction of it.
+#[must_use]
+pub fn line_by_year(start: f64, points: impl Iterator<Item = (u64, f64)>) -> BTreeMap<i64, f64> {
+    let mut years = BTreeMap::new();
+    let mut before = start;
+    for (ts, value) in points {
         let (year, _, _) = civil_from_days((ts / NANOS_PER_DAY) as i64);
-        years.entry(year).or_insert((before, before)).1 = equity;
-        before = equity;
+        *years.entry(year).or_insert(0.0) += (value - before) / start;
+        before = value;
+    }
+    years
+}
+
+/// What each UTC year returned on a line's value going into it.
+#[must_use]
+pub fn line_by_year_compounded(
+    start: f64,
+    points: impl Iterator<Item = (u64, f64)>,
+) -> BTreeMap<i64, Option<f64>> {
+    let mut years: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
+    let mut before = start;
+    for (ts, value) in points {
+        let (year, _, _) = civil_from_days((ts / NANOS_PER_DAY) as i64);
+        years.entry(year).or_insert((before, before)).1 = value;
+        before = value;
     }
     years
         .into_iter()
         .map(|(year, (start, end))| (year, (start > 0.0).then(|| end / start - 1.0)))
+        .collect()
+}
+
+/// The deepest fall from a peak along a line of values, as a positive fraction.
+#[must_use]
+pub fn line_drawdown(values: impl Iterator<Item = f64>) -> f64 {
+    let mut peak = 0.0_f64;
+    let mut fall = 0.0_f64;
+    for value in values {
+        peak = peak.max(value);
+        if peak > 0.0 {
+            fall = fall.max(1.0 - value / peak);
+        }
+    }
+    fall
+}
+
+/// The Sharpe ratio of a line of values, on the same terms as a run's.
+#[must_use]
+pub fn line_sharpe(start: f64, points: impl Iterator<Item = (u64, f64)>) -> Option<f64> {
+    daily_sharpe(start, points)
+}
+
+/// The market held from the first close that could trade, as `capital` grown with its closes.
+#[must_use]
+pub fn held_line(capital: f64, bars: &[(u64, f64)], from_index: usize) -> Vec<(u64, f64)> {
+    let span = bars.get(from_index..).unwrap_or_default();
+    let Some(first) = span.first().map(|(_, close)| *close).filter(|c| *c > 0.0) else {
+        return Vec::new();
+    };
+    span.iter()
+        .map(|&(ts, close)| (ts, capital * close / first))
         .collect()
 }
 
@@ -783,6 +836,10 @@ pub struct RunFigures {
     /// How much it moved with its market, day by day.
     pub beta: Option<f64>,
     pub benchmark: Option<Benchmark>,
+    /// What holding the market made each year, as `by_year` and `by_year_compounded` are worked
+    /// out, with no funding taken off.
+    pub benchmark_by_year: BTreeMap<i64, f64>,
+    pub benchmark_by_year_compounded: BTreeMap<i64, Option<f64>>,
     /// The share of limit orders that filled, if any went out.
     pub fill_rate: Option<f64>,
 }
@@ -797,6 +854,7 @@ impl RunFigures {
     ) -> Self {
         let trades = round_trips(report);
         let winners = trades.iter().filter(|t| t.profit > 0.0).count();
+        let held = held_line(report.starting_balance, bars, from_index);
         Self {
             trades: trades.len(),
             win_rate: (!trades.is_empty()).then(|| winners as f64 / trades.len() as f64),
@@ -807,6 +865,11 @@ impl RunFigures {
             by_year_compounded: by_year_compounded(report, from_index, bars),
             beta: beta(report, from_index, bars),
             benchmark: benchmark(report.starting_balance, bars, from_index, funding),
+            benchmark_by_year: line_by_year(report.starting_balance, held.iter().copied()),
+            benchmark_by_year_compounded: line_by_year_compounded(
+                report.starting_balance,
+                held.iter().copied(),
+            ),
             fill_rate: (report.limit_orders > 0)
                 .then(|| report.limits_filled as f64 / report.limit_orders as f64),
         }
@@ -971,6 +1034,32 @@ mod tests {
         assert!((alone - chance).abs() < 1e-12);
         let one = deflated_sharpe_of(1.5, &[1.5], 1, &daily).unwrap();
         assert!(alone < one);
+    }
+
+    #[test]
+    fn the_markets_years_compound_to_what_holding_it_made() {
+        // Two and a half years of daily closes, rising and falling.
+        let day = NANOS_PER_DAY;
+        let bars: Vec<(u64, f64)> = (0..900_u64)
+            .map(|at| {
+                let close = 100.0 + 30.0 * (at as f64 / 50.0).sin() + at as f64 / 20.0;
+                (1_704_067_200_000_000_000 + at * day, close)
+            })
+            .collect();
+        let held = benchmark(10_000.0, &bars, 5, &[]).unwrap();
+        let line = held_line(10_000.0, &bars, 5);
+        let years = line_by_year_compounded(10_000.0, line.iter().copied());
+        assert_eq!(years.len(), 3);
+        let compounded = years
+            .values()
+            .map(|year| 1.0 + year.unwrap())
+            .product::<f64>()
+            - 1.0;
+        assert!((compounded - held.return_).abs() < 1e-12, "{compounded}");
+        let added: f64 = line_by_year(10_000.0, line.iter().copied()).values().sum();
+        assert!((added - held.return_).abs() < 1e-12);
+        assert_eq!(line_sharpe(10_000.0, line.iter().copied()), held.sharpe);
+        assert!((line_drawdown(line.iter().map(|(_, v)| *v)) - held.max_drawdown).abs() < 1e-12);
     }
 
     #[test]

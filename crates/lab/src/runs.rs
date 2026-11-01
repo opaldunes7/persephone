@@ -223,6 +223,7 @@ fn summary_of(
     let losses: f64 = trades.iter().map(|t| (-t.profit).max(0.0)).sum();
     let winners = trades.iter().filter(|t| t.profit > 0.0).count();
     let (by_hour, by_weekday) = figures::by_time(&trades);
+    let held = figures::held_line(report.starting_balance, bars, from_index);
     let last = report
         .equity
         .last()
@@ -255,6 +256,11 @@ fn summary_of(
         "average_trade": (!trades.is_empty()).then(|| profit / trades.len() as f64),
         "by_year": figures::by_year(report, from_index, bars),
         "by_year_compounded": figures::by_year_compounded(report, from_index, bars),
+        "benchmark_by_year": figures::line_by_year(report.starting_balance, held.iter().copied()),
+        "benchmark_by_year_compounded": figures::line_by_year_compounded(
+            report.starting_balance,
+            held.iter().copied(),
+        ),
         "beta": figures::beta(report, from_index, bars),
         "by_hour": by_hour,
         "by_weekday": by_weekday,
