@@ -30,6 +30,10 @@ pub struct Picked {
     pub buy_and_hold_return: f64,
     pub fell: f64,
     pub trades: usize,
+    /// Its Sharpe ratio where it was picked, and that deflated for having been the best of the grid:
+    /// the chance it was more than luck there.
+    pub picked_sharpe: Option<f64>,
+    pub deflated_sharpe: Option<f64>,
 }
 
 /// One slide along the span. `picked` is `None` if nothing could be ranked, as nothing traded.
@@ -47,6 +51,9 @@ pub struct WalkForward {
     /// The unseen stretches' returns added up, each from the same capital.
     pub unseen_return: f64,
     pub buy_and_hold_return: f64,
+    /// The Sharpe ratio of the unseen stretches' daily returns, joined end to end. Nothing was
+    /// picked on these, so it needs no deflating.
+    pub unseen_sharpe: Option<f64>,
     /// The market held once from the first unseen stretch's start to the last one's end, so over
     /// the same bars as `compounded`, but without the gaps and re-buying between windows that
     /// adding or compounding window by window brings.
@@ -150,6 +157,7 @@ impl WalkForwardJob {
         let (mut unseen_line, mut market_line) = (vec![0.0], vec![0.0]);
         let mut starts = Vec::with_capacity(self.windows);
         let (mut trades, mut profitable, mut deepest) = (0, 0, 0.0_f64);
+        let mut unseen_daily = Vec::new();
         for window in 0..self.windows {
             let train_start = first + window * test;
             let train_end = train_start + train;
@@ -191,8 +199,13 @@ impl WalkForwardJob {
             }
             trying.candles = candles[train_end.saturating_sub(self.warm_up)..test_end].to_vec();
             trying.trade_from = candles[train_end].ts;
+            let times: Vec<u64> = trying.candles.iter().map(|c| c.ts).collect();
+            let warmed_up = times.partition_point(|&ts| ts < trying.trade_from);
             let report = backtest(trying)?;
             progress(finished.fetch_add(1, Ordering::Relaxed) + 1);
+            unseen_daily.extend(crate::figures::run_daily_returns(
+                &report, warmed_up, &times,
+            ));
             let capital = report.starting_balance;
             let unseen = report.equity.last().copied().unwrap_or(capital) / capital - 1.0;
             let made = round_trips(&report).len();
@@ -232,6 +245,8 @@ impl WalkForwardJob {
                 buy_and_hold_return: held,
                 fell,
                 trades: made,
+                picked_sharpe: found.sharpes.get(cell).copied().flatten(),
+                deflated_sharpe: found.deflated_sharpe,
             });
             rows.push(row);
         }
@@ -248,6 +263,7 @@ impl WalkForwardJob {
             unseen_return: unseen_total,
             buy_and_hold_return: held_total,
             buy_and_hold_whole: whole,
+            unseen_sharpe: crate::figures::sharpe_of_daily(&unseen_daily),
             profitable_windows: profitable,
             deepest_fall: deepest,
             trades,

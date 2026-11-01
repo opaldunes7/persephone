@@ -60,7 +60,7 @@ const FIGURES_WIDTH: f32 = 180.0;
 const RESULTS_WIDTH: f32 = 250.0;
 const RESULT_FIGURE: f32 = 56.0;
 /// Walk-forward's table of windows, beside its chart.
-const WALK_TABLE_WIDTH: f32 = 430.0;
+const WALK_TABLE_WIDTH: f32 = 494.0;
 /// How far down the legend over the pane reaches.
 const WALK_TOP: f32 = 48.0;
 /// A value that made money where it was picked and lost it on bars it hadn't seen.
@@ -1700,10 +1700,21 @@ fn portfolio_table(found: &PortfolioRun, picked: usize) -> Element<'_, PanelMess
         rows = rows.push(shown);
     }
     rows = rows.push(Space::new().height(8));
+    let costs = &found.figures.costs;
     rows = rows.push(cell(
         format!(
-            "Costs {:.0}, of which {:.0} interest. Turned over {:.1}×. {} orders.",
-            found.figures.costs_paid, report.interest_paid, report.turnover, report.total_orders
+            "Costs {:.0}: fees {:.0}, slippage {:.0}, spread {:.0}, range {:.0}, impact {:.0}, funding {:.0}, borrowing {:.0}, interest {:.0}. Turned over {:.1}×. {} orders.",
+            found.figures.costs_paid,
+            costs.fees(),
+            costs.slippage + costs.rounding,
+            costs.spread,
+            costs.range_slippage,
+            costs.impact,
+            costs.funding,
+            costs.borrow,
+            costs.interest,
+            report.turnover,
+            report.total_orders
         ),
         398.0,
         theme::TEXT_MUTED,
@@ -1711,7 +1722,7 @@ fn portfolio_table(found: &PortfolioRun, picked: usize) -> Element<'_, PanelMess
     let figures = &found.figures;
     rows = rows.push(cell(
         format!(
-            "Equal shares after funding {}. {}",
+            "Equal shares after funding {}. {} Beta {} against equal shares.",
             percent(figures.benchmark_after_funding),
             figures
                 .weights_held_return
@@ -1719,6 +1730,9 @@ fn portfolio_table(found: &PortfolioRun, picked: usize) -> Element<'_, PanelMess
                     "These weights held {}.",
                     percent(held)
                 )),
+            figures
+                .beta
+                .map_or_else(|| "—".to_owned(), |beta| format!("{beta:.2}")),
         ),
         398.0,
         theme::TEXT_MUTED,
@@ -1847,6 +1861,11 @@ fn walk_forward_table<'a>(found: &'a WalkForward, market: &str) -> Element<'a, P
         cell(market.to_owned(), 66.0, theme::TEXT_MUTED),
         cell("Fell".into(), 50.0, theme::TEXT_MUTED),
         cell("Trades".into(), 46.0, theme::TEXT_MUTED),
+        tip(
+            cell("Deflated".into(), 60.0, theme::TEXT_MUTED),
+            "Where it was picked: the chance its Sharpe ratio there was more than luck, for having been the best of all the values tried.",
+            None,
+        ),
     ]]
     .spacing(3);
     for window in &found.windows {
@@ -1865,6 +1884,14 @@ fn walk_forward_table<'a>(found: &'a WalkForward, market: &str) -> Element<'a, P
                     cell(percent(picked.buy_and_hold_return), 66.0, theme::TEXT),
                     cell(format!("{:.1}%", picked.fell * 100.0), 50.0, theme::TEXT),
                     cell(picked.trades.to_string(), 46.0, theme::TEXT),
+                    cell(
+                        picked.deflated_sharpe.map_or_else(
+                            || "–".to_owned(),
+                            |chance| format!("{:.0}%", chance * 100.0)
+                        ),
+                        60.0,
+                        theme::TEXT_MUTED
+                    ),
                 ]
             }
             None => row![
@@ -1872,6 +1899,13 @@ fn walk_forward_table<'a>(found: &'a WalkForward, market: &str) -> Element<'a, P
                 cell("nothing traded".into(), 200.0, theme::TEXT_MUTED),
             ],
         });
+    }
+    if let Some(sharpe) = found.unseen_sharpe {
+        rows = rows.push(cell(
+            format!("Unseen Sharpe {sharpe:.2}, needing no deflating as nothing was picked on it."),
+            420.0,
+            theme::TEXT_MUTED,
+        ));
     }
     // Below the legend, which sits over the top of the pane.
     iced::widget::scrollable(rows.padding(Padding {

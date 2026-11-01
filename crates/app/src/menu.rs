@@ -559,8 +559,9 @@ pub fn view<'a>(
             let notes = match tile.strategy {
                 // And the rows beyond the usual figures: costs, the market, and each year.
                 Some((_, Run::Done(report))) => {
+                    // Costs by kind (3) and beta (1) as well.
                     2 * report.notes.len()
-                        + 15
+                        + 19
                         + tile.figures.map_or(0, |figures| figures.by_year.len())
                 }
                 _ => 0,
@@ -1794,6 +1795,17 @@ fn statistics<'a>(
                 format!("{:.2} {quote}", costs.costs_paid),
                 bright,
             ));
+            // What the price moved against orders that took, by what moved it. Range slippage has
+            // its own row below, as it's known without the costless run.
+            for (name, paid) in [
+                ("Slippage paid", costs.costs.slippage),
+                ("Spread paid", costs.costs.spread),
+                ("Impact paid", costs.costs.impact),
+            ] {
+                if paid.abs() > 1e-9 {
+                    rows.push((name.into(), format!("{paid:.2} {quote}"), bright));
+                }
+            }
             rows.push((
                 "Break-even a fill".into(),
                 costs
@@ -1917,6 +1929,9 @@ fn statistics<'a>(
             format!("{:.2}%", held.max_drawdown * 100.0),
             theme::DOWN,
         ));
+    }
+    if let Some(beta) = figures.and_then(|f| f.beta) {
+        rows.push(("Beta to the market".into(), format!("{beta:.2}"), bright));
     }
     // A share of the capital, which adds up to the return, and on what the year started with,
     // which compounds to it.

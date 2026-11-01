@@ -291,6 +291,27 @@ impl Lab {
             Value::Array(row)
         }));
         rows.truncate(limit_of(args, DEFAULT_ROWS));
+        // The top row, made fair for being the best of all that ran.
+        let sharpes: Vec<f64> = succeeded
+            .iter()
+            .filter_map(|(_, run)| run["summary"]["sharpe"].as_f64())
+            .collect();
+        let deflated = succeeded.first().and_then(|(_, best)| {
+            let picked = best["summary"]["sharpe"].as_f64()?;
+            let saved =
+                portfolio::load_saved(&self.paths.lab().join("runs"), best["run_id"].as_str()?)
+                    .ok()?;
+            let daily = figures::daily_returns(
+                saved.report.starting_balance,
+                saved
+                    .opens
+                    .iter()
+                    .zip(&saved.report.equity)
+                    .skip(saved.from_index)
+                    .map(|(&time, &equity)| (time, equity)),
+            );
+            figures::deflated_sharpe_of(picked, &sharpes, &daily)
+        });
         Ok(json!({
             "columns": COLUMNS,
             "rows": rows,
@@ -299,6 +320,8 @@ impl Lab {
             "failed": errors,
             "not_run": not_run,
             "first_error": first_error,
+            "variants_tried": done,
+            "deflated_sharpe": deflated,
         }))
     }
 

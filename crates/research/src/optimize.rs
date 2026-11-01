@@ -278,6 +278,12 @@ pub struct OptimizeResult {
     pub on_edge: bool,
     /// Whether some bars were kept back.
     pub held_out: bool,
+    /// Each combination's Sharpe ratio over the bars it was scored on, in `outcomes`' order. `None`
+    /// when scored on random blocks, or with too few days to say.
+    pub sharpes: Vec<Option<f64>>,
+    /// The best's Sharpe ratio deflated for having been picked from all of them: the chance its
+    /// true Sharpe ratio is above nothing.
+    pub deflated_sharpe: Option<f64>,
 }
 
 /// Each scored combination with its score averaged with its neighbours' (the 8 around it, or the
@@ -334,6 +340,8 @@ struct Measured {
     return_: f64,
     drawdown: f64,
     fills: usize,
+    /// Its daily returns over the span, for its Sharpe ratio. Empty for a block.
+    daily: Vec<f64>,
     /// Monte Carlo's low end and chance of ruin; `None` if the trades were too few.
     draws: Option<(f64, f64)>,
 }
@@ -379,6 +387,19 @@ impl OptimizeJob {
         for ((cell, _), result) in tasks.iter().zip(measured) {
             by_cell[*cell].extend(result);
         }
+        // Each combination's Sharpe ratio and daily returns, from its one run over the span; a
+        // score on blocks has many runs, so none.
+        let dailies: Vec<Vec<f64>> = by_cell
+            .iter()
+            .map(|results| match results.as_slice() {
+                [Ok(one)] => one.daily.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let sharpes: Vec<Option<f64>> = dailies
+            .iter()
+            .map(|daily| crate::figures::sharpe_of_daily(daily))
+            .collect();
         let outcomes: Vec<Outcome> = by_cell
             .into_iter()
             .map(|results| self.outcome(results))
@@ -403,7 +424,14 @@ impl OptimizeJob {
                 unseen: unseen.flatten(),
             })
             .collect();
+        // The best's Sharpe ratio, made fair for being the best of all that were tried.
+        let tried: Vec<f64> = sharpes.iter().flatten().copied().collect();
+        let deflated_sharpe = top.first().and_then(|best| {
+            crate::figures::deflated_sharpe_of(sharpes[best.cell]?, &tried, &dailies[best.cell])
+        });
         Ok(OptimizeResult {
+            sharpes,
+            deflated_sharpe,
             on_edge: top
                 .first()
                 .is_some_and(|best| on_edge(best.cell, width, self.grid.height())),
@@ -434,7 +462,17 @@ impl OptimizeJob {
             }
             None => request.candles = self.candles[..end].to_vec(),
         }
+        let daily = if block.is_none() {
+            let times: Vec<u64> = request.candles.iter().map(|c| c.ts).collect();
+            let from = times.partition_point(|&ts| ts < request.trade_from);
+            Some((times, from))
+        } else {
+            None
+        };
         let report = backtest(request)?;
+        let daily = daily.map_or_else(Vec::new, |(times, from)| {
+            crate::figures::run_daily_returns(&report, from, &times)
+        });
         let draws = (self.score == ScoreBy::MonteCarlo)
             .then(|| {
                 monte_carlo(
@@ -452,6 +490,7 @@ impl OptimizeJob {
             return_: return_of(&report),
             drawdown: report.max_drawdown,
             fills: report.fills.len(),
+            daily,
             draws,
         })
     }

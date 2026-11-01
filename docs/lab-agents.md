@@ -349,6 +349,14 @@ What every number means, the same everywhere.
   a bar on, the same with `_24` for 24 bars on, and `barely_filled`, how many fills went under a hundredth of a percent past their price.
   **`get_limit_orders`** lists each order, with `reached_percent` for how far past its price the market traded, below zero if it stayed off.
   **`maker_fees` and `taker_fees`** split the fees, and **`funding_paid` and `borrow_paid`** are what holding cost.
+- **Costs by kind:** `total_costs_paid` is `maker_fees` + `taker_fees` + `slippage_paid` (the set ticks and percentage) +
+  `spread_paid` (half the assumed spread, crossed by each order that took) + `range_slippage_paid` (the volatility setting) +
+  `impact_paid` (size against the bar's volume) + `funding_paid` + `borrow_paid` (+ `interest_paid` in a portfolio) +
+  `cost_rounding`, which is what rounding prices to the tick left over, so they add up exactly. `run_backtests` and
+  `run_portfolios` have them as columns. The assumed spread counts even when the data brings its own quotes.
+- **`beta`** is how far the account moved with the market, from daily returns: the market's own for one market, equal
+  shares of its markets for a portfolio. 1 moves with it, 0 owes it nothing, below 0 moves against it. A strategy that
+  only beats the market by holding more of it shows a beta over 1.
 - **`fills_on`** in a summary says how orders filled: `bars`, `ticks`, `minute_bars` or `next_open`.
 - **`get_equity`'s `market`** is the app's market line: what holding the market with a position the run's size would be
   worth, from the first close that could trade. It's null on runs saved before it was added.
@@ -466,6 +474,11 @@ Optimize tries a range of one or two parameters, by the names `describe_strategy
 - **`hold_out`** scores on the span's first 70% and gives the top 5's `unseen_return` on the last 30%, with
   `held_out_buy_and_hold` for what the market did there. It's off unless asked for.
 - **Values with no score:** `status` says `too-few-trades` or `failed`, and the rest carry on.
+- **`deflated_sharpe`** is the chance the best's true Sharpe ratio is above nothing, given that it's the best of
+  `variants_tried`: Bailey and López de Prado's deflated Sharpe ratio, which allows for how many were tried, how much their
+  Sharpe ratios (`sharpe` on each value) differed, how many days it ran and how far its daily returns were from normal.
+  Under 0.95 is weak evidence. It counts only this grid: count what else you tried yourself. Not given when scoring on
+  random blocks. `run_backtests` and `run_portfolios` give it for their top row, with every run counted as a try.
 
 Walk-forward picks the best values on a stretch, tests them on the next, unseen, and slides along.
 
@@ -482,7 +495,8 @@ Each of `windows` says what it picked, its `unseen_return`, and the market's `bu
 top-level `unseen_return` and `buy_and_hold_return` add them up, as each stretch starts from the same capital, and so change with
 how many windows there are. `unseen_compounded` and `buy_and_hold_compounded` run them one after another, and
 `buy_and_hold_whole` holds the market once over all the unseen bars. `warning` says if a logic tree looks back further than
-`warm_up_bars`, as each stretch is warmed up on only that many. It fills on the chart's bars whatever the `precision`.
+`warm_up_bars`, as each stretch is warmed up on only that many. Each window's `picked_sharpe` and `deflated_sharpe` say
+how much its pick was luck where it was picked; `unseen_sharpe` is the unseen stretches' joined, which needs no deflating. It fills on the chart's bars whatever the `precision`.
 
 **Against chance:** `run_random_entries` places a run's own holds and directions at random times, on the same bars and
 settings, and says how many placings did as well.

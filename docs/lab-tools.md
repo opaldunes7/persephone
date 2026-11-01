@@ -232,7 +232,7 @@ Many portfolios in one call, in parallel, to sweep weights, rebalancing or costs
 - `defaults` (object): Arguments every run shares. A run's own win.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `columns`, `rows`, `total`, `succeeded`, `failed`, `first_error`, `not_run`
+Returns: `columns`, `rows`, `total`, `succeeded`, `failed`, `first_error`, `not_run`, `deflated_sharpe`, `variants_tried`
 
 ## `run_shifted` *job*
 
@@ -268,7 +268,7 @@ Each window picks the best of the setups you give on its stretch, and trades it 
 - `train_ratio` (number): How many times longer than its unseen stretch a window picks on. Default walk_ratio in settings, 3.
 - `pick_by` (string): `return` (default) or `sharpe`.
 
-Returns: `windows`, `unseen_return`, `buy_and_hold_return`, `profitable_windows`, `deepest_fall`, `chart`, `buy_and_hold_compounded`, `buy_and_hold_whole`, `test_bars`, `trades`, `train_bars`, `unseen_compounded`
+Returns: `windows`, `unseen_return`, `buy_and_hold_return`, `profitable_windows`, `deepest_fall`, `chart`, `buy_and_hold_compounded`, `buy_and_hold_whole`, `test_bars`, `trades`, `train_bars`, `unseen_compounded`, `unseen_sharpe`
 
 ## `run_backtests` *job*
 
@@ -278,7 +278,7 @@ Many backtests in one call, in parallel: much quicker for an agent than one call
 - `defaults` (object): Arguments every run shares, such as bars, from, to and settings. A run's own win.
 - `limit` (integer): How many runs to list, best return first. Default 100.
 
-Returns: `columns`, `rows`, `total`, `succeeded`, `failed`, `not_run`, `first_error`
+Returns: `columns`, `rows`, `total`, `succeeded`, `failed`, `not_run`, `first_error`, `deflated_sharpe`, `variants_tried`
 
 ## `run_monte_carlo` *job*
 
@@ -344,7 +344,7 @@ Picks the best values on one stretch, tests them on the next, unseen, and slides
 - `ruin_percent` (number): For monte-carlo. Default 50.
 - `seed` (integer): Default 0.
 
-Returns: `windows`, `unseen_return`, `profitable_windows`, `deepest_fall`, `trades`, `buy_and_hold_compounded`, `buy_and_hold_return`, `buy_and_hold_whole`, `chart`, `test_bars`, `train_bars`, `unseen_compounded`, `warning`
+Returns: `windows`, `unseen_return`, `profitable_windows`, `deepest_fall`, `trades`, `buy_and_hold_compounded`, `buy_and_hold_return`, `buy_and_hold_whole`, `chart`, `test_bars`, `train_bars`, `unseen_compounded`, `warning`, `unseen_sharpe`
 
 ## `run_optimize` *job*
 
@@ -367,7 +367,7 @@ Backtests a range of one or two parameters, scored by return, Monte Carlo or ran
 - `seed` (integer): Default 0.
 - `limit` (integer): How many values to list, best first. Default 50.
 
-Returns: `values`, `total`, `top`, `on_edge`, `held_out`, `backtests`, `chart`, `held_out_buy_and_hold`, `warning`
+Returns: `values`, `total`, `top`, `on_edge`, `held_out`, `backtests`, `chart`, `held_out_buy_and_hold`, `warning`, `deflated_sharpe`, `variants_tried`
 
 ## `get_report`
 

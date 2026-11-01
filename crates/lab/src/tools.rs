@@ -526,6 +526,8 @@ pub fn tools() -> Vec<Tool> {
                 "failed",
                 "first_error",
                 "not_run",
+                "deflated_sharpe",
+                "variants_tried",
             ],
         ),
         job(
@@ -640,6 +642,7 @@ pub fn tools() -> Vec<Tool> {
                 "trades",
                 "train_bars",
                 "unseen_compounded",
+                "unseen_sharpe",
             ],
         ),
         job(
@@ -670,6 +673,8 @@ pub fn tools() -> Vec<Tool> {
                 "failed",
                 "not_run",
                 "first_error",
+                "deflated_sharpe",
+                "variants_tried",
             ],
         ),
         job(
@@ -833,6 +838,7 @@ pub fn tools() -> Vec<Tool> {
                 "train_bars",
                 "unseen_compounded",
                 "warning",
+                "unseen_sharpe",
             ],
         ),
         job(
@@ -890,6 +896,8 @@ pub fn tools() -> Vec<Tool> {
                 "chart",
                 "held_out_buy_and_hold",
                 "warning",
+                "deflated_sharpe",
+                "variants_tried",
             ],
         ),
         tool(

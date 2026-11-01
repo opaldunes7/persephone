@@ -12,6 +12,7 @@ use persephone_engine::{BacktestReport, BacktestRequest, PortfolioReport, Portfo
 use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
 
 use crate::{
+    figures,
     portfolio::{self, PortfolioRun, PortfolioSetup},
     positions::{Positions, RandomEntries},
     results::with_params,
@@ -649,6 +650,7 @@ impl WalkJob {
         let time_at = |at: usize| opens.get(at).copied().unwrap_or(UnixNanos::MAX);
         let mut windows = Vec::with_capacity(self.windows);
         let (mut unseen_line, mut market_line, mut starts) = (vec![0.0], vec![0.0], Vec::new());
+        let mut unseen_daily = Vec::new();
         let (mut unseen_return, mut market_return, mut deepest, mut profitable, mut trades) =
             (0.0, 0.0, 0.0_f64, 0, 0);
         for window in 0..self.windows {
@@ -672,21 +674,35 @@ impl WalkJob {
                         self.over(&candidate.request, train_from, test_from),
                         false,
                     )?;
-                    Ok::<_, String>(score_of(&run, self.pick_by))
+                    Ok::<_, String>((
+                        score_of(&run, self.pick_by),
+                        run.figures.sharpe,
+                        portfolio_daily(&run),
+                    ))
                 },
             );
             let mut best: Option<(usize, f64)> = None;
-            for (at, score) in tries.into_iter().enumerate() {
+            let mut sharpes = Vec::with_capacity(tries.len());
+            let mut dailies = Vec::with_capacity(tries.len());
+            for (at, tried) in tries.into_iter().enumerate() {
                 if self.stop.load(Ordering::Relaxed) {
                     return Err("Stopped.".into());
                 }
-                let Some(score) = score.transpose()?.flatten() else {
+                let Some((score, sharpe, daily)) = tried.transpose()? else {
+                    sharpes.push(None);
+                    dailies.push(Vec::new());
+                    continue;
+                };
+                sharpes.push(sharpe);
+                dailies.push(daily);
+                let Some(score) = score else {
                     continue;
                 };
                 if best.is_none_or(|(_, top)| score > top) {
                     best = Some((at, score));
                 }
             }
+            let tried: Vec<f64> = sharpes.iter().flatten().copied().collect();
             let picked = match best {
                 Some((at, score)) => {
                     let candidate = &self.candidates[at];
@@ -712,6 +728,7 @@ impl WalkJob {
                         unseen_line.push(made_before + (equity / capital - 1.0) * 100.0);
                         market_line.push(market_before + (held / capital - 1.0) * 100.0);
                     }
+                    unseen_daily.extend(portfolio_daily(&run));
                     let returned = report.net_return();
                     let market = run.figures.benchmark_return;
                     unseen_return += returned;
@@ -729,6 +746,10 @@ impl WalkJob {
                         buy_and_hold_return: market,
                         fell: report.max_drawdown.abs(),
                         trades: fills,
+                        picked_sharpe: sharpes[at],
+                        deflated_sharpe: sharpes[at].and_then(|sharpe| {
+                            figures::deflated_sharpe_of(sharpe, &tried, &dailies[at])
+                        }),
                     })
                 }
                 None => None,
@@ -762,6 +783,7 @@ impl WalkJob {
             unseen_return,
             buy_and_hold_return: market_return,
             buy_and_hold_whole: whole,
+            unseen_sharpe: figures::sharpe_of_daily(&unseen_daily),
             profitable_windows: profitable,
             deepest_fall: deepest,
             trades,
@@ -772,6 +794,18 @@ impl WalkJob {
             starts,
         })
     }
+}
+
+/// A portfolio run's daily returns from the span's start, as its Sharpe ratio is worked out.
+fn portfolio_daily(run: &PortfolioRun) -> Vec<f64> {
+    figures::daily_returns(
+        run.report.starting_balance,
+        run.opens
+            .iter()
+            .zip(&run.report.equity)
+            .skip(run.from_index)
+            .map(|(&time, &equity)| (time, equity)),
+    )
 }
 
 /// How a candidate did on a stretch. One that stayed flat made nothing, which beats losing, so it's

@@ -26,7 +26,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    figures, market::MarketBars, positions::Positions, robustness::round_trips, settings::Settings,
+    figures::{self, CostBreakdown},
+    market::MarketBars,
+    positions::Positions,
+    robustness::round_trips,
+    settings::Settings,
 };
 
 /// What a position needs to stay open unless told otherwise, as a percentage of its value: about what
@@ -312,7 +316,11 @@ pub struct PortfolioFigures {
     pub gross_return: Option<f64>,
     /// Fees, slippage, spread, impact, funding and borrowing, in the quote currency.
     pub costs_paid: f64,
+    /// That by kind.
+    pub costs: CostBreakdown,
     pub sharpe: Option<f64>,
+    /// How much the account moved with equal shares of its markets, day by day.
+    pub beta: Option<f64>,
     pub by_year: BTreeMap<i64, f64>,
     pub by_year_compounded: BTreeMap<i64, Option<f64>>,
     /// An equal share of the capital held in each market from its first bar in the span.
@@ -446,9 +454,17 @@ pub fn written(run: &PortfolioRun, run_id: &str, created: u64, args: &Value) -> 
         "net_return": figures.net_return,
         "gross_return": figures.gross_return,
         "total_costs_paid": run.friction.then_some(figures.costs_paid),
+        "maker_fees": figures.costs.maker_fees,
+        "taker_fees": figures.costs.taker_fees,
+        "slippage_paid": figures.costs.slippage,
+        "spread_paid": figures.costs.spread,
+        "range_slippage_paid": figures.costs.range_slippage,
+        "impact_paid": figures.costs.impact,
+        "cost_rounding": figures.costs.rounding,
         "final_equity": report.equity.last(),
         "max_drawdown": report.max_drawdown.abs(),
         "sharpe": figures.sharpe,
+        "beta": figures.beta,
         "by_year": figures.by_year.iter().map(|(year, made)| (year.to_string(), json!(made))).collect::<serde_json::Map<_, _>>(),
         "by_year_compounded": figures.by_year_compounded.iter().map(|(year, made)| (year.to_string(), json!(made))).collect::<serde_json::Map<_, _>>(),
         "benchmark_return": figures.benchmark_return,
@@ -705,7 +721,23 @@ fn from_written(run: &Value) -> PortfolioRun {
         net_return: summary["net_return"].as_f64().unwrap_or(0.0),
         gross_return: summary["gross_return"].as_f64(),
         costs_paid: summary["total_costs_paid"].as_f64().unwrap_or(0.0),
+        costs: {
+            let figure = |name: &str| summary[name].as_f64().unwrap_or(0.0);
+            CostBreakdown {
+                maker_fees: figure("maker_fees"),
+                taker_fees: figure("taker_fees"),
+                slippage: figure("slippage_paid"),
+                spread: figure("spread_paid"),
+                range_slippage: figure("range_slippage_paid"),
+                impact: figure("impact_paid"),
+                funding: figure("funding_paid"),
+                borrow: figure("borrow_paid"),
+                interest: figure("interest_paid"),
+                rounding: figure("cost_rounding"),
+            }
+        },
         sharpe: summary["sharpe"].as_f64(),
+        beta: summary["beta"].as_f64(),
         by_year: summary["by_year"]
             .as_object()
             .map_or_else(BTreeMap::new, |years| {
@@ -791,11 +823,22 @@ impl PortfolioFigures {
                 *total += part;
             }
         }
+        let costs = cost_breakdown(report, request);
         Self {
             net_return: report.net_return(),
             gross_return: free.map(PortfolioReport::net_return),
-            costs_paid: costs_paid(report, request),
+            costs_paid: costs.total(),
+            costs,
             sharpe: figures::sharpe(&whole, from_index, &bars),
+            beta: figures::daily_beta(
+                (report.starting_balance, report.starting_balance),
+                opens
+                    .iter()
+                    .zip(&report.equity)
+                    .zip(&benchmark)
+                    .skip(from_index)
+                    .map(|((&time, &equity), &held)| (time, equity, held)),
+            ),
             by_year: figures::by_year(&whole, from_index, &bars),
             by_year_compounded: figures::by_year_compounded(&whole, from_index, &bars),
             benchmark_return: benchmark
@@ -813,8 +856,10 @@ impl PortfolioFigures {
     }
 }
 
-fn costs_paid(report: &PortfolioReport, request: &PortfolioRequest) -> f64 {
-    let legs: f64 = report
+/// What a portfolio paid by kind: each leg's, as one market's run works it out, and the interest on
+/// cash below zero, which belongs to the account.
+fn cost_breakdown(report: &PortfolioReport, request: &PortfolioRequest) -> CostBreakdown {
+    let legs = report
         .legs
         .iter()
         .zip(&request.legs)
@@ -826,15 +871,18 @@ fn costs_paid(report: &PortfolioReport, request: &PortfolioRequest) -> f64 {
                 borrow_paid: leg.borrow_paid,
                 ..BacktestReport::default()
             };
-            figures::costs_paid(
+            figures::cost_breakdown(
                 &shim,
                 &request.sim,
                 asked.instrument.price_precision,
                 &leg.volumes,
             )
         })
-        .sum();
-    legs + report.interest_paid
+        .fold(CostBreakdown::default(), CostBreakdown::plus);
+    CostBreakdown {
+        interest: report.interest_paid,
+        ..legs
+    }
 }
 
 /// The account holding an equal share of the capital in each market from its first bar in the span,
@@ -1030,7 +1078,14 @@ mod tests {
                 net_return: 0.01,
                 gross_return: Some(0.02),
                 costs_paid: 3.0,
+                costs: CostBreakdown {
+                    taker_fees: 2.0,
+                    impact: 0.5,
+                    interest: 0.5,
+                    ..CostBreakdown::default()
+                },
                 sharpe: Some(1.5),
+                beta: Some(0.8),
                 by_year: BTreeMap::from([(2024, 0.01)]),
                 by_year_compounded: BTreeMap::from([(2024, Some(0.01)), (2025, None)]),
                 benchmark_return: 0.5,
@@ -1088,6 +1143,9 @@ mod tests {
         );
         assert_eq!(back.figures.correlation, run.figures.correlation);
         assert_eq!(back.figures.sharpe, run.figures.sharpe);
+        assert_eq!(back.figures.costs.impact, 0.5);
+        assert_eq!(back.figures.beta, Some(0.8));
+        assert_eq!(back.figures.costs.taker_fees, 2.0);
         assert_eq!(back.figures.benchmark_after_funding, 0.4);
         assert_eq!(back.figures.weights_held_return, Some(0.3));
         assert_eq!(back.figures.by_weekday, vec![2.0; 7]);

@@ -51,7 +51,7 @@ const LISTED_RUNS: usize = 20;
 const LISTED_VALUES: usize = 50;
 /// The most backtests `run_backtests` takes in one call.
 const MAX_BACKTESTS: usize = 5_000;
-const BATCH_COLUMNS: [&str; 30] = [
+const BATCH_COLUMNS: [&str; 35] = [
     "index",
     "run_id",
     "label",
@@ -74,7 +74,12 @@ const BATCH_COLUMNS: [&str; 30] = [
     "break_even_cost_per_fill",
     "maker_fees",
     "taker_fees",
+    "slippage_paid",
+    "spread_paid",
+    "range_slippage_paid",
+    "impact_paid",
     "funding_paid",
+    "borrow_paid",
     "limit_orders",
     "limits_filled",
     "fill_rate",
@@ -250,6 +255,7 @@ fn summary_of(
         "average_trade": (!trades.is_empty()).then(|| profit / trades.len() as f64),
         "by_year": figures::by_year(report, from_index, bars),
         "by_year_compounded": figures::by_year_compounded(report, from_index, bars),
+        "beta": figures::beta(report, from_index, bars),
         "by_hour": by_hour,
         "by_weekday": by_weekday,
         "excess_return": figures::benchmark(report.starting_balance, bars, from_index, funding)
@@ -359,6 +365,8 @@ pub(crate) fn walk_answer(found: &WalkForward) -> Value {
                 row["unseen_return"] = json!(picked.unseen_return);
                 row["fell"] = json!(picked.fell);
                 row["trades"] = json!(picked.trades);
+                row["picked_sharpe"] = json!(picked.picked_sharpe);
+                row["deflated_sharpe"] = json!(picked.deflated_sharpe);
                 row["status"] = json!("tested");
             }
             row
@@ -371,6 +379,7 @@ pub(crate) fn walk_answer(found: &WalkForward) -> Value {
         "buy_and_hold_compounded": found.compounded().1,
         "buy_and_hold_return": found.buy_and_hold_return,
         "buy_and_hold_whole": found.buy_and_hold_whole,
+        "unseen_sharpe": found.unseen_sharpe,
         "profitable_windows": found.profitable_windows,
         "deepest_fall": found.deepest_fall,
         "trades": found.trades,
@@ -389,6 +398,20 @@ fn named_rows(mut page: Value) -> Value {
 }
 
 /// How many bars a logic tree needs before all its rules are ready. Nothing else says.
+/// The best of a batch's Sharpe ratio, deflated for having been picked from all of them, worked out
+/// from its saved run. `sharpes` are every run's.
+pub(crate) fn batch_deflated_sharpe(picked: f64, best: &Value, sharpes: &[f64]) -> Option<f64> {
+    let from = best["from_index"].as_u64().unwrap_or(0) as usize;
+    let times: Vec<u64> = best["times"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect();
+    let report = report_from(best);
+    let daily = figures::run_daily_returns(&report, from, &times);
+    figures::deflated_sharpe_of(picked, sharpes, &daily)
+}
+
 /// How many variants the run being tested was picked from, as said, or 1.
 pub(crate) fn variants_tried(args: &Value) -> u64 {
     args.get("variants_tried")
@@ -744,12 +767,20 @@ impl Lab {
             summary["total_costs_paid"] = json!(friction.costs_paid);
             summary["maker_fees"] = json!(friction.maker_fees);
             summary["taker_fees"] = json!(friction.taker_fees);
+            summary["slippage_paid"] = json!(friction.costs.slippage);
+            summary["spread_paid"] = json!(friction.costs.spread);
+            summary["impact_paid"] = json!(friction.costs.impact);
+            summary["cost_rounding"] = json!(friction.costs.rounding);
             summary["break_even_cost_per_fill"] = json!(friction.break_even_bp);
         } else {
             for figure in [
                 "gross_return",
                 "total_costs_paid",
                 "break_even_cost_per_fill",
+                "slippage_paid",
+                "spread_paid",
+                "impact_paid",
+                "cost_rounding",
             ] {
                 summary[figure] = Value::Null;
             }
@@ -1009,7 +1040,12 @@ impl Lab {
                     summary["break_even_cost_per_fill"],
                     summary["maker_fees"],
                     summary["taker_fees"],
+                    summary["slippage_paid"],
+                    summary["spread_paid"],
+                    summary["range_slippage_paid"],
+                    summary["impact_paid"],
                     summary["funding_paid"],
+                    summary["borrow_paid"],
                     summary["limit_orders"],
                     summary["limits_filled"],
                     summary["fill_rate"],
@@ -1027,14 +1063,26 @@ impl Lab {
             Value::Array(row)
         }));
         rows.truncate(limit_of(args, DEFAULT_ROWS));
+        // The top row, made fair for being the best of all that ran.
+        let sharpes: Vec<f64> = succeeded
+            .iter()
+            .filter_map(|(_, run)| run["summary"]["sharpe"].as_f64())
+            .collect();
+        let deflated = succeeded.first().and_then(|(_, best)| {
+            let picked = best["summary"]["sharpe"].as_f64()?;
+            let saved = self.load_run(best["run_id"].as_str()?).ok()?;
+            batch_deflated_sharpe(picked, &saved, &sharpes)
+        });
         Ok(json!({
-            "columns": BATCH_COLUMNS,
+            "columns": BATCH_COLUMNS.as_slice(),
             "rows": rows,
             "total": total,
             "succeeded": done,
             "failed": errors,
             "not_run": not_run,
             "first_error": first_error,
+            "variants_tried": done,
+            "deflated_sharpe": deflated,
         }))
     }
 
@@ -1731,7 +1779,7 @@ impl Lab {
                     }
                     Outcome::Failed(error) => (None, error.clone(), "failed"),
                 };
-                json!({"values": names_of(cell), "score": score, "status": status, "what": what})
+                json!({"values": names_of(cell), "score": score, "sharpe": found.sharpes[cell], "status": status, "what": what})
             })
             .collect();
         // Best first, and the list cut short: a grid can have thousands.
@@ -1746,6 +1794,7 @@ impl Lab {
                 json!({
                     "values": names_of(best.cell),
                     "score": best.score,
+                    "sharpe": found.sharpes[best.cell],
                     "with_neighbours": best.plateau,
                     "unseen_return": best.unseen,
                 })
@@ -1770,6 +1819,8 @@ impl Lab {
             "held_out": found.held_out,
             "held_out_buy_and_hold": held_out_market,
             "backtests": total,
+            "variants_tried": found.grid.cells(),
+            "deflated_sharpe": found.deflated_sharpe,
             "warning": warning,
         }))
     }

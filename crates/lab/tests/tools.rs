@@ -2107,6 +2107,22 @@ fn walk_forward_picks_only_on_what_came_before_what_it_tests() {
             )
             .unwrap();
         assert_eq!(window["values"], alone["top"][0]["values"], "{window}");
+        // Fast at 3, 6, 9 and 12 is four tried, and the best's Sharpe ratio is deflated for it.
+        assert_eq!(alone["variants_tried"], 4);
+        let picked = alone["top"][0]["sharpe"].as_f64();
+        let deflated = alone["deflated_sharpe"].as_f64();
+        assert_eq!(picked.is_some(), deflated.is_some(), "{alone}");
+        if let Some(deflated) = deflated {
+            assert!((0.0..=1.0).contains(&deflated), "{alone}");
+        }
+        assert_eq!(
+            window["picked_sharpe"], alone["top"][0]["sharpe"],
+            "{window}"
+        );
+        assert_eq!(
+            window["deflated_sharpe"], alone["deflated_sharpe"],
+            "{window}"
+        );
 
         // And its unseen return is that backtest's, on those bars alone.
         let mut chosen = strategy.clone();
@@ -3000,6 +3016,30 @@ fn what_costs_took_comes_out_as_worked_by_hand() {
         (summary["total_costs_paid"].as_f64().unwrap() - (fees + slipped)).abs() < 1.0,
         "{summary}"
     );
+    // By kind: it's all slippage and fees here, and the kinds add up to the total.
+    close(&summary["slippage_paid"], slipped, "slippage");
+    for nothing in ["spread_paid", "impact_paid", "range_slippage_paid"] {
+        close(&summary[nothing], 0.0, nothing);
+    }
+    let parts: f64 = [
+        "maker_fees",
+        "taker_fees",
+        "slippage_paid",
+        "spread_paid",
+        "range_slippage_paid",
+        "impact_paid",
+        "funding_paid",
+        "borrow_paid",
+        "cost_rounding",
+    ]
+    .iter()
+    .map(|name| summary[*name].as_f64().unwrap())
+    .sum();
+    assert!(
+        (parts - summary["total_costs_paid"].as_f64().unwrap()).abs() < 1e-9,
+        "{summary}"
+    );
+    assert!(summary["cost_rounding"].as_f64().unwrap().abs() < 0.01);
     // Without costs: the same run, at 100 and 120.
     let free = lab
         .dispatch(

@@ -106,6 +106,25 @@ pub(super) fn results(
             tooltip::Position::Left,
         ));
     }
+    // How much of the best is luck, for having been picked from all of these.
+    if let Some(best) = found.top.first()
+        && let Some(sharpe) = found.sharpes.get(best.cell).copied().flatten()
+    {
+        let deflated = found.deflated_sharpe.map_or_else(
+            || "–".to_owned(),
+            |chance| format!("{:.0}%", chance * 100.0),
+        );
+        list = list.push(tip(
+            text(format!(
+                "Best's Sharpe {sharpe:.2}. Deflated for {} tried: {deflated}",
+                grid.cells()
+            ))
+            .size(HINT)
+            .color(theme::TEXT_MUTED),
+            "The deflated Sharpe ratio: the chance the best's true Sharpe ratio is above nothing, allowing for how many values were tried, how much their Sharpe ratios differed, and how far its daily returns were from normal. Under 95% is weak evidence.",
+            None,
+        ));
+    }
     list = list.push(Space::new().height(Fill));
     if grid.second.is_some() {
         let scores = found.outcomes.iter().filter_map(Outcome::score);

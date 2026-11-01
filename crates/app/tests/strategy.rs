@@ -1524,6 +1524,7 @@ mod panel {
             "Market return",
             "Market Sharpe",
             "Market drawdown",
+            "Beta to the market",
             "Trades",
             "Fills",
             "In a position",
@@ -1547,6 +1548,7 @@ mod panel {
         assert!(found.windows.iter().all(|window| window.picked.is_some()));
         assert!(shows(&app, "Unseen"));
         assert!(shows(&app, "Picked"));
+        assert!(shows(&app, "Deflated"));
     }
 
     /// A panel set up with two markets on one account, the chart's and another.
