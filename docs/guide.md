@@ -623,10 +623,10 @@ it wider or narrower (220 to 520 pixels, always leaving the charts 400). It's sa
   **Macro** (the Fed, the SEC, and rates, inflation, hacks, failures and the like). The bar beside
   each headline says how much it may matter: red for market-moving, amber for naming this market,
   grey otherwise. It's a rough rule on the words, not a judgement.
-- **Clicking a headline** puts its bar in the middle of the chart, the playhead's in a replay
-  (the playhead goes there too) or the focused one otherwise, and lights its mark: a bigger diamond,
+- **Clicking a headline** puts its bar in the middle of every chart on screen (in a replay the
+  playhead goes there too), and lights its mark: a bigger diamond,
   ringed, with a line up through the bars and its title above. It's marked even if the filter
-  wouldn't mark it on its own. One from before the chart's first bar says so instead.
+  wouldn't mark it on its own. One from before the focused chart's first bar says so instead.
   **↗** opens it in the browser.
 - **On the charts:** while the sidebar's open, each chart marks the headlines that matter to it with
   a small diamond along the bottom of its price pane, on the bar each came out in, and none past a

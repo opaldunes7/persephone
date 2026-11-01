@@ -27,6 +27,8 @@
 //! (menu open), `Z` asks to delete its first market (symbol search open), `D` drops the file
 //! named by `SNAPSHOT_DROP` on the focused chart (detecting its layout here) and `I` imports it.
 //! `SNAPSHOT_HOVER=X,Y` moves the mouse there before the snapshot, to show a tooltip.
+//! `!` opens the news sidebar with headlines a day apart over the last week, and clicks the one
+//! from two days ago in it, as a person would.
 //! AT_MS freezes the clock that many milliseconds after the last action (default: settled),
 //! to look at animation frames. iced appends the renderer name to the file name.
 
@@ -85,6 +87,7 @@ fn main() -> anyhow::Result<()> {
         let focused = app.layout().focused();
         match c {
             'D' => drop_file(&mut app)?,
+            '!' => click_news(&mut app)?,
             'G' => draw_examples(&mut app, focused),
             'R' => rehearse_live(&mut app, focused)?,
             'c' => {
@@ -592,6 +595,48 @@ fn made_up(symbol: &str, timeframe: Timeframe) -> std::sync::Arc<ChartData> {
         })
         .collect();
     ChartData::new(symbol, "BINANCE", timeframe, 2, candles)
+}
+
+/// The news sidebar open with a headline a day for a week, and the one two days ago clicked.
+fn click_news(app: &mut Persephone) -> anyhow::Result<()> {
+    use persephone::news::NewsMessage;
+    use persephone_data::news::Headline;
+    let root =
+        std::env::temp_dir().join(format!("persephone-snapshot-news-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    app.use_news_root(root);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    const DAY: u64 = 86_400_000_000_000;
+    let found: Vec<Headline> = (1..=7)
+        .map(|days| Headline {
+            published: now - days * DAY,
+            seen: now - days * DAY,
+            source: "Wire".into(),
+            title: format!("Bitcoin story from {days} days ago"),
+            link: format!("https://example.com/{days}"),
+            id: format!("d{days}"),
+            official: false,
+        })
+        .collect();
+    let _ = app.update(Message::News(NewsMessage::Fetched(
+        std::sync::Arc::new(found),
+        Vec::new(),
+    )));
+    let _ = app.update(Message::News(NewsMessage::Toggle));
+    let _ = app.update(Message::Tick(Instant::now() + Duration::from_secs(3)));
+    let messages: Vec<Message> = {
+        let mut ui = iced_test::Simulator::with_size(Settings::default(), WINDOW, app.view());
+        ui.click("Bitcoin story from 2 days ago")
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        ui.into_messages().collect()
+    };
+    for message in messages {
+        eprintln!("clicked: {message:?}");
+        let _ = app.update(message);
+    }
+    Ok(())
 }
 
 /// `matches_image` only writes when the file is missing, so clear old snapshots first.

@@ -448,3 +448,33 @@ fn older_headlines_are_searched_for_over_the_charts_bars_once() {
     assert!(shows(&app, "Added 1 older headlines from GDELT."));
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn a_click_brings_every_chart_on_screen_to_the_headline() {
+    let mut app = app();
+    let root = dir("every");
+    app.use_news_root(root.clone());
+    let _ = app.update(Message::Key(Action::NewTile));
+    settle(&mut app);
+    let tiles = app.layout().tiles();
+    assert_eq!(tiles.len(), 2);
+    let picked = headline(700, "Bitcoin breaks out");
+    news(
+        &mut app,
+        NewsMessage::Fetched(Arc::new(vec![picked.clone()]), Vec::new()),
+    );
+    news(&mut app, NewsMessage::Toggle);
+    settle(&mut app);
+    news(&mut app, NewsMessage::Pick(picked.id.clone()));
+    for tile in tiles {
+        let chart = app.tile_chart(tile).unwrap();
+        let width = app.tile_rect(tile).unwrap().width - persephone_chart::PRICE_AXIS_WIDTH;
+        assert!(
+            (chart.middle_bar(width) - 700.0).abs() < 1.0,
+            "tile {tile}: {}",
+            chart.middle_bar(width)
+        );
+        assert_eq!(chart.lit_event(), Some(picked.id.as_str()));
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}

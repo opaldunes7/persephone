@@ -373,23 +373,23 @@ impl crate::Persephone {
                 self.news.note = None;
                 // Its mark shows whatever the filter, and stands out from the rest.
                 self.light_news(Some(id));
-                // Replaying: the playhead goes there, as far as the span allows, on the chart
-                // being played back. Otherwise the focused chart.
+                // Replaying: the playhead goes there too, as far as the span allows.
                 let mut task = iced::Task::none();
-                let tile = match self.panel.as_ref().filter(|p| p.playback.at.is_some()) {
-                    Some(panel) => {
-                        let tile = panel.replay_tile.unwrap_or(panel.tile);
-                        task = self.on_panel(crate::backtest::PanelMessage::Seek(at));
-                        tile
-                    }
-                    None => self.layout.focused(),
-                };
-                let width = self.tile_rect(tile).map_or(800.0, |rect| {
-                    (rect.width - persephone_chart::PRICE_AXIS_WIDTH).max(100.0)
-                });
-                if let Some(chart) = self.tiles.get_mut(&tile).and_then(|t| t.chart.as_mut()) {
+                if self.news_replay_time().is_some() {
+                    task = self.on_panel(crate::backtest::PanelMessage::Seek(at));
+                }
+                // Every chart on screen goes there, so whichever is being looked at shows it.
+                let focused = self.layout.focused();
+                for tile in self.layout.tiles() {
+                    let width = self.tile_rect(tile).map_or(800.0, |rect| {
+                        (rect.width - persephone_chart::PRICE_AXIS_WIDTH).max(100.0)
+                    });
+                    let Some(chart) = self.tiles.get_mut(&tile).and_then(|t| t.chart.as_mut())
+                    else {
+                        continue;
+                    };
                     let first = chart.data().candles.first().map(|c| c.ts);
-                    if !chart.center_on_time(at, width) {
+                    if !chart.center_on_time(at, width) && tile == focused {
                         self.news.note = Some(match first {
                             Some(first) => format!(
                                 "That's from before this chart's first bar, {}. Widen its span to see it.",
