@@ -45,6 +45,20 @@ A perpetual's funding rates, in pages: when each was paid, and the rate as a fra
 
 Returns: `columns`, `rows`, `next_cursor`
 
+## `get_news`
+
+Headlines the app has collected from public feeds, newest first, in pages: when each was published, its source, title, how much it may matter, and its link. Only from when the app started collecting (`collected_since`); feeds keep their last few dozen items only, so older spans have none. Times are when each was published, not when the news broke.
+
+- `from` (time): Start, in UTC.
+- `to` (time): End (not included), in UTC.
+- `query` (string): Only those whose title has these words.
+- `symbol` (string): The market they're judged against: one naming it is at least medium.
+- `importance` (string): The least: low (all, the default), medium or high.
+- `cursor` (string): Where to carry on, from the last page's next_cursor.
+- `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
+
+Returns: `columns`, `rows`, `next_cursor`, `total`, `collected_since`
+
 ## `get_history_range`
 
 When a market's history starts and ends.

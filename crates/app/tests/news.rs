@@ -273,3 +273,21 @@ fn charts_mark_the_headlines_that_matter_and_a_click_on_one_lights_it() {
     assert_eq!(marks(&app), 0, "and gone when it closes");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn nothing_is_fetched_until_the_sidebar_is_first_opened() {
+    let mut app = app();
+    let root = dir("unused");
+    app.use_news_root(root.clone());
+    assert!(!app.news().polling(), "never opened: no feeds read");
+    news(&mut app, NewsMessage::Toggle);
+    assert!(app.news().polling());
+    news(&mut app, NewsMessage::Toggle);
+    assert!(app.news().polling(), "collecting on once it's been used");
+    news(&mut app, NewsMessage::Collecting(false));
+    assert!(!app.news().polling());
+    news(&mut app, NewsMessage::Toggle);
+    news(&mut app, NewsMessage::Toggle);
+    assert!(!app.news().polling(), "and left off as set");
+    std::fs::remove_dir_all(root).unwrap();
+}

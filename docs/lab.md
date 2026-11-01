@@ -78,6 +78,7 @@ persephone-lab call run_backtest '{"symbol": "BTCUSDT", "bars": "1h", "from": "2
 |---|---|
 | For agents | `get_guide`, `get_settings` |
 | Markets and data | `list_markets`, `get_instrument`, `get_history_range`, `get_funding`, `get_bars`, `get_ticks`, `export_data`, `import_data`, `fetch_archive` |
+| News the app collected | `get_news` |
 | Indicators and models | `list_indicators`, `compute_indicator`, `list_models`, `run_model` |
 | Strategies | `list_strategies`, `describe_strategy`, `validate_logic`, `install_plugin` (compiled, or a program over a socket) |
 | Running tests | `run_backtest`, `run_backtests`, `run_monte_carlo`, `run_random_blocks`, `run_optimize`, `run_walk_forward`, `run_random_entries` |

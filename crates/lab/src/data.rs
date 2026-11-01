@@ -264,6 +264,75 @@ impl Lab {
         ))
     }
 
+    /// Headlines the app has collected, in pages, newest first: by time, by words in them, by how
+    /// much they matter to a market. Lab reads only what the app gathered; it fetches nothing.
+    pub(crate) fn get_news(&self, args: &Value) -> Result<Value, String> {
+        use persephone_data::news::{Importance, NewsStore, market_words};
+        let time = |name: &str| {
+            args.get(name)
+                .map(|value| parse_time(value).map_err(|e| format!("`{name}`: {e}")))
+                .transpose()
+        };
+        let (from, to) = (
+            time("from")?.unwrap_or(0),
+            time("to")?.unwrap_or(UnixNanos::MAX),
+        );
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .map(str::to_lowercase);
+        let words = args
+            .get("symbol")
+            .and_then(Value::as_str)
+            .map(market_words)
+            .unwrap_or_default();
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        let least = match args.get("importance").and_then(Value::as_str) {
+            None | Some("low") => Importance::Low,
+            Some("medium") => Importance::Medium,
+            Some("high") => Importance::High,
+            Some(other) => {
+                return Err(format!("`importance`: `{other}` isn't low, medium or high"));
+            }
+        };
+        let store = NewsStore::open(&self.paths.data);
+        let found: Vec<_> = store
+            .between(from, to)
+            .iter()
+            .rev()
+            .filter(|h| {
+                query
+                    .as_ref()
+                    .is_none_or(|q| h.title.to_lowercase().contains(q))
+            })
+            .filter(|h| h.importance(&words) >= least)
+            .collect();
+        let mut page = crate::tools::page_of(
+            &["ts", "time", "source", "title", "importance", "link"],
+            found.len(),
+            args,
+            DEFAULT_ROWS,
+            |i| {
+                let h = found[i];
+                let importance = match h.importance(&words) {
+                    Importance::High => "high",
+                    Importance::Medium => "medium",
+                    Importance::Low => "low",
+                };
+                json!([
+                    h.published,
+                    crate::time_text(h.published),
+                    h.source,
+                    h.title,
+                    importance,
+                    h.link
+                ])
+            },
+        );
+        page["collected_since"] = json!(store.since().map(crate::time_text));
+        Ok(page)
+    }
+
     pub(crate) fn get_history_range(&self, args: &Value) -> Result<Value, String> {
         let market = MarketArgs::parse(args)?;
         let (first, last) = match &market.venue {

@@ -19,6 +19,7 @@ chart, in the strategy report, and in `persephone-cli`. This guide walks through
 - [Paper and live trading](#paper-and-live-trading)
 - [Plugins, models and AI](#plugins-models-and-ai)
 - [Limit orders, stops and funding](#limit-orders-stops-and-funding)
+- [News](#news)
 - [Exporting and importing](#exporting-and-importing)
 - [Persephone Lab](#persephone-lab)
 - [Where files live](#where-files-live)
@@ -86,6 +87,7 @@ mouse.
 | Ctrl+T | toggle the split direction |
 | Ctrl+F | fullscreen the focused chart (again to restore) |
 | Ctrl+B | open or close the backtest panel on the focused chart |
+| Ctrl+N | open or close the news sidebar |
 | Ctrl+1…9 | switch to that workspace |
 | Ctrl+Shift+1…9 | move the focused chart to that workspace |
 
@@ -601,6 +603,36 @@ The chips over the settings ask whether a result is luck:
 - **Shifted** moves the last run's book along the span by random amounts, wrapping round. It holds the same things for as long, and only the timing goes. **As good** near 50% means the timing added nothing. **Random entries** has the same test for one market, under **Shifted**.
 - **Monte Carlo** draws the last run's returns again in blocks of **Block** bars, keeping how the markets moved together, and shows the band 19 in 20 stayed inside.
 - **Walk-forward** picks the best of the sweep's values on each stretch, trades it on the unseen one after, and slides along. **Windows** and **Ratio** are Walk-forward's own, and Run shows the same chart and table.
+
+## News
+
+**News** in a chart's right-click menu, or **Ctrl+N**, opens a narrow sidebar of headlines down the
+window's right edge, under the backtest panel. The charts make room for it, and its left edge drags
+it wider or narrower (220 to 520 pixels, always leaving the charts 400). It's saved with the layout.
+
+- **Where they come from:** public RSS and Atom feeds that need no key: CoinDesk, Cointelegraph,
+  Decrypt, and the Federal Reserve's and the SEC's press releases. List your own instead, one URL a
+  line, in `news/feeds.txt` in the data folder. They're read every 5 minutes, at once when the
+  sidebar first opens, and on **⟳**. Feeds that couldn't be read are named in red.
+- **Live and replay:** with no backtest playing back, it lists the latest first. While one plays
+  back, it lists only what had been published by the playhead, as of the time in its heading, and
+  moves with it, so it never gives away what came next.
+- **Filters:** **All**, the focused chart's market (headlines naming it, as BTC or Bitcoin), and
+  **Macro** (the Fed, the SEC, and rates, inflation, hacks, failures and the like). The bar beside
+  each headline says how much it may matter: red for market-moving, amber for naming this market,
+  grey otherwise. It's a rough rule on the words, not a judgement.
+- **Clicking a headline** takes the playhead there in a replay, or the focused chart otherwise.
+  **↗** opens it in the browser.
+- **On the charts:** while the sidebar's open, each chart marks the headlines that matter to it with
+  a small diamond along the bottom of its price pane, on the bar each came out in, and none past a
+  playhead. Hover one for its title; click it to find it in the sidebar.
+- **History:** every headline is kept in `news/headlines.jsonl` in the data folder, so a history
+  builds up. Feeds only carry their last few dozen items, so there's nothing from before you started:
+  a replay of an older span shows none, and says so. **Keep collecting** reads the feeds while the
+  sidebar's closed too, so there are no gaps. It turns on the first time you open the sidebar, and
+  stays as you set it; nothing is fetched until then.
+- **Times** are when each headline's publisher put it out, which can be after the news first broke.
+  Good for seeing what was being said around a bar, not for trading on to the second.
 
 ## Exporting and importing
 

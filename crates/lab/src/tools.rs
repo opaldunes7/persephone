@@ -294,6 +294,28 @@ pub fn tools() -> Vec<Tool> {
             &["columns", "rows", "next_cursor"],
         ),
         tool(
+            "get_news",
+            "Headlines the app has collected from public feeds, newest first, in pages: when each was published, its source, title, how much it may matter, and its link. Only from when the app started collecting (`collected_since`); feeds keep their last few dozen items only, so older spans have none. Times are when each was published, not when the news broke.",
+            vec![
+                opt("from", "time", "Start, in UTC."),
+                opt("to", "time", "End (not included), in UTC."),
+                opt("query", "string", "Only those whose title has these words."),
+                opt(
+                    "symbol",
+                    "string",
+                    "The market they're judged against: one naming it is at least medium.",
+                ),
+                opt(
+                    "importance",
+                    "string",
+                    "The least: low (all, the default), medium or high.",
+                ),
+                CURSOR,
+                LIMIT,
+            ],
+            &["columns", "rows", "next_cursor", "total", "collected_since"],
+        ),
+        tool(
             "get_history_range",
             "When a market's history starts and ends.",
             vec![SYMBOL, VENUE, BARS],
@@ -1257,6 +1279,7 @@ impl Lab {
             "get_instrument" => self.get_instrument(args),
             "get_history_range" => self.get_history_range(args),
             "get_funding" => self.get_funding(args),
+            "get_news" => self.get_news(args),
             "get_bars" => self.get_bars(args),
             "get_ticks" => self.get_ticks(args),
             "list_indicators" => self.list_indicators(),

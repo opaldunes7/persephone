@@ -357,6 +357,10 @@ What every number means, the same everywhere.
 - **`beta`** is how far the account moved with the market, from daily returns: the market's own for one market, equal
   shares of its markets for a portfolio. 1 moves with it, 0 owes it nothing, below 0 moves against it. A strategy that
   only beats the market by holding more of it shows a beta over 1.
+- **`get_news`** reads the headlines the app has collected from public feeds, newest first, by `from`/`to`,
+  `query` and the least `importance`, judged against a `symbol` as the sidebar does. Lab fetches none itself, and there are
+  none before `collected_since`. A headline's time is when it was published, which can be after the news broke, so don't
+  treat it as a signal to the second.
 - **`fills_on`** in a summary says how orders filled: `bars`, `ticks`, `minute_bars` or `next_open`.
 - **`get_equity`'s `market`** is the app's market line: what holding the market with a position the run's size would be
   worth, from the first close that could trade. It's null on runs saved before it was added.
@@ -620,6 +624,7 @@ imports. API keys, what AI models a plugin may use, plugins' code and market dat
 | Export and Import buttons | `export_state`, `import_state` |
 | Backtest: Limits view, each order and how they compare | `get_limit_orders`, `summary.limit_summary` |
 | A perpetual's funding, in its statistics | `summary.funding_paid`, `benchmark.return_after_funding`, `get_funding` |
+| The news sidebar, and the marks on the charts | `get_news`, with `symbol` and `importance` as the sidebar judges them |
 | Statistics: limits filled, maker and taker fees, funding, borrowing | `summary` |
 | Settings: limit orders, stop, target, impact, short borrow, maker and taker | `settings` |
 

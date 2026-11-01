@@ -39,9 +39,12 @@ pub enum Filter {
 pub struct NewsSaved {
     pub open: bool,
     pub width: f32,
-    /// Read the feeds even while it's closed, so the history has no gaps.
+    /// Read the feeds even while it's closed, so the history has no gaps. Off until the sidebar's
+    /// first opened, so nothing's fetched for someone who never uses it.
     pub collecting: bool,
     pub filter: Filter,
+    /// It's been opened before: collecting has been turned on once, and is left as set.
+    pub used: bool,
 }
 
 impl Default for NewsSaved {
@@ -49,8 +52,9 @@ impl Default for NewsSaved {
         Self {
             open: false,
             width: DEFAULT_WIDTH,
-            collecting: true,
+            collecting: false,
             filter: Filter::All,
+            used: false,
         }
     }
 }
@@ -218,6 +222,11 @@ impl crate::Persephone {
         match message {
             NewsMessage::Toggle => {
                 self.news.saved.open = !self.news.saved.open;
+                // Its first use starts collecting, which stays as set from then on.
+                if self.news.saved.open && !self.news.saved.used {
+                    self.news.saved.used = true;
+                    self.news.saved.collecting = true;
+                }
                 self.relayout(true);
                 self.save();
                 self.sync_news_marks();

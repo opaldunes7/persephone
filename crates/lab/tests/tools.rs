@@ -203,6 +203,7 @@ fn calls(lab: &Arc<Lab>, dir: &std::path::Path) -> Vec<(&'static str, Value)> {
             "get_history_range",
             json!({"symbol": "BTCUSDT", "venue": "TEST"}),
         ),
+        ("get_news", json!({})),
         ("get_bars", with(json!({"from": "2024-01-02", "limit": 5}))),
         (
             "export_data",
@@ -4840,5 +4841,51 @@ fn settings_switched_on_but_ignored_as_stock_is_off_are_named() {
             .to_string()
             .contains("`leverage`"),
         "{run}"
+    );
+}
+
+#[test]
+fn the_news_the_app_collected_reads_by_time_words_and_importance() {
+    use persephone_data::news::{Headline, NewsStore};
+    let (lab, dir) = lab();
+    let at = |day: u64| 1_704_067_200_000_000_000 + day * 86_400_000_000_000;
+    let headline = |day: u64, title: &str| Headline {
+        published: at(day),
+        seen: at(day),
+        source: "Wire".into(),
+        title: title.into(),
+        link: format!("https://example.com/{day}"),
+        id: format!("n{day}"),
+        official: false,
+    };
+    // As the app keeps them, under the same data folder.
+    NewsStore::open(&dir)
+        .add(vec![
+            headline(1, "Fed holds rates"),
+            headline(2, "Bitcoin miners sell"),
+            headline(3, "NFT sales fall"),
+            headline(4, "Ether staking grows"),
+        ])
+        .unwrap();
+    let get = |args: Value| lab.dispatch("get_news", &args).unwrap();
+    let all = get(json!({}));
+    assert_eq!(all["total"], 4);
+    assert_eq!(all["rows"][0][3], "Ether staking grows", "newest first");
+    assert_eq!(all["collected_since"], "2024-01-02 00:00");
+    let span = get(json!({"from": "2024-01-03", "to": "2024-01-05"}));
+    assert_eq!(span["total"], 2);
+    assert_eq!(get(json!({"query": "BITCOIN"}))["total"], 1);
+    let for_btc = get(json!({"symbol": "BTCUSDT", "importance": "medium"}));
+    let titles: Vec<&str> = for_btc["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row[3].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, ["Bitcoin miners sell", "Fed holds rates"]);
+    assert_eq!(for_btc["rows"][1][4], "high");
+    assert!(
+        lab.dispatch("get_news", &json!({"importance": "huge"}))
+            .is_err()
     );
 }

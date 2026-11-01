@@ -26,6 +26,9 @@ strategies can paper trade on live Binance bars.
 - **Strategies built in the app** as rules on the Build tab, or pasted as JSON, with no code: they
   run on the chart at once, their numbers can be variables to optimize, and they can be saved for
   every chart, portfolio and agent.
+- **News** down the window's right edge, from public RSS feeds with no key: the latest live,
+  or only what had been published by a backtest's playhead as it plays, with the headlines
+  that matter marked on the charts. Kept on disk, so a history builds from when you start.
 - **Your own indicators and strategies** as sandboxed WebAssembly plugins (Rust SDK), which
   can run ONNX models and ask language models, or as any process (Python, …) reached over a
   socket.
@@ -74,6 +77,7 @@ on any keyboard layout.
 | Ctrl+T | toggle split direction |
 | Ctrl+F | fullscreen |
 | Ctrl+B | open or close the backtest panel on the focused chart |
+| Ctrl+N | open or close the news sidebar |
 | Ctrl+1…9 | switch workspace |
 | Ctrl+Shift+1…9 | move chart to workspace |
 | Esc | close a menu, stop drawing |
