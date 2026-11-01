@@ -66,6 +66,9 @@ pub struct SavedTile {
     /// Its backtest settings, when they aren't the defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backtest: Option<Settings>,
+    /// The logic tree built on its Build tab, which is its strategy while that's `logic-…`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<serde_json::Value>,
 }
 
 /// A built-in strategy by id (e.g. "ema-cross") with its parameters. Unknown ids are skipped.
@@ -223,6 +226,7 @@ mod tests {
                     volume_hidden: false,
                     span: None,
                     backtest: None,
+                    draft: None,
                 },
                 SavedTile {
                     id: 1,
@@ -235,6 +239,7 @@ mod tests {
                     volume_hidden: false,
                     span: None,
                     backtest: None,
+                    draft: None,
                 },
             ],
         }

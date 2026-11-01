@@ -253,6 +253,30 @@ fn strategies_are_saved_and_restored() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+#[test]
+fn a_tree_built_on_a_chart_is_saved_with_the_layout_and_runs_again() {
+    use persephone::backtest::{BuildMessage, PanelMessage, TestKind};
+    let dir = std::env::temp_dir().join(format!("persephone-draft-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path: PathBuf = dir.join("layout.ron");
+    let (mut first, _loads) = Persephone::start(&[], Some(path.clone()));
+    let _ = first.update(Message::Key(Action::Backtest));
+    let _ = first.update(Message::Backtest(PanelMessage::Test(TestKind::Build)));
+    let _ = first.update(Message::Backtest(PanelMessage::Build(
+        BuildMessage::StartFrom(Some(0)),
+    )));
+    let (built, _) = first.tile_strategy(0).expect("the tree's on the chart");
+    let built = built.clone();
+    assert!(matches!(&built.kind, StrategyKind::Plugin(kind) if kind.starts_with("logic-")));
+
+    let (restored, _loads) = Persephone::start(&[], Some(path));
+    let (spec, run) = restored.tile_strategy(0).expect("restored");
+    assert_eq!(spec, &built);
+    assert_eq!(spec.info.name, "Fast over slow", "with its own description");
+    assert!(matches!(run, Run::Waiting), "reruns once bars arrive");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 mod sweeps {
     use iced::Point;
     use persephone::{
@@ -2713,6 +2737,217 @@ mod panel {
         })
     }
 
+    // --- Building a strategy on the Build tab --------------------------------------------------
+
+    fn build(app: &mut Persephone, message: persephone::backtest::BuildMessage) {
+        panel(app, PanelMessage::Build(message));
+    }
+
+    fn at(
+        wish: persephone::backtest::logic_draft::Wish,
+        steps: &[u8],
+    ) -> persephone::backtest::logic_draft::NodePath {
+        persephone::backtest::logic_draft::NodePath {
+            wish,
+            steps: steps.to_vec(),
+        }
+    }
+
+    /// The built-in EMA Cross, Fast 10 over Slow 30, clicked together as rules.
+    fn build_ema_cross(app: &mut Persephone) {
+        use persephone::backtest::{
+            BuildMessage as B, BuildSlot,
+            logic_draft::{Comparison, Wish},
+        };
+        build(app, B::StartFrom(None));
+        build(app, B::Side(Wish::Flat, false));
+        for (wish, cross) in [
+            (Wish::Long, Comparison::CrossesAbove),
+            (Wish::Short, Comparison::CrossesBelow),
+        ] {
+            if wish == Wish::Short {
+                build(app, B::Side(Wish::Short, true));
+            }
+            build(app, B::Comparison(at(wish, &[0]), cross));
+            build(app, B::Kind(at(wish, &[0, 0]), "ema"));
+            build(
+                app,
+                B::Typed(at(wish, &[0, 0]), BuildSlot::Bars, "10".into()),
+            );
+            build(app, B::Kind(at(wish, &[0, 1]), "ema"));
+            build(
+                app,
+                B::Typed(at(wish, &[0, 1]), BuildSlot::Bars, "30".into()),
+            );
+        }
+    }
+
+    #[test]
+    fn rules_clicked_together_trade_as_the_built_in_they_spell_out() {
+        let mut app = ready_panel(TestKind::Build);
+        assert!(shows(&app, "Go long when"));
+        assert!(
+            shows(&app, "Use on chart"),
+            "not on the chart till something changes"
+        );
+        let Run::Done(built_in) = run_state(&app) else {
+            panic!()
+        };
+        let built_in = Arc::clone(built_in);
+
+        build_ema_cross(&mut app);
+        let (spec, _) = app.tile_strategy(0).unwrap();
+        assert!(matches!(&spec.kind, StrategyKind::Plugin(kind) if kind.starts_with("logic-")));
+        finish_backtest(&mut app);
+        let Run::Done(ours) = run_state(&app) else {
+            panic!("{:?}", run_state(&app))
+        };
+        assert!(built_in.fills.len() >= 4, "it trades");
+        assert_eq!(ours.fills, built_in.fills);
+        assert_eq!(ours.equity, built_in.equity);
+        assert!(shows(&app, "The chart is running this tree."));
+        // And it plays back like the backtest.
+        panel(&mut app, PanelMessage::Step);
+        assert!(app.panel().unwrap().playback.at.is_some());
+    }
+
+    #[test]
+    fn a_number_made_a_variable_is_what_optimize_varies() {
+        use persephone::backtest::{BuildMessage as B, BuildSlot, logic_draft::Wish};
+        let mut app = ready_panel(TestKind::Build);
+        build_ema_cross(&mut app);
+        build(
+            &mut app,
+            B::Variable(at(Wish::Long, &[0, 0]), BuildSlot::Bars),
+        );
+        build(&mut app, B::RenameTyped("ema_length".into(), "fast".into()));
+        build(&mut app, B::Rename("ema_length".into()));
+        let (spec, _) = app.tile_strategy(0).unwrap();
+        let names: Vec<&str> = spec.info.params.iter().map(|p| p.name.as_ref()).collect();
+        assert_eq!(names, ["fast", "Size %"]);
+        assert_eq!(spec.params[0], 10.0);
+
+        panel(&mut app, PanelMessage::Test(TestKind::Optimize));
+        panel(&mut app, PanelMessage::Variable(0, "fast".into()));
+        set_range(&mut app, 0, "6", "14", "4");
+        app.optimize_now();
+        let found = found(&app);
+        assert_eq!(found.grid.cells(), 3);
+        assert!(found.outcomes.iter().any(|o| o.score().is_some()));
+        // Applying one makes it the tree's own value, which editing it keeps.
+        panel(&mut app, PanelMessage::Apply(2));
+        assert_eq!(app.tile_strategy(0).unwrap().0.params[0], 14.0);
+        panel(&mut app, PanelMessage::Test(TestKind::Build));
+        build(&mut app, B::Name("Fast over 30".into()));
+        assert_eq!(app.tile_strategy(0).unwrap().0.params[0], 14.0);
+    }
+
+    #[test]
+    fn pasted_json_fills_the_rules_and_a_bad_paste_says_where() {
+        use iced::widget::text_editor::{Action, Edit};
+        use persephone::backtest::BuildMessage as B;
+        let mut app = ready_panel(TestKind::Build);
+        let paste = |app: &mut Persephone, json: &str| {
+            build(app, B::JsonMode(true));
+            build(app, B::JsonEdit(Action::SelectAll));
+            build(
+                app,
+                B::JsonEdit(Action::Edit(Edit::Paste(Arc::new(json.to_owned())))),
+            );
+            build(app, B::ApplyJson);
+        };
+        let tree = serde_json::json!({"name": "Pasted", "params": {"n": 20},
+            "long": {"gt": ["close", {"sma": {"length": "$n"}}]},
+            "flat": {"lt": ["close", {"sma": {"length": "$n"}}]}});
+        // As an agent writes a strategy, wrapper and all.
+        paste(
+            &mut app,
+            &serde_json::json!({"logic": tree, "params": {"n": 20}}).to_string(),
+        );
+        let shown = app.panel().unwrap();
+        assert!(!shown.build.json_mode, "back to the rules");
+        assert_eq!(shown.build.error, None);
+        assert!(shows(&app, "$n"));
+        let (spec, _) = app.tile_strategy(0).unwrap();
+        assert_eq!(spec.info.name, "Pasted");
+
+        paste(&mut app, r#"{"long": {"and": [{"gtt": [1, 2]}]}}"#);
+        let error = app.panel().unwrap().build.error.clone().unwrap();
+        assert!(error.starts_with("long.and[0]"), "{error}");
+        assert_eq!(
+            app.tile_strategy(0).unwrap().0.info.name,
+            "Pasted",
+            "nothing changed"
+        );
+        paste(&mut app, "not json");
+        assert!(
+            app.panel()
+                .unwrap()
+                .build
+                .error
+                .clone()
+                .unwrap()
+                .contains("isn't JSON")
+        );
+    }
+
+    #[test]
+    fn saving_a_tree_puts_it_in_every_list_and_where_lab_finds_it() {
+        use persephone::backtest::{BuildMessage as B, PortfolioView};
+        let mut app = ready_panel(TestKind::Build);
+        let dir = results_dir();
+        let _ = app.use_results_dir(dir.clone());
+        build_ema_cross(&mut app);
+        build(&mut app, B::SaveName("Trend_v1".into()));
+        let _ = app.update(Message::Backtest(PanelMessage::Build(B::Save)));
+        assert!(
+            app.panel()
+                .unwrap()
+                .build
+                .saved
+                .as_deref()
+                .unwrap()
+                .contains("Trend_v1"),
+            "{:?}",
+            app.panel().unwrap().build.error
+        );
+        // Written where Lab lists results, as a tree Lab can run.
+        let saved = persephone_research::results::load_results(&dir);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "Trend_v1");
+        assert!(saved[0].strategy["logic"]["long"].is_object());
+        assert!(saved[0].settings.is_some());
+        // Listed for every chart, and a chart can run it as any saved strategy.
+        let _ = app.update(Message::LabResultsChanged);
+        assert_eq!(app.lab_results()[0].name, "Trend_v1");
+        let id = saved[0].id.clone();
+        panel(&mut app, choice(&id));
+        let (spec, _) = app.tile_strategy(0).unwrap();
+        assert_eq!(spec.info.name, "Trend_v1");
+        finish_backtest(&mut app);
+        assert!(matches!(run_state(&app), Run::Done(_)));
+        // And a portfolio's leg can trade it.
+        panel(&mut app, PanelMessage::Test(TestKind::Portfolio));
+        panel(&mut app, PanelMessage::PortfolioView(PortfolioView::Run));
+        panel(&mut app, PanelMessage::Edit(Edit::AddLeg));
+        panel(
+            &mut app,
+            PanelMessage::LegStrategy(
+                0,
+                persephone::backtest::LegChoice {
+                    label: "Trend_v1 (saved)".into(),
+                    choice: Some(StrategyChoice {
+                        kind: StrategyKind::Plugin(format!("lab:{id}")),
+                        name: "Trend_v1 (saved)".into(),
+                    }),
+                },
+            ),
+        );
+        let leg = &app.tile_backtest(0).unwrap().portfolio.legs[0];
+        assert_eq!(leg.strategy.as_ref().unwrap()["logic"]["name"], "Trend_v1");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn strategies_lab_saved_can_be_backtested_and_replayed_in_the_app() {
         let mut app = ready_panel(TestKind::Backtest);
@@ -2838,6 +3073,7 @@ mod panel {
                     volume_hidden: false,
                     span: None,
                     backtest: None,
+                    draft: None,
                 }],
             },
         )

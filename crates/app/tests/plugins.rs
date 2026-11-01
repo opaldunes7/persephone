@@ -215,6 +215,7 @@ fn saved_plugins_wait_for_their_plugin_then_resolve() {
                 volume_hidden: false,
                 span: None,
                 backtest: None,
+                draft: None,
             }],
         },
     )

@@ -30,6 +30,11 @@ pub(super) fn test_tabs<'a>(current: TestKind, panel: &'a Panel) -> Element<'a, 
             "One run through the span, which can be played back bar by bar.",
         ),
         tab(
+            "Build",
+            TestKind::Build,
+            "Write the strategy as rules, or paste one as JSON. It's this chart's strategy as soon as it can run, and its numbers can be variables to optimize.",
+        ),
+        tab(
             "Monte Carlo",
             TestKind::MonteCarlo,
             "Draws the backtest's trades at random many times, showing the range of results and drawdowns those trades could have given.",
@@ -330,7 +335,7 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
         )
     };
     let test_settings: Option<Element<'a, PanelMessage>> = match settings.test {
-        TestKind::Backtest => None,
+        TestKind::Backtest | TestKind::Build => None,
         TestKind::MonteCarlo => Some(
             row![
                 boxed(

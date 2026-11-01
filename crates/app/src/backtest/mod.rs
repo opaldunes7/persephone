@@ -31,8 +31,8 @@ use persephone_engine::BacktestReport;
 use persephone_tiling::TileId;
 
 pub use persephone_research::{
-    Field, RunColumn, WARM_UP_BARS, calendar, figures, optimize, portfolio, portfolio_tests,
-    positions, robustness,
+    Field, RunColumn, WARM_UP_BARS, calendar, figures, logic_draft, optimize, portfolio,
+    portfolio_tests, positions, robustness,
     settings::{
         self, BlockLength, Commission, Edit, FillTiming, OneWay, OptimizeSettings, Precision,
         ScoreBy, Section, SessionRule, Settings, TestKind, Variable, parse_time, time_text,
@@ -98,6 +98,83 @@ pub struct Panel {
     /// The chart the playback drives while following a trade on a market the panel's chart isn't
     /// showing. `None` is the panel's own.
     pub replay_tile: Option<TileId>,
+    /// The Build tab: what's typed, and how it's shown.
+    pub build: BuildState,
+}
+
+/// The Build tab's own state. The tree itself is the chart's, saved with it.
+#[derive(Debug, Default)]
+pub struct BuildState {
+    /// The raw JSON rather than the rule rows.
+    pub json_mode: bool,
+    pub json: iced::widget::text_editor::Content,
+    /// What's typed in each number box, by where it is, while it's typed.
+    pub typed: Vec<(logic_draft::NodePath, BuildSlot, String)>,
+    /// What each variable's name and starting value boxes hold while they're typed.
+    pub renaming: Vec<(String, String)>,
+    pub values: Vec<(String, String)>,
+    /// Why the last change couldn't be made, or why the tree can't run.
+    pub error: Option<String>,
+    /// The name to save it as.
+    pub save_name: String,
+    /// What saving last said.
+    pub saved: Option<String>,
+}
+
+/// Which box at a place in the tree is meant: the number itself, or a look-back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildSlot {
+    Number,
+    Bars,
+}
+
+impl BuildState {
+    #[must_use]
+    pub fn typed(&self, path: &logic_draft::NodePath, slot: BuildSlot) -> Option<&str> {
+        self.typed
+            .iter()
+            .find(|(at, s, _)| at == path && *s == slot)
+            .map(|(_, _, text)| text.as_str())
+    }
+
+    pub fn set_typed(&mut self, path: logic_draft::NodePath, slot: BuildSlot, text: String) {
+        self.typed.retain(|(at, s, _)| !(*at == path && *s == slot));
+        self.typed.push((path, slot, text));
+    }
+}
+
+/// What the Build tab asks for.
+#[derive(Clone, Debug)]
+pub enum BuildMessage {
+    /// Start again, from nothing or one of the guide's examples (by place in `EXAMPLES`).
+    StartFrom(Option<usize>),
+    /// Put the tree as it is on the chart, though nothing's changed yet.
+    UseOnChart,
+    Name(String),
+    /// Give a wish its first condition, or take it away.
+    Side(logic_draft::Wish, bool),
+    /// A condition, or a group of one, into the group at a place.
+    Add(logic_draft::NodePath, bool),
+    Remove(logic_draft::NodePath),
+    /// Make a group need all of its rules, or any one.
+    Group(logic_draft::NodePath, bool),
+    Not(logic_draft::NodePath),
+    Comparison(logic_draft::NodePath, logic_draft::Comparison),
+    Kind(logic_draft::NodePath, &'static str),
+    Typed(logic_draft::NodePath, BuildSlot, String),
+    Timeframe(logic_draft::NodePath, String),
+    /// A number into a variable or back (# and $), or a look-back.
+    Variable(logic_draft::NodePath, BuildSlot),
+    RenameTyped(String, String),
+    Rename(String),
+    ValueTyped(String, String),
+    /// Raw JSON rather than the rules, or back.
+    JsonMode(bool),
+    JsonEdit(iced::widget::text_editor::Action),
+    ApplyJson,
+    CopyJson,
+    SaveName(String),
+    Save,
 }
 
 /// One run's trades, picked out of a test to follow on the chart: the backtest's own, a draw or
@@ -413,6 +490,7 @@ impl Panel {
             calendar: calendar::CalendarView::default(),
             inspect: None,
             replay_tile: None,
+            build: BuildState::default(),
             tile,
             height: (window_height * DEFAULT_SHARE).max(MIN_HEIGHT),
             playback: Playback::default(),
@@ -582,6 +660,7 @@ pub enum PanelMessage {
     /// Biggest profit first, or the order they opened.
     InspectByProfit(bool),
     CloseInspection,
+    Build(BuildMessage),
 }
 
 /// A strategy in the panel's dropdown.

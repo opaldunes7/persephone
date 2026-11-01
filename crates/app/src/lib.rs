@@ -14,6 +14,7 @@
 //! can start paper trading it on live Binance bars.
 
 pub mod backtest;
+mod build;
 mod importing;
 mod inspect;
 pub mod keymap;
@@ -323,6 +324,8 @@ struct Tile {
     backtest: backtest::Settings,
     /// Another run's trades, shown in place of its own while the panel follows one of them.
     inspected: Option<persephone_chart::Trades>,
+    /// The logic tree built on the Build tab, if one has been.
+    draft: Option<backtest::logic_draft::Draft>,
 }
 
 /// 1-minute bars for High precision: on the way, in, or why not.
@@ -401,6 +404,8 @@ pub struct Persephone {
     results_dir: Option<PathBuf>,
     lab_results: Vec<SavedResult>,
     lab_logic: HashMap<String, Arc<Logic>>,
+    /// Trees built on charts' Build tabs, by their kind (`logic-…`), ready to run.
+    draft_logic: HashMap<String, Arc<Logic>>,
     /// Lists of positions Lab has saved, by the same kind of name.
     lab_positions: HashMap<String, Positions>,
     /// What's loaded from `plugin_dir`.
@@ -579,6 +584,7 @@ impl Persephone {
                     None,
                     Hidden::default(),
                     backtest::Settings::default(),
+                    None,
                 ),
             )],
         };
@@ -603,6 +609,7 @@ impl Persephone {
             results_dir: None,
             lab_results: Vec::new(),
             lab_logic: HashMap::new(),
+            draft_logic: HashMap::new(),
             lab_positions: HashMap::new(),
             plugins: Arc::default(),
             reloading: false,
@@ -693,6 +700,7 @@ impl Persephone {
             results_dir: None,
             lab_results: Vec::new(),
             lab_logic: HashMap::new(),
+            draft_logic: HashMap::new(),
             lab_positions: HashMap::new(),
             plugins: Arc::default(),
             reloading: false,
@@ -999,6 +1007,7 @@ impl Persephone {
                 .or_else(|| {
                     self.lab_logic
                         .get(id)
+                        .or_else(|| self.draft_logic.get(id))
                         .map(|logic| Arc::clone(logic) as Arc<dyn SignalFactory>)
                 })
                 .or_else(|| {
@@ -2877,6 +2886,7 @@ impl Persephone {
                 hidden: Hidden::default(),
                 backtest: backtest::Settings::default(),
                 inspected: None,
+                draft: None,
             },
         );
         let backtest = self.attach(id);
@@ -2887,12 +2897,19 @@ impl Persephone {
     fn restore(
         &mut self,
         id: TileId,
-        (market, indicators, strategy, hidden, settings): Restored,
+        (market, indicators, strategy, hidden, settings, draft): Restored,
     ) -> Task<Message> {
+        // A tree built on the Build tab runs again as it was, before its backtest is asked for.
+        let draft = draft.and_then(|json| backtest::logic_draft::Draft::from_json(&json).ok());
+        let strategy = match (&draft, strategy) {
+            (Some(draft), Some(saved)) => Some(self.restore_draft(draft, saved)),
+            (_, strategy) => strategy,
+        };
         let task = self.add_tile(id, market, indicators, strategy);
         if let Some(tile) = self.tiles.get_mut(&id) {
             tile.hidden = hidden;
             tile.backtest = settings;
+            tile.draft = draft;
         }
         task
     }
@@ -4462,6 +4479,8 @@ impl Persephone {
             }
             tile.live = None;
         }
+        // On a tree built here, they're its variables' starting values from now on.
+        self.keep_values_in_draft(id);
         self.save();
         let task = self.run_backtest(id);
         if let Some(panel) = self.panel.as_mut() {
@@ -4740,11 +4759,12 @@ impl Persephone {
         };
         let span = self.playback_span();
         // The backtest plays back, and so does any run whose trades are being followed.
-        let plays = self
-            .tiles
-            .get(&id)
-            .is_some_and(|t| t.backtest.test == backtest::TestKind::Backtest)
-            || self.panel.as_ref().is_some_and(|p| p.inspect.is_some());
+        let plays = self.tiles.get(&id).is_some_and(|t| {
+            matches!(
+                t.backtest.test,
+                backtest::TestKind::Backtest | backtest::TestKind::Build
+            )
+        }) || self.panel.as_ref().is_some_and(|p| p.inspect.is_some());
         if !plays
             && matches!(
                 message,
@@ -4845,6 +4865,7 @@ impl Persephone {
                 self.close_inspection();
                 return Task::none();
             }
+            P::Build(message) => return self.on_build(message),
             P::SelectLine(line) => {
                 panel.tests.line = line;
                 panel.tests.showing_trades = line.is_some();
@@ -5651,12 +5672,32 @@ impl Persephone {
             let made = result.summary["net_return"]
                 .as_f64()
                 .map_or(String::new(), |made| format!(" {:+.2}%", made * 100.0));
+            // Saved from the Build tab, or by an agent in Lab.
+            let from = if result.note == build::SAVED_NOTE {
+                "saved"
+            } else {
+                "Lab"
+            };
             backtest::StrategyChoice {
                 kind: StrategyKind::Plugin(format!("{LAB_PREFIX}{}", result.id)),
-                name: format!("{} (Lab{made})", result.name),
+                name: format!("{} ({from}{made})", result.name),
             }
         });
-        let strategies: Vec<_> = built_in.chain(from_plugins).chain(from_lab).collect();
+        // The tree built on this chart's Build tab, while it's what the chart runs.
+        let built_here = tile.strategy.as_ref().and_then(|s| match &s.spec.kind {
+            StrategyKind::Plugin(kind) if self.draft_logic.contains_key(kind) => {
+                Some(backtest::StrategyChoice {
+                    kind: s.spec.kind.clone(),
+                    name: format!("{} (built here)", s.spec.info.name),
+                })
+            }
+            _ => None,
+        });
+        let strategies: Vec<_> = built_in
+            .chain(from_plugins)
+            .chain(from_lab)
+            .chain(built_here)
+            .collect();
         let current = tile
             .strategy
             .as_ref()
@@ -5696,6 +5737,9 @@ impl Persephone {
             strategies,
             strategy: current,
             width: self.window.width,
+            draft: (tile.backtest.test == backtest::TestKind::Build)
+                .then(|| self.shown_draft())
+                .flatten(),
             panel,
             settings: &tile.backtest,
             // Worth saying wherever results show: they're not the strategy's own.
@@ -6190,6 +6234,7 @@ type Restored = (
     Option<StrategySpec>,
     Hidden,
     backtest::Settings,
+    Option<serde_json::Value>,
 );
 
 fn restore_tile(t: &SavedTile) -> Restored {
@@ -6224,7 +6269,14 @@ fn restore_tile(t: &SavedTile) -> Restored {
         plugins::saved_strategy(&s.kind, &s.params)
     });
     let settings = t.backtest.clone().unwrap_or_default();
-    (market, indicators, strategy, hidden, settings)
+    (
+        market,
+        indicators,
+        strategy,
+        hidden,
+        settings,
+        t.draft.clone(),
+    )
 }
 
 fn saved_tiles(tiles: &BTreeMap<TileId, Tile>) -> Vec<SavedTile> {
@@ -6255,6 +6307,10 @@ fn saved_tiles(tiles: &BTreeMap<TileId, Tile>) -> Vec<SavedTile> {
             span: tile.market.span,
             backtest: (tile.backtest != backtest::Settings::default())
                 .then(|| tile.backtest.clone()),
+            draft: tile
+                .draft
+                .as_ref()
+                .map(backtest::logic_draft::Draft::to_json),
         })
         .collect()
 }

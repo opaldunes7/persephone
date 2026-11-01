@@ -109,7 +109,7 @@ impl Field {
     #[must_use]
     pub const fn belongs_to(self, test: TestKind) -> bool {
         match test {
-            TestKind::Backtest => false,
+            TestKind::Backtest | TestKind::Build => false,
             TestKind::MonteCarlo => matches!(self, Self::Runs | Self::Ruin),
             TestKind::RandomBlocks => matches!(self, Self::Blocks),
             TestKind::Optimize | TestKind::WalkForward => self.belongs_to_tests(),

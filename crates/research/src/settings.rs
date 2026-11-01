@@ -187,6 +187,8 @@ pub enum TestKind {
     RandomEntries,
     /// Several markets on one account.
     Portfolio,
+    /// Building the chart's strategy as a logic tree, played back like the backtest.
+    Build,
 }
 
 /// What the Optimize test varies and how it scores the results.

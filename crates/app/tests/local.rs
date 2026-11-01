@@ -264,6 +264,7 @@ fn saved_layouts_remember_local_markets() {
                 volume_hidden: false,
                 span: None,
                 backtest: None,
+                draft: None,
             }],
         },
     )
@@ -538,6 +539,7 @@ fn saved_layouts_keep_spans_and_backtest_settings() {
                 volume_hidden: false,
                 span: Some((START + DAY, START + 2 * DAY)),
                 backtest: Some(settings),
+                draft: None,
             }],
         },
     )

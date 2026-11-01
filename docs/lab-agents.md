@@ -571,7 +571,10 @@ Showing a strategy to the person using the app, and seeing what's on their chart
 {"tool": "save_result", "args": {"name": "RSI bounce", "strategy": {"builtin": "rsi-reversion"}, "run_id": "$RUN", "note": "Worth a look on 4h"}}
 ```
 
-It appears in the app's backtest panel straight away, marked Lab, to chart and replay.
+It appears in the app's backtest panel straight away, marked Lab, to chart and replay. Trees the person builds on the
+app's Build tab and saves are in `list_results` too, with the note "Built in the app." and `{"logic": …, "params": …}` as
+their strategy, so `run_backtest` can run them by that strategy. A tree pasted into the Build tab's Raw JSON can be the
+`logic` you'd give `run_backtest`, with or without its wrapper.
 
 `get_layout`, `get_chart_settings` and `get_drawings` show what's on their charts, and `get_call_log` shows
 every call made to Lab, newest first. Lists of positions can be saved too: they're written out in full, and work on

@@ -38,12 +38,13 @@ use super::{
     },
 };
 
+mod build;
 mod calendar;
 mod inspect;
 mod results;
 mod settings;
 
-use self::{calendar::*, inspect::*, results::*, settings::*};
+use self::{build::*, calendar::*, inspect::*, results::*, settings::*};
 
 /// The settings' share of the panel's width, in tenths.
 const SETTINGS_PORTION: u16 = 3;
@@ -122,14 +123,17 @@ pub struct PanelInfo<'a> {
     /// The strategy's current values, and its parameters' names.
     pub params: &'a [f64],
     pub variables: Vec<String>,
+    /// On the Build tab: the chart's tree, and whether it's what the chart is running.
+    pub draft: Option<(super::logic_draft::Draft, bool)>,
 }
 
 pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
     let panel = info.panel;
     let settings = settings_section(&info);
     let test = info.settings.test;
-    // Only the backtest itself plays back.
-    let ready = test == TestKind::Backtest && matches!(info.status, Status::Done(_));
+    // The backtest plays back, on its own tab or while its tree is built.
+    let ready = matches!(test, TestKind::Backtest | TestKind::Build)
+        && matches!(info.status, Status::Done(_));
     let started = panel.playback.at.is_some();
 
     let play = if panel.playback.playing {
@@ -206,6 +210,10 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
     };
     let up_or_down = |value: f64| if value >= 0.0 { theme::UP } else { theme::DOWN };
     let pane: Element<'_, PanelMessage> = match (&info.status, test) {
+        (_, TestKind::Build) => match &info.draft {
+            Some((draft, on_chart)) => build_pane(panel, draft, *on_chart),
+            None => Space::new().width(Fill).height(Fill).into(),
+        },
         (Status::Done(report), TestKind::Backtest) => {
             let bars = info.shown.unwrap_or(report.equity.len());
             let now = progress(report, info.from_index, bars);

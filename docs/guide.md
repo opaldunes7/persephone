@@ -11,6 +11,7 @@ chart, in the strategy report, and in `persephone-cli`. This guide walks through
 - [The calendar: replaying a day's trades](#the-calendar-replaying-a-days-trades)
 - [Following any test's trades](#following-any-tests-trades)
 - [Skill or luck: Monte Carlo and random blocks](#skill-or-luck-monte-carlo-and-random-blocks)
+- [Building a strategy](#building-a-strategy)
 - [Optimizing a strategy](#optimizing-a-strategy)
 - [Parameter sweeps](#parameter-sweeps)
 - [Drawings](#drawings)
@@ -302,6 +303,31 @@ Results aren't saved, but your choices are, with the chart. The same inputs give
 Two related tests are already here: a [parameter sweep](#parameter-sweeps) shows how sensitive a
 result is to a parameter, and [paper trading](#paper-trading-in-the-app) is a forward test on bars
 the strategy has never seen.
+
+## Building a strategy
+
+**Build**, under **Test**, writes a strategy as rules: no code and no files. Three sections say what
+to hold: **Go long when**, **Go short when** and **Go flat when** (without it, a position is held
+until the other side is asked for). Each holds **All of** or **Any of** a list of conditions, which
+can nest as groups and be turned round with **not**. A condition compares two values: a number, a
+bar's price or volume, what's held (entry price, bars held, highs and lows since entry), the hour or
+weekday, an indicator (SMA, EMA, RSI, ATR, highest, lowest, ROC, z-score, std dev) of any value, a
+value some bars ago, arithmetic on two values, or a value on a longer timeframe, seen only once that
+bar has closed. **Start from…** begins again, or from one of the examples.
+
+- **It's the chart's strategy at once.** As soon as the rules can run, the chart runs them and the
+  backtest follows every change; the layout keeps them. Rules that can't run say why in red, and the
+  last ones that could keep running. **Use on chart** puts them on before you've changed anything.
+- **# and $:** every number has a **#** beside it. Click it and the number becomes a variable
+  (**$**), named for where it is, which **Variables** lists to rename and set. Variables are the
+  strategy's parameters, so **Optimize**, sweeps and **Walk-forward** can vary them, and applying an
+  optimized value makes it the variable's own.
+- **Raw JSON** shows the same tree as JSON. Paste one in, from Lab, an agent or a script, with or
+  without its `{"logic": …}` wrapper, and **Apply** fills in the rules; one with a mistake says
+  where, and nothing changes. **Copy JSON** copies it out.
+- **Save as strategy…** saves it by name, with the chart's settings, where saved strategies live:
+  it's then in every chart's strategy list and portfolio legs' list, marked *saved*, and Lab and
+  agents can read and run it. Saving again under a name makes a new one, newest first.
 
 ## Optimizing a strategy
 
