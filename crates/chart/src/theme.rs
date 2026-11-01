@@ -48,3 +48,6 @@ pub const STUDY_PALETTE: [Color; 6] = [
 pub const LONG_SHADE: Color = Color::from_rgba8(0x26, 0xa6, 0x9a, 0.07);
 /// ...or a short one.
 pub const SHORT_SHADE: Color = Color::from_rgba8(0xef, 0x53, 0x50, 0.07);
+/// A trade picked out to follow: behind its bars, and its edges.
+pub const PICKED_SHADE: Color = Color::from_rgba8(0xff, 0xd5, 0x4f, 0.10);
+pub const PICKED_EDGE: Color = Color::from_rgba8(0xff, 0xd5, 0x4f, 0.55);

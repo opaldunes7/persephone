@@ -31,9 +31,14 @@ impl Ledger {
     /// One market's run.
     #[must_use]
     pub fn from_report(report: &BacktestReport, symbol: &str) -> Self {
-        let capital = report.starting_balance;
+        Self::from_trips(round_trips(report), symbol, report.starting_balance)
+    }
+
+    /// Trades of one market already in hand, as Monte Carlo's draws and Random blocks keep them.
+    #[must_use]
+    pub fn from_trips(trips: Vec<RoundTrip>, symbol: &str, capital: f64) -> Self {
         Self {
-            rows: round_trips(report)
+            rows: trips
                 .into_iter()
                 .map(|trip| row(symbol, trip, capital))
                 .collect(),

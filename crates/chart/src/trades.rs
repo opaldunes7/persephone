@@ -35,6 +35,8 @@ pub struct Trades {
     /// Sorted by bar.
     pub markers: Vec<TradeMarker>,
     pub spans: Vec<PositionSpan>,
+    /// One trade picked out to follow, drawn brighter than the rest.
+    pub highlight: Option<PositionSpan>,
 }
 
 impl Trades {

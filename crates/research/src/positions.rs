@@ -264,6 +264,19 @@ pub struct RandomEntries {
     /// What every placing returned and how far it fell, each sorted, to draw.
     pub returns: Vec<f64>,
     pub falls: Vec<f64>,
+    /// Each placing's draw and what it returned, to find one again. Empty where they can't be.
+    pub by_draw: Vec<(u64, f64)>,
+}
+
+impl RandomEntries {
+    /// The draw whose return was nearest `value`.
+    #[must_use]
+    pub fn draw_near(&self, value: f64) -> Option<u64> {
+        self.by_draw
+            .iter()
+            .min_by(|a, b| (a.1 - value).abs().total_cmp(&(b.1 - value).abs()))
+            .map(|(draw, _)| *draw)
+    }
 }
 
 /// What's said when there's too little for the test to mean anything.
@@ -271,13 +284,10 @@ pub const ONE_TRADE: &str =
     "With one trade there's little to place at random, so this says almost nothing.";
 
 impl RandomEntriesJob {
-    /// # Errors
-    ///
-    /// Returns a message if the run has no trades or they don't fit, a backtest fails, or it's
-    /// stopped before any finish.
-    pub fn run(self, progress: &(impl Fn(usize) + Sync)) -> Result<RandomEntries, String> {
+    /// Each trade's direction and how many bars it held.
+    fn holds(&self) -> Vec<(i8, usize)> {
         let report = &self.report;
-        let holds: Vec<(i8, usize)> = round_trips(report)
+        round_trips(report)
             .iter()
             .map(|trade| {
                 let bars = if trade.open {
@@ -287,22 +297,70 @@ impl RandomEntriesJob {
                 };
                 (if trade.long { 1 } else { -1 }, bars.max(1))
             })
-            .collect();
-        if holds.is_empty() {
-            return Err("That run made no trades, so there's nothing to place at random.".into());
-        }
-        let mut request = self.request;
+            .collect()
+    }
+
+    /// The backtest sized as the run was, with positions to come in place of its strategy.
+    fn shell(&self) -> Result<BacktestRequest, String> {
+        let mut request = self.request.clone();
         request.ticks = None;
         request.fill_bars = None;
-        let opens: Vec<u64> = request.candles.iter().map(|c| c.ts).collect();
-        let closes = request.bars.closes(&request.candles);
-        // Sized as the run was, with positions in place of its strategy.
         let shell = Positions::from_list(Vec::new());
         request.strategy = with_params(
             shell.spec().kind,
             Arc::new(shell.info()),
             &serde_json::json!({"params": {"Size %": request.strategy.size_fraction() * 100.0}}),
         )?;
+        Ok(request)
+    }
+
+    fn placed(
+        &self,
+        shell: &BacktestRequest,
+        holds: &[(i8, usize)],
+        draw: u64,
+    ) -> Result<BacktestRequest, String> {
+        let closes = shell.bars.closes(&shell.candles);
+        let changes = random_entries(
+            holds,
+            self.from_index,
+            shell.candles.len(),
+            self.seed ^ (draw << 16),
+        )
+        .ok_or("Its trades don't fit the span.")?;
+        let list = changes
+            .iter()
+            .map(|&(bar, position)| (closes[bar], position))
+            .collect();
+        let mut trying = shell.clone();
+        trying.plugin = Some(Arc::new(Positions::from_list(list)));
+        Ok(trying)
+    }
+
+    /// Placing `draw` alone, as `run` backtests it, to look into its trades.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if the run has no trades or they don't fit.
+    pub fn placing(&self, draw: u64) -> Result<BacktestRequest, String> {
+        let holds = self.holds();
+        if holds.is_empty() {
+            return Err("That run made no trades, so there's nothing to place at random.".into());
+        }
+        self.placed(&self.shell()?, &holds, draw)
+    }
+
+    /// # Errors
+    ///
+    /// Returns a message if the run has no trades or they don't fit, a backtest fails, or it's
+    /// stopped before any finish.
+    pub fn run(self, progress: &(impl Fn(usize) + Sync)) -> Result<RandomEntries, String> {
+        let report = &self.report;
+        let holds = self.holds();
+        if holds.is_empty() {
+            return Err("That run made no trades, so there's nothing to place at random.".into());
+        }
+        let shell = self.shell()?;
         let seeds: Vec<u64> = (0..self.runs as u64).collect();
         let done = AtomicUsize::new(0);
         let results = pool(
@@ -311,20 +369,7 @@ impl RandomEntriesJob {
             &self.stop,
             &|| progress(done.fetch_add(1, Ordering::Relaxed) + 1),
             &|&draw| {
-                let changes = random_entries(
-                    &holds,
-                    self.from_index,
-                    opens.len(),
-                    self.seed ^ (draw << 16),
-                )
-                .ok_or("Its trades don't fit the span.")?;
-                let list = changes
-                    .iter()
-                    .map(|&(bar, position)| (closes[bar], position))
-                    .collect();
-                let mut trying = request.clone();
-                trying.plugin = Some(Arc::new(Positions::from_list(list)));
-                backtest(trying).map(|run| {
+                backtest(self.placed(&shell, &holds, draw)?).map(|run| {
                     let capital = run.starting_balance;
                     let last = run.equity.last().copied().unwrap_or(capital);
                     (last / capital - 1.0, run.max_drawdown.abs())
@@ -333,10 +378,13 @@ impl RandomEntriesJob {
         );
         let mut returns = Vec::with_capacity(self.runs);
         let mut falls = Vec::with_capacity(self.runs);
-        for result in results.into_iter().flatten() {
+        let mut by_draw = Vec::with_capacity(self.runs);
+        for (draw, result) in seeds.iter().zip(results) {
+            let Some(result) = result else { continue };
             let (returned, fell) = result?;
             returns.push(returned);
             falls.push(fell);
+            by_draw.push((*draw, returned));
         }
         if returns.is_empty() {
             return Err("Stopped.".into());
@@ -359,6 +407,7 @@ impl RandomEntriesJob {
             high: percentile(&returns, 0.95),
             returns,
             falls,
+            by_draw,
         })
     }
 }

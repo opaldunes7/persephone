@@ -1452,12 +1452,26 @@ mod panel {
         let expected = result.stats[result.worst].return_ * report.starting_balance;
         assert!((made - expected).abs() < 1e-6, "{made} against {expected}");
 
-        // A trade can be seen where it really happened, even though the run's order isn't real.
-        let exit = trades[draws[2]].exit_bar;
-        panel(&mut app, PanelMessage::ShowTrade(2, exit));
+        // A trade can be followed where it really happened, even though the run's order isn't
+        // real: the draws open beside it, and the playhead goes to just before it opened.
+        let trade = &trades[draws[2]];
+        panel(&mut app, PanelMessage::ShowTrade(2, trade.exit_bar));
         assert_eq!(app.panel().unwrap().tests.trade_row, Some(2));
+        let listed = ledger(&app);
+        assert_eq!(listed.rows.len(), draws.len());
+        assert_eq!(listed.rows[2].trip, *trade);
+        let at = app.panel().unwrap().playback.at.expect("a playhead");
+        assert!(at <= trade.entry_ts, "{at} for {}", trade.entry_ts);
         let right = app.tile_chart(0).unwrap().viewport().right;
-        assert!((right - exit as f64).abs() < 30.0, "{right} for {exit}");
+        assert!(
+            (right - trade.entry_bar as f64).abs() < 30.0,
+            "{right} for {}",
+            trade.entry_bar
+        );
+        assert_eq!(
+            app.tile_trades(0).unwrap().highlight.unwrap().from,
+            trade.entry_bar
+        );
 
         // Back to the notable runs, with the line still picked.
         panel(&mut app, PanelMessage::ShowRuns);
@@ -1917,6 +1931,246 @@ mod panel {
         );
         panel(&mut app, PanelMessage::Edit(Edit::RemoveLeg(0)));
         assert!(app.panel().unwrap().input(Field::LegSymbol(0)).is_none());
+    }
+
+    // --- Following a test's trades on a chart ------------------------------------------------
+
+    fn ledger(app: &Persephone) -> Arc<persephone::backtest::trades::Ledger> {
+        use persephone::backtest::Inspected;
+        let inspection = app
+            .panel()
+            .unwrap()
+            .inspect
+            .as_ref()
+            .expect("an inspection");
+        match &inspection.found {
+            Inspected::Ready(ledger) => Arc::clone(ledger),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_backtests_trade_is_followed_from_just_before_it_opened() {
+        use persephone::backtest::InspectWhat;
+        let mut app = ready_panel(TestKind::Backtest);
+        panel(&mut app, PanelMessage::Inspect(InspectWhat::Backtest));
+        let found = ledger(&app);
+        let Run::Done(report) = run_state(&app) else {
+            panic!()
+        };
+        assert_eq!(found.rows.len(), round_trips(report).len());
+        assert!(found.rows.len() > 2);
+        assert!(shows(&app, "By profit"));
+
+        panel(&mut app, PanelMessage::InspectTrade(2));
+        let trip = &found.rows[2].trip;
+        let shown = app.panel().unwrap();
+        assert!(!shown.playback.playing);
+        assert_eq!(shown.replay_tile, None, "the panel's own chart");
+        let at = shown.playback.at.expect("a playhead");
+        assert!(at < trip.entry_ts, "before it opened");
+        let lit = app.tile_trades(0).unwrap().highlight.expect("picked out");
+        assert_eq!(lit.from, trip.entry_bar);
+        assert_eq!(lit.to, trip.exit_bar);
+        // And it plays on from there.
+        panel(&mut app, PanelMessage::Step);
+        assert!(app.panel().unwrap().playback.at.unwrap() > at);
+
+        // Closing it puts the chart's own trades back, whole.
+        panel(&mut app, PanelMessage::CloseInspection);
+        assert!(app.panel().unwrap().inspect.is_none());
+        assert_eq!(app.tile_trades(0).unwrap().highlight, None);
+        assert_eq!(app.panel().unwrap().playback.at, None);
+    }
+
+    #[test]
+    fn an_optimized_value_is_run_again_to_show_its_trades_and_apply_is_a_button() {
+        use persephone::backtest::InspectWhat;
+        let mut app = ready_panel(TestKind::Optimize);
+        panel(&mut app, PanelMessage::Variable(0, "Fast".into()));
+        set_range(&mut app, 0, "6", "14", "2");
+        app.optimize_now();
+        let found = found(&app);
+        let fast = |app: &Persephone| app.tile_strategy(0).unwrap().0.params[0];
+        run_task(&mut app, PanelMessage::Inspect(InspectWhat::Optimized(4)));
+        // Looking doesn't apply it.
+        assert_eq!(fast(&app), 10.0);
+        let trades = ledger(&app);
+        // What its trades made is the return it scored.
+        let score = found.outcomes[4].score().unwrap();
+        let capital = app.tile_backtest(0).unwrap().capital;
+        assert!(
+            (trades.profit() / capital - score).abs() < 1e-9,
+            "{} against {score}",
+            trades.profit() / capital
+        );
+        assert!(shows(&app, "Apply"));
+        panel(&mut app, PanelMessage::InspectTrade(0));
+        assert!(app.panel().unwrap().playback.at.is_some());
+    }
+
+    #[test]
+    fn a_walk_forward_windows_pick_is_run_again_on_its_unseen_stretch() {
+        use persephone::backtest::{InspectWhat, TestRun};
+        let mut app = ready_panel(TestKind::WalkForward);
+        panel(&mut app, PanelMessage::Input(Field::Windows, "2".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Windows));
+        set_range(&mut app, 0, "5", "8", "3");
+        run_task(&mut app, PanelMessage::RunWalkForward);
+        let TestRun::Done(walked) = &app.panel().unwrap().tests.walk_forward else {
+            panic!()
+        };
+        let window = walked.windows[1].clone();
+        let picked = window.picked.clone().unwrap();
+        run_task(&mut app, PanelMessage::Inspect(InspectWhat::WalkWindow(1)));
+        let trades = ledger(&app);
+        let capital = app.tile_backtest(0).unwrap().capital;
+        assert!(
+            (trades.profit() / capital - picked.unseen_return).abs() < 1e-9,
+            "{} against {}",
+            trades.profit() / capital,
+            picked.unseen_return
+        );
+        assert!(
+            trades
+                .rows
+                .iter()
+                .all(|row| row.trip.entry_ts >= window.test_from)
+        );
+    }
+
+    #[test]
+    fn a_portfolio_trade_on_another_market_opens_a_chart_of_it_to_follow() {
+        use persephone::backtest::InspectWhat;
+        let mut app = portfolio_panel();
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        assert!(shows(&app, "Trades"));
+        panel(&mut app, PanelMessage::Inspect(InspectWhat::Portfolio));
+        let trades = ledger(&app);
+        let symbols: Vec<&str> = trades.rows.iter().map(|row| row.symbol.as_str()).collect();
+        assert!(
+            symbols.contains(&"BTCUSDT") && symbols.contains(&"ETHUSDT"),
+            "{symbols:?}"
+        );
+        let before = app.tile_symbols().len();
+
+        let eth = symbols
+            .iter()
+            .position(|symbol| *symbol == "ETHUSDT")
+            .unwrap();
+        panel(&mut app, PanelMessage::InspectTrade(eth));
+        let charts = app.tile_symbols();
+        assert_eq!(charts.len(), before + 1, "a chart of ETH beside it");
+        let (opened, _) = charts
+            .iter()
+            .find(|(_, symbol)| symbol == "ETHUSDT")
+            .unwrap()
+            .clone();
+        let shown = app.panel().unwrap();
+        assert_eq!(shown.replay_tile, Some(opened));
+        // Held from the span's first bar, so the playhead can't start any earlier than that.
+        assert!(shown.playback.at.unwrap() <= trades.rows[eth].trip.entry_ts);
+        assert!(app.tile_trades(opened).unwrap().highlight.is_some());
+        // The panel's own chart doesn't show it.
+        assert!(app.tile_trades(0).is_none_or(|t| t.highlight.is_none()));
+
+        // Another ETH trade uses the same chart; a BTC one goes back to the panel's.
+        let btc = symbols
+            .iter()
+            .position(|symbol| *symbol == "BTCUSDT")
+            .unwrap();
+        panel(&mut app, PanelMessage::InspectTrade(btc));
+        assert_eq!(app.tile_symbols().len(), before + 1);
+        assert_eq!(app.panel().unwrap().replay_tile, None);
+        assert!(app.tile_trades(0).unwrap().highlight.is_some());
+        assert!(
+            app.tile_trades(opened)
+                .is_none_or(|t| t.highlight.is_none())
+        );
+    }
+
+    #[test]
+    fn a_portfolio_sweeps_setup_is_run_again_to_show_its_trades() {
+        use persephone::backtest::{InspectWhat, PortfolioView, TestRun};
+        let mut app = portfolio_panel();
+        panel(&mut app, PanelMessage::PortfolioView(PortfolioView::Sweep));
+        for (field, value) in [
+            (Field::SweepMin, "0.5"),
+            (Field::SweepMax, "1"),
+            (Field::SweepStep, "0.5"),
+        ] {
+            panel(&mut app, PanelMessage::Input(field, value.into()));
+            panel(&mut app, PanelMessage::Submit(field));
+        }
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        let TestRun::Done(rows) = &app.panel().unwrap().tests.portfolio_sweep else {
+            panic!()
+        };
+        let row = rows[0].clone();
+        run_task(
+            &mut app,
+            PanelMessage::Inspect(InspectWhat::PortfolioSweep(row.label.clone())),
+        );
+        let trades = ledger(&app);
+        assert!(!trades.rows.is_empty());
+        assert!(
+            app.panel()
+                .unwrap()
+                .inspect
+                .as_ref()
+                .unwrap()
+                .title
+                .contains(&row.label)
+        );
+    }
+
+    #[test]
+    fn a_random_placing_is_found_again_by_what_it_returned() {
+        use persephone::backtest::{InspectWhat, TestRun};
+        let mut app = ready_panel(TestKind::RandomEntries);
+        panel(&mut app, PanelMessage::Input(Field::Entries, "6".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Entries));
+        run_task(&mut app, PanelMessage::RunRandomEntries);
+        let TestRun::Done(found) = &app.panel().unwrap().tests.random_entries else {
+            panic!()
+        };
+        let (_, returned) = found.by_draw[3];
+        run_task(
+            &mut app,
+            PanelMessage::Inspect(InspectWhat::RandomPlacing(returned)),
+        );
+        let trades = ledger(&app);
+        let capital = app.tile_backtest(0).unwrap().capital;
+        assert!(
+            (trades.profit() / capital - returned).abs() < 1e-9,
+            "{} against {returned}",
+            trades.profit() / capital
+        );
+    }
+
+    #[test]
+    fn a_shift_of_the_backtests_timing_is_found_again_by_what_it_returned() {
+        use persephone::backtest::{InspectWhat, TestRun};
+        let mut app = ready_panel(TestKind::RandomEntries);
+        panel(&mut app, PanelMessage::EntriesShifted(true));
+        panel(&mut app, PanelMessage::Input(Field::Entries, "5".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Entries));
+        run_task(&mut app, PanelMessage::RunShifted);
+        let TestRun::Done(found) = &app.panel().unwrap().tests.shifted else {
+            panic!("{:?}", app.panel().unwrap().tests.shifted);
+        };
+        let (_, returned) = found.by_draw[1];
+        run_task(
+            &mut app,
+            PanelMessage::Inspect(InspectWhat::ShiftedPlacing(returned)),
+        );
+        let trades = ledger(&app);
+        let capital = app.tile_backtest(0).unwrap().capital;
+        assert!(
+            (trades.profit() / capital - returned).abs() < 1e-9,
+            "{} against {returned}",
+            trades.profit() / capital
+        );
     }
 
     #[test]

@@ -57,6 +57,31 @@ impl<Message> canvas::Program<Message> for Grid<'_> {
                             );
                         }
                     }
+                    // The trade being followed, as far as the playback has got: brighter, and
+                    // edged where it opened and, once it has, where it closed.
+                    if let Some(picked) = trades.highlight.filter(|s| s.from < shown) {
+                        let left = price.x(picked.from as f64 - 0.5).max(0.0);
+                        let to = picked.to.min(shown - 1);
+                        let right = price.x(to as f64 + 0.5).min(plot.width);
+                        if right > left {
+                            frame.fill_rectangle(
+                                Point::new(left, price.offset),
+                                Size::new(right - left, price.height),
+                                theme::PICKED_SHADE,
+                            );
+                        }
+                        let mut edges = vec![left];
+                        if picked.to < shown {
+                            edges.push(right);
+                        }
+                        for x in edges.into_iter().filter(|x| (0.0..=plot.width).contains(x)) {
+                            frame.fill_rectangle(
+                                Point::new(x.round(), price.offset),
+                                Size::new(1.0, price.height),
+                                theme::PICKED_EDGE,
+                            );
+                        }
+                    }
                 }
 
                 for pane in panes.all() {

@@ -63,6 +63,7 @@ fn summing_up(
     mut falls: Vec<f64>,
     trades: usize,
     actual: (f64, f64),
+    by_draw: Vec<(u64, f64)>,
 ) -> RandomEntries {
     returns.sort_by(f64::total_cmp);
     falls.sort_by(f64::total_cmp);
@@ -79,6 +80,7 @@ fn summing_up(
         high: percentile(&returns, 0.95),
         returns,
         falls,
+        by_draw,
     }
 }
 
@@ -126,19 +128,17 @@ impl ShiftedJob {
         changes
     }
 
-    /// # Errors
-    ///
-    /// Returns a message if the run never traded, a backtest fails, or it's stopped before any finish.
-    pub fn run(self, progress: &(impl Fn(usize) + Sync)) -> Result<RandomEntries, String> {
-        let changes = self.changes();
-        if changes.is_empty() {
-            return Err("That run made no trades, so there's no timing to move.".into());
-        }
+    /// The backtest sized as the run was, with positions to come in place of its strategy, and how
+    /// many bars of the span it has to move along.
+    fn shell(&self) -> Result<(BacktestRequest, usize), String> {
         let mut request = self.request.clone();
         request.ticks = None;
         request.fill_bars = None;
-        let closes = request.bars.closes(&request.candles);
-        let bars = closes.len().saturating_sub(self.from_index);
+        let bars = request
+            .bars
+            .closes(&request.candles)
+            .len()
+            .saturating_sub(self.from_index);
         if bars < 2 {
             return Err("The span's too short to move anything along.".into());
         }
@@ -148,6 +148,51 @@ impl ShiftedJob {
             Arc::new(shell.info()),
             &serde_json::json!({"params": {"Size %": request.strategy.size_fraction() * 100.0}}),
         )?;
+        Ok((request, bars))
+    }
+
+    fn moved(
+        &self,
+        shell: &BacktestRequest,
+        bars: usize,
+        changes: &[(usize, i8)],
+        draw: u64,
+    ) -> BacktestRequest {
+        let closes = shell.bars.closes(&shell.candles);
+        let mut rng = StdRng::seed_from_u64(self.seed ^ (draw << 16));
+        let by = offset(&mut rng, bars);
+        let list = shifted(changes, bars, by, &0)
+            .into_iter()
+            .map(|(at, held)| (closes[self.from_index + at], held))
+            .collect();
+        let mut trying = shell.clone();
+        trying.plugin = Some(Arc::new(Positions::from_list(list)));
+        trying
+    }
+
+    /// Shift `draw` alone, as `run` backtests it, to look into its trades.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if the run never traded or the span's too short.
+    pub fn placing(&self, draw: u64) -> Result<BacktestRequest, String> {
+        let changes = self.changes();
+        if changes.is_empty() {
+            return Err("That run made no trades, so there's no timing to move.".into());
+        }
+        let (shell, bars) = self.shell()?;
+        Ok(self.moved(&shell, bars, &changes, draw))
+    }
+
+    /// # Errors
+    ///
+    /// Returns a message if the run never traded, a backtest fails, or it's stopped before any finish.
+    pub fn run(self, progress: &(impl Fn(usize) + Sync)) -> Result<RandomEntries, String> {
+        let changes = self.changes();
+        if changes.is_empty() {
+            return Err("That run made no trades, so there's no timing to move.".into());
+        }
+        let (shell, bars) = self.shell()?;
         let draws: Vec<u64> = (0..self.runs as u64).collect();
         let done = AtomicUsize::new(0);
         let results = pool(
@@ -156,26 +201,20 @@ impl ShiftedJob {
             &self.stop,
             &|| progress(done.fetch_add(1, Ordering::Relaxed) + 1),
             &|&draw| {
-                let mut rng = StdRng::seed_from_u64(self.seed ^ (draw << 16));
-                let by = offset(&mut rng, bars);
-                let list = shifted(&changes, bars, by, &0)
-                    .into_iter()
-                    .map(|(at, held)| (closes[self.from_index + at], held))
-                    .collect();
-                let mut trying = request.clone();
-                trying.plugin = Some(Arc::new(Positions::from_list(list)));
-                backtest(trying).map(|run| {
+                backtest(self.moved(&shell, bars, &changes, draw)).map(|run| {
                     let capital = run.starting_balance;
                     let last = run.equity.last().copied().unwrap_or(capital);
                     (last / capital - 1.0, run.max_drawdown.abs())
                 })
             },
         );
-        let (mut returns, mut falls) = (Vec::new(), Vec::new());
-        for result in results.into_iter().flatten() {
+        let (mut returns, mut falls, mut by_draw) = (Vec::new(), Vec::new(), Vec::new());
+        for (draw, result) in draws.iter().zip(results) {
+            let Some(result) = result else { continue };
             let (returned, fell) = result?;
             returns.push(returned);
             falls.push(fell);
+            by_draw.push((*draw, returned));
         }
         if returns.is_empty() {
             return Err("Stopped.".into());
@@ -187,6 +226,7 @@ impl ShiftedJob {
             falls,
             changes.len(),
             (actual, self.report.max_drawdown.abs()),
+            by_draw,
         ))
     }
 }
@@ -315,7 +355,8 @@ impl ShiftedPortfolioJob {
         if returns.is_empty() {
             return Err("Stopped.".into());
         }
-        Ok(summing_up(returns, falls, book.len(), actual))
+        // Each draw here is a weight table, not a run to follow on one chart.
+        Ok(summing_up(returns, falls, book.len(), actual, Vec::new()))
     }
 }
 
@@ -615,16 +656,7 @@ impl WalkJob {
 
     /// A candidate over the bars opening in `[from, to)`, with some before them to warm up on.
     fn over(&self, request: &PortfolioRequest, from: UnixNanos, to: UnixNanos) -> PortfolioRequest {
-        let mut cut = request.clone();
-        cut.trade_from = from;
-        for leg in &mut cut.legs {
-            let first = leg.candles.partition_point(|c| c.ts < from);
-            let last = leg.candles.partition_point(|c| c.ts < to);
-            let start = first.saturating_sub(self.warm_up);
-            leg.candles = leg.candles[start..last].to_vec();
-        }
-        cut.legs.retain(|leg| !leg.candles.is_empty());
-        cut
+        over(request, from, to, self.warm_up)
     }
 
     /// # Errors
@@ -794,6 +826,27 @@ impl WalkJob {
             starts,
         })
     }
+}
+
+/// `request` trading only from `from` until `to`, with `warm_up` bars before for its strategies, as
+/// a walk-forward runs each stretch.
+#[must_use]
+pub fn over(
+    request: &PortfolioRequest,
+    from: UnixNanos,
+    to: UnixNanos,
+    warm_up: usize,
+) -> PortfolioRequest {
+    let mut cut = request.clone();
+    cut.trade_from = from;
+    for leg in &mut cut.legs {
+        let first = leg.candles.partition_point(|c| c.ts < from);
+        let last = leg.candles.partition_point(|c| c.ts < to);
+        let start = first.saturating_sub(warm_up);
+        leg.candles = leg.candles[start..last].to_vec();
+    }
+    cut.legs.retain(|leg| !leg.candles.is_empty());
+    cut
 }
 
 /// A portfolio run's daily returns from the span's start, as its Sharpe ratio is worked out.

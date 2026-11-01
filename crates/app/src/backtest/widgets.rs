@@ -381,6 +381,8 @@ pub struct Distribution<'a> {
     /// The range to shade: 19 in 20 of them.
     pub band: Option<(f64, f64)>,
     pub median: f64,
+    /// What clicking it says, with the value clicked: to look into the run nearest it.
+    pub pick: Option<fn(f64) -> PanelMessage>,
 }
 
 /// Room kept above a chart for the heading over it.
@@ -396,10 +398,32 @@ impl canvas::Program<PanelMessage> for Distribution<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<PanelMessage>> {
+        let at = cursor.position_in(bounds)?;
+        if let (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Some(pick)) =
+            (event, self.pick)
+        {
+            // The value under the mouse, as the bars are laid out.
+            let found = Histogram::of(self.values, figures::HISTOGRAM_BINS, self.actual);
+            let (left, right) = (12.0, (bounds.width - 12.0).max(13.0));
+            let share = f64::from(((at.x - left) / (right - left)).clamp(0.0, 1.0));
+            let value = found.lo + (found.hi - found.lo) * share;
+            return Some(canvas::Action::publish(pick(value)).and_capture());
+        }
         matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }))
-            .then(|| cursor.position_in(bounds))
-            .flatten()
-            .map(|_| canvas::Action::request_redraw())
+            .then(canvas::Action::request_redraw)
+    }
+
+    fn mouse_interaction(
+        &self,
+        _state: &(),
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        if self.pick.is_some() && cursor.position_in(bounds).is_some() {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::default()
+        }
     }
 
     fn draw(
@@ -1800,7 +1824,10 @@ impl canvas::Program<PanelMessage> for Landscape<'_> {
         };
         let cell = self.cell_at(cursor.position_in(bounds)?, bounds.size())?;
         self.found.outcomes[cell].score()?;
-        Some(canvas::Action::publish(PanelMessage::Apply(cell)).and_capture())
+        Some(
+            canvas::Action::publish(PanelMessage::Inspect(super::InspectWhat::Optimized(cell)))
+                .and_capture(),
+        )
     }
 
     fn mouse_interaction(

@@ -13,9 +13,9 @@ use persephone_engine::{BacktestReport, LimitOutcome, PortfolioReport};
 use persephone_research::figures::LimitSummary;
 
 use super::{
-    BlockLength, BlockRun, Commission, Edit, Field, FillTiming, LegChoice, NO_VARIABLE, OneWay,
-    OptimizeRun, Panel, PanelMessage, PortfolioView, Precision, RunColumn, ScoreBy, Settings,
-    StrategyChoice, TestKind, TestRun, VaryChoice,
+    BlockLength, BlockRun, Commission, Edit, Field, FillTiming, InspectWhat, LegChoice,
+    NO_VARIABLE, OneWay, OptimizeRun, Panel, PanelMessage, PortfolioView, Precision, RunColumn,
+    ScoreBy, Settings, StrategyChoice, TestKind, TestRun, VaryChoice,
     calendar::{Calendar, Level, Total, days_in_month, weeks},
     optimize::{OptimizeResult, Outcome},
     portfolio::{PortfolioRun, SavedPortfolio},
@@ -39,10 +39,11 @@ use super::{
 };
 
 mod calendar;
+mod inspect;
 mod results;
 mod settings;
 
-use self::{calendar::*, results::*, settings::*};
+use self::{calendar::*, inspect::*, results::*, settings::*};
 
 /// The settings' share of the panel's width, in tenths.
 const SETTINGS_PORTION: u16 = 3;
@@ -259,6 +260,19 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                 ]
                 .spacing(2),
             );
+            let inspecting = panel.inspect.is_some();
+            heading = heading.push(tip(
+                button(text("Trades").size(HINT).center())
+                    .padding([2, 7])
+                    .on_press(if inspecting {
+                        PanelMessage::CloseInspection
+                    } else {
+                        PanelMessage::Inspect(InspectWhat::Backtest)
+                    })
+                    .style(move |_, status| chip(inspecting, status)),
+                "Every trade, beside the chart: click one to put the playhead just before it opened, and Play to watch it.",
+                None,
+            ));
             if !report.limit_log.is_empty() {
                 let shown = panel.limits_shown;
                 heading = heading.push(tip(
@@ -513,6 +527,7 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                             actual: found.actual_fell,
                             band: None,
                             median: percentile(&found.falls, 0.5),
+                            pick: None,
                         })
                         .width(FillPortion(2))
                         .height(Fill),
@@ -561,7 +576,12 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                         })
                         .width(Fill)
                         .height(Fill),
-                        walk_forward_table(found, "Equal"),
+                        walk_forward_table(
+                            found,
+                            "Equal",
+                            InspectWhat::PortfolioWalkWindow,
+                            inspected_window(panel, true),
+                        ),
                     ]
                     .into()
                 }
@@ -650,7 +670,14 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                     })
                     .width(Fill)
                     .height(Fill),
-                    portfolio_table(found, panel.tests.portfolio_leg),
+                    portfolio_table(
+                        found,
+                        panel.tests.portfolio_leg,
+                        panel
+                            .inspect
+                            .as_ref()
+                            .is_some_and(|i| i.what == InspectWhat::Portfolio),
+                    ),
                 ]
                 .into()
             }
@@ -727,7 +754,12 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                         })
                         .width(Fill)
                         .height(Fill),
-                        walk_forward_table(found, "Market"),
+                        walk_forward_table(
+                            found,
+                            "Market",
+                            InspectWhat::WalkWindow,
+                            inspected_window(panel, false),
+                        ),
                     ]
                     .into()
                 }
@@ -840,6 +872,9 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                         actual: found.actual_return,
                         band: Some((found.low, found.high)),
                         median: found.median,
+                        pick: Some(|value| PanelMessage::Inspect(InspectWhat::RandomPlacing(
+                            value
+                        ))),
                     })
                     .width(FillPortion(3))
                     .height(Fill),
@@ -849,6 +884,7 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                         actual: found.actual_fell,
                         band: None,
                         median: percentile(falls, 0.5),
+                        pick: None,
                     })
                     .width(FillPortion(2))
                     .height(Fill),
@@ -1116,7 +1152,17 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
     if let Some(fills) = info.fills.filter(|_| !table) {
         legend = legend.push(muted(fills));
     }
-    let pane = stack![pane, legend].width(Fill).height(Fill);
+    let pane: Element<'_, PanelMessage> = stack![pane, legend].width(Fill).height(Fill).into();
+    // A run's trades beside the test, when one's being looked into.
+    let pane: Element<'_, PanelMessage> = match &panel.inspect {
+        Some(inspection) => row![
+            container(pane).width(FillPortion(3)).height(Fill),
+            inspect_drawer(inspection, info.quote),
+        ]
+        .height(Fill)
+        .into(),
+        None => pane,
+    };
 
     let label = |content: &'static str, what: &'static str| {
         tip(
@@ -1423,7 +1469,10 @@ fn decisions_table(report: &BacktestReport) -> Element<'_, PanelMessage> {
 }
 
 /// A book moved along its span: what those returned and how far they fell.
+/// Clicking where they returned looks into the one nearest, where they can be found again.
 fn shifted_charts(found: &RandomEntries) -> Element<'_, PanelMessage> {
+    let pick: Option<fn(f64) -> PanelMessage> = (!found.by_draw.is_empty())
+        .then_some(|value| PanelMessage::Inspect(InspectWhat::ShiftedPlacing(value)));
     row![
         canvas(Distribution {
             title: "What the moved ones returned",
@@ -1431,6 +1480,7 @@ fn shifted_charts(found: &RandomEntries) -> Element<'_, PanelMessage> {
             actual: found.actual_return,
             band: Some((found.low, found.high)),
             median: found.median,
+            pick,
         })
         .width(FillPortion(3))
         .height(Fill),
@@ -1440,6 +1490,7 @@ fn shifted_charts(found: &RandomEntries) -> Element<'_, PanelMessage> {
             actual: found.actual_fell,
             band: None,
             median: percentile(&found.falls, 0.5),
+            pick: None,
         })
         .width(FillPortion(2))
         .height(Fill),
@@ -1448,6 +1499,17 @@ fn shifted_charts(found: &RandomEntries) -> Element<'_, PanelMessage> {
 }
 
 /// A sweep's values, best first.
+/// Which walk-forward window's pick the drawer shows, if it shows one: a portfolio's, or one
+/// market's.
+fn inspected_window(panel: &Panel, portfolio: bool) -> Option<usize> {
+    match (&panel.inspect.as_ref()?.what, portfolio) {
+        (InspectWhat::PortfolioWalkWindow(at), true) | (InspectWhat::WalkWindow(at), false) => {
+            Some(*at)
+        }
+        _ => None,
+    }
+}
+
 fn portfolio_sweep_table(rows: &[SweepRow]) -> Element<'_, PanelMessage> {
     let cell = |value: String, width: f32, color: Color| {
         text(value)
@@ -1472,7 +1534,7 @@ fn portfolio_sweep_table(rows: &[SweepRow]) -> Element<'_, PanelMessage> {
         } else {
             theme::DOWN
         };
-        lines = lines.push(row![
+        let line = row![
             cell(found.label.clone(), 92.0, theme::TEXT),
             cell(percent(found.net_return), 76.0, color),
             cell(
@@ -1498,7 +1560,17 @@ fn portfolio_sweep_table(rows: &[SweepRow]) -> Element<'_, PanelMessage> {
                 90.0,
                 theme::DOWN
             ),
-        ]);
+        ];
+        lines = lines.push(tip(
+            button(line)
+                .padding(0)
+                .on_press(PanelMessage::Inspect(InspectWhat::PortfolioSweep(
+                    found.label.clone(),
+                )))
+                .style(|_, status| result_style(false, status)),
+            "Click to see this setup's trades, and follow one on the chart.",
+            None,
+        ));
     }
     iced::widget::scrollable(lines.padding(Padding {
         top: WALK_TOP,
@@ -1622,7 +1694,11 @@ fn portfolio_exposure(report: &PortfolioReport) -> Lines<'_> {
 }
 
 /// Each leg's part, and how their returns moved together.
-fn portfolio_table(found: &PortfolioRun, picked: usize) -> Element<'_, PanelMessage> {
+fn portfolio_table(
+    found: &PortfolioRun,
+    picked: usize,
+    inspecting: bool,
+) -> Element<'_, PanelMessage> {
     let report = &found.report;
     let cell = |value: String, width: f32, color: Color| {
         text(value)
@@ -1788,8 +1864,21 @@ fn portfolio_table(found: &PortfolioRun, picked: usize) -> Element<'_, PanelMess
                 .width(398.0),
         );
     }
-    // One market's fills at a time, as there can be thousands.
-    let mut tabs = row![].spacing(4);
+    // Every trade across the markets, to follow on a chart of its own market; then one market's
+    // fills at a time, as there can be thousands.
+    let mut tabs = row![tip(
+        button(text("Trades").size(SMALL))
+            .padding([2, 6])
+            .on_press(if inspecting {
+                PanelMessage::CloseInspection
+            } else {
+                PanelMessage::Inspect(InspectWhat::Portfolio)
+            })
+            .style(move |_, status| chip(inspecting, status)),
+        "Every trade across the markets, flat to flat, beside the test: click one to follow it on a chart of its market, then Play.",
+        None,
+    )]
+    .spacing(4);
     for (at, leg) in report.legs.iter().enumerate() {
         tabs = tabs.push(
             button(text(leg.symbol.as_str()).size(SMALL))
@@ -1845,7 +1934,13 @@ fn portfolio_table(found: &PortfolioRun, picked: usize) -> Element<'_, PanelMess
 }
 
 /// Each window of a walk-forward: what it picked, and how that did on what it hadn't seen.
-fn walk_forward_table<'a>(found: &'a WalkForward, market: &str) -> Element<'a, PanelMessage> {
+/// `inspect` is what clicking a window's row opens: its pick's trades on its unseen stretch.
+fn walk_forward_table<'a>(
+    found: &'a WalkForward,
+    market: &str,
+    inspect: fn(usize) -> InspectWhat,
+    picked: Option<usize>,
+) -> Element<'a, PanelMessage> {
     let day = |ts: UnixNanos| DateTime::from_nanos(ts).date();
     let cell = |value: String, width: f32, color: Color| {
         text(value)
@@ -1868,16 +1963,18 @@ fn walk_forward_table<'a>(found: &'a WalkForward, market: &str) -> Element<'a, P
         ),
     ]]
     .spacing(3);
-    for window in &found.windows {
+    for (at, window) in found.windows.iter().enumerate() {
         let stretch = day(window.test_from);
         rows = rows.push(match &window.picked {
-            Some(picked) => {
+            Some(picked_here) => {
+                let picked_now = picked == Some(at);
+                let picked = picked_here;
                 let color = if picked.unseen_return >= 0.0 {
                     theme::UP
                 } else {
                     theme::DOWN
                 };
-                row![
+                let line = row![
                     cell(stretch, 84.0, theme::TEXT),
                     cell(picked.label.clone(), 92.0, theme::TEXT),
                     cell(percent(picked.unseen_return), 66.0, color),
@@ -1892,12 +1989,22 @@ fn walk_forward_table<'a>(found: &'a WalkForward, market: &str) -> Element<'a, P
                         60.0,
                         theme::TEXT_MUTED
                     ),
-                ]
+                ];
+                let line: Element<'a, PanelMessage> = tip(
+                    button(line)
+                        .padding(0)
+                        .on_press(PanelMessage::Inspect(inspect(at)))
+                        .style(move |_, status| result_style(picked_now, status)),
+                    "Click to see this pick's trades on its unseen stretch, and follow one on the chart.",
+                    None,
+                );
+                line
             }
             None => row![
                 cell(stretch, 84.0, theme::TEXT),
                 cell("nothing traded".into(), 200.0, theme::TEXT_MUTED),
-            ],
+            ]
+            .into(),
         });
     }
     if let Some(sharpe) = found.unseen_sharpe {

@@ -37,7 +37,7 @@ pub use persephone_research::{
         self, BlockLength, Commission, Edit, FillTiming, OneWay, OptimizeSettings, Precision,
         ScoreBy, Section, SessionRule, Settings, TestKind, Variable, parse_time, time_text,
     },
-    thousands, walk_forward,
+    thousands, trades, walk_forward,
 };
 
 pub use self::view::{PLUGIN_SLOTS, PanelInfo, Status, panel};
@@ -93,6 +93,89 @@ pub struct Panel {
     pub tests: Tests,
     /// Whether the backtest's calendar is showing, and how far into it.
     pub calendar: calendar::CalendarView,
+    /// A test's trades, open beside it to follow on a chart, if any.
+    pub inspect: Option<Inspection>,
+    /// The chart the playback drives while following a trade on a market the panel's chart isn't
+    /// showing. `None` is the panel's own.
+    pub replay_tile: Option<TileId>,
+}
+
+/// One run's trades, picked out of a test to follow on the chart: the backtest's own, a draw or
+/// block of them, a value an optimization tried, a walk-forward's pick, or a portfolio's.
+#[derive(Debug)]
+pub struct Inspection {
+    /// What it's of, and that as the drawer heads it.
+    pub what: InspectWhat,
+    pub title: String,
+    pub found: Inspected,
+    /// Each market's venue, by its symbol, for a portfolio's legs.
+    pub venues: Vec<(String, Option<String>)>,
+    /// The row last sent to the chart.
+    pub picked: Option<usize>,
+    /// Biggest profit first, rather than the order they opened.
+    pub by_profit: bool,
+}
+
+/// Where an inspection's trades have got to. Some are found by running that one run again.
+#[derive(Debug)]
+pub enum Inspected {
+    Finding(u64),
+    Ready(Arc<trades::Ledger>),
+    Failed(String),
+}
+
+impl Inspection {
+    #[must_use]
+    pub fn new(what: InspectWhat, title: String, found: Inspected) -> Self {
+        Self {
+            what,
+            title,
+            found,
+            venues: Vec::new(),
+            picked: None,
+            by_profit: false,
+        }
+    }
+
+    /// The order rows show in: each row's place in the ledger.
+    #[must_use]
+    pub fn order(&self) -> Vec<usize> {
+        let Inspected::Ready(ledger) = &self.found else {
+            return Vec::new();
+        };
+        let mut order: Vec<usize> = (0..ledger.rows.len()).collect();
+        if self.by_profit {
+            order.sort_by(|&a, &b| {
+                ledger.rows[b]
+                    .trip
+                    .profit
+                    .total_cmp(&ledger.rows[a].trip.profit)
+            });
+        }
+        order
+    }
+}
+
+/// What an inspection is of.
+#[derive(Clone, Debug, PartialEq)]
+pub enum InspectWhat {
+    /// The chart's own backtest.
+    Backtest,
+    /// The trades Monte Carlo or Random blocks lists beside its lines.
+    Listed,
+    /// A value an optimization tried, by its place in the grid.
+    Optimized(usize),
+    /// A walk-forward window's pick, on its unseen stretch.
+    WalkWindow(usize),
+    /// The portfolio run.
+    Portfolio,
+    /// A portfolio sweep's setup, by its label.
+    PortfolioSweep(String),
+    /// A portfolio walk-forward window's pick, on its unseen stretch.
+    PortfolioWalkWindow(usize),
+    /// The random placing, or the shift of the backtest's timing, whose return was nearest this.
+    RandomPlacing(f64),
+    ShiftedPlacing(f64),
 }
 
 /// The results of the tests beyond the backtest itself. They aren't saved: they follow from the
@@ -328,6 +411,8 @@ impl Panel {
             plugin_search: plugin_search(settings),
             tests: Tests::default(),
             calendar: calendar::CalendarView::default(),
+            inspect: None,
+            replay_tile: None,
             tile,
             height: (window_height * DEFAULT_SHARE).max(MIN_HEIGHT),
             playback: Playback::default(),
@@ -489,6 +574,14 @@ pub enum PanelMessage {
     CalendarLevel(calendar::Level),
     /// Move the playhead to just before this trade opened, by its place in the backtest's trades.
     ReplayTrade(usize),
+    /// Open a run's trades beside the test, to follow one on the chart.
+    Inspect(InspectWhat),
+    /// Follow this trade, by its place in the inspection's trades: the playhead goes to just
+    /// before it opened, on a chart of its market, for Play to show it happen.
+    InspectTrade(usize),
+    /// Biggest profit first, or the order they opened.
+    InspectByProfit(bool),
+    CloseInspection,
 }
 
 /// A strategy in the panel's dropdown.

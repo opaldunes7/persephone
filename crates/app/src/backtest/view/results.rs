@@ -93,18 +93,33 @@ pub(super) fn results(
         )
         .padding([2, 6])
         .width(Fill)
-        .on_press(PanelMessage::Apply(ranked.cell))
+        .on_press(PanelMessage::Inspect(InspectWhat::Optimized(ranked.cell)))
         .style(move |_, status| result_style(current == Some(ranked.cell), status));
-        // To the left, so it doesn't cover the rows below.
-        list = list.push(tip_at(
-            row,
-            format!(
-                "{what} With its neighbours, {}.{warning} Click to put it on the chart's strategy.",
-                percent(ranked.plateau)
-            ),
+        let apply = tip(
+            button(text("Apply").size(HINT).center())
+                .padding([2, 6])
+                .on_press(PanelMessage::Apply(ranked.cell))
+                .style(move |_, status| chip(current == Some(ranked.cell), status)),
+            "Put these values on the chart's strategy.",
             None,
-            tooltip::Position::Left,
-        ));
+        );
+        // To the left, so it doesn't cover the rows below.
+        list = list.push(
+            row![
+                tip_at(
+                    row,
+                    format!(
+                        "{what} With its neighbours, {}.{warning} Click to see its trades, and follow one on the chart.",
+                        percent(ranked.plateau)
+                    ),
+                    None,
+                    tooltip::Position::Left,
+                ),
+                apply,
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center),
+        );
     }
     // How much of the best is luck, for having been picked from all of these.
     if let Some(best) = found.top.first()

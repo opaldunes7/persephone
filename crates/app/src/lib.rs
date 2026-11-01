@@ -15,6 +15,7 @@
 
 pub mod backtest;
 mod importing;
+mod inspect;
 pub mod keymap;
 pub mod live;
 mod local;
@@ -320,6 +321,8 @@ struct Tile {
     hidden: Hidden,
     /// What its backtests assume, and the rules its strategy trades by.
     backtest: backtest::Settings,
+    /// Another run's trades, shown in place of its own while the panel follows one of them.
+    inspected: Option<persephone_chart::Trades>,
 }
 
 /// 1-minute bars for High precision: on the way, in, or why not.
@@ -523,6 +526,8 @@ pub enum Message {
         (Option<String>, String),
         Result<Arc<backtest::History>, String>,
     ),
+    /// A run's trades, found again for the panel's inspection drawer.
+    Inspected(u64, Result<Arc<backtest::trades::Ledger>, String>),
 }
 
 impl Persephone {
@@ -804,6 +809,23 @@ impl Persephone {
     }
 
     /// The backtest panel, while it's open.
+    /// The trades tile `id`'s chart shows: its own, or another run's it's following.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn tile_trades(&self, id: TileId) -> Option<&persephone_chart::Trades> {
+        self.tiles.get(&id)?.chart.as_ref()?.trades()
+    }
+
+    /// Every tile there is, and its market's symbol.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn tile_symbols(&self) -> Vec<(TileId, String)> {
+        self.tiles
+            .iter()
+            .map(|(&id, tile)| (id, tile.market.symbol.clone()))
+            .collect()
+    }
+
     #[must_use]
     pub fn panel(&self) -> Option<&backtest::Panel> {
         self.panel.as_ref()
@@ -1066,6 +1088,15 @@ impl Persephone {
                     .map(|(&id, _)| id)
                     .collect();
                 let mut tasks: Vec<_> = waiting.iter().map(|&id| self.attach(id)).collect();
+                // A chart opened to follow a trade on gets it once its bars are in.
+                if self
+                    .panel
+                    .as_ref()
+                    .and_then(|panel| panel.replay_tile)
+                    .is_some_and(|replay| waiting.contains(&replay))
+                {
+                    self.show_picked_trade();
+                }
                 tasks.extend(waiting.into_iter().map(|id| self.request_fine(id)));
                 return Task::batch(tasks);
             }
@@ -1440,6 +1471,7 @@ impl Persephone {
                     panel.history = Some(result.map(|h| (*h).clone()));
                 }
             }
+            Message::Inspected(run, result) => self.inspected(run, result),
             Message::LabResultsChanged => return self.load_lab_results(),
             Message::PluginsChanged => {
                 if !self.reloading {
@@ -2844,6 +2876,7 @@ impl Persephone {
                 live: None,
                 hidden: Hidden::default(),
                 backtest: backtest::Settings::default(),
+                inspected: None,
             },
         );
         let backtest = self.attach(id);
@@ -2980,6 +3013,10 @@ impl Persephone {
 
     /// Forgets what the panel's tests found about tile `id`, as its backtest is changing.
     fn clear_tests(&mut self, id: TileId) {
+        if self.panel.as_ref().is_some_and(|p| p.tile == id) {
+            // Its trades were the old backtest's, or a test of it.
+            self.close_inspection();
+        }
         if let Some(panel) = self.panel.as_mut().filter(|p| p.tile == id) {
             panel.tests.clear();
             // The trades it pointed at are about to change.
@@ -4497,6 +4534,7 @@ impl Persephone {
     }
 
     fn close_panel(&mut self) {
+        self.close_inspection();
         if let Some(panel) = self.panel.take()
             && let Some(chart) = self
                 .tiles
@@ -4531,10 +4569,10 @@ impl Persephone {
 
     /// The panel's chart's playback runs from the open of its first traded bar (earlier ones
     /// warm the strategy up) to the close of its last; also makes sure its timeline is for
-    /// the chart's current bars.
+    /// the chart's current bars. It's the chart a followed trade is on, while there is one.
     fn playback_span(&mut self) -> Option<(UnixNanos, UnixNanos)> {
         let panel = self.panel.as_mut()?;
-        let tile = self.tiles.get(&panel.tile)?;
+        let tile = self.tiles.get(&panel.replay_tile.unwrap_or(panel.tile))?;
         let data = tile.chart.as_ref()?.data();
         if panel.timeline.as_ref().is_none_or(|t| !t.is_for(data)) {
             panel.timeline = Some(backtest::Timeline::new(data));
@@ -4561,7 +4599,7 @@ impl Persephone {
     /// started), with the bar being built in High precision.
     fn sync_playhead(&mut self) {
         let Some(panel) = &self.panel else { return };
-        let id = panel.tile;
+        let id = panel.replay_tile.unwrap_or(panel.tile);
         let Some(at) = panel.playback.at else {
             if let Some(chart) = self.tiles.get_mut(&id).and_then(|t| t.chart.as_mut()) {
                 chart.set_playhead(None);
@@ -4581,7 +4619,7 @@ impl Persephone {
     /// shows bars forming and the playback is slow enough to see them.
     fn forming_bar(&mut self, bars: usize, at: UnixNanos) -> Option<Candle> {
         let panel = self.panel.as_ref()?;
-        let tile = self.tiles.get(&panel.tile)?;
+        let tile = self.tiles.get(&panel.replay_tile.unwrap_or(panel.tile))?;
         if tile.backtest.precision != backtest::Precision::High {
             return None;
         }
@@ -4701,11 +4739,12 @@ impl Persephone {
             return Task::none();
         };
         let span = self.playback_span();
-        // Only the backtest itself plays back.
+        // The backtest plays back, and so does any run whose trades are being followed.
         let plays = self
             .tiles
             .get(&id)
-            .is_some_and(|t| t.backtest.test == backtest::TestKind::Backtest);
+            .is_some_and(|t| t.backtest.test == backtest::TestKind::Backtest)
+            || self.panel.as_ref().is_some_and(|p| p.inspect.is_some());
         if !plays
             && matches!(
                 message,
@@ -4787,13 +4826,23 @@ impl Persephone {
                 panel.tests.trade_row = None;
                 return Task::none();
             }
-            P::ShowTrade(row, exit) => {
+            P::ShowTrade(row, _exit) => {
+                // Followed as any run's trade is: these trades in the drawer, this one on the
+                // chart, the playhead before it.
                 panel.tests.trade_row = Some(row);
-                if let Some(chart) = self.tiles.get_mut(&id).and_then(|t| t.chart.as_mut()) {
-                    // A little past its end, so what came next shows too.
-                    let last = chart.data().candles.len().saturating_sub(1);
-                    chart.show_bar((exit + backtest::REPLAY_LEAD_BARS).min(last));
+                let opened = self.inspect(backtest::InspectWhat::Listed);
+                return Task::batch([opened, self.inspect_trade(row)]);
+            }
+            P::Inspect(what) => return self.inspect(what),
+            P::InspectTrade(row) => return self.inspect_trade(row),
+            P::InspectByProfit(by_profit) => {
+                if let Some(inspection) = panel.inspect.as_mut() {
+                    inspection.by_profit = by_profit;
                 }
+                return Task::none();
+            }
+            P::CloseInspection => {
+                self.close_inspection();
                 return Task::none();
             }
             P::SelectLine(line) => {
@@ -4867,6 +4916,11 @@ impl Persephone {
                 if let Some(tile) = self.tiles.get_mut(&id) {
                     tile.backtest.test = test;
                 }
+                // The drawer's trades were the last test's.
+                self.close_inspection();
+                let Some(panel) = self.panel.as_mut() else {
+                    return Task::none();
+                };
                 panel.playback.reset();
                 panel.tests.reset_fan();
                 self.sync_playhead();
@@ -5404,6 +5458,8 @@ impl Persephone {
             .filter(|_| !tile.hidden.strategy)
             .and_then(|l| Some((l.since?, l.fills.as_slice())));
         chart.set_trades(match (report, live) {
+            // Another run's trades, while the panel follows one of them here.
+            _ if tile.inspected.is_some() => tile.inspected.clone(),
             (report, Some((since, fills))) => Some(studies::live_trades(
                 report.map_or(&[], |r| r.fills.as_slice()),
                 fills,

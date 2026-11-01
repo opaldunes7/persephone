@@ -9,6 +9,7 @@ chart, in the strategy report, and in `persephone-cli`. This guide walks through
 - [Strategies and backtests](#strategies-and-backtests)
 - [The backtest panel](#the-backtest-panel)
 - [The calendar: replaying a day's trades](#the-calendar-replaying-a-days-trades)
+- [Following any test's trades](#following-any-tests-trades)
 - [Skill or luck: Monte Carlo and random blocks](#skill-or-luck-monte-carlo-and-random-blocks)
 - [Optimizing a strategy](#optimizing-a-strategy)
 - [Parameter sweeps](#parameter-sweeps)
@@ -211,6 +212,29 @@ Hover over any square or total for its percentage of the capital. With a day ope
 and **Day after** step through the days that have trades. Changing the backtest takes the calendar
 back to its months.
 
+## Following any test's trades
+
+Every test can be taken down to single trades and played on a chart. The trades open in a drawer
+beside the test: when each opened and closed, the market, long or short, its size, its profit after
+fees, its return on what it put in, and its fees. **By profit** puts the best first. Click a trade
+and playback pauses with the playhead 10 bars before it opened, the trade shaded and edged in
+yellow, and every other trade of that run as markers. Press **Play** or **Step** to watch it happen,
+at any speed. **✕** closes the drawer and the chart goes back to its own trades, whole.
+
+| Test | Where its trades open |
+|---|---|
+| Backtest | **Trades** in the legend |
+| Monte Carlo, Random blocks | a run's trade list beside the lines: click a trade |
+| Optimize | click a value's row or its square; **Apply** puts it on the strategy |
+| Walk-forward | click a window's row: its pick, on its unseen stretch alone |
+| Random entries, shifted signals | click the returns chart: the run nearest that return |
+| Portfolio | **Trades** beside the markets; a sweep's row; a walk-forward window's row |
+
+Runs a test kept only the figures of are run again on their own, which takes a moment; their trades
+add up to the figure on the row. A portfolio's trade on a market the panel's chart isn't showing
+opens a chart of that market beside it, which the playback then drives; later trades on that market
+use the same chart. Moving to another test, or changing the backtest, closes the drawer.
+
 ## Skill or luck: Monte Carlo and random blocks
 
 A backtest is one path through one stretch of history, which can't tell skill from luck. **Test**
@@ -313,8 +337,9 @@ on the chart's bars.
   that made money where it was picked but lost on the unseen bars shows in orange, and is likely
   only fit to the past.
 
-Click a row or a bar to put that value on the strategy and see its trades on the chart; the results
-stay, so you can try several, and **Back to the original** undoes it. A live session on that chart
+Click a row or a bar to see that value's trades beside the results, and follow one on the chart
+(see [Following any test's trades](#following-any-tests-trades)). **Apply** on a row puts that value
+on the strategy; the results stay, so you can try several, and **Back to the original** undoes it. A live session on that chart
 stops, as it runs the old settings. Changing anything else clears the results.
 
 ## Parameter sweeps
