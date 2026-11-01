@@ -253,6 +253,8 @@ pub enum InspectWhat {
     /// The random placing, or the shift of the backtest's timing, whose return was nearest this.
     RandomPlacing(f64),
     ShiftedPlacing(f64),
+    /// The portfolio's trades placed at random, the placing whose return was nearest this.
+    PortfolioRandomPlacing(f64),
 }
 
 /// The results of the tests beyond the backtest itself. They aren't saved: they follow from the
@@ -278,6 +280,7 @@ pub struct Tests {
     pub portfolio_vary: portfolio_tests::Vary,
     pub portfolio_sweep: TestRun<Vec<portfolio_tests::SweepRow>>,
     pub portfolio_shifted: TestRun<positions::RandomEntries>,
+    pub portfolio_random: TestRun<positions::RandomEntries>,
     pub portfolio_monte_carlo: TestRun<portfolio_tests::PortfolioMonteCarlo>,
     pub portfolio_walk: TestRun<walk_forward::WalkForward>,
     /// Random entries moves the backtest's own timing rather than placing its trades afresh.
@@ -318,6 +321,7 @@ impl Default for Tests {
             portfolio_vary: portfolio_tests::Vary::Scale,
             portfolio_sweep: TestRun::Idle,
             portfolio_shifted: TestRun::Idle,
+            portfolio_random: TestRun::Idle,
             portfolio_monte_carlo: TestRun::Idle,
             portfolio_walk: TestRun::Idle,
             entries_shifted: false,
@@ -416,6 +420,7 @@ impl Tests {
         self.portfolio = TestRun::Idle;
         self.portfolio_sweep = TestRun::Idle;
         self.portfolio_shifted = TestRun::Idle;
+        self.portfolio_random = TestRun::Idle;
         self.portfolio_monte_carlo = TestRun::Idle;
         self.portfolio_walk = TestRun::Idle;
         self.shifted = TestRun::Idle;
@@ -683,6 +688,7 @@ pub enum PortfolioView {
     Run,
     Sweep,
     Shifted,
+    RandomEntries,
     MonteCarlo,
     WalkForward,
 }

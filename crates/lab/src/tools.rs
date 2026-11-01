@@ -806,7 +806,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         job(
             "run_random_entries",
-            "Whether a run beat chance: the same holds and directions at random times, on the same bars and settings, many times over. Returns and falls are fractions.",
+            "Whether a run beat chance: the same holds and directions at random times, on the same bars and settings, many times over. For a portfolio, each leg's own trades, with their shares of the account, are placed at random leg by leg and run as a table of weights; `actual_return` is then the run's own trades as a table at their own times. `by_draw` lists each placing's draw and return. Returns and falls are fractions.",
             vec![
                 RUN_ID,
                 opt("runs", "integer", "How many random placings. Default 200."),
@@ -836,6 +836,7 @@ pub fn tools() -> Vec<Tool> {
                 "warning",
                 "variants_tried",
                 "share_matching_adjusted",
+                "by_draw",
             ],
         ),
         job(
@@ -1304,7 +1305,10 @@ impl Lab {
         // A portfolio's run has no one market's trades, and an empty answer would read as none made.
         if let Some(id) = args.get("run_id").and_then(Value::as_str)
             && !name.starts_with("get_portfolio")
-            && !matches!(name, "run_shifted" | "run_portfolio_monte_carlo")
+            && !matches!(
+                name,
+                "run_shifted" | "run_portfolio_monte_carlo" | "run_random_entries"
+            )
             && self.is_portfolio_run(id)
         {
             return Err(format!(

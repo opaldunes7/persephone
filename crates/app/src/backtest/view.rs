@@ -486,6 +486,46 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                 }
             }
         }
+        (_, TestKind::Portfolio) if panel.tests.portfolio_view == PortfolioView::RandomEntries => {
+            match &panel.tests.portfolio_random {
+                TestRun::Done(found) => {
+                    heading = heading
+                        .push(figure("This book", percent(found.actual_return), up_or_down(found.actual_return), "The run's own trades as a table of weights at their own times: what the placings are held against."))
+                        .push(figure("Median", percent(found.median), up_or_down(found.median), "The return half the placings beat."))
+                        .push(figure("As good", format!("{:.0}%", found.share_matching_return * 100.0), theme::TEXT, "The share of placings that returned at least as much. Near 50% means the entries added nothing."))
+                        .push(figure("As safe", format!("{:.0}%", found.share_matching_fall * 100.0), theme::TEXT, "The share of placings that fell no further."));
+                    note = Some(muted(if found.trades < 2 {
+                        "With one trade there's little to place at random, so this says almost nothing.".to_owned()
+                    } else {
+                        format!(
+                            "{} trades placed at random {} times, each leg's apart. 19 in 20 returned {} to {}. Click the returns to see a placing's trades.",
+                            found.trades,
+                            found.runs,
+                            percent(found.low),
+                            percent(found.high),
+                        )
+                    }));
+                    placing_charts(found, |value| {
+                        PanelMessage::Inspect(InspectWhat::PortfolioRandomPlacing(value))
+                    })
+                }
+                TestRun::Running { done, total, .. } => {
+                    note = Some(muted(format!("Running {done} of {total}…")));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+                TestRun::Failed(message) => {
+                    note = Some(text(message.as_str()).size(SMALL).color(theme::DOWN));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+                TestRun::Idle => {
+                    note = Some(muted(
+                        "Press Run to place the last run's trades at random along the span."
+                            .to_owned(),
+                    ));
+                    Space::new().width(Fill).height(Fill).into()
+                }
+            }
+        }
         (_, TestKind::Portfolio) if panel.tests.portfolio_view == PortfolioView::MonteCarlo => {
             match &panel.tests.portfolio_monte_carlo {
                 TestRun::Done(found) => {
@@ -1507,6 +1547,37 @@ fn shifted_charts(found: &RandomEntries) -> Element<'_, PanelMessage> {
             band: Some((found.low, found.high)),
             median: found.median,
             pick,
+        })
+        .width(FillPortion(3))
+        .height(Fill),
+        canvas(Distribution {
+            title: "How far each fell at worst",
+            values: &found.falls,
+            actual: found.actual_fell,
+            band: None,
+            median: percentile(&found.falls, 0.5),
+            pick: None,
+        })
+        .width(FillPortion(2))
+        .height(Fill),
+    ]
+    .into()
+}
+
+/// What random placings returned and how far they fell, a click on the returns opening the
+/// placing nearest.
+fn placing_charts(
+    found: &RandomEntries,
+    pick: fn(f64) -> PanelMessage,
+) -> Element<'_, PanelMessage> {
+    row![
+        canvas(Distribution {
+            title: "What the placings returned",
+            values: &found.returns,
+            actual: found.actual_return,
+            band: Some((found.low, found.high)),
+            median: found.median,
+            pick: Some(pick),
         })
         .width(FillPortion(3))
         .height(Fill),

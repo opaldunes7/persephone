@@ -4527,6 +4527,36 @@ fn a_portfolio_can_be_kept_within_the_account() {
 }
 
 #[test]
+fn a_portfolios_trades_can_be_placed_at_random() {
+    let (lab, _dir) = lab();
+    let portfolio = lab
+        .dispatch(
+            "run_portfolio",
+            &json!({
+                "legs": [{"symbol": "BTCUSDT", "venue": "TEST", "weight": 1.0, "strategy": ema()}],
+                "bars": "1h",
+                "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    let args = json!({
+        "run_id": portfolio["run_id"], "runs": 20, "seed": 3, "variants_tried": 10,
+        "wait_seconds": 240,
+    });
+    let found = lab.dispatch("run_random_entries", &args).unwrap();
+    assert_eq!(found["runs"], 20, "{found}");
+    assert!(found["trades"].as_u64().unwrap() > 2);
+    assert_eq!(found["by_draw"].as_array().unwrap().len(), 20);
+    assert!(
+        found["share_matching_adjusted"].as_f64().unwrap()
+            >= found["share_matching_return"].as_f64().unwrap()
+    );
+    // The same seed, the same placings.
+    let again = lab.dispatch("run_random_entries", &args).unwrap();
+    assert_eq!(again["by_draw"], found["by_draw"]);
+}
+
+#[test]
 fn one_market_as_a_portfolio_reads_as_its_backtest_does() {
     let (lab, _dir) = lab();
     let settings = json!({"commission": {"on": true, "value": {"percent": 0.1}}});

@@ -333,14 +333,14 @@ Returns: `profitable`, `median`, `best`, `worst`, `blocks`, `total`, `chart`, `m
 
 ## `run_random_entries` *job*
 
-Whether a run beat chance: the same holds and directions at random times, on the same bars and settings, many times over. Returns and falls are fractions.
+Whether a run beat chance: the same holds and directions at random times, on the same bars and settings, many times over. For a portfolio, each leg's own trades, with their shares of the account, are placed at random leg by leg and run as a table of weights; `actual_return` is then the run's own trades as a table at their own times. `by_draw` lists each placing's draw and return. Returns and falls are fractions.
 
 - `run_id` (string, required): A run, from run_backtest or list_runs.
 - `runs` (integer): How many random placings. Default 200.
 - `seed` (integer): The same seed gives the same placings. Default 0.
 - `variants_tried` (integer): How many variants this run was picked from, counting every setting, rule and span you tried. `share_matching_adjusted` is then the chance that one of that many worthless tries would have done as well. Default 1.
 
-Returns: `runs`, `trades`, `actual_return`, `share_matching_return`, `share_matching_fall`, `median`, `low`, `high`, `actual_fell`, `fall_chart`, `return_chart`, `warning`, `variants_tried`, `share_matching_adjusted`
+Returns: `runs`, `trades`, `actual_return`, `share_matching_return`, `share_matching_fall`, `median`, `low`, `high`, `actual_fell`, `fall_chart`, `return_chart`, `warning`, `variants_tried`, `share_matching_adjusted`, `by_draw`
 
 ## `run_walk_forward` *job*
 

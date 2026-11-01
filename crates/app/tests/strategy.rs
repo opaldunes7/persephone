@@ -2220,6 +2220,42 @@ mod panel {
     }
 
     #[test]
+    fn a_portfolios_trades_placed_at_random_are_found_again_by_what_they_returned() {
+        use persephone::backtest::{InspectWhat, PortfolioView, TestRun};
+        let mut app = portfolio_panel();
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        panel(
+            &mut app,
+            PanelMessage::PortfolioView(PortfolioView::RandomEntries),
+        );
+        assert!(shows(
+            &app,
+            "Press Run to place the last run's trades at random along the span."
+        ));
+        panel(&mut app, PanelMessage::Input(Field::Entries, "6".into()));
+        panel(&mut app, PanelMessage::Submit(Field::Entries));
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        let TestRun::Done(found) = &app.panel().unwrap().tests.portfolio_random else {
+            panic!("{:?}", app.panel().unwrap().tests.portfolio_random);
+        };
+        assert_eq!((found.runs, found.by_draw.len()), (6, 6));
+        assert!(shows(&app, "As good"));
+        let (_, returned) = found.by_draw[2];
+        run_task(
+            &mut app,
+            PanelMessage::Inspect(InspectWhat::PortfolioRandomPlacing(returned)),
+        );
+        let trades = ledger(&app);
+        assert!(!trades.rows.is_empty());
+        // The first placing that returned that, which may be an earlier one returning the same.
+        let title = &app.panel().unwrap().inspect.as_ref().unwrap().title;
+        assert!(
+            title.ends_with(&format!("which returned {:+.2}%", returned * 100.0)),
+            "{title}"
+        );
+    }
+
+    #[test]
     fn a_shift_of_the_backtests_timing_is_found_again_by_what_it_returned() {
         use persephone::backtest::{InspectWhat, TestRun};
         let mut app = ready_panel(TestKind::RandomEntries);

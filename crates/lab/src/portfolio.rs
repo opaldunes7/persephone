@@ -8,7 +8,10 @@ use persephone_engine::{PortfolioLeg, PortfolioRequest};
 use persephone_research::{
     figures,
     portfolio::{self, LegSetup, PortfolioSetup, RebalanceSetup},
-    portfolio_tests::{self, Candidate, PickBy, ShiftedJob, ShiftedPortfolioJob, WalkJob},
+    portfolio_tests::{
+        self, Candidate, PickBy, RandomPortfolioJob, ShiftedJob, ShiftedPortfolioJob, WalkJob,
+    },
+    positions::RandomEntries,
     robustness::pool,
     trades::Ledger,
 };
@@ -380,6 +383,28 @@ impl Lab {
             "return_chart": histogram_json(&found.returns, found.actual_return),
             "fall_chart": histogram_json(&found.falls, found.actual_fell),
         }))
+    }
+
+    /// A portfolio's trades placed at random, for run_random_entries.
+    pub(crate) fn random_portfolio_entries(
+        &self,
+        id: &str,
+        run: &Value,
+        draws: usize,
+        seed: u64,
+        job: &Arc<Job>,
+    ) -> Result<RandomEntries, String> {
+        let saved = portfolio::load_saved(&self.paths.lab().join("runs"), id)?;
+        RandomPortfolioJob {
+            report: Arc::new(saved.report),
+            request: self.prepare_portfolio(&run["request"])?,
+            from_index: saved.from_index,
+            runs: draws,
+            seed,
+            workers: workers(),
+            stop: Arc::clone(&job.stop),
+        }
+        .run(&|done| job.done.store(done, Ordering::Relaxed))
     }
 
     /// A portfolio's account returns, drawn again in blocks.

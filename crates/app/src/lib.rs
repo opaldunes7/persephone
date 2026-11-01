@@ -500,6 +500,8 @@ pub enum Message {
     SweepProgress(u64, usize),
     PortfolioShiftedDone(u64, Result<Arc<backtest::positions::RandomEntries>, String>),
     PortfolioShiftedProgress(u64, usize),
+    PortfolioRandomDone(u64, Result<Arc<backtest::positions::RandomEntries>, String>),
+    PortfolioRandomProgress(u64, usize),
     PortfolioWalkDone(
         u64,
         Result<Arc<backtest::walk_forward::WalkForward>, String>,
@@ -1341,6 +1343,16 @@ impl Persephone {
             Message::PortfolioShiftedDone(run, result) => {
                 if let Some(panel) = self.panel.as_mut() {
                     panel.tests.portfolio_shifted.finish(run, result);
+                }
+            }
+            Message::PortfolioRandomProgress(run, count) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.portfolio_random.progress(run, count);
+                }
+            }
+            Message::PortfolioRandomDone(run, result) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.portfolio_random.finish(run, result);
                 }
             }
             Message::PortfolioWalkProgress(run, count) => {
@@ -3874,6 +3886,7 @@ impl Persephone {
                 self.run_portfolio_candidates()
             }
             Some(backtest::PortfolioView::Shifted) => self.run_portfolio_shifted(),
+            Some(backtest::PortfolioView::RandomEntries) => self.run_portfolio_random(),
             Some(backtest::PortfolioView::MonteCarlo) => self.run_portfolio_monte_carlo(),
             _ => self.run_portfolio_test(),
         }
@@ -4078,6 +4091,65 @@ impl Persephone {
             },
             Message::PortfolioShiftedProgress,
             Message::PortfolioShiftedDone,
+        )
+    }
+
+    /// The last portfolio run's trades, each leg's placed at random along the span.
+    fn run_portfolio_random(&mut self) -> Task<Message> {
+        use backtest::{TestRun, portfolio_tests};
+        let Some(found) = self
+            .panel
+            .as_ref()
+            .and_then(|panel| match &panel.tests.portfolio {
+                TestRun::Done(found) => Some(Arc::clone(found)),
+                _ => None,
+            })
+        else {
+            if let Some(panel) = self.panel.as_mut() {
+                panel.tests.portfolio_random = TestRun::Failed(
+                    "Run the portfolio first, then this places its trades at random.".into(),
+                );
+            }
+            return Task::none();
+        };
+        let inputs = match self.portfolio_inputs() {
+            Ok(inputs) => inputs,
+            Err(message) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.portfolio_random = TestRun::Failed(message);
+                }
+                return Task::none();
+            }
+        };
+        let Some(panel) = self.panel.as_mut() else {
+            return Task::none();
+        };
+        let run = backtest::next_run();
+        let runs = panel_entries(&inputs.settings);
+        let seed = panel.tests.seed;
+        let flag = Arc::new(AtomicBool::new(false));
+        panel.tests.portfolio_random = TestRun::Running {
+            run,
+            done: 0,
+            total: runs,
+            stop: backtest::StopOnDrop(Arc::clone(&flag)),
+        };
+        batch_task(
+            run,
+            move |progress| {
+                portfolio_tests::RandomPortfolioJob {
+                    report: Arc::new(found.report.clone()),
+                    request: inputs.request()?,
+                    from_index: found.from_index,
+                    runs,
+                    seed,
+                    workers: portfolio_workers(),
+                    stop: flag,
+                }
+                .run(&|count| progress(count))
+            },
+            Message::PortfolioRandomProgress,
+            Message::PortfolioRandomDone,
         )
     }
 
@@ -5092,6 +5164,7 @@ impl Persephone {
             P::StopPortfolioTest => {
                 panel.tests.portfolio_sweep = backtest::TestRun::Idle;
                 panel.tests.portfolio_shifted = backtest::TestRun::Idle;
+                panel.tests.portfolio_random = backtest::TestRun::Idle;
                 panel.tests.portfolio_walk = backtest::TestRun::Idle;
                 return Task::none();
             }

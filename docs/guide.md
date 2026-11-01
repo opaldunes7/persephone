@@ -602,6 +602,7 @@ The chips over the settings ask whether a result is luck:
 
 - **Sweep** varies one thing, such as a weight, rebalancing or a cost, from **Min** to **Max** by **Step**, into a table with the best first. **Deflated** on the best row is its Sharpe ratio deflated for having been picked from the rest. Click a row to see that setup's trades.
 - **Shifted** moves the last run's book along the span by random amounts, wrapping round. It holds the same things for as long, and only the timing goes. **As good** near 50% means the timing added nothing. **Random entries** has the same test for one market, under **Shifted**.
+- **Random entries** places the last run's trades at random along the span instead: each market's own trades keep their direction, how long they were held and their share of the account, and land at random times, market by market, run as a table of weights with the same costs. **This book** is the run's own trades as such a table at their own times. **As good** near 50% means the entries added nothing. Click the returns chart to see the placing nearest that return, and follow its trades on a chart.
 - **Monte Carlo** draws the last run's returns again in blocks of **Block** bars, keeping how the markets moved together, and shows the band 19 in 20 stayed inside.
 - **Walk-forward** picks the best of the sweep's values on each stretch, trades it on the unseen one after, and slides along. **Windows** and **Ratio** are Walk-forward's own, and Run shows the same chart and table.
 

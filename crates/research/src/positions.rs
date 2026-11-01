@@ -182,11 +182,24 @@ pub fn random_entries(
     end: usize,
     seed: u64,
 ) -> Option<Vec<(usize, i8)>> {
+    placed_at_random(holds, first, end, seed, &0)
+}
+
+/// As [`random_entries`], for holds of anything: each is what's held and for how many bars, and
+/// `flat` is what's held between them. The same seed places the same number of holds alike,
+/// whatever they hold.
+pub fn placed_at_random<T: Clone + PartialEq>(
+    holds: &[(T, usize)],
+    first: usize,
+    end: usize,
+    seed: u64,
+    flat: &T,
+) -> Option<Vec<(usize, T)>> {
     let mut rng = StdRng::seed_from_u64(seed);
     let rng = &mut rng;
     let held: usize = holds.iter().map(|hold| hold.1).sum();
     let spare = end.checked_sub(first)?.checked_sub(held)?;
-    let mut order: Vec<(i8, usize)> = holds.to_vec();
+    let mut order: Vec<(T, usize)> = holds.to_vec();
     order.shuffle(rng);
     // Where the gaps fall: as many cuts of the spare bars as there are holds.
     let mut cuts: Vec<usize> = (0..order.len())
@@ -200,13 +213,13 @@ pub fn random_entries(
         // Right after the last, the entry itself ends what came before.
         if changes
             .last()
-            .is_some_and(|last: &(usize, i8)| last.0 == entry)
+            .is_some_and(|last: &(usize, T)| last.0 == entry)
         {
             changes.pop();
         }
         changes.push((entry, direction));
         used += bars;
-        changes.push((entry + bars, 0));
+        changes.push((entry + bars, flat.clone()));
     }
     // The last can run to the end, with no bar to close on.
     if changes.last().is_some_and(|last| last.0 >= end) {
@@ -488,6 +501,45 @@ mod tests {
             assert_eq!((long, short), (60, 6), "{changes:?}");
         }
         assert!(random_entries(&holds, 0, 10, 0).is_none());
+    }
+
+    #[test]
+    fn holds_of_any_kind_keep_each_share_and_how_long_it_was_held() {
+        let holds = [(0.5_f64, 10), (-0.3, 5), (0.5, 30), (0.2, 1)];
+        for seed in 0..200 {
+            let changes = placed_at_random(&holds, 100, 180, seed, &0.0).unwrap();
+            let mut placed: Vec<(i64, usize)> = changes
+                .iter()
+                .enumerate()
+                .filter(|(_, change)| change.1 != 0.0)
+                .map(|(i, &(bar, share))| {
+                    let until = changes.get(i + 1).map_or(180, |next| next.0);
+                    ((share * 10.0).round() as i64, until - bar)
+                })
+                .collect();
+            placed.sort_unstable();
+            assert_eq!(
+                placed,
+                vec![(-3, 5), (2, 1), (5, 10), (5, 30)],
+                "{changes:?}"
+            );
+        }
+        // The same seed places directions as random_entries does.
+        let signs = [(1_i8, 10), (-1, 5), (1, 30)];
+        let as_shares: Vec<(f64, usize)> = signs.iter().map(|&(d, b)| (f64::from(d), b)).collect();
+        for seed in 0..20 {
+            let bars = |changes: Vec<(usize, f64)>| -> Vec<usize> {
+                changes.into_iter().map(|c| c.0).collect()
+            };
+            assert_eq!(
+                bars(placed_at_random(&as_shares, 0, 100, seed, &0.0).unwrap()),
+                random_entries(&signs, 0, 100, seed)
+                    .unwrap()
+                    .into_iter()
+                    .map(|c| c.0)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

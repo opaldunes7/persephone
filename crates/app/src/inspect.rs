@@ -53,7 +53,60 @@ impl Persephone {
             InspectWhat::PortfolioWalkWindow(window) => self.inspect_portfolio(None, Some(window)),
             InspectWhat::RandomPlacing(value) => self.inspect_placing(id, false, value),
             InspectWhat::ShiftedPlacing(value) => self.inspect_placing(id, true, value),
+            InspectWhat::PortfolioRandomPlacing(value) => self.inspect_portfolio_placing(value),
         }
+    }
+
+    /// The portfolio's placing at random whose return was nearest `value`, run again alone.
+    fn inspect_portfolio_placing(&mut self, value: f64) -> Task<Message> {
+        use backtest::{portfolio, portfolio_tests};
+        let Some(panel) = self.panel.as_ref() else {
+            return Task::none();
+        };
+        let (TestRun::Done(found), TestRun::Done(ran)) =
+            (&panel.tests.portfolio_random, &panel.tests.portfolio)
+        else {
+            return Task::none();
+        };
+        let Some(draw) = found.draw_near(value) else {
+            return Task::none();
+        };
+        let returned = found
+            .by_draw
+            .iter()
+            .find(|(known, _)| *known == draw)
+            .map_or(value, |(_, returned)| *returned);
+        let (seed, ran) = (panel.tests.seed, Arc::clone(ran));
+        let what = InspectWhat::PortfolioRandomPlacing(value);
+        let title = format!(
+            "Placing {}, which returned {:+.2}%",
+            draw + 1,
+            returned * 100.0
+        );
+        let inputs = match self.portfolio_inputs() {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.inspect = Some(Inspection::new(what, title, Inspected::Failed(error)));
+                }
+                return Task::none();
+            }
+        };
+        let venues = self.leg_venues();
+        self.find_trades(what, title, venues, move || {
+            let placed = portfolio_tests::RandomPortfolioJob {
+                report: Arc::new(ran.report.clone()),
+                request: inputs.request()?,
+                from_index: ran.from_index,
+                runs: 1,
+                seed,
+                workers: 1,
+                stop: Arc::default(),
+            }
+            .placing(draw)?;
+            let run = portfolio::run(placed, false)?;
+            Ok(Ledger::from_portfolio(&run))
+        })
     }
 
     /// Trades already in hand, ready to follow.

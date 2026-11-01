@@ -545,6 +545,7 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                 chip_of("Run", PortfolioView::Run, "One run of this book."),
                 chip_of("Sweep", PortfolioView::Sweep, "Vary one thing from Min to Max by Step, into a table with the best first."),
                 chip_of("Shifted", PortfolioView::Shifted, "The last run's book moved along the span by random amounts. If those do as well, its timing is worth nothing."),
+                chip_of("Random entries", PortfolioView::RandomEntries, "The last run's trades, each leg's placed at random along the span with the same directions, lengths and shares. If those do as well, its entries are worth nothing."),
                 chip_of("Monte Carlo", PortfolioView::MonteCarlo, "The last run's returns drawn again in blocks, keeping how the markets moved together."),
                 chip_of("Walk-forward", PortfolioView::WalkForward, "Each window picks the best of the sweep's values on its stretch, and trades it on the unseen one after."),
             ]
@@ -618,6 +619,20 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                             matches!(panel.tests.portfolio_shifted, TestRun::Running { .. }),
                             matches!(panel.tests.portfolio_shifted, TestRun::Done(_)),
                             "Move the last run's book along the span, that many times.",
+                        ))
+                        .align_right(Fill),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center)
+                    .into(),
+                ),
+                PortfolioView::RandomEntries => Some(
+                    row![
+                        small("Runs", Field::Entries, "How many times to place them."),
+                        container(test_run(
+                            matches!(panel.tests.portfolio_random, TestRun::Running { .. }),
+                            matches!(panel.tests.portfolio_random, TestRun::Done(_)),
+                            "Place the last run's trades at random along the span, that many times.",
                         ))
                         .align_right(Fill),
                     ]

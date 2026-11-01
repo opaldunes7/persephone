@@ -170,8 +170,11 @@ A strategy is `{"builtin": id}`, `{"plugin": id}`, `{"logic": tree}` or `{"posit
   from weights isn't quite how a strategy sizes. A table run is already a table, so there it's the run itself. `run_portfolio_monte_carlo` draws the account's returns again in blocks along the timeline, keeping how the markets moved together. It doesn't run fills or costs again.
   `run_portfolio_walk_forward` picks among `candidates` on each stretch and trades the pick on the unseen one after. A candidate with `"weights": {}` stays flat, and is picked when all else loses; one naming no `legs` takes the first candidate's. Candidates merge with `defaults` as `run_portfolios`' runs do, and the stretches are worked out from the first candidate's `walk_ratio` and `warm_up_bars`. A candidate that can't be run stops the call, saying which `item` it is. In its answer `buy_and_hold_return` is equal shares of the markets, with no funding taken off. It and `unseen_return` add up each window from the same capital, and `unseen_compounded` and `buy_and_hold_compounded` run them one after another. `buy_and_hold_whole` is equal shares held once from the first unseen bar to the last, with no gaps between windows: the market to beat. `headline` puts `unseen_compounded` beside it.
 - **What it doesn't do yet.** Market orders only: `limit`, stops and targets are for single
-  markets, and are refused. `precision: "high"` does nothing here, as portfolios fill on bars. `run_optimize`, `run_monte_carlo`, `run_walk_forward` and `run_random_entries` don't take a portfolio, so
-  sweep with `run_portfolios`. A plugin can be a leg or write a weight table, but can't see several markets at once. All legs must be quoted in
+  markets, and are refused. `precision: "high"` does nothing here, as portfolios fill on bars. `run_optimize`, `run_monte_carlo` and `run_walk_forward` don't take a portfolio, so
+  sweep with `run_portfolios`. `run_random_entries` does: each leg's own trades keep their direction, how long they were held
+  and their share of the account, and are placed at random along the span, leg by leg, then run as a table of weights with
+  the same costs. As with `run_shifted`, `actual_return` is the run's own trades as a table at their own times, which a row
+  stating the whole book sizes slightly differently from a strategy. A plugin can be a leg or write a weight table, but can't see several markets at once. All legs must be quoted in
   one currency and share time bars. Paper and live trading don't run them.
 - **A check on all of this:** one leg at weight 1 with its strategy comes out exactly as `run_backtest` does: its fills, equity, costs and figures.
 

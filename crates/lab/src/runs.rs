@@ -920,21 +920,31 @@ impl Lab {
     /// A run's holds at random times, many times over: what the same trading comes to with entries
     /// owing nothing to the strategy.
     pub(crate) fn run_random_entries(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {
-        let run = self.load_run(text(args, "run_id")?)?;
-        let report = report_from(&run);
-        let (request, from_index, _) = self.prepare(&run["request"])?;
+        let id = text(args, "run_id")?;
+        let run = self.load_run(id)?;
         let draws = number(args, "runs", 200).clamp(1, MAX_BACKTESTS as u64) as usize;
+        let seed = number(args, "seed", 0);
         job.total.store(draws, Ordering::Relaxed);
-        let found = RandomEntriesJob {
-            report: Arc::new(report),
-            workers: self.workers_for(&request.strategy),
-            request,
-            from_index,
-            runs: draws,
-            seed: number(args, "seed", 0),
-            stop: Arc::clone(&job.stop),
-        }
-        .run(&|done| job.done.store(done, Ordering::Relaxed))?;
+        let found = if run["kind"] == "portfolio" {
+            self.random_portfolio_entries(id, &run, draws, seed, job)?
+        } else {
+            let (request, from_index, _) = self.prepare(&run["request"])?;
+            RandomEntriesJob {
+                report: Arc::new(report_from(&run)),
+                workers: self.workers_for(&request.strategy),
+                request,
+                from_index,
+                runs: draws,
+                seed,
+                stop: Arc::clone(&job.stop),
+            }
+            .run(&|done| job.done.store(done, Ordering::Relaxed))?
+        };
+        let by_draw: Vec<Value> = found
+            .by_draw
+            .iter()
+            .map(|(draw, returned)| json!([draw, returned]))
+            .collect();
         Ok(json!({
             "runs": found.runs,
             "trades": found.trades,
@@ -950,6 +960,7 @@ impl Lab {
             "high": found.high,
             "return_chart": histogram_json(&found.returns, found.actual_return),
             "fall_chart": histogram_json(&found.falls, found.actual_fell),
+            "by_draw": by_draw,
         }))
     }
 

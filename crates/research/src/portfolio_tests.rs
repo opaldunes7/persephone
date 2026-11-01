@@ -14,7 +14,7 @@ use rand::{RngExt as _, SeedableRng as _, rngs::StdRng};
 use crate::{
     figures,
     portfolio::{self, PortfolioRun, PortfolioSetup},
-    positions::{Positions, RandomEntries},
+    positions::{Positions, RandomEntries, placed_at_random},
     results::with_params,
     robustness::{backtest, percentile, pool},
     settings::Settings,
@@ -357,6 +357,203 @@ impl ShiftedPortfolioJob {
         }
         // Each draw here is a weight table, not a run to follow on one chart.
         Ok(summing_up(returns, falls, book.len(), actual, Vec::new()))
+    }
+}
+
+/// A portfolio's trades at random times. Each leg's own trades keep their direction, how long they
+/// were held and their share of the account when they began; they're placed at random along the
+/// span, leg by leg, with gaps between, and the book is run as a table of weights with the same
+/// costs. The run's own trades as a table at their own times are what the placings are held
+/// against, as sizing from weights isn't quite how a strategy sizes: a row states the whole book,
+/// so legs held are sized again from the account whenever another leg changes.
+pub struct RandomPortfolioJob {
+    pub report: Arc<PortfolioReport>,
+    pub request: PortfolioRequest,
+    pub from_index: usize,
+    pub runs: usize,
+    pub seed: u64,
+    pub workers: usize,
+    pub stop: Arc<AtomicBool>,
+}
+
+/// Each leg's trades, as its share of the account (signed) and how many moments it was held.
+type Holds = Vec<Vec<(f64, usize)>>;
+
+impl RandomPortfolioJob {
+    /// Each leg's trades, and when each began and ended, by the bar it was decided on.
+    fn trades(&self) -> Vec<Vec<(f64, usize, Option<usize>)>> {
+        let report = &self.report;
+        let end = report.times.len();
+        let decided = |bar: usize| {
+            if self.request.sim.next_open {
+                bar.saturating_sub(1)
+            } else {
+                bar
+            }
+        };
+        report
+            .legs
+            .iter()
+            .map(|leg| {
+                crate::trades::leg_round_trips(leg)
+                    .iter()
+                    .filter_map(|trip| {
+                        let equity = *report.equity.get(trip.entry_bar)?;
+                        if equity <= 0.0 {
+                            return None;
+                        }
+                        let share = trip.qty * trip.entry_price / equity;
+                        let share = if trip.long { share } else { -share };
+                        let from = decided(trip.entry_bar).max(self.from_index);
+                        let to = (!trip.open).then(|| decided(trip.exit_bar).min(end));
+                        Some((share, from, to))
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn holds(&self) -> Holds {
+        let end = self.report.times.len();
+        self.trades()
+            .into_iter()
+            .map(|trades| {
+                trades
+                    .into_iter()
+                    .map(|(share, from, to)| (share, to.unwrap_or(end).saturating_sub(from).max(1)))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Each leg's changes of share, by bar, joined into one table of the whole book.
+    fn table_of(&self, legs: &[Vec<(usize, f64)>]) -> PortfolioRequest {
+        let times = &self.report.times;
+        let mut moments: Vec<usize> = legs.iter().flatten().map(|change| change.0).collect();
+        moments.sort_unstable();
+        moments.dedup();
+        let mut book = vec![0.0; legs.len()];
+        let mut next = vec![0; legs.len()];
+        let mut rows = Vec::with_capacity(moments.len());
+        for at in moments {
+            for (leg, changes) in legs.iter().enumerate() {
+                while let Some(&(when, share)) = changes.get(next[leg]) {
+                    if when > at {
+                        break;
+                    }
+                    book[leg] = share;
+                    next[leg] += 1;
+                }
+            }
+            if let Some(&time) = times.get(at) {
+                rows.push((time, book.clone()));
+            }
+        }
+        let mut trying = self.request.clone();
+        for leg in &mut trying.legs {
+            leg.strategy = None;
+            leg.plugin = None;
+        }
+        trying.rebalance = persephone_engine::Rebalance::default();
+        trying.weights = Some(Arc::new(rows));
+        trying
+    }
+
+    /// The run's own trades, as a table at their own times.
+    fn own_table(&self) -> PortfolioRequest {
+        let legs: Vec<Vec<(usize, f64)>> = self
+            .trades()
+            .into_iter()
+            .map(|trades| {
+                let mut changes = Vec::new();
+                for (share, from, to) in trades {
+                    // A trade beginning where the last ended replaces its close.
+                    if changes
+                        .last()
+                        .is_some_and(|last: &(usize, f64)| last.0 == from)
+                    {
+                        changes.pop();
+                    }
+                    changes.push((from, share));
+                    if let Some(to) = to {
+                        changes.push((to, 0.0));
+                    }
+                }
+                changes
+            })
+            .collect();
+        self.table_of(&legs)
+    }
+
+    fn placed(&self, holds: &Holds, draw: u64) -> Result<PortfolioRequest, String> {
+        let end = self.report.times.len();
+        let legs = holds
+            .iter()
+            .enumerate()
+            .map(|(leg, holds)| {
+                // Each leg its own draw, so they don't land together.
+                let seed =
+                    self.seed ^ (draw << 16) ^ (leg as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                placed_at_random(holds, self.from_index, end, seed, &0.0).ok_or_else(|| {
+                    format!(
+                        "{}'s trades don't fit the span.",
+                        self.report.legs[leg].symbol
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(self.table_of(&legs))
+    }
+
+    /// Placing `draw` alone, as `run` runs it, to look into its trades.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message if the run made no trades or they don't fit.
+    pub fn placing(&self, draw: u64) -> Result<PortfolioRequest, String> {
+        let holds = self.holds();
+        if holds.iter().all(Vec::is_empty) {
+            return Err("That run made no trades, so there's nothing to place at random.".into());
+        }
+        self.placed(&holds, draw)
+    }
+
+    /// # Errors
+    ///
+    /// Returns a message if the run made no trades or they don't fit, a run fails, or it's
+    /// stopped before any finish.
+    pub fn run(self, progress: &(impl Fn(usize) + Sync)) -> Result<RandomEntries, String> {
+        let holds = self.holds();
+        let trades: usize = holds.iter().map(Vec::len).sum();
+        if trades == 0 {
+            return Err("That run made no trades, so there's nothing to place at random.".into());
+        }
+        let figures_of = |request: PortfolioRequest| {
+            portfolio::run(request, false)
+                .map(|run| (run.report.net_return(), run.report.max_drawdown.abs()))
+        };
+        let actual = figures_of(self.own_table())?;
+        let draws: Vec<u64> = (0..self.runs as u64).collect();
+        let done = AtomicUsize::new(0);
+        let results = pool(
+            &draws,
+            self.workers,
+            &self.stop,
+            &|| progress(done.fetch_add(1, Ordering::Relaxed) + 1),
+            &|&draw| figures_of(self.placed(&holds, draw)?),
+        );
+        let (mut returns, mut falls, mut by_draw) = (Vec::new(), Vec::new(), Vec::new());
+        for (draw, result) in draws.iter().zip(results) {
+            let Some(result) = result else { continue };
+            let (returned, fell) = result?;
+            returns.push(returned);
+            falls.push(fell);
+            by_draw.push((*draw, returned));
+        }
+        if returns.is_empty() {
+            return Err("Stopped.".into());
+        }
+        Ok(summing_up(returns, falls, trades, actual, by_draw))
     }
 }
 
@@ -1019,6 +1216,82 @@ mod tests {
             "{}",
             found.share_matching_return
         );
+    }
+
+    /// Two markets on waves, and a book that holds each only through its rises, from hindsight.
+    fn hindsight() -> (PortfolioRequest, PortfolioRun) {
+        let wave = |phase: f64| -> Vec<f64> {
+            (0..400)
+                .map(|at| 100.0 + 30.0 * (f64::from(at) / 20.0 + phase).sin())
+                .map(|close| (close * 100.0).round() / 100.0)
+                .collect()
+        };
+        let (a, b) = (wave(0.0), wave(1.5));
+        let mut table = Vec::new();
+        for at in 0..399 {
+            let rising = |closes: &[f64]| {
+                if closes[at + 1] > closes[at] {
+                    0.45
+                } else {
+                    0.0
+                }
+            };
+            table.push(((at as u64 + 1) * HOUR, vec![rising(&a), rising(&b)]));
+        }
+        let mut asked = request(vec![leg("AAA", &a, 0.0), leg("BBB", &b, 0.0)]);
+        asked.weights = Some(Arc::new(table));
+        let run = portfolio::run(asked.clone(), false).unwrap();
+        (asked, run)
+    }
+
+    fn random_job(asked: &PortfolioRequest, run: &PortfolioRun, seed: u64) -> RandomPortfolioJob {
+        RandomPortfolioJob {
+            report: Arc::new(run.report.clone()),
+            request: asked.clone(),
+            from_index: 0,
+            runs: 30,
+            seed,
+            workers: 4,
+            stop: Arc::default(),
+        }
+    }
+
+    #[test]
+    fn a_portfolio_with_hindsight_beats_its_trades_placed_at_random() {
+        let (asked, run) = hindsight();
+        let trips: usize = run
+            .report
+            .legs
+            .iter()
+            .map(|leg| crate::trades::leg_round_trips(leg).len())
+            .sum();
+        let found = random_job(&asked, &run, 1).run(&|_| {}).unwrap();
+        assert_eq!(found.trades, trips);
+        assert_eq!(found.runs, 30);
+        assert!(found.actual_return > 0.3, "{}", found.actual_return);
+        assert!(found.share_matching_return < 0.05, "{found:?}");
+        assert!(found.median < found.actual_return);
+
+        // The same seed, the same draws; another, others.
+        let again = random_job(&asked, &run, 1).run(&|_| {}).unwrap();
+        assert_eq!(again.by_draw, found.by_draw);
+        let other = random_job(&asked, &run, 2).run(&|_| {}).unwrap();
+        assert_ne!(other.by_draw, found.by_draw);
+
+        // A draw run again alone returns what it was listed with.
+        let (draw, listed) = found.by_draw[7];
+        let placing = random_job(&asked, &run, 1).placing(draw).unwrap();
+        let alone = portfolio::run(placing, false).unwrap();
+        assert!((alone.report.net_return() - listed).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_portfolio_that_never_traded_has_nothing_to_place() {
+        let closes = [100.0; 50];
+        let asked = request(vec![leg("AAA", &closes, 0.0)]);
+        let run = portfolio::run(asked.clone(), false).unwrap();
+        let error = random_job(&asked, &run, 0).run(&|_| {}).unwrap_err();
+        assert!(error.contains("no trades"), "{error}");
     }
 
     #[test]
