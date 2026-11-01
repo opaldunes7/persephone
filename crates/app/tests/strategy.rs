@@ -1623,6 +1623,7 @@ mod panel {
         // so they're spaced apart however long they are. "Account", "Gross" and "Net" are only
         // ever in the legends.
         for words in [
+            "Beta",
             "Account",
             "Gross",
             "Net",
@@ -1827,6 +1828,7 @@ mod panel {
         assert_eq!(rows.len(), 3);
         assert!(rows[0].net_return >= rows[2].net_return);
         assert!(shows(&app, "Turnover"));
+        assert!(shows(&app, "Deflated"));
 
         panel(
             &mut app,
@@ -2037,6 +2039,51 @@ mod panel {
                 .iter()
                 .all(|row| row.trip.entry_ts >= window.test_from)
         );
+    }
+
+    #[test]
+    fn a_chart_opened_to_follow_a_trade_takes_half_the_panels_chart_whatever_has_focus() {
+        use persephone::backtest::InspectWhat;
+        let mut app = portfolio_panel();
+        run_task(&mut app, PanelMessage::RunPortfolio);
+        // Another chart, which takes the focus, so the panel's chart isn't focused.
+        let _ = app.update(Message::Key(Action::NewTile));
+        let settle = |app: &mut Persephone| {
+            let _ = app.update(Message::Tick(Instant::now() + Duration::from_secs(3)));
+        };
+        settle(&mut app);
+        let other = app
+            .tile_symbols()
+            .into_iter()
+            .map(|(id, _)| id)
+            .find(|&id| id != 0)
+            .unwrap();
+        let (own_before, other_before) = (app.tile_rect(0).unwrap(), app.tile_rect(other).unwrap());
+
+        panel(&mut app, PanelMessage::Inspect(InspectWhat::Portfolio));
+        let eth = ledger(&app)
+            .rows
+            .iter()
+            .position(|row| row.symbol == "ETHUSDT")
+            .unwrap();
+        panel(&mut app, PanelMessage::InspectTrade(eth));
+        settle(&mut app);
+        let opened = app.panel().unwrap().replay_tile.expect("a chart of ETH");
+        let (own, new) = (app.tile_rect(0).unwrap(), app.tile_rect(opened).unwrap());
+        // The other chart is left alone; the panel's is split down the middle of its longer side.
+        assert_eq!(app.tile_rect(other).unwrap(), other_before);
+        let near = |a: f32, b: f32| (a - b).abs() < 8.0;
+        if own_before.width >= own_before.height {
+            assert!(near(own.width, new.width), "{own:?} {new:?}");
+            assert!(near(own.height, own_before.height) && near(new.height, own_before.height));
+            assert!(near(own.x, own_before.x) && new.x >= own.x + own.width - 1.0);
+            assert!(near(new.x + new.width, own_before.x + own_before.width));
+        } else {
+            assert!(near(own.height, new.height), "{own:?} {new:?}");
+            assert!(near(own.width, own_before.width) && near(new.width, own_before.width));
+            assert!(near(own.y, own_before.y) && new.y >= own.y + own.height - 1.0);
+            assert!(near(new.y + new.height, own_before.y + own_before.height));
+        }
     }
 
     #[test]

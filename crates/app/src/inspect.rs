@@ -477,6 +477,9 @@ impl Persephone {
         if let Some((&id, _)) = self.tiles.iter().find(|(_, tile)| tile.market == market) {
             return (id, Task::none());
         }
+        // Split the panel's own chart in half, Hyprland-style, whatever else has focus: the new
+        // market takes its right or bottom half.
+        self.layout.focus(own);
         let area = self.tiling_area();
         match self.layout.insert(area) {
             Ok(id) => {

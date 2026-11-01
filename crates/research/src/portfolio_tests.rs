@@ -586,6 +586,8 @@ pub struct SweepRow {
     pub turnover: f64,
     pub peak_margin_use: f64,
     pub liquidated: bool,
+    /// On the best row only: its Sharpe ratio deflated for being the best of the sweep.
+    pub deflated_sharpe: Option<f64>,
 }
 
 /// Runs each candidate, best first.
@@ -606,14 +608,18 @@ pub fn sweep(
         stop,
         &|| progress(done.fetch_add(1, Ordering::Relaxed) + 1),
         &|candidate| {
-            portfolio::run(candidate.request.clone(), false).map(|run| SweepRow {
-                label: candidate.label.clone(),
-                net_return: run.report.net_return(),
-                sharpe: run.figures.sharpe,
-                fell: run.report.max_drawdown.abs(),
-                turnover: run.report.turnover,
-                peak_margin_use: run.report.peak_margin_use,
-                liquidated: run.report.liquidated_at.is_some(),
+            portfolio::run(candidate.request.clone(), false).map(|run| {
+                let row = SweepRow {
+                    label: candidate.label.clone(),
+                    net_return: run.report.net_return(),
+                    sharpe: run.figures.sharpe,
+                    fell: run.report.max_drawdown.abs(),
+                    turnover: run.report.turnover,
+                    peak_margin_use: run.report.peak_margin_use,
+                    liquidated: run.report.liquidated_at.is_some(),
+                    deflated_sharpe: None,
+                };
+                (row, portfolio_daily(&run))
             })
         },
     );
@@ -624,8 +630,16 @@ pub fn sweep(
     if rows.is_empty() {
         return Err("Stopped.".into());
     }
-    rows.sort_by(|a, b| b.net_return.total_cmp(&a.net_return));
-    Ok(rows)
+    rows.sort_by(|a, b| b.0.net_return.total_cmp(&a.0.net_return));
+    // The top row, made fair for being the best of all the sweep tried.
+    let tried: Vec<f64> = rows.iter().filter_map(|(row, _)| row.sharpe).collect();
+    let mut rows: Vec<(SweepRow, Vec<f64>)> = rows;
+    if let Some((best, daily)) = rows.first_mut() {
+        best.deflated_sharpe = best
+            .sharpe
+            .and_then(|sharpe| figures::deflated_sharpe_of(sharpe, &tried, daily));
+    }
+    Ok(rows.into_iter().map(|(row, _)| row).collect())
 }
 
 /// What a walk-forward picks by.
@@ -1177,5 +1191,15 @@ mod tests {
         .unwrap();
         let labels: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
         assert_eq!(labels, vec!["0.8", "0.5", "0.2"]);
+        // Only the best is deflated, for being picked from the three.
+        assert_eq!(
+            rows[0].deflated_sharpe.is_some(),
+            rows[0].sharpe.is_some(),
+            "{rows:?}"
+        );
+        assert!(rows[1..].iter().all(|row| row.deflated_sharpe.is_none()));
+        if let Some(chance) = rows[0].deflated_sharpe {
+            assert!((0.0..=1.0).contains(&chance));
+        }
     }
 }

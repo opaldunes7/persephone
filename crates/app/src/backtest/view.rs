@@ -631,6 +631,12 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                         "Return for the ups and downs taken, from daily returns over the span.",
                     ))
                     .push(figure(
+                        "Beta",
+                        figures.beta.map_or("—".to_owned(), |beta| format!("{beta:.2}")),
+                        theme::TEXT,
+                        "How far the account moved with equal shares of its markets, day by day: 1 moves with them, 0 owes them nothing, below 0 moves against them.",
+                    ))
+                    .push(figure(
                         "Fell",
                         format!("{:.1}%", report.max_drawdown * 100.0),
                         theme::TEXT,
@@ -1522,6 +1528,11 @@ fn portfolio_sweep_table(rows: &[SweepRow]) -> Element<'_, PanelMessage> {
         cell("Value".into(), 92.0, theme::TEXT_MUTED),
         cell("Return".into(), 76.0, theme::TEXT_MUTED),
         cell("Sharpe".into(), 66.0, theme::TEXT_MUTED),
+        tip(
+            cell("Deflated".into(), 66.0, theme::TEXT_MUTED),
+            "For the best: the chance its true Sharpe ratio is above nothing, allowing for how many setups were tried, how much their Sharpe ratios differed, and how far its daily returns were from normal. Under 95% is weak evidence.",
+            None,
+        ),
         cell("Fell".into(), 66.0, theme::TEXT_MUTED),
         cell("Turnover".into(), 76.0, theme::TEXT_MUTED),
         cell("Margin".into(), 66.0, theme::TEXT_MUTED),
@@ -1543,6 +1554,13 @@ fn portfolio_sweep_table(rows: &[SweepRow]) -> Element<'_, PanelMessage> {
                     .map_or("—".to_owned(), |sharpe| format!("{sharpe:.2}")),
                 66.0,
                 theme::TEXT
+            ),
+            cell(
+                found
+                    .deflated_sharpe
+                    .map_or(String::new(), |chance| format!("{:.0}%", chance * 100.0)),
+                66.0,
+                theme::TEXT_MUTED
             ),
             cell(format!("{:.1}%", found.fell * 100.0), 66.0, theme::TEXT),
             cell(format!("{:.1}×", found.turnover), 76.0, theme::TEXT),
@@ -1798,7 +1816,7 @@ fn portfolio_table(
     let figures = &found.figures;
     rows = rows.push(cell(
         format!(
-            "Equal shares after funding {}. {} Beta {} against equal shares.",
+            "Equal shares after funding {}. {}",
             percent(figures.benchmark_after_funding),
             figures
                 .weights_held_return
@@ -1806,9 +1824,6 @@ fn portfolio_table(
                     "These weights held {}.",
                     percent(held)
                 )),
-            figures
-                .beta
-                .map_or_else(|| "—".to_owned(), |beta| format!("{beta:.2}")),
         ),
         398.0,
         theme::TEXT_MUTED,
