@@ -65,6 +65,9 @@ pub struct Panel {
     pub playback: Playback,
     /// The market's whole history, once known; the error if it couldn't be found.
     pub history: Option<Result<History, String>>,
+    /// The market (venue and symbol) whose history was last asked for. An answer for any other
+    /// is out of date and dropped.
+    pub history_for: Option<(Option<String>, String)>,
     /// The span's handles while they're dragged, as times.
     pub dragging: Option<(UnixNanos, UnixNanos)>,
     /// When the chart's bars close, for the playhead.
@@ -329,6 +332,7 @@ impl Panel {
             height: (window_height * DEFAULT_SHARE).max(MIN_HEIGHT),
             playback: Playback::default(),
             history: None,
+            history_for: None,
             dragging: None,
             timeline: None,
             ticks: None,

@@ -1435,6 +1435,7 @@ impl Persephone {
                     .map(|t| (t.market.local.clone(), t.market.symbol.clone()));
                 if let Some(panel) = self.panel.as_mut().filter(|p| p.tile == id)
                     && wanted.as_ref() == Some(&key)
+                    && panel.history_for.as_ref().is_none_or(|asked| asked == &key)
                 {
                     panel.history = Some(result.map(|h| (*h).clone()));
                 }
@@ -2873,23 +2874,22 @@ impl Persephone {
             return Task::none();
         }
         let other_market = tile.market.local != market.local || tile.market.symbol != market.symbol;
-        let mut history = Task::none();
-        if let Some(panel) = self.panel.as_mut().filter(|p| p.tile == id) {
-            // New bars: the playback starts over, at the same speed.
-            panel.playback.reset();
-            panel.timeline = None;
-            if other_market {
-                history = self.load_history(id);
-            }
-        }
-        let Some(tile) = self.tiles.get_mut(&id) else {
-            return history;
-        };
         tile.market = market.clone();
         tile.chart = None;
         tile.live = None;
         if let Some(strategy) = &mut tile.strategy {
             strategy.run = Run::Waiting;
+        }
+        let mut history = Task::none();
+        if let Some(panel) = self.panel.as_mut().filter(|p| p.tile == id) {
+            // New bars: the playback starts over, at the same speed.
+            panel.playback.reset();
+            panel.timeline = None;
+            // Only once the tile is on the new market, or the answer would be for the old one
+            // and thrown away, leaving the slider waiting forever.
+            if other_market {
+                history = self.load_history(id);
+            }
         }
         let load = self.request(&market);
         let backtest = self.attach(id);
@@ -4513,10 +4513,11 @@ impl Persephone {
         let Some(tile) = self.tiles.get(&id) else {
             return Task::none();
         };
+        let key = (tile.market.local.clone(), tile.market.symbol.clone());
         if let Some(panel) = self.panel.as_mut().filter(|p| p.tile == id) {
             panel.history = None;
+            panel.history_for = Some(key.clone());
         }
-        let key = (tile.market.local.clone(), tile.market.symbol.clone());
         let (job, store) = (key.clone(), self.store.clone());
         Task::perform(
             on_thread(move || {

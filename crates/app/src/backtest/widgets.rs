@@ -770,7 +770,8 @@ impl canvas::Program<PanelMessage> for BarsByTime {
     }
 }
 
-/// Lines over one timeline, named above them, with what each reads under the mouse.
+/// Lines over one timeline, with what each reads under the mouse. Their names go above the canvas,
+/// in the view's legend, where they can't run into each other.
 pub struct Lines<'a> {
     pub lines: Vec<(String, &'a [f64], Color)>,
     pub times: &'a [UnixNanos],
@@ -835,7 +836,7 @@ impl canvas::Program<PanelMessage> for Lines<'_> {
             .iter()
             .flat_map(|(_, line, _)| line.iter().copied())
             .chain(std::iter::once(self.start));
-        let pane = pane_with_room(values, self.start, count, size, 16.0);
+        let pane = pane_with_room(values, self.start, count, size, 4.0);
         price_grid(&mut frame, &pane);
         axes_and_start(&mut frame, &pane, self.start);
         // No more points than pixels: the rest can't be seen.
@@ -850,18 +851,6 @@ impl canvas::Program<PanelMessage> for Lines<'_> {
                 });
                 frame.stroke(&path, Stroke::default().with_color(*color).with_width(1.2));
             }
-        }
-        let mut x = 12.0;
-        for (name, _, color) in &self.lines {
-            frame.fill_text(Text {
-                content: name.clone(),
-                position: Point::new(x, 8.0),
-                color: *color,
-                size: theme::TEXT_SIZE.into(),
-                align_y: alignment::Vertical::Center,
-                ..Text::default()
-            });
-            x += name.len() as f32 * 6.5 + 14.0;
         }
         if let Some(at) = cursor
             .position_in(bounds)

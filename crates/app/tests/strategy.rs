@@ -884,6 +884,42 @@ mod panel {
     }
 
     #[test]
+    fn the_span_slider_gets_the_new_markets_history_after_a_symbol_change() {
+        let mut app = ready_panel(TestKind::Backtest);
+        let _ = app.update(Message::Chart(
+            0,
+            ChartMessage::RightClicked {
+                at: Point::new(200.0, 200.0),
+            },
+        ));
+        menu(&mut app, MenuMessage::SetSymbol("ETHUSDT".into()));
+        let panel_now = app.panel().unwrap();
+        // It asks about the market the chart is now on, not the one it was on.
+        assert_eq!(
+            panel_now.history_for,
+            Some((None, "ETHUSDT".to_owned())),
+            "asked about the wrong market"
+        );
+        assert!(panel_now.history.is_none());
+        let history = |symbol: &str| {
+            Message::History(
+                0,
+                (None, symbol.into()),
+                Ok(Arc::new(History {
+                    first: 0,
+                    last: Timeframe::H1.nanos() * 1_000,
+                    closes: Vec::new(),
+                })),
+            )
+        };
+        // A late answer about the old market is dropped; the new one's is kept.
+        let _ = app.update(history("BTCUSDT"));
+        assert!(app.panel().unwrap().history.is_none());
+        let _ = app.update(history("ETHUSDT"));
+        assert!(matches!(app.panel().unwrap().history, Some(Ok(_))));
+    }
+
+    #[test]
     fn typed_values_count_when_run_is_pressed() {
         let mut app = ready_panel(TestKind::RandomBlocks);
         panel(&mut app, PanelMessage::BlockLength(BlockLength::Week));
@@ -1567,7 +1603,18 @@ mod panel {
             found.report.legs[1].fills[0].side,
             persephone_core::Side::Sell
         );
-        for words in ["Equal shares", "Margin", "Moved with", "ETHUSDT"] {
+        // The equity chart's names are laid out as widgets, not guessed into place on the canvas,
+        // so they're spaced apart however long they are. "Account", "Gross" and "Net" are only
+        // ever in the legends.
+        for words in [
+            "Account",
+            "Gross",
+            "Net",
+            "Equal shares",
+            "Margin",
+            "Moved with",
+            "ETHUSDT",
+        ] {
             assert!(shows(&app, words), "{words}");
         }
     }

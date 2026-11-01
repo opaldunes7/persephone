@@ -500,17 +500,13 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                         percent(found.high),
                     )));
                     row![
-                        container(
-                            canvas(portfolio_band(found, info.settings.capital))
-                                .width(Fill)
-                                .height(Fill)
-                        )
-                        .padding(Padding {
-                            top: WALK_TOP,
-                            ..Padding::ZERO
-                        })
-                        .width(FillPortion(3))
-                        .height(Fill),
+                        container(with_legend(portfolio_band(found, info.settings.capital)))
+                            .padding(Padding {
+                                top: WALK_TOP,
+                                ..Padding::ZERO
+                            })
+                            .width(FillPortion(3))
+                            .height(Fill),
                         canvas(Distribution {
                             title: "How far each fell at worst",
                             values: &found.falls,
@@ -643,9 +639,9 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                 }
                 row![
                     column![
-                        container(canvas(portfolio_equity(found)).width(Fill).height(Fill))
+                        container(with_legend(portfolio_equity(found)))
                             .height(iced::Length::FillPortion(3)),
-                        container(canvas(portfolio_exposure(report)).width(Fill).height(Fill))
+                        container(with_legend(portfolio_exposure(report)))
                             .height(iced::Length::FillPortion(1)),
                     ]
                     .padding(Padding {
@@ -1544,6 +1540,34 @@ fn portfolio_band(found: &PortfolioMonteCarlo, capital: f64) -> Lines<'_> {
         start: capital,
         format: |value| format!("{value:.0}"),
     }
+}
+
+/// A chart of lines under their names: each with a swatch of its color, spaced apart and wrapping
+/// onto another row when there are too many for one.
+fn with_legend(lines: Lines<'_>) -> Element<'_, PanelMessage> {
+    let legend = row(lines.lines.iter().map(|(name, _, color)| {
+        let color = *color;
+        row![
+            container(Space::new().width(8).height(8)).style(move |_| container::Style {
+                background: Some(color.into()),
+                ..container::Style::default()
+            }),
+            text(name.clone()).size(theme::TEXT_SIZE).color(color),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center)
+        .into()
+    }))
+    .spacing(12)
+    .padding(Padding {
+        left: 12.0,
+        ..Padding::ZERO
+    })
+    .wrap()
+    .vertical_spacing(2);
+    column![legend, canvas(lines).width(Fill).height(Fill)]
+        .spacing(2)
+        .into()
 }
 
 /// The account, what equal shares would have done, and what each leg has made.
