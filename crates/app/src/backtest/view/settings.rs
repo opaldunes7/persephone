@@ -6,8 +6,13 @@ use super::*;
 
 /// The panel's left side: the strategy, every stock setting and the plugin slots, packed into
 /// as many columns as fit. What each one does is in the tooltips of its name and controls.
-/// Which test to run, all on one line across the top of the panel.
-pub(super) fn test_tabs<'a>(current: TestKind, panel: &'a Panel) -> Element<'a, PanelMessage> {
+/// Which test to run, all on one line, for the window's top bar; then what the panel last said,
+/// and exporting and importing. `notice` and `export_runs` are the open panel's.
+pub fn test_tabs<'a>(
+    current: TestKind,
+    notice: Option<&'a (String, bool)>,
+    export_runs: bool,
+) -> Element<'a, PanelMessage> {
     let tab = |label: &'a str, test: TestKind, what: &'a str| {
         tip(
             button(text(label).size(SMALL).center())
@@ -77,7 +82,7 @@ pub(super) fn test_tabs<'a>(current: TestKind, panel: &'a Panel) -> Element<'a, 
             None,
         )
     };
-    let notice = panel.notice.as_ref().map(|(said, failed)| {
+    let notice = notice.map(|(said, failed)| {
         text(said.as_str()).size(HINT).color(if *failed {
             theme::DOWN
         } else {
@@ -99,7 +104,7 @@ pub(super) fn test_tabs<'a>(current: TestKind, panel: &'a Panel) -> Element<'a, 
         ),
         tip(
             row![
-                toggler(panel.export_runs)
+                toggler(export_runs)
                     .size(15)
                     .on_toggle(PanelMessage::ExportRuns)
                     .style(switch_style),

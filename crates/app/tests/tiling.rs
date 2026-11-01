@@ -9,6 +9,7 @@ use persephone_core::{Candle, Timeframe};
 use persephone_tiling::{Direction, MAX_TILES, Rect};
 
 const WINDOW: Size = Size::new(1600.0, 900.0);
+const TOP: f32 = persephone::TOP_BAR;
 
 fn app() -> Persephone {
     let candles = (0..500u64)
@@ -48,7 +49,8 @@ fn rect(app: &Persephone, id: u32) -> (f32, f32, f32, f32) {
 #[test]
 fn a_lone_chart_fills_the_window() {
     let app = app();
-    assert_eq!(rect(&app, 0), (0.0, 0.0, 1600.0, 900.0));
+    // Under the top bar that holds the test tabs.
+    assert_eq!(rect(&app, 0), (0.0, TOP, 1600.0, 900.0 - TOP));
 }
 
 #[test]
@@ -96,17 +98,19 @@ fn new_charts_dwindle_with_gaps_and_animate_in() {
     assert!(app.is_animating(), "the new chart pops in");
     settle(&mut app);
 
-    // 6px outer gap, 6px between: two 791px columns.
-    assert_eq!(rect(&app, 0), (6.0, 6.0, 791.0, 888.0));
-    assert_eq!(rect(&app, 1), (803.0, 6.0, 791.0, 888.0));
+    // 6px outer gap, 6px between: two 791px columns, under the top bar.
+    assert_eq!(rect(&app, 0), (6.0, TOP + 6.0, 791.0, 888.0 - TOP));
+    assert_eq!(rect(&app, 1), (803.0, TOP + 6.0, 791.0, 888.0 - TOP));
     assert_eq!(app.layout().focused(), 1);
 
     press(&mut app, Action::NewTile);
     settle(&mut app);
-    assert_eq!(
-        rect(&app, 2),
-        (803.0, 453.0, 791.0, 441.0),
-        "third goes under the second"
+    let (x, y, w, h) = rect(&app, 2);
+    let half = (888.0 - TOP - 6.0) / 2.0;
+    assert_eq!((x, w), (803.0, 791.0), "third goes under the second");
+    assert!(
+        (y - (TOP + 6.0 + half + 6.0)).abs() < 1.0 && (h - half).abs() < 1.0,
+        "{y} {h}"
     );
 }
 
@@ -131,7 +135,7 @@ fn closing_hands_space_back_and_keeps_the_last_chart() {
     press(&mut app, Action::CloseTile);
     settle(&mut app);
     assert_eq!(app.layout().len(), 1);
-    assert_eq!(rect(&app, 0), (0.0, 0.0, 1600.0, 900.0));
+    assert_eq!(rect(&app, 0), (0.0, TOP, 1600.0, 900.0 - TOP));
 
     press(&mut app, Action::CloseTile);
     assert_eq!(app.layout().len(), 1, "the last chart stays");
@@ -144,11 +148,11 @@ fn fullscreen_covers_the_window_and_returns() {
     press(&mut app, Action::NewTile);
     press(&mut app, Action::Fullscreen);
     settle(&mut app);
-    assert_eq!(rect(&app, 1), (0.0, 0.0, 1600.0, 900.0));
+    assert_eq!(rect(&app, 1), (0.0, TOP, 1600.0, 900.0 - TOP));
 
     press(&mut app, Action::Fullscreen);
     settle(&mut app);
-    assert_eq!(rect(&app, 1), (803.0, 6.0, 791.0, 888.0));
+    assert_eq!(rect(&app, 1), (803.0, TOP + 6.0, 791.0, 888.0 - TOP));
 }
 
 #[test]
@@ -188,7 +192,7 @@ fn window_resizes_snap_without_animating() {
     settle(&mut app);
     let _ = app.update(Message::WindowResized(Size::new(1000.0, 700.0)));
     assert!(!app.is_animating());
-    assert_eq!(rect(&app, 1), (503.0, 6.0, 491.0, 688.0));
+    assert_eq!(rect(&app, 1), (503.0, TOP + 6.0, 491.0, 688.0 - TOP));
 }
 
 mod restore {
@@ -397,4 +401,61 @@ mod workspaces {
         assert_eq!(restored.workspaces(), vec![1, 4]);
         std::fs::remove_dir_all(dir).unwrap();
     }
+}
+
+/// What a click on `label` in the app's view sends.
+fn click(app: &Persephone, label: &str) -> Vec<Message> {
+    let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), WINDOW, app.view());
+    ui.click(label).unwrap_or_else(|e| panic!("{label}: {e:?}"));
+    ui.into_messages().collect()
+}
+
+#[test]
+fn the_top_bar_has_the_tests_and_one_opens_the_panel_on_it() {
+    use persephone::backtest::{PanelMessage, TestKind};
+    let mut app = app();
+    assert!(app.panel().is_none());
+    let sent = click(&app, "Monte Carlo");
+    assert!(
+        sent.iter().all(|m| !matches!(m, Message::DragWindow)),
+        "a tab doesn't move the window"
+    );
+    assert!(
+        sent.iter()
+            .any(|m| matches!(m, Message::Top(PanelMessage::Test(TestKind::MonteCarlo))))
+    );
+    for message in sent {
+        let _ = app.update(message);
+    }
+    assert_eq!(app.panel().expect("opened").tile, 0);
+    assert_eq!(app.tile_backtest(0).unwrap().test, TestKind::MonteCarlo);
+    settle(&mut app);
+    // The chart is now a pane below the panel's, a gap apart, under the top bar.
+    let (x, y, w, _) = rect(&app, 0);
+    let band = app.panel().unwrap().height_in(900.0 - TOP);
+    assert_eq!((x, w), (6.0, 1588.0));
+    assert!(
+        (y - (TOP + band + 6.0)).abs() < 1.0,
+        "{y} against {}",
+        TOP + band + 6.0
+    );
+}
+
+#[test]
+fn the_top_bars_empty_part_moves_the_window() {
+    let app = app();
+    let mut ui = iced_test::Simulator::with_size(iced::Settings::default(), WINDOW, app.view());
+    // Far right of the bar, past the tabs and buttons.
+    ui.point_at(iced::Point::new(1590.0, persephone::TOP_BAR / 2.0));
+    ui.simulate([
+        iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+            iced::mouse::Button::Left,
+        )),
+    ]);
+    let sent: Vec<Message> = ui.into_messages().collect();
+    assert!(
+        sent.iter().any(|m| matches!(m, Message::DragWindow)),
+        "{sent:?}"
+    );
 }

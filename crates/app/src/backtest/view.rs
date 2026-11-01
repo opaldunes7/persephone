@@ -44,6 +44,8 @@ mod inspect;
 mod results;
 mod settings;
 
+pub use settings::test_tabs;
+
 use self::{build::*, calendar::*, inspect::*, results::*, settings::*};
 
 /// The settings' share of the panel's width, in tenths.
@@ -1352,17 +1354,7 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
     let side = container(settings)
         .width(FillPortion(SETTINGS_PORTION))
         .height(Fill);
-    let tabs = container(settings::test_tabs(test, panel))
-        .padding([0, 10])
-        .height(super::TABS_HEIGHT)
-        .align_y(Alignment::Center);
-    let under_tabs = container(Space::new())
-        .width(Fill)
-        .height(1)
-        .style(|_| container::background(theme::AXIS_LINE));
     container(column![
-        tabs,
-        under_tabs,
         row![side, divider, main].height(Fill),
         canvas(Edge).width(Fill).height(super::EDGE_HEIGHT)
     ])

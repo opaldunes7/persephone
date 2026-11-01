@@ -110,8 +110,9 @@ fn the_menu_opens_a_sidebar_that_the_charts_make_room_for() {
     let narrower = app.tile_rect(0).unwrap();
     let width = app.news().width(1400.0);
     assert_eq!(width, 300.0);
+    // The chart is a pane of its own now, 6 px from the window's edge and from the sidebar.
     assert!(
-        (full.width - narrower.width - width).abs() < 1.0,
+        (full.width - narrower.width - width - 12.0).abs() < 1.0,
         "{full:?} {narrower:?}"
     );
     assert!(shows(&app, "Keep collecting"));

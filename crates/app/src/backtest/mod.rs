@@ -40,15 +40,15 @@ pub use persephone_research::{
     thousands, trades, walk_forward,
 };
 
-pub use self::view::{PLUGIN_SLOTS, PanelInfo, Status, panel};
+pub use self::view::{PLUGIN_SLOTS, PanelInfo, Status, panel, test_tabs};
 
 /// The panel's share of the window when it opens, and the least it's ever given.
 pub const DEFAULT_SHARE: f32 = 0.3;
 pub const MIN_HEIGHT: f32 = 190.0;
 /// The panel's draggable bottom edge.
 const EDGE_HEIGHT: f32 = 5.0;
-/// The bar across the top that picks the test.
-const TABS_HEIGHT: f32 = 32.0;
+/// What the panel's pane takes around its content: the gap above it and its border.
+const PANE_FRAME: f32 = 10.0;
 /// What the panel leaves the charts, however much it wants.
 const CHARTS_ROOM: f32 = 160.0;
 /// At Max speed, a whole span plays in this long.
@@ -513,7 +513,7 @@ impl Panel {
     /// takes to show all the settings, unless the window is too short to leave the charts room.
     #[must_use]
     pub fn height_in(&self, window_height: f32) -> f32 {
-        let least = MIN_HEIGHT.max(self.settings_height + EDGE_HEIGHT + TABS_HEIGHT);
+        let least = MIN_HEIGHT.max(self.settings_height + EDGE_HEIGHT + PANE_FRAME);
         self.height
             .min(window_height * 0.6)
             .max(least)

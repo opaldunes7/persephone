@@ -92,8 +92,19 @@ use crate::{
 const LAB_PREFIX: &str = "lab:";
 /// Every backtest starts with this much of the quote currency.
 pub const STARTING_BALANCE: f64 = 100_000.0;
-/// Space around and between tiles when there is more than one.
+/// Space around and between tiles, the panel and the news sidebar, once more than one shows.
 const GAP: f32 = 6.0;
+/// The bar across the top of the window holding the test tabs. On the Mac it's the title bar,
+/// drawn into, with room at its left for the window's own buttons.
+#[cfg(target_os = "macos")]
+pub const TOP_BAR: f32 = 38.0;
+#[cfg(not(target_os = "macos"))]
+pub const TOP_BAR: f32 = 34.0;
+const TOP_BAR_LEFT: f32 = if cfg!(target_os = "macos") {
+    78.0
+} else {
+    10.0
+};
 const BORDER: f32 = 2.0;
 /// How far one Ctrl+Alt press moves a divider, as a share of its split.
 const RESIZE_STEP: f32 = 0.05;
@@ -115,8 +126,37 @@ pub fn run() -> iced::Result {
         .title(Persephone::title)
         .subscription(Persephone::subscription)
         .theme(Theme::Dark)
-        .window_size(DEFAULT_WINDOW)
+        .window(window_settings())
         .run()
+}
+
+/// The window: on the Mac its title bar is see-through and the app draws under it, so the top bar
+/// sits beside the window's own buttons.
+fn window_settings() -> window::Settings {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut settings = window::Settings {
+        size: DEFAULT_WINDOW,
+        ..window::Settings::default()
+    };
+    #[cfg(target_os = "macos")]
+    {
+        settings.platform_specific = window::settings::PlatformSpecific {
+            title_hidden: true,
+            titlebar_transparent: true,
+            fullsize_content_view: true,
+        };
+    }
+    settings
+}
+
+/// Where each part of the window goes, under the top bar.
+struct Panes {
+    panel: Option<Rect>,
+    news: Option<Rect>,
+    /// What the charts have: below the panel, left of the sidebar.
+    charts: Rect,
+    /// More than one pane shows, so each sits in its own space, `GAP` from the others.
+    gapped: bool,
 }
 
 /// What a tile shows. Tiles showing the same market share its bars.
@@ -452,6 +492,11 @@ pub enum Message {
     /// The mouse entered a tile: focus follows it, as on Hyprland.
     Hover(TileId),
     WindowResized(Size),
+    /// A tab or button in the top bar: the panel's, opening it first if it's closed.
+    Top(backtest::PanelMessage),
+    /// The top bar's empty part pressed or double-clicked: move the window, or maximise it.
+    DragWindow,
+    ToggleMaximize,
     Tick(Instant),
     Menu(MenuMessage),
     /// Closes the open popup.
@@ -1458,6 +1503,15 @@ impl Persephone {
             Message::Hover(id) => {
                 self.layout.focus(id);
             }
+            Message::Top(message) => {
+                if self.panel.is_none() {
+                    let open = self.open_panel(self.layout.focused());
+                    return Task::batch([open, self.on_panel(message)]);
+                }
+                return self.on_panel(message);
+            }
+            Message::DragWindow => return window::latest().and_then(window::drag),
+            Message::ToggleMaximize => return window::latest().and_then(window::toggle_maximize),
             Message::WindowResized(size) => {
                 self.window = size;
                 self.relayout(false);
@@ -3046,7 +3100,11 @@ impl Persephone {
             .get(&id)
             .map(|t| t.backtest.clone())
             .unwrap_or_default();
-        self.panel = Some(backtest::Panel::new(id, self.window.height, &settings));
+        self.panel = Some(backtest::Panel::new(
+            id,
+            self.window.height - TOP_BAR,
+            &settings,
+        ));
         self.relayout(true);
         self.refresh_variables(id);
         Task::batch([
@@ -5322,7 +5380,7 @@ impl Persephone {
             }
             P::Latest => return self.set_span(id, None),
             P::Resize(y) => {
-                panel.height = y.max(backtest::MIN_HEIGHT);
+                panel.height = (y - TOP_BAR).max(backtest::MIN_HEIGHT);
                 self.relayout(false);
             }
             P::SettingsHeight(height) => {
@@ -5604,23 +5662,55 @@ impl Persephone {
         )
     }
 
-    /// Where charts go: the window, below the backtest panel if it's open.
+    /// Where charts go: under the top bar, below the backtest panel if it's open, left of the
+    /// news sidebar.
     fn window_rect(&self) -> Rect {
-        let top = self.panel_height();
-        Rect::new(
-            0.0,
-            top,
-            (self.window.width - self.news.width(self.window.width)).max(0.0),
-            (self.window.height - top).max(0.0),
-        )
+        self.panes().charts
     }
 
-    /// How tall the backtest panel is; 0 while it's closed (or its chart is elsewhere).
+    /// Where the panel, the sidebar and the charts go. Once more than one shows, each is a pane
+    /// of its own, `GAP` from the others and the window's edges, as tiles are.
+    fn panes(&self) -> Panes {
+        let (width, height) = (self.window.width, self.window.height);
+        let band = self.panel_height();
+        let news = self.news.width(width);
+        let gapped = band > 0.0 || news > 0.0 || self.layout.len() > 1;
+        let gap = if gapped { GAP } else { 0.0 };
+        let below = TOP_BAR + band;
+        Panes {
+            panel: (band > 0.0).then(|| {
+                Rect::new(
+                    gap,
+                    TOP_BAR + gap,
+                    (width - 2.0 * gap).max(0.0),
+                    (band - gap).max(0.0),
+                )
+            }),
+            news: (news > 0.0).then(|| {
+                Rect::new(
+                    width - news,
+                    below + gap,
+                    (news - gap).max(0.0),
+                    (height - below - 2.0 * gap).max(0.0),
+                )
+            }),
+            charts: Rect::new(
+                0.0,
+                below,
+                (width - news).max(0.0),
+                (height - below).max(0.0),
+            ),
+            gapped,
+        }
+    }
+
+    /// How much height the backtest panel takes under the top bar; 0 while it's closed (or its
+    /// chart is elsewhere).
     fn panel_height(&self) -> f32 {
         self.panel
             .as_ref()
             .filter(|p| self.tiles.contains_key(&p.tile))
-            .map_or(0.0, |p| p.height_in(self.window.height))
+            .map_or(0.0, |p| p.height_in(self.window.height - TOP_BAR))
     }
 
     /// The area tiles are arranged in when there is more than one.
@@ -5628,10 +5718,47 @@ impl Persephone {
         self.window_rect().inset(GAP)
     }
 
+    /// The bar across the top: the test tabs (a click opens the panel on that test if it's
+    /// closed), what the panel last said, and exporting. Its empty part moves the window, and a
+    /// double-click maximises it.
+    fn top_bar(&self) -> Element<'_, Message> {
+        let test = self
+            .panel
+            .as_ref()
+            .map_or(self.layout.focused(), |panel| panel.tile);
+        let test = self
+            .tiles
+            .get(&test)
+            .map_or(backtest::TestKind::Backtest, |tile| tile.backtest.test);
+        let (notice, runs) = self
+            .panel
+            .as_ref()
+            .map_or((None, false), |p| (p.notice.as_ref(), p.export_runs));
+        let bar = container(
+            row![
+                iced::widget::Space::new().width(TOP_BAR_LEFT),
+                backtest::test_tabs(test, notice, runs).map(Message::Top),
+            ]
+            .align_y(iced::Alignment::Center),
+        )
+        .width(self.window.width)
+        .height(TOP_BAR)
+        .padding(Padding {
+            right: 10.0,
+            ..Padding::ZERO
+        })
+        .align_y(iced::Alignment::Center)
+        .style(|_| container::background(theme::DESKTOP));
+        mouse_area(bar)
+            .on_press(Message::DragWindow)
+            .on_double_click(Message::ToggleMaximize)
+            .into()
+    }
+
     /// Points every tile at where the layout wants it, gliding there if `animate`.
     fn relayout(&mut self, animate: bool) {
         let full = self.window_rect();
-        let targets = if self.layout.len() == 1 {
+        let targets = if self.layout.len() == 1 && !self.panes().gapped {
             vec![(self.layout.focused(), full)]
         } else {
             self.layout.arrange(self.tiling_area(), GAP)
@@ -5843,7 +5970,10 @@ impl Persephone {
             }),
             strategies,
             strategy: current,
-            width: self.window.width,
+            width: self
+                .panes()
+                .panel
+                .map_or(self.window.width, |rect| rect.width),
             draft: (tile.backtest.test == backtest::TestKind::Build)
                 .then(|| self.shown_draft())
                 .flatten(),
@@ -5881,7 +6011,8 @@ impl Persephone {
     pub fn view(&self) -> Element<'_, Message> {
         let focused = self.layout.focused();
         let fullscreen = self.layout.is_fullscreen();
-        let framed = self.layout.len() > 1 && !fullscreen;
+        let panes = self.panes();
+        let framed = panes.gapped && !fullscreen;
 
         let mut layers: Vec<Element<'_, Message>> = self
             .tiles
@@ -5890,32 +6021,38 @@ impl Persephone {
             .map(|(&id, tile)| self.tile_view(id, tile, framed, id == focused))
             .collect();
 
+        layers.push(pin(self.top_bar()).into());
+        // The panel and the news sidebar, each a pane framed as a tile is.
+        fn pane(content: Element<'_, Message>, rect: Rect) -> Element<'_, Message> {
+            pin(container(content)
+                .width(rect.width)
+                .height(rect.height)
+                .padding(BORDER)
+                .style(|_| container::Style {
+                    background: Some(Background::Color(theme::BACKGROUND)),
+                    border: Border {
+                        color: theme::AXIS_LINE,
+                        width: BORDER,
+                        radius: 0.0.into(),
+                    },
+                    ..container::Style::default()
+                }))
+            .x(rect.x)
+            .y(rect.y)
+            .into()
+        }
         if let Some(panel) = &self.panel
             && let Some(tile) = self.tiles.get(&panel.tile)
+            && let Some(rect) = panes.panel
         {
-            let height = self.panel_height();
-            layers.push(
-                pin(container(
-                    backtest::panel(self.panel_info(panel, tile)).map(Message::Backtest),
-                )
-                .width(self.window.width)
-                .height(height))
-                .into(),
-            );
+            layers.push(pane(
+                backtest::panel(self.panel_info(panel, tile)).map(Message::Backtest),
+                rect,
+            ));
         }
-
         // The news sidebar, down the right under the panel.
-        let news_width = self.news.width(self.window.width);
-        if news_width > 0.0 {
-            let top = self.panel_height();
-            layers.push(
-                pin(container(self.news_view())
-                    .width(news_width)
-                    .height(self.window.height - top))
-                .x(self.window.width - news_width)
-                .y(top)
-                .into(),
-            );
+        if let Some(rect) = panes.news {
+            layers.push(pane(self.news_view(), rect));
         }
 
         // The popup goes above every tile, so neighbouring charts can't cover it.
