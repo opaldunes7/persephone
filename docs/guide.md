@@ -123,7 +123,7 @@ The chart then shows:
 - a summary in the top-right corner: return, drawdown, win rate, trades. A trade is flat to flat, so a reversal counts as two; fills are counted separately in the statistics.
 
 Click the summary for the **report**. It has the parameters (editing one reruns the backtest),
-net profit, return, max drawdown, Sharpe, Sortino, profit factor, win rate, trades, fills, time in a position and fees. It also shows the return before costs, what costs took and the break-even cost a fill, which take a second backtest with costs off that runs when you open it, unless the strategy asks AI models. Below those are what the market did on its own, its Sharpe and drawdown, and what each year added. A strategy that can only go wrong by rounding, running out of money or a mismatch with what it asked for shows a red `!` and says so here.
+net profit, return, max drawdown, Sharpe, Sortino, profit factor, win rate, trades, fills, time in a position and fees. It also shows the return before costs, what costs took and the break-even cost a fill, which take a second backtest with costs off that runs when you open it, unless the strategy asks AI models. What costs took is split by kind where there was any: **Slippage paid** (the set ticks and percentage), **Spread paid** (half the assumed spread, crossed by each order that took), **Impact paid** (size against the bar's volume) and **Range slip paid**, beside the fees, funding and borrowing. Below those are what the market did on its own, its Sharpe and drawdown, **Beta to the market** (how far the strategy's account moved with the market, day by day: 1 moves with it, 0 owes it nothing, below 0 moves against it), and each year: what it added as a share of the starting capital, which adds up to the return, and in brackets what it returned **on the year**, on what the account began it with, which compounds to it. A strategy that can only go wrong by rounding, running out of money or a mismatch with what it asked for shows a red `!` and says so here.
 Notes from the strategy go at the bottom, such as a language model's look-ahead warning.
 
 **How backtests run:**
@@ -233,8 +233,9 @@ at any speed. **✕** closes the drawer and the chart goes back to its own trade
 
 Runs a test kept only the figures of are run again on their own, which takes a moment; their trades
 add up to the figure on the row. A portfolio's trade on a market the panel's chart isn't showing
-opens a chart of that market beside it, which the playback then drives; later trades on that market
-use the same chart. Moving to another test, or changing the backtest, closes the drawer.
+opens a chart of that market by splitting the panel's chart in half, as a new chart does, whichever
+chart has focus: the new market takes the right or bottom half, and the playback then drives it.
+Later trades on that market use the same chart. Moving to another test, or changing the backtest, closes the drawer.
 
 ## Skill or luck: Monte Carlo and random blocks
 
@@ -331,7 +332,7 @@ bar has closed. **Start from…** begins again, or from one of the examples.
 
 ## Optimizing a strategy
 
-**Walk-forward**, under **Test**, is Optimize done fairly. It picks the best values on a stretch, tests them on the unseen stretch after it, slides along and repeats, for as many **Windows** as you set. The heading's **Unseen** is what those stretches returned added up, beside what the **Market** did. It's the figure to trust, as none of it was used to pick anything. The chart joins those stretches end to end beside the market's held in full, marks each window and shades those that lost. The table beside it shows what each window picked and how that did; hover the chart for the same.
+**Walk-forward**, under **Test**, is Optimize done fairly. It picks the best values on a stretch, tests them on the unseen stretch after it, slides along and repeats, for as many **Windows** as you set. The heading's **Unseen** is what those stretches returned added up, beside what the **Market** did. It's the figure to trust, as none of it was used to pick anything. The chart joins those stretches end to end beside the market's held in full, marks each window and shades those that lost. The table beside it shows what each window picked and how that did; hover the chart for the same. Its **Deflated** column is the chance the pick's Sharpe ratio where it was picked was more than luck, for having been the best of every value tried, and the line under the table gives the unseen stretches' own Sharpe ratio, which needs no deflating. Click a window's row to see its pick's trades on its unseen stretch.
 
 **Random entries**, under **Test**, compares a backtest with chance. It places the same trades at random times, holding each as long, as many **Runs** as you set. **As good** is the share of placings that returned at least as much: near 50% means the entries add nothing. The charts show how the placings' returns and worst falls were spread, with the backtest's own marked in yellow, the median dashed and the middle 19 in 20 shaded.
 
@@ -362,6 +363,11 @@ on the chart's bars.
   5 on the last 30%, warmed up on the bars before it and starting from the full capital. A value
   that made money where it was picked but lost on the unseen bars shows in orange, and is likely
   only fit to the past.
+
+Under the results, **Best's Sharpe … Deflated for N tried** puts a number on the luck: the deflated
+Sharpe ratio, the chance the best's true Sharpe ratio is above nothing, allowing for how many values
+were tried, how much their Sharpe ratios differed, and how far its daily returns were from normal.
+Under 95% is weak evidence. It counts only this grid, so ideas you tried before aren't in it.
 
 Click a row or a bar to see that value's trades beside the results, and follow one on the chart
 (see [Following any test's trades](#following-any-tests-trades)). **Apply** on a row puts that value
@@ -580,7 +586,7 @@ Paper and live trading stay on market orders and spot markets for now, and won't
 
 **Add market** for each, as `BTCUSDT`, or `BTCUSDT-PERP` for a perpetual, with its weight: 0.5 holds half the capital in it, and -0.5 half short. Under **Trades**, each can hold its weight or trade a strategy of its own, with **Chart's** making those that hold trade this chart's strategy instead. **Venue** is for a market you imported, blank meaning where this chart's bars come from. Or use **Load weights** for a JSON file of `[[time, {"BTCUSDT": 0.5, "ETHUSDT": -0.5}], ...]`, which states the whole book at each time and is how to run pairs or rotation. **Every** and **Drift** go back to the weights every so many bars or when a leg strays, and **Min** skips trades too small to be worth their fees. Costs come from the settings above.
 
-The results show the account, equal shares of each market held, and what each market has made, with gross and net exposure below. The tables have each market's part, how large orders were worked (**To go** being what never got out, **Gaps** bars it was missing), how the markets' own returns moved together, returns by year, and each market's fills, a click on its name away.
+The heading has the return, before costs, equal shares, Sharpe, **Beta** (how far the account moved with equal shares of its markets, day by day), the deepest fall and margin. The results show the account, equal shares of each market held, and what each market has made, with gross and net exposure below. Under the tables, what costs took is split into fees, slippage, spread, range, impact, funding, borrowing and interest, and each year shows what it added and what it returned on the year. **Trades**, before each market's fills, lists every trade across the markets to follow on a chart. The tables have each market's part, how large orders were worked (**To go** being what never got out, **Gaps** bars it was missing), how the markets' own returns moved together, returns by year, and each market's fills, a click on its name away.
 
 Every run is kept where Lab keeps its runs. **Saved runs** goes back to one, including those from Lab, and Lab reads the app's with `get_portfolio`. They travel in **Export all** with **Runs** on.
 
@@ -591,7 +597,7 @@ Every run is kept where Lab keeps its runs. **Saved runs** goes back to one, inc
 
 The chips over the settings ask whether a result is luck:
 
-- **Sweep** varies one thing, such as a weight, rebalancing or a cost, from **Min** to **Max** by **Step**, into a table with the best first.
+- **Sweep** varies one thing, such as a weight, rebalancing or a cost, from **Min** to **Max** by **Step**, into a table with the best first. **Deflated** on the best row is its Sharpe ratio deflated for having been picked from the rest. Click a row to see that setup's trades.
 - **Shifted** moves the last run's book along the span by random amounts, wrapping round. It holds the same things for as long, and only the timing goes. **As good** near 50% means the timing added nothing. **Random entries** has the same test for one market, under **Shifted**.
 - **Monte Carlo** draws the last run's returns again in blocks of **Block** bars, keeping how the markets moved together, and shows the band 19 in 20 stayed inside.
 - **Walk-forward** picks the best of the sweep's values on each stretch, trades it on the unseen one after, and slides along. **Windows** and **Ratio** are Walk-forward's own, and Run shows the same chart and table.

@@ -17,8 +17,15 @@ strategies can paper trade on live Binance bars.
   history, plays the run back bar by bar at any speed from real time up, and sets costs,
   slippage, latency, leverage, direction, trading sessions and intra-bar precision. Monte Carlo
   and random-block tests show how much of a result was luck, and an optimizer tries one or two
-  variables by return, survival or consistency, checking the best on bars it kept unseen. A calendar shows what each month and day made, down
-  to a day's trades, any of which can be replayed on the chart.
+  variables by return, survival or consistency, checking the best on bars it kept unseen, with
+  a deflated Sharpe ratio for how many were tried. Walk-forward, random-entry and shifted-signal
+  tests, and portfolios of several markets on one account, are there too. Every test's trades
+  open beside it, and any trade can be played back on the chart, on a chart of its own market
+  split in half beside it if need be. A calendar shows what each month and day made, down to a
+  day's trades.
+- **Strategies built in the app** as rules on the Build tab, or pasted as JSON, with no code: they
+  run on the chart at once, their numbers can be variables to optimize, and they can be saved for
+  every chart, portfolio and agent.
 - **Your own indicators and strategies** as sandboxed WebAssembly plugins (Rust SDK), which
   can run ONNX models and ask language models, or as any process (Python, …) reached over a
   socket.
