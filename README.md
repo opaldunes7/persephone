@@ -95,6 +95,7 @@ and the time axis to stretch time; double-click either to reset it.
 - [User guide](docs/guide.md): charts, strategies and reports, sweeps, drawings, your own
   data, paper and live trading, where files live.
 - [Persephone Lab](docs/lab.md): connecting agents and scripts, with [every tool](docs/lab-tools.md).
+- [Running an agent trial](docs/agent-trial.md): an AI agent researching with Lab, blind to the code, and reporting what's wrong.
 - [Writing plugins](docs/plugins.md): indicators and strategies in Rust, models and AI,
   external strategies in Python or anything else.
 - [Design plan](docs/plan.md): architecture and the decisions behind it.
