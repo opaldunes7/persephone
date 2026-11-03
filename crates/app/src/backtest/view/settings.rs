@@ -1536,17 +1536,23 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
             continue;
         }
         let open = panel.open_chapters.contains(&chapter);
+        let switched_on = chapter.group().is_none_or(|group| settings.group_on(group));
         let said = match chapter.on(settings) {
+            _ if !switched_on => "off".to_owned(),
             Some(on) => format!("{on} on"),
             None if chapter == Chapter::Markets => legs_named.clone(),
             None => String::new(),
         };
-        let head = button(
+        let title = button(
             row![
                 text(if open { "▾" } else { "▸" }).size(SMALL + 2.0),
                 text(chapter.name(settings.test))
                     .size(SMALL)
-                    .color(theme::TEXT_BRIGHT),
+                    .color(if switched_on {
+                        theme::TEXT_BRIGHT
+                    } else {
+                        theme::TEXT_MUTED
+                    }),
                 text(said).size(HINT).color(theme::TEXT_MUTED),
             ]
             .spacing(6)
@@ -1556,6 +1562,25 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
         .padding([3, 0])
         .on_press(PanelMessage::Chapter(chapter, !open))
         .style(|_, status| plain(status));
+        // Its master switch, at the right: off, nothing in it applies, and each switch inside is
+        // kept for when it's back on.
+        let head: Element<'a, PanelMessage> = match chapter.group() {
+            Some(group) => row![
+                title,
+                tip(
+                    toggler(switched_on)
+                        .size(15)
+                        .on_toggle(move |on| PanelMessage::Edit(Edit::Group(group, on)))
+                        .style(switch_style),
+                    "The whole chapter on or off. Off, none of it applies; each setting inside keeps its own switch for when it's back on.",
+                    None,
+                ),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into(),
+            None => title.into(),
+        };
         body = body.push(head);
         if open {
             let mut inside = column![].spacing(7).padding(Padding {

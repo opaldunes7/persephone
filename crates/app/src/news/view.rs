@@ -313,7 +313,13 @@ pub fn sidebar<'a>(
         filters,
         history,
         notes,
-        scrollable(list).id(list_id()).height(Fill),
+        // It scrolls by wheel or trackpad, with no bar drawn down its side.
+        scrollable(list)
+            .id(list_id())
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::hidden(),
+            ))
+            .height(Fill),
         footer,
     ]
     .spacing(6)

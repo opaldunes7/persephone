@@ -190,7 +190,9 @@ chapters:
 - **Position & account** (compound, leverage, most exposure, direction, invert),
 - **Trading hours** (the session), **Data & records** (warm-up, decision log) and **Plugins**.
 
-Each setting has its own switch, and they're saved with each chart. A layout saved with the old
+Each chapter has a switch at the right of its heading: off, nothing in it applies and its heading
+says **off**, but each setting inside keeps its own switch for when it's back on. Each setting has
+its own switch too, and they're all saved with each chart. A layout saved with the old
 **Stock** switch off opens with each of those settings off instead.
 
 | Setting | What it does |
@@ -353,6 +355,13 @@ bar has closed. **Start from…** begins again, or from one of the examples.
 ## Optimizing a strategy
 
 **Walk-forward**, under **Test**, is Optimize done fairly. It picks the best values on a stretch, tests them on the unseen stretch after it, slides along and repeats, for as many **Windows** as you set. The heading's **Unseen** is what those stretches returned added up, beside what the **Market** did. It's the figure to trust, as none of it was used to pick anything. The chart joins those stretches end to end beside the market's held in full, marks each window and shades those that lost. The table beside it shows what each window picked and how that did; hover the chart for the same. Its **Deflated** column is the chance the pick's Sharpe ratio where it was picked was more than luck, for having been the best of every value tried, and the line under the table gives the unseen stretches' own Sharpe ratio, which needs no deflating. Click a window's row to see its pick's trades on its unseen stretch.
+
+**Playing a trade from any test:** pick a trade in a test's trades drawer (an Optimize value, a
+walk-forward window, a random placing, a portfolio's run) and the play button lights blue. Play,
+step, the speed slider and the span work as for a backtest, on that run: its trades on the chart
+it's followed on, its own equity in the pane below, over the span it traded (a walk-forward
+window's unseen stretch, say), and the drawer says what it's made **so far**. Closing the drawer
+goes back to the chart's own backtest.
 
 **Random entries**, under **Test**, compares a backtest with chance. It places the same trades at random times, holding each as long, as many **Runs** as you set. **As good** is the share of placings that returned at least as much: near 50% means the entries add nothing. The charts show how the placings' returns and worst falls were spread, with the backtest's own marked in yellow, the median dashed and the middle 19 in 20 shaded.
 

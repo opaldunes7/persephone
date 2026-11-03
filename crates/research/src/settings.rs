@@ -1,7 +1,7 @@
 //! A chart's backtest settings, saved with the layout: the stock ones every market shares, and
 //! what the engine makes of them.
 
-use std::{fmt, sync::Arc};
+use std::{collections::BTreeSet, fmt, sync::Arc};
 
 use persephone_core::{
     UnixNanos,
@@ -73,6 +73,9 @@ pub struct Settings {
     pub latency_seed: u32,
     /// Nothing to pay at all: no fees, funding or cost settings, whatever else says.
     pub no_costs: bool,
+    /// Chapters switched off as a whole: nothing in them applies, though each setting keeps its
+    /// own switch for when the chapter's back on.
+    pub chapters_off: BTreeSet<Group>,
     /// What the Portfolio test's sweep runs through, and how long Monte Carlo's blocks are.
     pub sweep_min: f64,
     pub sweep_max: f64,
@@ -146,6 +149,7 @@ impl Default for Settings {
             latency_jitter: Section::off(50),
             latency_seed: 0,
             no_costs: false,
+            chapters_off: BTreeSet::new(),
             sweep_min: 0.1,
             sweep_max: 1.0,
             sweep_step: 0.1,
@@ -430,6 +434,19 @@ pub fn time_text(minutes: u32) -> String {
     format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
+/// A chapter of the settings, which can be switched off as a whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Group {
+    Costs,
+    Orders,
+    Exits,
+    Position,
+    Hours,
+    Records,
+    Plugins,
+}
+
 /// A switch or choice in the settings section, applied as soon as it's made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Edit {
@@ -454,6 +471,8 @@ pub enum Edit {
     LegsUseStrategy(bool),
     CashInterest(bool),
     NoCosts(bool),
+    /// A chapter's master switch.
+    Group(Group, bool),
     TrailingStop(bool),
     DecisionLog(bool),
     ClearWeights,
@@ -526,6 +545,13 @@ impl Settings {
             Edit::LegsUseStrategy(on) => self.portfolio.use_chart_strategy = on,
             Edit::CashInterest(on) => self.cash_interest_percent_per_year.on = on,
             Edit::NoCosts(on) => self.no_costs = on,
+            Edit::Group(group, on) => {
+                if on {
+                    self.chapters_off.remove(&group);
+                } else {
+                    self.chapters_off.insert(group);
+                }
+            }
             Edit::TrailingStop(on) => self.trailing_stop_percent.on = on,
             Edit::DecisionLog(on) => self.decision_log = on,
             Edit::ClearWeights => self.portfolio.weights = None,
@@ -922,17 +948,29 @@ impl Settings {
         })
     }
 
-    fn on<'a, T>(&self, section: &'a Section<T>) -> Option<&'a T> {
-        (self.stock && section.on).then_some(&section.value)
+    /// Whether a chapter's master switch is on.
+    #[must_use]
+    pub fn group_on(&self, group: Group) -> bool {
+        !self.chapters_off.contains(&group)
+    }
+
+    /// A section's value, if it applies: its own switch on, its chapter on, and `stock` on.
+    fn on_in<'a, T>(&self, group: Group, section: &'a Section<T>) -> Option<&'a T> {
+        (self.stock && self.group_on(group) && section.on).then_some(&section.value)
+    }
+
+    /// No costs, if Costs is on.
+    fn free(&self) -> bool {
+        self.no_costs && self.group_on(Group::Costs)
     }
 
     /// The fee rates fills pay: a set percentage, or the market's own.
     #[must_use]
     pub fn fees(&self, market: FeeRates) -> FeeRates {
-        if self.no_costs {
+        if self.free() {
             return FeeRates::ZERO;
         }
-        match self.on(&self.commission) {
+        match self.on_in(Group::Costs, &self.commission) {
             Some(Commission::Percent(percent)) => FeeRates {
                 maker: percent / 100.0,
                 taker: percent / 100.0,
@@ -948,43 +986,73 @@ impl Settings {
     #[must_use]
     pub fn sim(&self) -> SimSettings {
         let sim = SimSettings {
-            fee_per_order: match self.on(&self.commission) {
+            fee_per_order: match self.on_in(Group::Costs, &self.commission) {
                 Some(Commission::PerOrder(fee)) => Some(*fee),
                 _ => None,
             },
-            slippage_ticks: self.on(&self.slippage).copied().unwrap_or(0),
-            slippage_percent: self.on(&self.slippage_percent).copied().unwrap_or(0.0),
-            spread_ticks: self.on(&self.spread).copied().unwrap_or(0),
-            latency_ms: self.on(&self.latency).copied().unwrap_or(0),
-            leverage: self.on(&self.leverage).copied().unwrap_or(1.0),
-            compound: self.stock && self.compound,
-            next_open: self.fill_timing == FillTiming::NextOpen,
-            limit: self.on(&self.limit).map(|limit| LimitOrders {
-                offset_percent: limit.offset_percent,
-                expires_bars: limit.expires_bars,
-                through_percent: limit.through_percent,
-            }),
-            stop_loss_percent: self.on(&self.stop_loss_percent).copied(),
-            trailing_stop_percent: self.on(&self.trailing_stop_percent).copied(),
-            decision_log: self.decision_log,
-            take_profit_percent: self.on(&self.take_profit_percent).copied(),
-            borrow_percent_per_year: self.on(&self.borrow_percent_per_year).copied(),
-            impact_percent: self.on(&self.impact_percent).copied().unwrap_or(0.0),
+            slippage_ticks: self
+                .on_in(Group::Costs, &self.slippage)
+                .copied()
+                .unwrap_or(0),
+            slippage_percent: self
+                .on_in(Group::Costs, &self.slippage_percent)
+                .copied()
+                .unwrap_or(0.0),
+            spread_ticks: self.on_in(Group::Costs, &self.spread).copied().unwrap_or(0),
+            latency_ms: self
+                .on_in(Group::Orders, &self.latency)
+                .copied()
+                .unwrap_or(0),
+            leverage: self
+                .on_in(Group::Position, &self.leverage)
+                .copied()
+                .unwrap_or(1.0),
+            compound: self.stock && self.compound && self.group_on(Group::Position),
+            next_open: self.fill_timing == FillTiming::NextOpen && self.group_on(Group::Orders),
+            limit: self
+                .on_in(Group::Orders, &self.limit)
+                .map(|limit| LimitOrders {
+                    offset_percent: limit.offset_percent,
+                    expires_bars: limit.expires_bars,
+                    through_percent: limit.through_percent,
+                }),
+            stop_loss_percent: self.on_in(Group::Exits, &self.stop_loss_percent).copied(),
+            trailing_stop_percent: self
+                .on_in(Group::Exits, &self.trailing_stop_percent)
+                .copied(),
+            decision_log: self.decision_log && self.group_on(Group::Records),
+            take_profit_percent: self.on_in(Group::Exits, &self.take_profit_percent).copied(),
+            borrow_percent_per_year: self
+                .on_in(Group::Costs, &self.borrow_percent_per_year)
+                .copied(),
+            impact_percent: self
+                .on_in(Group::Costs, &self.impact_percent)
+                .copied()
+                .unwrap_or(0.0),
             impact_exponent: self.impact_exponent,
             volume_warning_percent: self.volume_warning_percent,
             fill_warning_percent: self.fill_warning_percent,
-            cash_interest_percent_per_year: self.on(&self.cash_interest_percent_per_year).copied(),
+            cash_interest_percent_per_year: self
+                .on_in(Group::Costs, &self.cash_interest_percent_per_year)
+                .copied(),
             range_slippage_look_back: self.range_look_back,
-            max_participation_percent: self.on(&self.max_participation_percent).copied(),
+            max_participation_percent: self
+                .on_in(Group::Orders, &self.max_participation_percent)
+                .copied(),
             range_slippage_percent: self
-                .on(&self.range_slippage_percent)
+                .on_in(Group::Costs, &self.range_slippage_percent)
                 .copied()
                 .unwrap_or(0.0),
-            latency_jitter_ms: self.on(&self.latency_jitter).copied().unwrap_or(0),
+            latency_jitter_ms: self
+                .on_in(Group::Orders, &self.latency_jitter)
+                .copied()
+                .unwrap_or(0),
             latency_seed: u64::from(self.latency_seed),
-            max_gross_percent: self.on(&self.max_gross_percent).copied(),
+            max_gross_percent: self
+                .on_in(Group::Position, &self.max_gross_percent)
+                .copied(),
         };
-        if self.no_costs {
+        if self.free() {
             crate::figures::free_sim(&sim)
         } else {
             sim
@@ -997,7 +1065,7 @@ impl Settings {
         &self,
         rates: Option<std::sync::Arc<Vec<(UnixNanos, f64)>>>,
     ) -> Option<std::sync::Arc<Vec<(UnixNanos, f64)>>> {
-        rates.filter(|_| !self.no_costs)
+        rates.filter(|_| !self.free())
     }
 
     /// The inverting, direction and session rules, for backtests and live trading alike.
@@ -1006,12 +1074,12 @@ impl Settings {
     ///
     /// Returns a message if the session's time zone isn't one.
     pub fn rules(&self) -> Result<TradingRules, String> {
-        let direction = match self.on(&self.direction) {
+        let direction = match self.on_in(Group::Position, &self.direction) {
             Some(OneWay::LongOnly) => Direction::LongOnly,
             Some(OneWay::ShortOnly) => Direction::ShortOnly,
             None => Direction::Both,
         };
-        let session = match self.on(&self.session) {
+        let session = match self.on_in(Group::Hours, &self.session) {
             Some(rule) => {
                 let zone: Zone = rule.zone.parse().map_err(|e| format!("{e:#}"))?;
                 let close_after = rule.close_after;
@@ -1024,7 +1092,7 @@ impl Settings {
             None => None,
         };
         Ok(TradingRules {
-            invert: self.stock && self.invert,
+            invert: self.stock && self.invert && self.group_on(Group::Position),
             direction,
             session,
         })
@@ -1033,7 +1101,7 @@ impl Settings {
     /// The commission as said in the panel: `0.1%` or `2.5 per order`, or the market's.
     #[must_use]
     pub fn describe_commission(&self) -> Option<String> {
-        self.on(&self.commission).map(|c| match c {
+        self.on_in(Group::Costs, &self.commission).map(|c| match c {
             Commission::Percent(p) => format!("{p}%"),
             Commission::PerOrder(fee) => format!("{fee} per order"),
             Commission::Rates { maker, taker } => format!("{maker}% maker, {taker}% taker"),
@@ -1043,6 +1111,37 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_chapter_switched_off_takes_all_of_it_off_and_back_on_restores_it() {
+        let market = FeeRates {
+            maker: 0.001,
+            taker: 0.002,
+        };
+        let mut settings = Settings::default();
+        settings.slippage_percent.on = true;
+        settings.commission.on = true;
+        settings.limit.on = true;
+        settings.fill_timing = FillTiming::NextOpen;
+        let with = settings.sim();
+        assert!(with.slippage_percent > 0.0 && with.limit.is_some() && with.next_open);
+        assert_ne!(settings.fees(market), market);
+
+        settings.apply(Edit::Group(Group::Costs, false));
+        let without = settings.sim();
+        assert_eq!(without.slippage_percent, 0.0);
+        assert_eq!(settings.fees(market), market, "the market's own");
+        assert!(settings.slippage_percent.on, "its own switch is kept");
+        assert!(without.limit.is_some(), "other chapters stay");
+
+        settings.apply(Edit::Group(Group::Orders, false));
+        let neither = settings.sim();
+        assert!(neither.limit.is_none() && !neither.next_open);
+
+        settings.apply(Edit::Group(Group::Costs, true));
+        settings.apply(Edit::Group(Group::Orders, true));
+        assert_eq!(settings.sim(), with);
+    }
+
     #[test]
     fn retiring_the_stock_switch_runs_the_same() {
         let mut settings = Settings {

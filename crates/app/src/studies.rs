@@ -79,6 +79,12 @@ pub fn equity(report: &BacktestReport, bars: usize) -> Study {
     let mut values = report.equity.clone();
     let last = values.last().copied().unwrap_or(report.starting_balance);
     values.resize(bars.max(values.len()), last);
+    equity_line(values, report.starting_balance)
+}
+
+/// An account's line in a pane of its own, one value a bar (not a number where there's none),
+/// with its starting balance marked.
+pub fn equity_line(values: Vec<f64>, start: f64) -> Study {
     Study {
         label: "Equity".into(),
         placement: Placement::Pane,
@@ -89,7 +95,7 @@ pub fn equity(report: &BacktestReport, bars: usize) -> Study {
             style: OutputStyle::Line,
         }],
         fill: None,
-        levels: vec![report.starting_balance],
+        levels: vec![start],
         range: None,
         error: None,
     }

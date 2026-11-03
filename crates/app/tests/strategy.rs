@@ -1410,6 +1410,20 @@ mod panel {
             request.sim.slippage_percent > 0.0,
             "and the backtest has it"
         );
+        // Its chapter's own switch takes all of it off, and back on restores it.
+        panel(
+            &mut app,
+            PanelMessage::Edit(Edit::Group(persephone::backtest::Group::Costs, false)),
+        );
+        assert!(shows(&app, "off"), "the heading says so");
+        let (_, request) = app.backtest_request(0).unwrap();
+        assert_eq!(request.sim.slippage_percent, 0.0);
+        assert!(app.tile_backtest(0).unwrap().slippage_percent.on, "kept");
+        panel(
+            &mut app,
+            PanelMessage::Edit(Edit::Group(persephone::backtest::Group::Costs, true)),
+        );
+        assert!(app.backtest_request(0).unwrap().1.sim.slippage_percent > 0.0);
         panel(&mut app, PanelMessage::Chapter(Chapter::Costs, false));
         assert!(!shows(&app, "Slippage %"));
         // Closing changes nothing about the backtest.
@@ -2085,6 +2099,49 @@ mod panel {
         assert!(shows(&app, "Apply"));
         panel(&mut app, PanelMessage::InspectTrade(0));
         assert!(app.panel().unwrap().playback.at.is_some());
+
+        // Picked, the trade plays: its run, bar by bar, as a backtest's does.
+        let run = app
+            .panel()
+            .unwrap()
+            .inspect
+            .as_ref()
+            .unwrap()
+            .run
+            .clone()
+            .expect("the run found again is kept");
+        let equity = |app: &Persephone| {
+            let chart = app.tile_chart(0).unwrap();
+            let study = chart
+                .studies()
+                .iter()
+                .find(|study| study.label == "Equity")
+                .expect("an equity pane");
+            (chart.data().candles.clone(), study.lines[0].values.clone())
+        };
+        let (candles, values) = equity(&app);
+        // Inside its run (which stops where any kept-back bars begin), and blank past it.
+        let last = candles.partition_point(|c| c.ts <= run.span.1) - 1;
+        let bar = last - 5;
+        if last + 1 < candles.len() {
+            assert!(values[last + 1].is_nan());
+        }
+        assert_eq!(
+            values[bar],
+            run.at(candles[bar].ts).unwrap(),
+            "the optimized run's account, not the chart's own backtest's"
+        );
+        let before = app.panel().unwrap().playback.at.unwrap();
+        panel(&mut app, PanelMessage::Play);
+        assert!(app.panel().unwrap().playback.playing);
+        let _ = app.update(Message::Tick(Instant::now()));
+        let _ = app.update(Message::Tick(Instant::now() + Duration::from_millis(500)));
+        let after = app.panel().unwrap().playback.at.unwrap();
+        assert!(after > before, "it plays on: {after} after {before}");
+        assert!(shows(&app, "So far"), "the drawer says what it's made");
+        panel(&mut app, PanelMessage::Pause);
+        panel(&mut app, PanelMessage::Step);
+        assert!(app.panel().unwrap().playback.at.unwrap() > after);
     }
 
     #[test]
@@ -2115,6 +2172,13 @@ mod panel {
                 .iter()
                 .all(|row| row.trip.entry_ts >= window.test_from)
         );
+        // Played back, it plays its unseen stretch only.
+        panel(&mut app, PanelMessage::InspectTrade(0));
+        panel(&mut app, PanelMessage::Restart);
+        let at = app.panel().unwrap().playback.at.unwrap();
+        assert!(at >= window.test_from, "{at} before {}", window.test_from);
+        panel(&mut app, PanelMessage::Play);
+        assert!(app.panel().unwrap().playback.playing);
     }
 
     #[test]

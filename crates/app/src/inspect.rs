@@ -7,7 +7,7 @@ use persephone_core::Side;
 
 use super::*;
 use crate::backtest::{
-    InspectWhat, Inspected, Inspection, OptimizeRun, TestRun,
+    InspectWhat, Inspected, InspectedRun, Inspection, OptimizeRun, TestRun,
     trades::{Ledger, LedgerRow},
 };
 
@@ -105,7 +105,10 @@ impl Persephone {
             }
             .placing(draw)?;
             let run = portfolio::run(placed, false)?;
-            Ok(Ledger::from_portfolio(&run))
+            Ok((
+                Ledger::from_portfolio(&run),
+                Some(InspectedRun::of_portfolio(&run)),
+            ))
         })
     }
 
@@ -224,7 +227,8 @@ impl Persephone {
             request.ticks = None;
             request.fill_bars = None;
             let report = persephone_engine::run_backtest(&request).map_err(|e| e.to_string())?;
-            Ok(Ledger::from_report(&report, &symbol))
+            let run = InspectedRun::of_backtest(&report, &request.candles, request.trade_from);
+            Ok((Ledger::from_report(&report, &symbol), Some(run)))
         })
     }
 
@@ -270,7 +274,8 @@ impl Persephone {
             request.ticks = None;
             request.fill_bars = None;
             let report = persephone_engine::run_backtest(&request).map_err(|e| e.to_string())?;
-            Ok(Ledger::from_report(&report, &symbol))
+            let run = InspectedRun::of_backtest(&report, &request.candles, request.trade_from);
+            Ok((Ledger::from_report(&report, &symbol), Some(run)))
         })
     }
 
@@ -352,7 +357,10 @@ impl Persephone {
                 None => candidate.request,
             };
             let run = portfolio::run(request, false)?;
-            Ok(Ledger::from_portfolio(&run))
+            Ok((
+                Ledger::from_portfolio(&run),
+                Some(InspectedRun::of_portfolio(&run)),
+            ))
         })
     }
 
@@ -427,8 +435,9 @@ impl Persephone {
                 }
                 .placing(draw)?
             };
-            let run = persephone_engine::run_backtest(&placed).map_err(|e| e.to_string())?;
-            Ok(Ledger::from_report(&run, &symbol))
+            let report = persephone_engine::run_backtest(&placed).map_err(|e| e.to_string())?;
+            let run = InspectedRun::of_backtest(&report, &placed.candles, placed.trade_from);
+            Ok((Ledger::from_report(&report, &symbol), Some(run)))
         })
     }
 
@@ -438,7 +447,7 @@ impl Persephone {
         what: InspectWhat,
         title: String,
         venues: Vec<(String, Option<String>)>,
-        job: impl FnOnce() -> Result<Ledger, String> + Send + 'static,
+        job: impl FnOnce() -> Result<(Ledger, Option<InspectedRun>), String> + Send + 'static,
     ) -> Task<Message> {
         let run = backtest::next_run();
         if let Some(panel) = self.panel.as_mut() {
@@ -446,13 +455,14 @@ impl Persephone {
             inspection.venues = venues;
             panel.inspect = Some(inspection);
         }
-        Task::perform(on_thread(move || job().map(Arc::new)), move |result| {
-            Message::Inspected(run, result)
-        })
+        Task::perform(
+            on_thread(move || job().map(|(ledger, run)| (Arc::new(ledger), run.map(Arc::new)))),
+            move |result| Message::Inspected(run, result),
+        )
     }
 
     /// What a run found again came to, if the drawer's still waiting for it.
-    pub(crate) fn inspected(&mut self, run: u64, result: Result<Arc<Ledger>, String>) {
+    pub(crate) fn inspected(&mut self, run: u64, result: Result<backtest::Found, String>) {
         if let Some(inspection) = self
             .panel
             .as_mut()
@@ -462,7 +472,10 @@ impl Persephone {
             )
         {
             inspection.found = match result {
-                Ok(ledger) => Inspected::Ready(ledger),
+                Ok((ledger, found)) => {
+                    inspection.run = found;
+                    Inspected::Ready(ledger)
+                }
                 Err(error) => Inspected::Failed(error),
             };
         }
@@ -596,6 +609,8 @@ impl Persephone {
         });
         tile.inspected = Some(trades.clone());
         chart.set_trades(Some(trades));
+        // Its equity, the run's rather than the chart's own, when that run was found again.
+        self.restudy_chart(target);
         // As the calendar's replay does: paused, a few bars before it opened.
         let Some((start, end)) = self.playback_span() else {
             return;

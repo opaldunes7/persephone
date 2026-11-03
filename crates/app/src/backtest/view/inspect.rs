@@ -16,6 +16,7 @@ fn muted<'a>(content: String) -> iced::widget::Text<'a> {
 pub(super) fn inspect_drawer<'a>(
     inspection: &'a Inspection,
     quote: &'a str,
+    playhead: Option<persephone_core::UnixNanos>,
 ) -> Element<'a, PanelMessage> {
     let close = tip(
         button(text("✕").size(12).center())
@@ -55,6 +56,34 @@ pub(super) fn inspect_drawer<'a>(
     ]
     .spacing(6)
     .align_y(Alignment::Center);
+    // While its run plays: what it has made by the playhead, as the backtest's legend says.
+    let so_far: Option<Element<'a, PanelMessage>> =
+        match (&inspection.found, &inspection.run, playhead) {
+            (Inspected::Ready(ledger), Some(run), Some(at)) if inspection.picked.is_some() => {
+                run.at(at).map(|value| {
+                    let made = value / run.start - 1.0;
+                    let closed = ledger
+                        .rows
+                        .iter()
+                        .filter(|row| !row.trip.open && row.trip.exit_ts <= at)
+                        .count();
+                    row![
+                        text("So far").size(HINT).color(theme::TEXT_MUTED),
+                        text(format!("{:+.2}%", made * 100.0))
+                            .size(SMALL)
+                            .font(iced::Font::MONOSPACE)
+                            .color(if made >= 0.0 { theme::UP } else { theme::DOWN }),
+                        text(format!("{closed} of {} trades closed", ledger.rows.len()))
+                            .size(HINT)
+                            .color(theme::TEXT_MUTED),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                    .into()
+                })
+            }
+            _ => None,
+        };
     let body: Element<'a, PanelMessage> = match &inspection.found {
         Inspected::Finding(_) => muted("Running it again to find its trades…".into()).into(),
         Inspected::Failed(error) => text(error.as_str()).size(SMALL).color(theme::DOWN).into(),
@@ -66,7 +95,9 @@ pub(super) fn inspect_drawer<'a>(
         .style(|_| container::background(theme::AXIS_LINE));
     row![
         divider,
-        column![heading, body]
+        column![heading]
+            .push(so_far)
+            .push(body)
             .spacing(6)
             .padding(Padding {
                 top: 8.0,
