@@ -7,6 +7,8 @@
 //! persephone-agents mcp                             Serve the tools over MCP on stdio
 //! persephone-agents serve [--port N]                Serve them over local HTTP (default 8766)
 //! persephone-agents run TEAM [--run NAME]           Run a team here, saying what it does
+//! persephone-agents export TEAM [FILE]              A team's setup file, to keep or share
+//! persephone-agents import FILE [--name NAME]       A team from a setup file
 //! ```
 //!
 //! `--root DIR` before any of them keeps teams somewhere other than `~/persephone-agents`, and
@@ -25,7 +27,7 @@ use persephone_agents::{
 };
 use serde_json::{Value, json};
 
-const USAGE: &str = "usage: persephone-agents [--root DIR] [--claude PATH] tools [--markdown] | call NAME [ARGS-AS-JSON | @FILE] | mcp | serve [--port N] | run TEAM [--run NAME]";
+const USAGE: &str = "usage: persephone-agents [--root DIR] [--claude PATH] tools [--markdown] | call NAME [ARGS-AS-JSON | @FILE] | mcp | serve [--port N] | run TEAM [--run NAME] | export TEAM [FILE] | import FILE [--name NAME]";
 
 fn run_cli() -> Result<(), String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -99,6 +101,45 @@ fn run_cli() -> Result<(), String> {
                     http::token_path(&desk).display()
                 );
             })
+        }
+        Some("export") => {
+            let team = args.get(1).ok_or(USAGE)?;
+            let mut call = json!({"team": team});
+            if let Some(path) = args.get(2) {
+                call["path"] = json!(path);
+            }
+            let answer = desk.dispatch("export_team", &call)?;
+            match answer["written"].as_str() {
+                Some(path) => eprintln!("Wrote {path}"),
+                None => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&answer["setup"]).unwrap_or_default()
+                ),
+            }
+            Ok(())
+        }
+        Some("import") => {
+            let path = args.get(1).ok_or(USAGE)?;
+            let mut call = json!({"path": path});
+            match args.get(2).map(String::as_str) {
+                Some("--name") => call["name"] = json!(args.get(3).ok_or("--name needs a name")?),
+                Some(_) => return Err(USAGE.into()),
+                None => {}
+            }
+            let team = desk.dispatch("import_team", &call)?;
+            println!(
+                "Made {} ({} agents) in {}",
+                team["name"].as_str().unwrap_or_default(),
+                team["agents"].as_array().map_or(0, Vec::len),
+                team["folder"].as_str().unwrap_or_default()
+            );
+            if let Some(problems) = team["problems"].as_array().filter(|p| !p.is_empty()) {
+                println!("Before it can run:");
+                for problem in problems {
+                    println!("- {}", problem.as_str().unwrap_or_default());
+                }
+            }
+            Ok(())
         }
         Some("run") => {
             let team = args.get(1).ok_or(USAGE)?;

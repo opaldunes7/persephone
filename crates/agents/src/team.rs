@@ -292,7 +292,7 @@ impl Team {
             id: fresh_id(name),
             name: name.to_owned(),
             brief: String::new(),
-            principles: PRINCIPLES.to_owned(),
+            principles: PRINCIPLES.trim_end().to_owned(),
             agents: Vec::new(),
             links: Vec::new(),
             lab: LabCard {

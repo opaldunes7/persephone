@@ -689,7 +689,8 @@ including the data behind its charts, is available to them as well.
 role, model and effort, who reports to whom, who hands work to whom, and who reviews whom. **Run**
 starts them as Claude Code sessions that work through Lab, sandboxed so they can't touch Persephone's
 code, a shell or the web. Their cards light up as they work, and their reports, memory, and bugs and
-ideas for the app show beside them. Another AI can do all of it too, through `persephone-agents`. See
+ideas for the app show beside them. Another AI can do all of it too, through `persephone-agents`, and a whole team can be saved and
+loaded as one JSON file ([setup files](agents-setup.md)). See
 [Agents](agents.md).
 
 ## Where files live

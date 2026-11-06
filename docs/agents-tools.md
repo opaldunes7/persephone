@@ -194,6 +194,21 @@ Every agent's bugs and ideas for Persephone, in one place.
 
 - `team` (string, required): The team, by its id or name.
 
+## `export_team`
+
+A team's whole setup as a file: its brief, principles, every agent's settings, the links, Lab and the layout, by name. Import it with import_team to get the same setup again, here or on another computer. Agents' memory isn't in it.
+
+- `team` (string, required): The team, by its id or name.
+- `path` (string): Also write it to this file.
+
+## `import_team`
+
+Makes a team from a setup file, as export_team writes it or as written by hand or by an AI (docs/agents-setup.md says how). Every key is checked, so a typo is caught rather than ignored. Its agents start with no memory.
+
+- `setup` (object): The setup itself.
+- `path` (string): Or a file holding it.
+- `name` (string): A name for the team instead of the file's, such as when that one's taken.
+
 ## `set_notes`
 
 Writes an agent's tasks.md (jobs for it to work through) or vetoed.md (what you reverted from its memory, and why). Only for an agent that reports to no one.

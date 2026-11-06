@@ -1,0 +1,48 @@
+{
+  "format": "persephone-agents/1",
+  "name": "Crypto research desk",
+  "brief": "Is there anything worth trading in BTCUSDT and ETHUSDT, spot or perpetual, on 1h or 4h bars, after realistic costs? Learn how these markets behave, and how far Persephone can be trusted to tell you.",
+  "at_once": 2,
+  "lab": {"data": "own"},
+  "agents": [
+    {
+      "name": "Head",
+      "role": "Leads the research. Turns the brief into questions that can be tested, gives each analyst one to work, checks what they bring back by re-running what matters, and writes the desk's report.",
+      "model": "opus",
+      "effort": "high",
+      "budget": 60,
+      "spend_cap": 15,
+      "memory": true,
+      "app_notes": true,
+      "uses_lab": true
+    },
+    {
+      "name": "Trend",
+      "role": "Tests trend-following rules on the question the head gives it, with next-open fills, slippage and funding, and brings back the figures and run ids.",
+      "model": "sonnet",
+      "effort": "medium",
+      "budget": 80,
+      "reports_to": "Head"
+    },
+    {
+      "name": "Carry",
+      "role": "Tests funding-rate and basis ideas on perpetuals, against holding the market at the same size, and brings back the figures and run ids.",
+      "model": "sonnet",
+      "effort": "medium",
+      "budget": 80,
+      "reports_to": "Head"
+    },
+    {
+      "name": "Skeptic",
+      "role": "Checks the head's report by re-running its claims in Lab, and with tests that could break them: other years, shifted starts, random entries, higher costs. Says plainly what holds and what doesn't.",
+      "model": "sonnet",
+      "effort": "high",
+      "budget": 60,
+      "spend_cap": 8,
+      "app_notes": false
+    }
+  ],
+  "links": [
+    {"from": "Skeptic", "to": "Head", "kind": "reviews", "rounds": 1}
+  ]
+}

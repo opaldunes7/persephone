@@ -416,3 +416,46 @@ fn a_run_started_elsewhere_lights_the_cards_and_can_be_stopped() {
     let _ = runner.wait();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn a_setup_file_imports_as_a_team_and_exports_again() {
+    let dir = dir("setup");
+    let mut app = app();
+    app.use_agents_root(dir.join("teams"), found());
+    let _ = app.update(Message::Agents(AgentsMessage::Toggle));
+    let example =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/agents-setup.json");
+    say(&mut app, AgentsMessage::SetupPicked(Some(example.clone())));
+    let team = app.agents().team().unwrap().clone();
+    assert_eq!(team.name, "Crypto research desk");
+    assert_eq!(team.agents.len(), 4);
+    assert_eq!(
+        app.agents().note.as_deref(),
+        Some("Imported Crypto research desk.")
+    );
+    // Again: the name's taken, so the next free one.
+    say(&mut app, AgentsMessage::SetupPicked(Some(example)));
+    assert_eq!(app.agents().team().unwrap().name, "Crypto research desk 2");
+    let out = dir.join("out.json");
+    say(&mut app, AgentsMessage::SetupSaveTo(Some(out.clone())));
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+    assert_eq!(
+        written,
+        persephone_agents::control::export(app.agents().team().unwrap())
+    );
+    // A broken file says why, and changes nothing.
+    std::fs::write(
+        dir.join("bad.json"),
+        r#"{"name": "X", "agents": [{"nmae": "A"}]}"#,
+    )
+    .unwrap();
+    let before = app.agents().teams.len();
+    say(
+        &mut app,
+        AgentsMessage::SetupPicked(Some(dir.join("bad.json"))),
+    );
+    assert_eq!(app.agents().teams.len(), before);
+    assert!(app.agents().note.as_deref().unwrap().contains("`nmae`"));
+    std::fs::remove_dir_all(dir).unwrap();
+}

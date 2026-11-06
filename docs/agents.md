@@ -40,6 +40,8 @@ Lab's on the Lab card.
 | Lead and analysts | An Opus lead with two Sonnet analysts, in one session |
 | Researcher and reviewer | Two sessions: a researcher, and a reviewer that re-runs its claims, for one round |
 
+**Setup files:** **Import…** makes a team from a JSON file, and **Export…** saves the team on the canvas as one, so a setup that works can be kept, shared, or written by another AI. See [Agent setup files](agents-setup.md).
+
 **Duplicate** copies a design with new agents, so the copy starts with no memory. **Archive** moves a
 team's folder out of the way. Nothing is ever deleted.
 

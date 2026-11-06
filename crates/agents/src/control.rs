@@ -352,6 +352,24 @@ pub fn tools() -> Vec<Tool> {
             args: vec![TEAM],
         },
         Tool {
+            name: "export_team",
+            what: "A team's whole setup as a file: its brief, principles, every agent's settings, the links, Lab and the layout, by name. Import it with import_team to get the same setup again, here or on another computer. Agents' memory isn't in it.",
+            args: vec![TEAM, opt("path", "string", "Also write it to this file.")],
+        },
+        Tool {
+            name: "import_team",
+            what: "Makes a team from a setup file, as export_team writes it or as written by hand or by an AI (docs/agents-setup.md says how). Every key is checked, so a typo is caught rather than ignored. Its agents start with no memory.",
+            args: vec![
+                opt("setup", "object", "The setup itself."),
+                opt("path", "string", "Or a file holding it."),
+                opt(
+                    "name",
+                    "string",
+                    "A name for the team instead of the file's, such as when that one's taken.",
+                ),
+            ],
+        },
+        Tool {
             name: "set_notes",
             what: "Writes an agent's tasks.md (jobs for it to work through) or vetoed.md (what you reverted from its memory, and why). Only for an agent that reports to no one.",
             args: vec![
@@ -420,7 +438,8 @@ session's spend cap holds; check_team says the most a run can spend.
 
 ## Building one
 
-1. create_team with a name, a brief, and its agents and links, all in one call.
+1. create_team with a name, a brief, and its agents and links, all in one call; or import_team
+   with a setup file (export_team writes one from any team).
 2. check_team, and fix what it says with update_team, update_agent, link and unlink.
 3. run_team, then get_run until it's ended.
 4. get_outputs and get_feedback for what the agents wrote.";
@@ -477,6 +496,21 @@ impl Desk {
             "get_outputs" => self.get_outputs(args),
             "get_feedback" => self.get_feedback(args),
             "set_notes" => self.set_notes(args),
+            "export_team" => {
+                let team = self.load(text(args, "team")?)?;
+                let setup = export(&team);
+                let written = match args.get("path").and_then(Value::as_str) {
+                    Some(path) => {
+                        let path = expand(path);
+                        let text = serde_json::to_string_pretty(&setup).unwrap_or_default() + "\n";
+                        folder::write_aside(&path, text.as_bytes())?;
+                        Some(path)
+                    }
+                    None => None,
+                };
+                Ok(json!({"setup": setup, "written": written}))
+            }
+            "import_team" => self.import_team(args),
             _ => Err(format!(
                 "there's no tool called `{tool}`; the tools are {}",
                 tools()
@@ -673,6 +707,34 @@ impl Desk {
         }
         if args.get("agents").is_some() {
             tidy(&mut team);
+        }
+        self.save(&team)?;
+        Ok(self.describe(&team))
+    }
+
+    fn import_team(&self, args: &Value) -> Result<Value, String> {
+        let setup = match (args.get("setup"), args.get("path").and_then(Value::as_str)) {
+            (Some(setup), _) => setup.clone(),
+            (None, Some(path)) => read_setup(&expand(path))?,
+            (None, None) => return Err("give `setup`, or the `path` of a file holding one".into()),
+        };
+        let mut team = import(&setup)?;
+        if let Some(name) = args.get("name").and_then(Value::as_str) {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("a team needs a name".into());
+            }
+            team.name = name.to_owned();
+        }
+        if self
+            .teams()
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case(&team.name))
+        {
+            return Err(format!(
+                "there's a team called `{}` already: pass `name` to call this one something else",
+                team.name
+            ));
         }
         self.save(&team)?;
         Ok(self.describe(&team))
@@ -1513,6 +1575,323 @@ fn add_link(team: &mut Team, spec: &Value) -> Result<(), String> {
     Ok(())
 }
 
+// --- Setup files -----------------------------------------------------------------------------
+
+/// What a setup file says it is.
+pub const FORMAT: &str = "persephone-agents/1";
+
+const TEAM_KEYS: [&str; 9] = [
+    "format",
+    "name",
+    "brief",
+    "principles",
+    "at_once",
+    "lab",
+    "agents",
+    "links",
+    "view",
+];
+const AGENT_KEYS: [&str; 11] = [
+    "name",
+    "role",
+    "model",
+    "effort",
+    "budget",
+    "spend_cap",
+    "memory",
+    "app_notes",
+    "uses_lab",
+    "reports_to",
+    "at",
+];
+const LINK_KEYS: [&str; 4] = ["from", "to", "kind", "rounds"];
+const LAB_KEYS: [&str; 3] = ["data", "folder", "at"];
+const VIEW_KEYS: [&str; 2] = ["at", "zoom"];
+
+/// A team's whole setup, as a file: everything but its id and its agents' memory, by name, so
+/// it can be kept, shared, or written by hand or by another AI. Lab's program isn't in it, as
+/// that's where Lab is on this computer.
+#[must_use]
+pub fn export(team: &Team) -> Value {
+    let agents: Vec<Value> = team
+        .agents
+        .iter()
+        .map(|agent| {
+            json!({
+                "name": agent.name,
+                "role": agent.role,
+                "model": agent.model.cli(),
+                "effort": agent.effort.cli(),
+                "budget": agent.budget,
+                "spend_cap": agent.spend_cap,
+                "memory": agent.memory,
+                "app_notes": agent.app_notes,
+                "uses_lab": team.uses_lab(&agent.id),
+                "reports_to": team.lead_of(&agent.id).map(|id| team.name_of(id)),
+                "at": agent.at,
+            })
+        })
+        .collect();
+    // Leads are said by each agent's reports_to; the rest are links.
+    let links: Vec<Value> = team
+        .links
+        .iter()
+        .filter(|l| matches!(l.kind, LinkKind::HandsTo | LinkKind::Reviews { .. }))
+        .map(|link| {
+            let mut out = json!({
+                "from": team.name_of(&link.from),
+                "to": team.name_of(&link.to),
+                "kind": kind_name(link.kind),
+            });
+            if let LinkKind::Reviews { rounds } = link.kind {
+                out["rounds"] = json!(rounds);
+            }
+            out
+        })
+        .collect();
+    let mut lab = json!({"at": team.lab.at});
+    match &team.lab.data {
+        LabData::App => lab["data"] = json!("app"),
+        LabData::Own(dir) => {
+            lab["data"] = json!("own");
+            if LabData::Own(dir.clone()) != LabData::own_default() {
+                lab["folder"] = json!(tilde(dir));
+            }
+        }
+    }
+    json!({
+        "format": FORMAT,
+        "name": team.name,
+        "brief": team.brief,
+        "principles": team.principles,
+        "at_once": team.at_once,
+        "lab": lab,
+        "agents": agents,
+        "links": links,
+        "view": {"at": team.view.at, "zoom": team.view.zoom},
+    })
+}
+
+/// A team from a setup file, with a new id; its agents start with no memory. Every key is
+/// checked, so a misspelt one is said rather than ignored. The cards stay where the file puts
+/// them if it places every one; otherwise they're laid out as a tree.
+///
+/// # Errors
+///
+/// Says what in the file is wrong, and where.
+pub fn import(setup: &Value) -> Result<Team, String> {
+    only(setup, &TEAM_KEYS, "The setup")?;
+    if let Some(format) = setup.get("format") {
+        let format = format.as_str().unwrap_or_default();
+        if format != FORMAT {
+            return Err(format!(
+                "the setup's format is `{format}`, and this reads `{FORMAT}`"
+            ));
+        }
+    }
+    let name = setup
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or("the setup needs a `name` for the team")?;
+    kinds(
+        setup,
+        &[
+            ("brief", "text"),
+            ("principles", "text"),
+            ("at_once", "whole number"),
+        ],
+        "The setup",
+    )?;
+    let mut team = Team::new(name, Starter::Blank);
+    team_fields(&mut team, setup)?;
+
+    let specs = match setup.get("agents") {
+        None => Vec::new(),
+        Some(agents) => agents
+            .as_array()
+            .ok_or("`agents` is a list of objects, one for each agent")?
+            .clone(),
+    };
+    let mut leads = Vec::new();
+    let mut placed = !specs.is_empty();
+    for (n, spec) in specs.iter().enumerate() {
+        let what = format!("Agent {}", n + 1);
+        only(spec, &AGENT_KEYS, &what)?;
+        kinds(
+            spec,
+            &[
+                ("name", "text"),
+                ("role", "text"),
+                ("model", "text"),
+                ("effort", "text"),
+                ("budget", "whole number"),
+                ("spend_cap", "number"),
+                ("memory", "true or false"),
+                ("app_notes", "true or false"),
+                ("uses_lab", "true or false"),
+                ("reports_to", "text or null"),
+                ("at", "[x, y]"),
+            ],
+            &what,
+        )?;
+        let agent_name = spec
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| format!("{what} needs a `name`"))?;
+        if team.agents.iter().any(|a| key(&a.name) == key(agent_name)) {
+            return Err(format!(
+                "two agents are called `{agent_name}`: names must differ"
+            ));
+        }
+        let id = team.add_agent([0.0, 0.0]);
+        if let Some(agent) = team.agent_mut(&id) {
+            agent.name = agent_name.to_owned();
+        }
+        let mut fields = spec.clone();
+        if let Some(lead) = fields.as_object_mut().and_then(|f| f.remove("reports_to")) {
+            leads.push((id.clone(), lead));
+        }
+        if fields.get("uses_lab").is_none() {
+            fields["uses_lab"] = json!(true);
+        }
+        placed &= fields.get("at").is_some();
+        agent_fields(&mut team, &id, &fields).map_err(|e| format!("{agent_name}: {e}"))?;
+    }
+    for (id, lead) in leads {
+        agent_fields(&mut team, &id, &json!({"reports_to": lead}))
+            .map_err(|e| format!("{}: {e}", team.name_of(&id)))?;
+    }
+    if let Some(links) = setup.get("links") {
+        let links = links
+            .as_array()
+            .ok_or("`links` is a list of objects, each with from, to and kind")?;
+        for (n, spec) in links.iter().enumerate() {
+            let what = format!("Link {}", n + 1);
+            only(spec, &LINK_KEYS, &what)?;
+            kinds(
+                spec,
+                &[
+                    ("from", "text"),
+                    ("to", "text"),
+                    ("kind", "text"),
+                    ("rounds", "whole number"),
+                ],
+                &what,
+            )?;
+            add_link(&mut team, spec).map_err(|e| format!("{what}: {e}"))?;
+        }
+    }
+    if placed {
+        if let Some(view) = setup.get("view") {
+            only(view, &VIEW_KEYS, "`view`")?;
+            if let Some(at) = point(view.get("at")) {
+                team.view.at = at;
+            }
+            if let Some(zoom) = view.get("zoom").and_then(Value::as_f64) {
+                #[allow(clippy::cast_possible_truncation)]
+                let zoom = zoom as f32;
+                team.view.zoom = zoom.clamp(0.3, 2.5);
+            }
+        }
+    } else {
+        tidy(&mut team);
+    }
+    if let Some(lab) = setup.get("lab") {
+        only(lab, &LAB_KEYS, "`lab`")?;
+        let folder = lab.get("folder").and_then(Value::as_str);
+        team.lab.data = match (lab.get("data").and_then(Value::as_str), folder) {
+            (Some("app"), _) => LabData::App,
+            (Some("own") | None, Some(folder)) => LabData::Own(expand(folder)),
+            (Some("own") | None, None) => LabData::own_default(),
+            (Some(other), _) => {
+                return Err(format!("`lab.data` is own or app, not `{other}`"));
+            }
+        };
+        if placed && let Some(at) = point(lab.get("at")) {
+            team.lab.at = at;
+        }
+    }
+    Ok(team)
+}
+
+/// A setup from a file.
+///
+/// # Errors
+///
+/// Says why it couldn't be read.
+pub fn read_setup(path: &Path) -> Result<Value, String> {
+    let text =
+        fs::read_to_string(path).map_err(|e| format!("couldn't read {}: {e}", path.display()))?;
+    serde_json::from_str(&text).map_err(|e| format!("{} isn't JSON: {e}", path.display()))
+}
+
+/// Refuses keys a part of a setup doesn't take.
+fn only(value: &Value, keys: &[&str], what: &str) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{what} is a JSON object"))?;
+    match object.keys().find(|k| !keys.contains(&k.as_str())) {
+        Some(stray) => Err(format!(
+            "{what} has `{stray}`, which a setup doesn't take; it takes {}",
+            keys.join(", ")
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Refuses values of the wrong kind.
+fn kinds(value: &Value, wanted: &[(&str, &str)], what: &str) -> Result<(), String> {
+    for (name, kind) in wanted {
+        let Some(found) = value.get(*name) else {
+            continue;
+        };
+        let fits = match *kind {
+            "text" => found.is_string(),
+            "text or null" => found.is_string() || found.is_null(),
+            "whole number" => found.is_u64(),
+            "number" => found.is_number(),
+            "true or false" => found.is_boolean(),
+            "[x, y]" => point(Some(found)).is_some(),
+            _ => true,
+        };
+        if !fits {
+            return Err(format!("{what}'s `{name}` should be {kind}, not {found}"));
+        }
+    }
+    Ok(())
+}
+
+fn point(value: Option<&Value>) -> Option<[f32; 2]> {
+    let xy = value?.as_array()?;
+    #[allow(clippy::cast_possible_truncation)]
+    match xy[..] {
+        [Value::Number(ref x), Value::Number(ref y)] => {
+            Some([x.as_f64()? as f32, y.as_f64()? as f32])
+        }
+        _ => None,
+    }
+}
+
+/// A path, with a leading `~` as the home folder.
+fn expand(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => crate::team::home().join(rest),
+        None => PathBuf::from(path),
+    }
+}
+
+/// A path, with the home folder as `~`, so a file works on another computer.
+fn tilde(path: &Path) -> String {
+    match path.strip_prefix(crate::team::home()) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 /// How far apart cards are laid out.
 const WIDE: f32 = 260.0;
 const TALL: f32 = 170.0;
@@ -1764,6 +2143,121 @@ mod tests {
             .unwrap_err();
         assert!(empty.contains("brief is empty"), "{empty}");
         let _ = fs::remove_dir_all(&desk.root);
+    }
+
+    #[test]
+    fn a_setup_exported_imports_as_the_same_team() {
+        let desk = desk("roundtrip");
+        call(
+            &desk,
+            "create_team",
+            json!({
+                "name": "Desk",
+                "brief": "Study BTC.",
+                "at_once": 3,
+                "agents": [
+                    {"name": "Head", "role": "Leads.", "model": "fable", "effort": "max", "spend_cap": 7.5, "memory": false},
+                    {"name": "Quant", "role": "Tests.", "model": "haiku", "budget": 33, "reports_to": "Head", "uses_lab": true},
+                    {"name": "Critic", "role": "Re-runs.", "app_notes": false, "uses_lab": false}
+                ],
+                "links": [{"from": "Critic", "to": "Head", "kind": "reviews", "rounds": 3}]
+            }),
+        );
+        call(&desk, "set_lab", json!({"team": "Desk", "data": "app"}));
+        let path = desk.root.join("desk.json");
+        let exported = call(
+            &desk,
+            "export_team",
+            json!({"team": "Desk", "path": path.display().to_string()}),
+        );
+        assert_eq!(exported["setup"]["format"], FORMAT);
+        let imported = call(
+            &desk,
+            "import_team",
+            json!({"path": path.display().to_string(), "name": "Desk 2"}),
+        );
+        let original = call(&desk, "get_team", json!({"team": "Desk"}));
+        for field in [
+            "brief",
+            "principles",
+            "at_once",
+            "links",
+            "lab",
+            "steps",
+            "most_spend",
+            "problems",
+        ] {
+            let (mut a, mut b) = (original[field].clone(), imported[field].clone());
+            if field == "lab" {
+                a["folder"] = Value::Null;
+                b["folder"] = Value::Null;
+            }
+            assert_eq!(a, b, "{field}");
+        }
+        for (a, b) in original["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(imported["agents"].as_array().unwrap())
+        {
+            for field in [
+                "name",
+                "role",
+                "model",
+                "effort",
+                "budget",
+                "spend_cap",
+                "memory",
+                "app_notes",
+                "uses_lab",
+                "reports_to",
+                "at",
+            ] {
+                assert_eq!(a[field], b[field], "{field}");
+            }
+            assert_ne!(a["id"], b["id"], "new agents, with no memory");
+        }
+        let _ = fs::remove_dir_all(&desk.root);
+    }
+
+    #[test]
+    fn a_setup_with_a_mistake_says_where() {
+        let wrong = |setup: Value| import(&setup).unwrap_err();
+        assert!(
+            wrong(json!({"name": "T", "agents": [{"name": "A", "modle": "opus"}]}))
+                .contains("Agent 1 has `modle`")
+        );
+        assert!(
+            wrong(json!({"name": "T", "agents": [{"name": "A", "budget": "lots"}]}))
+                .contains("`budget` should be whole number")
+        );
+        assert!(
+            wrong(json!({"name": "T", "agents": [{"name": "A", "model": "gpt"}]}))
+                .contains("A: `gpt` isn't a model")
+        );
+        assert!(
+            wrong(json!({"name": "T", "agents": [{"name": "A"}, {"name": "a"}]}))
+                .contains("two agents")
+        );
+        assert!(wrong(json!({"name": "T", "agents": [{"name": "A"}], "links": [{"from": "A", "to": "B", "kind": "hands_to"}]})).contains("Link 1: there's no agent called `B`"));
+        assert!(wrong(json!({"name": "T", "team": "x"})).contains("The setup has `team`"));
+        assert!(wrong(json!({"format": "persephone-agents/9", "name": "T"})).contains("format"));
+        assert!(wrong(json!({"brief": "x"})).contains("needs a `name`"));
+        // Without places for every card, they're laid out.
+        let team = import(
+            &json!({"name": "T", "agents": [{"name": "A"}, {"name": "B", "reports_to": "A"}]}),
+        )
+        .unwrap();
+        assert_eq!(team.agents[1].at[1], 170.0);
+        assert!(team.uses_lab(&team.agents[0].id), "Lab unless it says not");
+    }
+
+    #[test]
+    fn the_example_setup_imports_ready_to_run() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/agents-setup.json");
+        let team = import(&read_setup(&path).unwrap()).unwrap();
+        assert_eq!(check(&team), vec![], "{}", team.name);
     }
 
     #[test]

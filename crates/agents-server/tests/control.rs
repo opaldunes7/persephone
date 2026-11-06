@@ -194,3 +194,42 @@ fn the_written_reference_matches_the_tools() {
         "run: persephone-agents tools --markdown > docs/agents-tools.md"
     );
 }
+
+#[test]
+fn a_setup_file_goes_out_and_comes_back_in() {
+    let rig = Rig::new("setup");
+    let program = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_persephone-agents"))
+            .arg("--root")
+            .arg(&rig.root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let example =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/agents-setup.json");
+    let made = program(&["import", example.to_str().unwrap()]);
+    assert!(
+        made.starts_with("Made Crypto research desk (4 agents)"),
+        "{made}"
+    );
+    assert!(!made.contains("Before it can run"), "{made}");
+    let file = rig.root.join("desk.json");
+    program(&["export", "Crypto research desk", file.to_str().unwrap()]);
+    let made = program(&["import", file.to_str().unwrap(), "--name", "Second desk"]);
+    assert!(made.starts_with("Made Second desk (4 agents)"), "{made}");
+    let first = rig
+        .call("export_team", &json!({"team": "Crypto research desk"}))
+        .unwrap();
+    let mut second = rig
+        .call("export_team", &json!({"team": "Second desk"}))
+        .unwrap();
+    second["setup"]["name"] = first["setup"]["name"].clone();
+    assert_eq!(first["setup"], second["setup"], "the same setup, exactly");
+}

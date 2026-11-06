@@ -228,6 +228,23 @@ fn teams(agents: &Agents) -> Element<'_, Message> {
             .spacing(4),
         );
     }
+    list = list
+        .push(Space::new().height(10))
+        .push(hint("Setup files"))
+        .push(
+            row![
+                chip("Import…", false, Some(AgentsMessage::ImportSetup)),
+                chip(
+                    "Export…",
+                    false,
+                    agents
+                        .team()
+                        .is_some()
+                        .then_some(AgentsMessage::ExportSetup)
+                ),
+            ]
+            .spacing(4),
+        );
     if let Some(note) = &agents.note {
         list = list
             .push(Space::new().height(10))

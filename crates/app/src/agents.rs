@@ -597,6 +597,43 @@ impl Agents {
         }
     }
 
+    /// Makes a team from a setup file, under its own name or the next free one, and shows it.
+    pub fn import_setup(&mut self, path: &Path) {
+        use persephone_agents::control::{import, read_setup};
+        let mut team = match read_setup(path).and_then(|setup| import(&setup)) {
+            Ok(team) => team,
+            Err(why) => {
+                self.note = Some(format!("Couldn't import it: {why}"));
+                return;
+            }
+        };
+        let base = team.name.clone();
+        let mut n = 2;
+        while self
+            .teams
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case(&team.name))
+        {
+            team.name = format!("{base} {n}");
+            n += 1;
+        }
+        let problems = check(&team).len();
+        self.note = Some(match problems {
+            0 => format!("Imported {}.", team.name),
+            n => format!(
+                "Imported {}. Check finds {n} thing{} to fix before it runs.",
+                team.name,
+                if n == 1 { "" } else { "s" }
+            ),
+        });
+        self.saved.team = Some(team.id.clone());
+        self.teams.push(team);
+        self.selected = Selected::Team;
+        self.tab = Tab::Setup;
+        self.save_team();
+        self.after_switch();
+    }
+
     /// The selected agent's files, or the first session's when it's the team.
     fn load_outputs(&mut self) {
         self.outputs = None;
@@ -763,6 +800,12 @@ pub enum AgentsMessage {
     Pick(String),
     New(Starter),
     Duplicate,
+    /// Pick a setup file to make a team from.
+    ImportSetup,
+    SetupPicked(Option<PathBuf>),
+    /// Pick where to save the current team's setup file.
+    ExportSetup,
+    SetupSaveTo(Option<PathBuf>),
     Archive,
     TeamName(String),
     Select(Selected),
@@ -938,6 +981,45 @@ impl crate::Persephone {
                     self.save();
                 }
             }
+            AgentsMessage::ImportSetup => {
+                let dialog = rfd::AsyncFileDialog::new()
+                    .set_title("Import a team's setup")
+                    .add_filter("JSON", &["json"]);
+                return Task::perform(dialog.pick_file(), |picked| {
+                    Message::Agents(AgentsMessage::SetupPicked(
+                        picked.map(|file| file.path().to_owned()),
+                    ))
+                });
+            }
+            AgentsMessage::SetupPicked(Some(path)) => {
+                agents.import_setup(&path);
+                self.save();
+            }
+            AgentsMessage::ExportSetup => {
+                let Some(team) = agents.team() else {
+                    return Task::none();
+                };
+                let dialog = rfd::AsyncFileDialog::new()
+                    .set_title("Export this team's setup")
+                    .set_file_name(format!("{}.json", key(&team.name)))
+                    .add_filter("JSON", &["json"]);
+                return Task::perform(dialog.save_file(), |picked| {
+                    Message::Agents(AgentsMessage::SetupSaveTo(
+                        picked.map(|file| file.path().to_owned()),
+                    ))
+                });
+            }
+            AgentsMessage::SetupSaveTo(Some(path)) => {
+                if let Some(team) = agents.team() {
+                    let setup = persephone_agents::control::export(team);
+                    let text = serde_json::to_string_pretty(&setup).unwrap_or_default() + "\n";
+                    agents.note = Some(match folder::write_aside(&path, text.as_bytes()) {
+                        Ok(()) => format!("Saved its setup to {}", path.display()),
+                        Err(why) => why,
+                    });
+                }
+            }
+            AgentsMessage::SetupPicked(None) | AgentsMessage::SetupSaveTo(None) => {}
             AgentsMessage::Archive => {
                 if agents.running() {
                     agents.note = Some("Stop the run before archiving its team.".into());
