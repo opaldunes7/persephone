@@ -179,7 +179,10 @@ pub fn view(agents: &Agents) -> Element<'_, Message> {
     };
     row![teams(agents), main]
         .spacing(6)
-        .padding(6)
+        .padding(iced::Padding {
+            top: 0.0,
+            ..iced::Padding::new(6.0)
+        })
         .width(Fill)
         .height(Fill)
         .into()

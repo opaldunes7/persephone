@@ -9,12 +9,12 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use iced::{
     Task,
-    futures::{SinkExt, StreamExt, channel::mpsc},
+    futures::{SinkExt, Stream, StreamExt, channel::mpsc},
     widget::text_editor,
     window,
 };
@@ -23,7 +23,7 @@ use persephone_agents::{
     folder::{self, Setup},
     plan::{Plan, plan, sessions},
     run::{self, Control, RunEvent, Status, Summary},
-    stream::{Event, Who, is_lab},
+    stream::{Event, Reader, Who, is_lab},
     team::{Effort, LAB, LabData, Link, LinkKind, Model, Starter, Team, View, fresh_id, key},
 };
 use serde::{Deserialize, Serialize};
@@ -102,6 +102,9 @@ pub struct Live {
     pub ended: Option<Summary>,
     pub failed: Option<String>,
     pub lab_calls: u32,
+    /// The run's folder, for a run another program started: it's read from there, and asked to
+    /// stop or wrap up there.
+    pub external: Option<PathBuf>,
     /// Each session's members' ids by their keys.
     keys: Vec<HashMap<String, String>>,
 }
@@ -121,8 +124,59 @@ impl Live {
             ended: None,
             failed: None,
             lab_calls: 0,
+            external: None,
             keys: Vec::new(),
         }
+    }
+
+    /// A run another program started, read from its folder as it is now: its plan, each step's
+    /// stream, and how it says it's going.
+    fn from_files(team: &Team, dir: &Path) -> Option<Self> {
+        let plan = run::read_plan(dir)?;
+        let state = run::read_state(dir)?;
+        let mut live = Self::new(&team.id, Control::default());
+        live.external = Some(dir.to_owned());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        live.started = Instant::now()
+            .checked_sub(Duration::from_secs(now.saturating_sub(state.started)))
+            .unwrap_or_else(Instant::now);
+        live.apply(RunEvent::Planned {
+            run: state.run.clone(),
+            plan: plan.clone(),
+        });
+        for (step, saved) in state.steps.iter().enumerate().take(plan.steps.len()) {
+            let log = dir.join(format!("{}.jsonl", run::step_name(&plan, step)));
+            if let Ok(text) = fs::read_to_string(&log) {
+                live.apply(RunEvent::Status {
+                    step,
+                    status: Status::Running,
+                });
+                let mut reader = Reader::default();
+                for event in text.lines().flat_map(|line| reader.read(line)) {
+                    live.apply(RunEvent::Event { step, event });
+                }
+            }
+            if !matches!(saved.status, Status::Running | Status::Waiting) {
+                live.apply(RunEvent::Status {
+                    step,
+                    status: saved.status.clone(),
+                });
+            }
+        }
+        live.notes.clone_from(&state.notes);
+        if state.ended.is_some() {
+            live.ended = Some(Summary {
+                run: state.run.clone(),
+                team: team.name.clone(),
+                steps: Vec::new(),
+                spend: state.spend(),
+            });
+        } else if !state.going() {
+            live.failed = Some("its runner stopped before the run ended".into());
+        }
+        Some(live)
     }
 
     #[must_use]
@@ -283,6 +337,10 @@ pub struct Agents {
     pub found: Option<Found>,
     pub looking: bool,
     pub live: Option<Live>,
+    /// The current team's run that another program started, read from its folder.
+    pub watched: Option<Live>,
+    /// What this app last wrote of each team, by id, to tell its own saves from others'.
+    saved_json: HashMap<String, String>,
     /// The current team's past runs, newest first.
     pub past: Vec<Summary>,
     /// A past run, read again: its record and its lines.
@@ -313,6 +371,8 @@ impl Default for Agents {
             found: None,
             looking: false,
             live: None,
+            watched: None,
+            saved_json: HashMap::new(),
             past: Vec::new(),
             viewing: None,
             outputs: None,
@@ -355,17 +415,103 @@ impl Agents {
         self.teams.iter_mut().find(|t| t.id == id)
     }
 
-    /// Whether a run of any team is going.
+    /// Whether a run is going: this app's, or another program's of the current team.
     #[must_use]
     pub fn running(&self) -> bool {
         self.live.as_ref().is_some_and(Live::going)
+            || self.watched.as_ref().is_some_and(Live::going)
     }
 
-    /// The run on screen, if it's the current team's.
+    /// The run on screen, if it's the current team's: this app's own, else one another program
+    /// started.
     #[must_use]
     pub fn live(&self) -> Option<&Live> {
         let team = self.saved.team.as_deref()?;
-        self.live.as_ref().filter(|live| live.team == team)
+        self.live
+            .as_ref()
+            .filter(|live| live.team == team)
+            .or_else(|| self.watched.as_ref().filter(|live| live.team == team))
+    }
+
+    /// Takes in teams changed by another program, keeping this app's own as they are.
+    fn reload_teams(&mut self) {
+        let current = self.saved.team.clone();
+        let mut changed_current = false;
+        let mut teams = Vec::new();
+        for team in folder::load_teams(&self.root()) {
+            let text = serde_json::to_string_pretty(&team).unwrap_or_default();
+            let ours = self.saved_json.get(&team.id) == Some(&text);
+            match self.teams.iter().find(|t| t.id == team.id) {
+                Some(mine) if ours => teams.push(mine.clone()),
+                _ => {
+                    changed_current |= current.as_ref() == Some(&team.id);
+                    teams.push(team);
+                }
+            }
+        }
+        self.teams = teams;
+        if !self.teams.iter().any(|t| Some(&t.id) == current.as_ref()) {
+            self.saved.team = self.teams.first().map(|t| t.id.clone());
+            self.selected = Selected::Team;
+            self.after_switch();
+            return;
+        }
+        if !changed_current {
+            return;
+        }
+        let Some(team) = self.team() else { return };
+        let gone = match &self.selected {
+            Selected::Agent(id) => team.agent(id).is_none(),
+            Selected::Link(index) => *index >= team.links.len(),
+            _ => false,
+        };
+        let role = match &self.selected {
+            Selected::Agent(id) => team.agent(id).map(|a| a.role.clone()),
+            _ => None,
+        };
+        let (brief, principles) = (team.brief.clone(), team.principles.clone());
+        if gone {
+            self.selected = Selected::Team;
+        }
+        // What another program changed shows in the editors too.
+        if self.brief.text().trim_end() != brief {
+            self.brief = text_editor::Content::with_text(&brief);
+        }
+        if self.principles.text().trim_end() != principles {
+            self.principles = text_editor::Content::with_text(&principles);
+        }
+        if let Some(role) = role
+            && self.role.text().trim_end() != role
+        {
+            self.role = text_editor::Content::with_text(&role);
+        }
+        self.fill_editors();
+        self.problems.clear();
+    }
+
+    /// Reads the current team's run that another program started, as it is now.
+    fn watch_run(&mut self) {
+        let Some(team) = self.team().cloned() else {
+            self.watched = None;
+            return;
+        };
+        // This app's own run it shows from its own events.
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.team == team.id && live.going())
+        {
+            return;
+        }
+        let root = self.root();
+        let going = run::going_run(&root, &team).filter(|state| state.pid != std::process::id());
+        let dir = match (&going, &self.watched) {
+            (Some(state), _) => Some(run::run_dir(&root, &team, &state.run)),
+            // The one watched until now, read once more as it ended.
+            (None, Some(watched)) if watched.team == team.id => watched.external.clone(),
+            _ => None,
+        };
+        self.watched = dir.and_then(|dir| Live::from_files(&team, &dir));
     }
 
     /// Reads the teams from disk, keeping the current one if it's still there.
@@ -390,6 +536,7 @@ impl Agents {
         self.load_feedback();
         self.load_outputs();
         self.fill_editors();
+        self.watch_run();
     }
 
     /// Fills the text editors from the team and agent they're for, if those changed.
@@ -421,10 +568,32 @@ impl Agents {
 
     fn save_team(&mut self) {
         let root = self.root();
-        if let Some(team) = self.team()
-            && let Err(why) = folder::save_team(&root, team)
+        let Some(team) = self.team() else { return };
+        let (id, text) = (
+            team.id.clone(),
+            serde_json::to_string_pretty(team).unwrap_or_default(),
+        );
+        match folder::save_team(&root, team) {
+            Ok(()) => {
+                self.saved_json.insert(id, text);
+            }
+            Err(why) => self.note = Some(why),
+        }
+    }
+
+    /// Reads the shown agent's files again, as an agent or another program wrote them; what's
+    /// being typed into its notes stays.
+    fn refresh_outputs(&mut self) {
+        let typed = self
+            .outputs
+            .take()
+            .map(|outputs| (outputs.agent, outputs.vetoed, outputs.tasks));
+        self.load_outputs();
+        if let (Some((agent, vetoed, tasks)), Some(outputs)) = (typed, &mut self.outputs)
+            && outputs.agent == agent
         {
-            self.note = Some(why);
+            outputs.vetoed = vetoed;
+            outputs.tasks = tasks;
         }
     }
 
@@ -526,6 +695,66 @@ fn newest(dir: &Path) -> Option<PathBuf> {
     files.pop()
 }
 
+/// Says when teams' designs, runs or agents' own files change under `root`, a burst of changes
+/// at a time: what another program, or the agents, did.
+pub fn watch(root: &Path) -> impl Stream<Item = Message> + use<> {
+    let root = root.to_path_buf();
+    iced::stream::channel(8, async move |mut output: mpsc::Sender<Message>| {
+        let _ = fs::create_dir_all(&root);
+        let (raw, heard) = std::sync::mpsc::channel::<[bool; 3]>();
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            let Ok(event) = event else { return };
+            let mut kind = [false; 3];
+            for path in &event.paths {
+                // Git's own files, and Lab's big answers, say nothing worth showing.
+                if path
+                    .components()
+                    .any(|c| c.as_os_str() == ".git" || c.as_os_str() == "lab-answers")
+                {
+                    continue;
+                }
+                if path.file_name().is_some_and(|name| name == "team.json") {
+                    kind[0] = true;
+                } else if path.components().any(|c| c.as_os_str() == "runs") {
+                    kind[1] = true;
+                } else if path.extension().is_some_and(|ext| ext == "md") {
+                    kind[2] = true;
+                }
+            }
+            if kind.iter().any(|k| *k) {
+                let _ = raw.send(kind);
+            }
+        });
+        let Ok(mut watcher) = watcher else { return };
+        if notify::Watcher::watch(&mut watcher, &root, notify::RecursiveMode::Recursive).is_err() {
+            return;
+        }
+        let (tx, mut rx) = mpsc::unbounded();
+        std::thread::spawn(move || {
+            while let Ok(mut kind) = heard.recv() {
+                let until = Instant::now() + Duration::from_millis(300);
+                while let Ok(more) =
+                    heard.recv_timeout(until.saturating_duration_since(Instant::now()))
+                {
+                    for (k, m) in kind.iter_mut().zip(more) {
+                        *k |= m;
+                    }
+                }
+                if tx.unbounded_send(kind).is_err() {
+                    break;
+                }
+            }
+        });
+        while let Some([teams, runs, files]) = rx.next().await {
+            let changed = AgentsMessage::Changed { teams, runs, files };
+            if output.send(Message::Agents(changed)).await.is_err() {
+                break;
+            }
+        }
+        drop(watcher);
+    })
+}
+
 /// What the Agents view asks for.
 #[derive(Clone, Debug)]
 pub enum AgentsMessage {
@@ -585,6 +814,12 @@ pub enum AgentsMessage {
     Vetoed(text_editor::Action),
     Tasks(text_editor::Action),
     SaveNotes,
+    /// Files under the teams' folder changed: teams' designs, runs, or agents' own files.
+    Changed {
+        teams: bool,
+        runs: bool,
+        files: bool,
+    },
 }
 
 /// What the run counts as `budget` and `spend` take; at once is a pick.
@@ -993,18 +1228,46 @@ impl crate::Persephone {
                 }
             }
             AgentsMessage::Run => return self.start_agents(),
-            AgentsMessage::WrapUp => {
-                if let Some(live) = &agents.live {
-                    live.control
-                        .wrap_up
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+            AgentsMessage::WrapUp | AgentsMessage::Stop => {
+                let stop = matches!(message, AgentsMessage::Stop);
+                match agents.live() {
+                    // Another program's run: asked through its folder.
+                    Some(live) if live.external.is_some() => {
+                        let dir = live.external.clone().unwrap_or_default();
+                        let asked = if stop {
+                            run::ask_stop(&dir)
+                        } else {
+                            run::ask_wrap_up(&dir)
+                        };
+                        if let Err(why) = asked {
+                            agents.note = Some(why);
+                        }
+                    }
+                    Some(live) => {
+                        let flag = if stop {
+                            &live.control.stop
+                        } else {
+                            &live.control.wrap_up
+                        };
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    None => {}
                 }
             }
-            AgentsMessage::Stop => {
-                if let Some(live) = &agents.live {
-                    live.control
-                        .stop
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+            AgentsMessage::Changed { teams, runs, files } => {
+                if teams {
+                    agents.reload_teams();
+                }
+                if teams || runs {
+                    agents.watch_run();
+                    agents.past = agents
+                        .team()
+                        .map(|team| run::past_runs(&agents.root(), team))
+                        .unwrap_or_default();
+                }
+                if files || runs {
+                    agents.refresh_outputs();
+                    agents.load_feedback();
                 }
             }
             AgentsMessage::Running(event) => {

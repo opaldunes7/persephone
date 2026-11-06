@@ -36,7 +36,8 @@ pub struct Control {
     pub wrap_up: Arc<AtomicBool>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Status {
     Waiting,
     Running,
@@ -124,6 +125,159 @@ pub struct StepSummary {
     pub session_id: String,
 }
 
+/// A run as it goes, kept as `runs/<run>/state.json` for whoever's watching: the app, or another
+/// program through the control tools.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunState {
+    pub run: String,
+    /// The team, by id.
+    pub team: String,
+    /// The process running it, to tell a run that's going from one whose runner died; 0 while
+    /// it's being started.
+    pub pid: u32,
+    /// When it started and ended, in Unix seconds.
+    pub started: u64,
+    #[serde(default)]
+    pub ended: Option<u64>,
+    pub steps: Vec<StepState>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StepState {
+    pub label: String,
+    /// The agent at the top of its session, by id.
+    pub agent: String,
+    pub status: Status,
+    pub calls: u32,
+    pub spend: f64,
+    /// Its latest tool call or hand-out: who, and what.
+    pub doing: String,
+}
+
+impl RunState {
+    /// Whether it's still going: not ended, and its runner still there, or being started.
+    #[must_use]
+    pub fn going(&self) -> bool {
+        let starting = self.pid == 0 && unix_now() < self.started.saturating_add(STARTING_SECS);
+        self.ended.is_none() && (starting || alive(self.pid))
+    }
+
+    #[must_use]
+    pub fn spend(&self) -> f64 {
+        self.steps.iter().fold(0.0, |spent, s| spent + s.spend)
+    }
+}
+
+/// Whether a process is there.
+#[must_use]
+pub fn alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 only asks whether the process exists.
+    pid > 0 && unsafe { libc::kill(pid, 0) } == 0
+}
+
+/// How long a run being started counts as going, before its runner has said anything.
+const STARTING_SECS: u64 = 60;
+
+/// Files in a run's folder that ask it to stop, or to wrap up, from outside the process running
+/// it.
+pub const STOP_FILE: &str = "stop";
+pub const WRAP_UP_FILE: &str = "wrap-up";
+
+/// A run's folder.
+#[must_use]
+pub fn run_dir(root: &Path, team: &Team, run: &str) -> PathBuf {
+    team_dir(root, team).join("runs").join(run)
+}
+
+/// What a run says of itself as it goes, if it's said anything.
+#[must_use]
+pub fn read_state(run_dir: &Path) -> Option<RunState> {
+    serde_json::from_str(&fs::read_to_string(run_dir.join("state.json")).ok()?).ok()
+}
+
+/// What a run set out to do.
+#[must_use]
+pub fn read_plan(run_dir: &Path) -> Option<Plan> {
+    serde_json::from_str(&fs::read_to_string(run_dir.join("plan.json")).ok()?).ok()
+}
+
+/// The team's run that's going, if one is.
+#[must_use]
+pub fn going_run(root: &Path, team: &Team) -> Option<RunState> {
+    let mut runs: Vec<RunState> = fs::read_dir(team_dir(root, team).join("runs"))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| read_state(&entry.path()))
+        .filter(RunState::going)
+        .collect();
+    runs.sort_by(|a, b| b.run.cmp(&a.run));
+    runs.into_iter().next()
+}
+
+/// Asks a run to stop, from any process.
+///
+/// # Errors
+///
+/// Says why the request couldn't be left.
+pub fn ask_stop(run_dir: &Path) -> Result<(), String> {
+    fs::write(run_dir.join(STOP_FILE), "").map_err(|e| e.to_string())
+}
+
+/// Asks a run to wrap up, from any process.
+///
+/// # Errors
+///
+/// Says why the request couldn't be left.
+pub fn ask_wrap_up(run_dir: &Path) -> Result<(), String> {
+    fs::write(run_dir.join(WRAP_UP_FILE), "").map_err(|e| e.to_string())
+}
+
+/// Keeps `state.json` up to date: at once when a step's status changes, and at most every second
+/// for the counts in between.
+struct Records {
+    dir: PathBuf,
+    state: RunState,
+    written: Option<Instant>,
+    statuses: Vec<Status>,
+}
+
+impl Records {
+    fn write(&self) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(&self.state).unwrap_or_default();
+        folder::write_aside(&self.dir.join("state.json"), text.as_bytes())
+    }
+
+    fn save(&mut self, states: &[State], doing: &[String], force: bool) {
+        let statuses: Vec<Status> = states.iter().map(|s| s.status.clone()).collect();
+        let due = self
+            .written
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
+        if !force && statuses == self.statuses && !due {
+            return;
+        }
+        for (step, (state, saved)) in states.iter().zip(&mut self.state.steps).enumerate() {
+            saved.status = state.status.clone();
+            saved.calls = state.calls;
+            saved.spend = state.finish.as_ref().map_or(0.0, |f| f.spend);
+            saved.doing.clone_from(&doing[step]);
+        }
+        let _ = self.write();
+        self.written = Some(Instant::now());
+        self.statuses = statuses;
+    }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// A step's tool calls past its budget before it's stopped, should it not wrap up.
 fn margin(budget: u32) -> u32 {
     (budget / 4).max(20)
@@ -161,12 +315,63 @@ pub fn run(
     control: &Control,
     send: &mut dyn FnMut(RunEvent),
 ) -> Result<Summary, String> {
+    run_named(team, setup, control, None, send)
+}
+
+/// [`run`], under the name [`reserve_run`] gave it, if it's given one.
+///
+/// # Errors
+///
+/// Says why it couldn't start: a problem in the design, or a folder that couldn't be made.
+pub fn run_named(
+    team: &Team,
+    setup: &Setup,
+    control: &Control,
+    named: Option<&str>,
+    send: &mut dyn FnMut(RunEvent),
+) -> Result<Summary, String> {
     if let Some(problem) = check(team).into_iter().next() {
         return Err(problem.what);
     }
     let plan = plan(team).map_err(|_| "Its steps wait on each other in a circle.".to_owned())?;
     let team_dir = team_dir(&setup.root, team);
-    let (run, run_dir) = new_run(&team_dir)?;
+    let (run, run_dir) = match named {
+        Some(run) => {
+            let dir = team_dir.join("runs").join(run);
+            fs::create_dir_all(dir.join("steps"))
+                .map_err(|e| format!("couldn't make {}: {e}", dir.display()))?;
+            (run.to_owned(), dir)
+        }
+        None => reserve_run(&team_dir)?,
+    };
+    let text = serde_json::to_string_pretty(&plan).unwrap_or_default();
+    folder::write_aside(&run_dir.join("plan.json"), text.as_bytes())?;
+    let mut doing: Vec<String> = vec![String::new(); plan.steps.len()];
+    let mut records = Records {
+        dir: run_dir.clone(),
+        state: RunState {
+            run: run.clone(),
+            team: team.id.clone(),
+            pid: std::process::id(),
+            started: unix_now(),
+            ended: None,
+            steps: (0..plan.steps.len())
+                .map(|step| StepState {
+                    label: plan.label(team, step),
+                    agent: plan.agent_of(step).to_owned(),
+                    status: Status::Waiting,
+                    calls: 0,
+                    spend: 0.0,
+                    doing: String::new(),
+                })
+                .collect(),
+            notes: Vec::new(),
+        },
+        written: None,
+        statuses: Vec::new(),
+    };
+    // Going from now: no other run of this team starts while its folders are made.
+    records.write()?;
     // Every folder now, so each one's sandbox knows today's fellow agents.
     let dirs = plan
         .sessions
@@ -210,6 +415,14 @@ pub fn run(
         };
 
     loop {
+        records.save(&states, &doing, false);
+        // Asked from outside this process: by the app watching it, or the control tools.
+        if run_dir.join(STOP_FILE).exists() {
+            control.stop.store(true, Ordering::Relaxed);
+        }
+        if run_dir.join(WRAP_UP_FILE).exists() {
+            control.wrap_up.store(true, Ordering::Relaxed);
+        }
         if !stopped && control.stop.load(Ordering::Relaxed) {
             stopped = true;
             for step in 0..states.len() {
@@ -328,6 +541,21 @@ pub fn run(
                     Event::Finished(finish) => state.finish = Some(finish.clone()),
                     _ => {}
                 }
+                match &event {
+                    Event::Called {
+                        who, tool, about, ..
+                    } => {
+                        doing[step] =
+                            format!("{}: {tool} {about}", who_name(team, &plan, step, who))
+                                .trim()
+                                .to_owned();
+                    }
+                    Event::Delegated { who, to, task } => {
+                        doing[step] =
+                            format!("{} hands {to}: {task}", who_name(team, &plan, step, who));
+                    }
+                    _ => {}
+                }
                 if event.is_call() {
                     state.calls += 1;
                     let budget = budgets[step];
@@ -406,28 +634,51 @@ pub fn run(
     if let Err(why) = folder::write_aside(&run_dir.join("summary.json"), text.as_bytes()) {
         send(RunEvent::Note(why));
     }
+    records.state.ended = Some(unix_now());
+    records.save(&states, &doing, true);
     send(RunEvent::Ended(summary.clone()));
     Ok(summary)
 }
 
-/// A name for a new run, from the time, and its folder.
-fn new_run(team_dir: &Path) -> Result<(String, PathBuf), String> {
+/// Who did something, by name: the agent at the top of its session, or a member's key.
+fn who_name(team: &Team, plan: &Plan, step: usize, who: &crate::stream::Who) -> String {
+    match who {
+        crate::stream::Who::Lead => team.name_of(plan.agent_of(step)).to_owned(),
+        crate::stream::Who::Member(key) => key.clone(),
+    }
+}
+
+/// A name for a new run, from the time, and its folder, made now so no other run can have it.
+///
+/// # Errors
+///
+/// Says why its folder couldn't be made.
+pub fn reserve_run(team_dir: &Path) -> Result<(String, PathBuf), String> {
     let runs = team_dir.join("runs");
+    fs::create_dir_all(&runs).map_err(|e| format!("couldn't make {}: {e}", runs.display()))?;
     let base = stamp();
     let mut run = base.clone();
     let mut n = 2;
-    while runs.join(&run).exists() {
-        run = format!("{base}-{n}");
-        n += 1;
+    loop {
+        let dir = runs.join(&run);
+        match fs::create_dir(&dir) {
+            Ok(()) => {
+                fs::create_dir_all(dir.join("steps"))
+                    .map_err(|e| format!("couldn't make {}: {e}", dir.display()))?;
+                return Ok((run, dir));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                run = format!("{base}-{n}");
+                n += 1;
+            }
+            Err(e) => return Err(format!("couldn't make {}: {e}", dir.display())),
+        }
     }
-    let dir = runs.join(&run);
-    fs::create_dir_all(dir.join("steps"))
-        .map_err(|e| format!("couldn't make {}: {e}", dir.display()))?;
-    Ok((run, dir))
 }
 
 /// What a step's records are called: `02-reviewer`.
-fn step_name(plan: &Plan, step: usize) -> String {
+#[must_use]
+pub fn step_name(plan: &Plan, step: usize) -> String {
     format!("{step:02}-{}", plan.sessions[plan.steps[step].session].key)
 }
 

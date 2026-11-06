@@ -276,3 +276,143 @@ fn a_runs_events_light_the_cards() {
     assert!(!app.agents().running());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+fn desk(root: &std::path::Path) -> persephone_agents::control::Desk {
+    persephone_agents::control::Desk {
+        root: root.to_owned(),
+        claude: None,
+        runner: None,
+    }
+}
+
+#[test]
+fn a_team_changed_by_another_program_shows_at_once() {
+    use serde_json::json;
+    let dir = dir("outside");
+    let mut app = app();
+    app.use_agents_root(dir.clone(), found());
+    let _ = app.update(Message::Agents(AgentsMessage::Toggle));
+    let desk = desk(&dir);
+    desk.dispatch(
+        "create_team",
+        &json!({"name": "From outside", "brief": "Study.", "agents": [{"name": "Solo", "role": "Studies."}]}),
+    )
+    .unwrap();
+    let changed = AgentsMessage::Changed {
+        teams: true,
+        runs: false,
+        files: false,
+    };
+    say(&mut app, changed.clone());
+    let team = app
+        .agents()
+        .teams
+        .iter()
+        .find(|t| t.name == "From outside")
+        .unwrap()
+        .clone();
+    say(&mut app, AgentsMessage::Pick(team.id.clone()));
+    let solo = team.agents[0].id.clone();
+    say(
+        &mut app,
+        AgentsMessage::Select(Selected::Agent(solo.clone())),
+    );
+    say(&mut app, AgentsMessage::Model(Model::Haiku));
+    // The app's own save isn't taken for another's.
+    say(&mut app, changed.clone());
+    assert_eq!(app.agents().team().unwrap().agents[0].model, Model::Haiku);
+    // Another program's change shows, editors and all, on top of the app's.
+    desk.dispatch(
+        "update_agent",
+        &json!({"team": "From outside", "agent": "Solo", "role": "Studies harder."}),
+    )
+    .unwrap();
+    say(&mut app, changed);
+    let agent = &app.agents().team().unwrap().agents[0];
+    assert_eq!(agent.role, "Studies harder.");
+    assert_eq!(agent.model, Model::Haiku);
+    assert_eq!(app.agents().role.text().trim_end(), "Studies harder.");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_run_started_elsewhere_lights_the_cards_and_can_be_stopped() {
+    use persephone_agents::{
+        folder,
+        run::{self, RunState, StepState},
+    };
+    use serde_json::json;
+    let dir = dir("elsewhere");
+    let mut app = app();
+    app.use_agents_root(dir.clone(), found());
+    let _ = app.update(Message::Agents(AgentsMessage::Toggle));
+    say(&mut app, AgentsMessage::New(Starter::LeadAndAnalysts));
+    let team = app.agents().team().unwrap().clone();
+    let plan = plan(&team).unwrap();
+    let (name, run_dir) = run::reserve_run(&folder::team_dir(&dir, &team)).unwrap();
+    // Its runner, in another process that's still there.
+    let mut runner = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    std::fs::write(
+        run_dir.join("plan.json"),
+        serde_json::to_string(&plan).unwrap(),
+    )
+    .unwrap();
+    let state = RunState {
+        run: name,
+        team: team.id.clone(),
+        pid: runner.id(),
+        started: 0,
+        ended: None,
+        steps: vec![StepState {
+            label: plan.label(&team, 0),
+            agent: team.agents[0].id.clone(),
+            status: Status::Running,
+            calls: 2,
+            spend: 0.0,
+            doing: String::new(),
+        }],
+        notes: Vec::new(),
+    };
+    std::fs::write(
+        run_dir.join("state.json"),
+        serde_json::to_string(&state).unwrap(),
+    )
+    .unwrap();
+    let lines = [
+        json!({"type": "assistant", "parent_tool_use_id": null, "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Agent", "input": {"subagent_type": "analyst-a", "description": "Test EMA"}}
+        ]}}),
+        json!({"type": "assistant", "parent_tool_use_id": "t1", "message": {"content": [
+            {"type": "tool_use", "id": "t2", "name": "mcp__persephone-lab__run_backtest", "input": {"symbol": "BTCUSDT"}}
+        ]}}),
+    ];
+    let log: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    std::fs::write(run_dir.join("00-lead.jsonl"), log).unwrap();
+    say(
+        &mut app,
+        AgentsMessage::Changed {
+            teams: false,
+            runs: true,
+            files: false,
+        },
+    );
+    let live = app.agents().live().expect("the run started elsewhere");
+    assert!(live.external.is_some());
+    let analyst = &team.agents[1].id;
+    assert_eq!(live.cards[&team.agents[0].id].status, Some(Status::Running));
+    assert_eq!(live.cards[analyst].status, Some(Status::Running));
+    assert_eq!(live.cards[analyst].calls, 1);
+    assert!(app.agents().running());
+    assert!(shows(&app, "Stop"));
+    say(&mut app, AgentsMessage::Stop);
+    assert!(
+        run_dir.join("stop").exists(),
+        "asked to stop through its folder"
+    );
+    let _ = runner.kill();
+    let _ = runner.wait();
+    std::fs::remove_dir_all(dir).unwrap();
+}

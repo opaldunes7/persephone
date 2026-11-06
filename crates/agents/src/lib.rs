@@ -3,6 +3,7 @@
 //! reading those sessions. It has no interface of its own: the app draws it.
 
 pub mod check;
+pub mod control;
 pub mod folder;
 pub mod plan;
 pub mod prompts;

@@ -1,0 +1,20 @@
+[package]
+name = "persephone-agents-server"
+description = "The agents' controls for another program or AI: Persephone's agent teams over MCP, local HTTP and the command line."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "persephone-agents"
+path = "src/main.rs"
+
+[dependencies]
+persephone-agents.workspace = true
+getrandom = "0.3"
+rmcp = { version = "1", default-features = false, features = ["server", "transport-io"] }
+serde_json.workspace = true
+tiny_http = "0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "time"] }
+

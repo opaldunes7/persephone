@@ -5781,14 +5781,14 @@ impl Persephone {
             .into()
     }
 
-    /// Where the Agents view goes: everything under the top bar.
+    /// Where the Agents view goes: everything under the top bar, right up against it.
     fn agents_rect(&self) -> Rect {
         let (width, height) = (self.window.width, self.window.height);
         Rect::new(
             GAP,
-            TOP_BAR + GAP,
+            TOP_BAR,
             (width - 2.0 * GAP).max(0.0),
-            (height - TOP_BAR - 2.0 * GAP).max(0.0),
+            (height - TOP_BAR - GAP).max(0.0),
         )
     }
 
@@ -5881,6 +5881,12 @@ impl Persephone {
         }
         if self.is_animating() {
             subscriptions.push(window::frames().map(Message::Tick));
+        }
+        if self.agents.saved.open {
+            subscriptions.push(Subscription::run_with(
+                self.agents.root(),
+                |root: &PathBuf| agents::watch(root),
+            ));
         }
         if self.news.polling()
             && let Some(root) = &self.news.root

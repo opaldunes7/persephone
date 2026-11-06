@@ -8,10 +8,12 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 use crate::team::{LinkKind, Team, key};
 
-/// What a run does, in order.
-#[derive(Clone, Debug, PartialEq)]
+/// What a run does, in order. Kept with the run as `plan.json`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
     pub sessions: Vec<Session>,
     /// Each in an order it can run in: every step comes after those it waits on.
@@ -19,7 +21,7 @@ pub struct Plan {
 }
 
 /// An agent at the top, and everyone under it, run as one Claude Code session in its folder.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     /// The agent at the top, by id.
     pub root: String,
@@ -33,7 +35,7 @@ pub struct Session {
     pub lab: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Member {
     pub id: String,
     /// Its name in `--agents`, and what its lead calls it by.
@@ -44,7 +46,8 @@ pub struct Member {
     pub depth: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StepKind {
     /// Its own work on the brief.
     Work,
@@ -55,7 +58,7 @@ pub enum StepKind {
 }
 
 /// One session of one agent.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Step {
     pub session: usize,
     pub kind: StepKind,
@@ -68,7 +71,7 @@ pub struct Step {
 }
 
 /// Another step's report, for this one's inbox.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Input {
     pub step: usize,
     /// Its folder in `inbox/<run>/`.

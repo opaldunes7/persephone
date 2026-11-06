@@ -12,6 +12,7 @@ broken in Persephone and what would make it better.
 - [The folders](#the-folders)
 - [The sandbox](#the-sandbox)
 - [Costs](#costs)
+- [From another AI](#from-another-ai)
 
 ## Opening it
 
@@ -194,3 +195,62 @@ isolation, run the app as a separate macOS user.
 
 Spend is in dollars at API prices, as Claude Code counts it. **Run** shows the most a run can spend:
 every step's session cap, added up. A member spends from its lead's session, inside that cap.
+
+## From another AI
+
+Another program or AI can do everything the view does: build a team, change it, check and run it,
+watch it, stop it, and read what its agents wrote. They work on the same files, so a change made
+from outside shows in the view at once, and a run started from outside lights up the cards there.
+It works the other way too: a run started in the app can be watched and stopped from outside.
+
+The controls are `persephone-agents`, a program of their own:
+
+```bash
+cargo build --release -p persephone-agents-server
+```
+
+That gives `target/release/persephone-agents`, with three ways in:
+
+- **MCP, for AI clients.** Its 24 tools then show up as the client's own. For Claude Code:
+
+  ```bash
+  claude mcp add persephone-agents -- /full/path/to/persephone-agents mcp
+  ```
+
+- **HTTP, for scripts and custom agents.** Run `persephone-agents serve`, which listens on
+  `http://127.0.0.1:8766`. Send `POST /v1/tools/<name>` with the arguments as JSON, or
+  `GET /v1/tools` for the list. Each call needs `Authorization: Bearer <token>`, with the token in
+  `~/persephone-agents/http-token`. It only answers this machine, and not web pages.
+- **The command line:** `persephone-agents call <tool> '<arguments as JSON>'`. Add `--root DIR`
+  first to use another teams' folder.
+
+One call can build a whole team:
+
+```bash
+persephone-agents call create_team '{
+  "name": "BTC desk",
+  "brief": "Is there anything worth trading in BTCUSDT on 1h bars, after realistic costs?",
+  "agents": [
+    {"name": "Head", "role": "Leads the research and writes the report.", "model": "opus", "effort": "high", "spend_cap": 15},
+    {"name": "Trend", "role": "Tests trend rules through Lab.", "model": "sonnet", "reports_to": "Head"},
+    {"name": "Skeptic", "role": "Re-runs the head's claims with tests that could break them.", "model": "sonnet"}
+  ],
+  "links": [{"from": "Skeptic", "to": "Head", "kind": "reviews", "rounds": 1}]
+}'
+```
+
+Then `check_team`, `run_team`, `get_run` while it goes, and `get_outputs` and `get_feedback` for
+what the agents wrote. `get_guide` explains the rest, and [the tools' reference](agents-tools.md)
+lists every tool and its arguments.
+
+**What it can and can't do:**
+
+- `run_team` starts a run in the background and answers at once. The run goes on even if what
+  asked for it stops.
+- Only one run of a team goes at a time.
+- Each run keeps `plan.json` and a live `state.json` in its folder. Leaving a `stop` or `wrap-up`
+  file there asks it to stop or wrap up, which is how `stop_run`, `wrap_up_run` and the app's
+  buttons reach a run in another process.
+- The agents in a team can't reach any of this. They have no shell and no web, Lab is their only
+  tools server, and their sandbox keeps them out of the teams' folder.
+
