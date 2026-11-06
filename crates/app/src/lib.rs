@@ -13,6 +13,7 @@
 //! files dropped on a chart import into the local store and open there. A strategy's report
 //! can start paper trading it on live Binance bars.
 
+pub mod agents;
 pub mod backtest;
 mod build;
 mod importing;
@@ -136,6 +137,8 @@ fn window_settings() -> window::Settings {
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut settings = window::Settings {
         size: DEFAULT_WINDOW,
+        // Its close button asks first, so agents' sessions are stopped before the app goes.
+        exit_on_close_request: false,
         ..window::Settings::default()
     };
     #[cfg(target_os = "macos")]
@@ -449,6 +452,8 @@ pub struct Persephone {
     draft_logic: HashMap<String, Arc<Logic>>,
     /// The news sidebar, and the headlines collected.
     news: news::News,
+    /// The Agents view, and the teams it has.
+    agents: agents::Agents,
     /// Lists of positions Lab has saved, by the same kind of name.
     lab_positions: HashMap<String, Positions>,
     /// What's loaded from `plugin_dir`.
@@ -584,6 +589,9 @@ pub enum Message {
     /// A run's trades, found again for the panel's inspection drawer.
     Inspected(u64, Result<Arc<backtest::trades::Ledger>, String>),
     News(news::NewsMessage),
+    Agents(agents::AgentsMessage),
+    /// The window's close button: it closes once any agents' run has stopped.
+    CloseRequested(window::Id),
 }
 
 impl Persephone {
@@ -647,6 +655,7 @@ impl Persephone {
         let workspace = saved.as_ref().map_or(1, |s| s.workspace);
         let others = saved.as_ref().map_or_else(Vec::new, |s| s.others.clone());
         let news_saved = saved.as_ref().and_then(|s| s.news.clone());
+        let agents_saved = saved.as_ref().and_then(|s| s.agents.clone());
         let mut app = Self {
             layout: saved.map_or_else(Layout::new, |s| s.layout),
             tiles: BTreeMap::new(),
@@ -666,6 +675,7 @@ impl Persephone {
             lab_logic: HashMap::new(),
             draft_logic: HashMap::new(),
             news: news::News::default(),
+            agents: agents::Agents::default(),
             lab_positions: HashMap::new(),
             plugins: Arc::default(),
             reloading: false,
@@ -689,6 +699,7 @@ impl Persephone {
             panel: None,
         };
         app.news = news::News::from_saved(news_saved);
+        app.agents = agents::Agents::from_saved(agents_saved);
         app.refresh_local_markets();
         let mut loads: Vec<_> = tiles
             .into_iter()
@@ -759,6 +770,7 @@ impl Persephone {
             lab_logic: HashMap::new(),
             draft_logic: HashMap::new(),
             news: news::News::default(),
+            agents: agents::Agents::default(),
             lab_positions: HashMap::new(),
             plugins: Arc::default(),
             reloading: false,
@@ -1504,6 +1516,11 @@ impl Persephone {
                 self.layout.focus(id);
             }
             Message::Top(message) => {
+                // A test tab is about the charts: the Agents view makes way for them.
+                if self.agents.saved.open {
+                    self.agents.saved.open = false;
+                    self.save();
+                }
                 if self.panel.is_none() {
                     let open = self.open_panel(self.layout.focused());
                     return Task::batch([open, self.on_panel(message)]);
@@ -1562,6 +1579,8 @@ impl Persephone {
             }
             Message::Inspected(run, result) => self.inspected(run, result),
             Message::News(message) => return self.on_news(message),
+            Message::Agents(message) => return self.on_agents(message),
+            Message::CloseRequested(window) => return self.close_after_agents(window),
             Message::LabResultsChanged => return self.load_lab_results(),
             Message::PluginsChanged => {
                 if !self.reloading {
@@ -1864,6 +1883,7 @@ impl Persephone {
             }
             Action::Backtest => return self.toggle_panel(self.layout.focused()),
             Action::News => return self.on_news(news::NewsMessage::Toggle),
+            Action::Agents => return self.on_agents(agents::AgentsMessage::Toggle),
             Action::Workspace(number) => return self.switch_workspace(number),
             Action::MoveToWorkspace(number) => return self.move_to_workspace(number),
         };
@@ -2705,6 +2725,7 @@ impl Persephone {
             }
             MenuMessage::OpenBacktest => return self.open_panel(id),
             MenuMessage::News => return self.on_news(news::NewsMessage::Toggle),
+            MenuMessage::Agents => return self.on_agents(agents::AgentsMessage::Toggle),
             MenuMessage::GoLive(mode) => {
                 self.popup = Some(popup);
                 return self.go_live(id, mode);
@@ -5740,8 +5761,10 @@ impl Persephone {
         let bar = container(
             row![
                 iced::widget::Space::new().width(TOP_BAR_LEFT),
+                agents::view::top_button(self.agents.saved.open),
                 backtest::test_tabs(test, notice, runs).map(Message::Top),
             ]
+            .spacing(8)
             .align_y(iced::Alignment::Center),
         )
         .width(self.window.width)
@@ -5756,6 +5779,17 @@ impl Persephone {
             .on_press(Message::DragWindow)
             .on_double_click(Message::ToggleMaximize)
             .into()
+    }
+
+    /// Where the Agents view goes: everything under the top bar.
+    fn agents_rect(&self) -> Rect {
+        let (width, height) = (self.window.width, self.window.height);
+        Rect::new(
+            GAP,
+            TOP_BAR + GAP,
+            (width - 2.0 * GAP).max(0.0),
+            (height - TOP_BAR - 2.0 * GAP).max(0.0),
+        )
     }
 
     /// Points every tile at where the layout wants it, gliding there if `animate`.
@@ -5787,6 +5821,7 @@ impl Persephone {
             tiles: saved_tiles(&self.tiles),
             workspace: self.workspace,
             news: Some(self.news.saved.clone()),
+            agents: Some(self.agents.saved.clone()),
             others: self
                 .stash
                 .iter()
@@ -5806,7 +5841,10 @@ impl Persephone {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let input = event::listen_with(|event, _status, _window| match event {
+        let input = event::listen_with(|event, _status, window| match event {
+            iced::Event::Window(window::Event::CloseRequested) => {
+                Some(Message::CloseRequested(window))
+            }
             iced::Event::Keyboard(keyboard::Event::KeyPressed {
                 physical_key: Physical::Code(Code::Escape),
                 ..
@@ -6056,6 +6094,25 @@ impl Persephone {
         // The news sidebar, down the right under the panel.
         if let Some(rect) = panes.news {
             layers.push(pane(self.news_view(), rect));
+        }
+        // The Agents view, over all of them, on the desktop's colour so no chart shows round it;
+        // nothing under it hears the mouse.
+        if self.agents.saved.open {
+            let (width, height) = (self.window.width, self.window.height);
+            layers.push(
+                pin(iced::widget::opaque(
+                    container(iced::widget::Space::new())
+                        .width(width)
+                        .height((height - TOP_BAR).max(0.0))
+                        .style(|_| container::background(theme::DESKTOP)),
+                ))
+                .y(TOP_BAR)
+                .into(),
+            );
+            layers.push(pane(
+                iced::widget::opaque(self.agents_view()),
+                self.agents_rect(),
+            ));
         }
 
         // The popup goes above every tile, so neighbouring charts can't cover it.

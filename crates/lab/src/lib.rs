@@ -43,6 +43,8 @@ pub struct Paths {
     pub store: PathBuf,
     pub plugins: PathBuf,
     pub models: PathBuf,
+    /// Where answers too big to send an agent are saved for it to read.
+    pub answers: PathBuf,
 }
 
 impl Paths {
@@ -54,6 +56,7 @@ impl Paths {
             store: data.join("store"),
             plugins: data.join("plugins"),
             models: data.join("models"),
+            answers: data.join("lab").join("answers"),
             data,
         }
     }
@@ -115,9 +118,10 @@ impl Lab {
         paths: Paths,
         source: Arc<dyn cache::BarSource>,
     ) -> Result<Arc<Self>, String> {
-        for dir in ["runs", "jobs", "results", "exports", "answers"] {
+        for dir in ["runs", "jobs", "results", "exports"] {
             std::fs::create_dir_all(paths.lab().join(dir)).map_err(|e| e.to_string())?;
         }
+        std::fs::create_dir_all(&paths.answers).map_err(|e| e.to_string())?;
         std::fs::create_dir_all(&paths.models).map_err(|e| e.to_string())?;
         let models = Arc::new(Models::new(&paths.models));
         // No language models: a plugin that asks gets no answer, and nothing here can spend money.
@@ -146,8 +150,7 @@ impl Lab {
         }
         let path = self
             .paths
-            .lab()
-            .join("answers")
+            .answers
             .join(format!("{}.json", new_id("answer")));
         if let Err(error) = std::fs::write(&path, &text) {
             return serde_json::json!({

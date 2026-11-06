@@ -7,6 +7,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+persephone-agents.workspace = true
 persephone-chart.workspace = true
 persephone-core.workspace = true
 persephone-data.workspace = true

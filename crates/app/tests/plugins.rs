@@ -196,6 +196,7 @@ fn saved_plugins_wait_for_their_plugin_then_resolve() {
             workspace: 1,
             others: Vec::new(),
             news: None,
+            agents: None,
             layout: Layout::new(),
             tiles: vec![SavedTile {
                 id: 0,

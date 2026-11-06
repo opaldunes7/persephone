@@ -403,7 +403,7 @@ impl LocalMarket {
     pub fn save_info(&self) -> anyhow::Result<()> {
         let path = self.dir.join(MARKET_FILE);
         let text = serde_json::to_string_pretty(&self.info)?;
-        let tmp = path.with_extension("json.tmp");
+        let tmp = crate::aside(&path);
         fs::write(&tmp, text + "\n").with_context(|| format!("writing {}", path.display()))?;
         fs::rename(&tmp, &path)?;
         Ok(())
@@ -1155,7 +1155,7 @@ fn write_columns(path: &Path, names: &[&str], columns: Vec<ArrayRef>) -> anyhow:
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let tmp = path.with_extension("parquet.tmp");
+    let tmp = crate::aside(path);
     let file = fs::File::create(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
     let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(properties.build()))?;
     writer.write(&batch)?;

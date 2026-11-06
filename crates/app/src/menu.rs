@@ -365,6 +365,8 @@ pub enum MenuMessage {
     OpenBacktest,
     /// Open the news sidebar, or close it.
     News,
+    /// Open the Agents view, or close it.
+    Agents,
     /// Trade the tile's strategy on live bars, or stop.
     GoLive(LiveMode),
     StopLive,
@@ -731,6 +733,7 @@ fn root<'a>(tile: &TileInfo<'a>) -> Element<'a, MenuMessage> {
         item("Draw", "›", MenuMessage::Open(Page::Draw)),
         item("Backtest", backtest_shortcut(), MenuMessage::OpenBacktest),
         item("News", news_shortcut(), MenuMessage::News),
+        item("Agents", agents_shortcut(), MenuMessage::Agents),
         item(
             "Symbol",
             tile.symbol,
@@ -1660,6 +1663,14 @@ fn amount(value: f64) -> String {
     match trimmed {
         "+" | "-" | "+0" | "-0" => "0".into(),
         other => other.to_owned(),
+    }
+}
+
+const fn agents_shortcut() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "⌃G"
+    } else {
+        "Ctrl+G"
     }
 }
 

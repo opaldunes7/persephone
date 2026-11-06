@@ -28,6 +28,7 @@ nautilus-sandbox = { version = "=0.66.0", default-features = false }
 nautilus-trading = "=0.66.0"
 
 persephone = { path = "crates/app" }
+persephone-agents = { path = "crates/agents" }
 persephone-chart = { path = "crates/chart" }
 persephone-core = { path = "crates/core" }
 persephone-data = { path = "crates/data" }
@@ -51,6 +52,8 @@ dirs = "6"
 flate2 = "1"
 iced = { version = "0.14", features = ["advanced", "canvas", "wgpu"] }
 jiff = "0.2"
+# Stopping an agent's session and everything it started, as one process group.
+libc = "0.2"
 log = "0.4"
 notify = "8"
 # Opening a headline's link in the browser.

@@ -14,6 +14,7 @@
 //! | Ctrl+F                 | fullscreen                 |
 //! | Ctrl+B                 | backtest panel, open/close |
 //! | Ctrl+N                 | news sidebar, open/close   |
+//! | Ctrl+G                 | agents, open/close         |
 //! | Ctrl+1…9               | switch workspace           |
 //! | Ctrl+Shift+1…9         | move chart to workspace    |
 
@@ -36,6 +37,8 @@ pub enum Action {
     Backtest,
     /// Open the news sidebar, or close it.
     News,
+    /// Open the Agents view, or close it.
+    Agents,
     /// Show workspace 1 to 9.
     Workspace(u8),
     /// Move the focused chart to workspace 1 to 9.
@@ -78,6 +81,7 @@ pub fn action(key: Physical, modifiers: Modifiers, repeat: bool) -> Option<Actio
             Code::KeyF => Action::Fullscreen,
             Code::KeyB => Action::Backtest,
             Code::KeyN => Action::News,
+            Code::KeyG => Action::Agents,
             _ => return None,
         },
     };
@@ -125,6 +129,7 @@ mod tests {
         assert_eq!(press(Code::KeyQ, ctrl), Some(Action::CloseTile));
         assert_eq!(press(Code::KeyB, ctrl), Some(Action::Backtest));
         assert_eq!(press(Code::KeyN, ctrl), Some(Action::News));
+        assert_eq!(press(Code::KeyG, ctrl), Some(Action::Agents));
         assert_eq!(
             press(Code::KeyH, ctrl),
             Some(Action::Focus(Direction::Left))

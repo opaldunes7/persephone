@@ -4800,6 +4800,7 @@ dependencies = [
  "iced_test",
  "notify",
  "opener",
+ "persephone-agents",
  "persephone-chart",
  "persephone-core",
  "persephone-data",
@@ -4810,6 +4811,16 @@ dependencies = [
  "persephone-tiling",
  "rfd",
  "ron",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "persephone-agents"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "libc",
  "serde",
  "serde_json",
 ]

@@ -28,6 +28,9 @@ pub struct Saved {
     /// The news sidebar: open or not, its width and what it lists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub news: Option<crate::news::NewsSaved>,
+    /// The Agents view: open or not, the team on it, and where things are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<crate::agents::AgentsSaved>,
 }
 
 /// A workspace that wasn't on screen.
@@ -209,6 +212,7 @@ mod tests {
             workspace: 1,
             others: Vec::new(),
             news: None,
+            agents: None,
             layout,
             tiles: vec![
                 SavedTile {

@@ -22,6 +22,7 @@ chart, in the strategy report, and in `persephone-cli`. This guide walks through
 - [News](#news)
 - [Exporting and importing](#exporting-and-importing)
 - [Persephone Lab](#persephone-lab)
+- [Agents](#agents)
 - [Where files live](#where-files-live)
 
 ## Starting
@@ -88,6 +89,7 @@ mouse.
 | Ctrl+F | fullscreen the focused chart (again to restore) |
 | Ctrl+B | open or close the backtest panel on the focused chart |
 | Ctrl+N | open or close the news sidebar |
+| Ctrl+G | open or close the [Agents](#agents) view |
 | Ctrl+1…9 | switch to that workspace |
 | Ctrl+Shift+1…9 | move the focused chart to that workspace |
 
@@ -681,6 +683,14 @@ Agents and scripts can read every data point and run every test through
 strategy list, marked **Lab**, ready to backtest and replay. Everything the backtest panel shows,
 including the data behind its charts, is available to them as well.
 
+## Agents
+
+**Agents** in the top bar (or Ctrl+G) opens a canvas where you draw a team of Claude agents: each one's
+role, model and effort, who reports to whom, who hands work to whom, and who reviews whom. **Run**
+starts them as Claude Code sessions that work through Lab, sandboxed so they can't touch Persephone's
+code, a shell or the web. Their cards light up as they work, and their reports, memory, and bugs and
+ideas for the app show beside them. See [Agents](agents.md).
+
 ## Where files live
 
 Everything is in one folder:
@@ -701,3 +711,5 @@ Everything is in one folder:
 
 `persephone-cli data dir`, `plugin dir` and `models dir` print their folders. Delete
 `layout.ron` to start over with one chart.
+
+Agent teams are kept apart from all this, in `~/persephone-agents`; see [Agents](agents.md#the-folders).

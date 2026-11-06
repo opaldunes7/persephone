@@ -1172,11 +1172,13 @@ impl Lab {
     /// Returns a message if a folder can't be read.
     pub fn prune(&self, age: Duration) -> Result<(usize, u64), String> {
         let (mut files, mut bytes) = (0, 0);
-        for folder in ["runs", "jobs", "answers"] {
-            for entry in fs::read_dir(self.paths.lab().join(folder))
-                .map_err(|e| e.to_string())?
-                .flatten()
-            {
+        let lab = self.paths.lab();
+        for folder in [
+            lab.join("runs"),
+            lab.join("jobs"),
+            self.paths.answers.clone(),
+        ] {
+            for entry in fs::read_dir(folder).map_err(|e| e.to_string())?.flatten() {
                 let Ok(meta) = entry.metadata() else { continue };
                 let old = meta
                     .modified()

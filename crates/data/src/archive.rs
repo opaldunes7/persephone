@@ -152,7 +152,7 @@ pub fn download(
     if let Some(dir) = dest.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let partial = dest.with_extension("zip.part");
+    let partial = crate::aside(dest);
     let mut file =
         fs::File::create(&partial).with_context(|| format!("writing {}", partial.display()))?;
     let mut hasher = Sha256::new();
@@ -311,7 +311,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("checksum"), "{error}");
-        assert!(!dest.exists() && !dest.with_extension("zip.part").exists());
+        assert!(!dest.exists());
+        let left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".partial"))
+            .collect();
+        assert!(left.is_empty(), "the partial download is removed");
 
         let missing = Period::Month {
             year: 2019,

@@ -1,0 +1,278 @@
+//! The Agents view, driven through the messages the UI sends. Teams are kept in a folder of the
+//! test's own; nothing here starts Claude Code: a run's events are handed in as the runner
+//! would send them.
+
+use std::{path::PathBuf, sync::Arc};
+
+use iced::Size;
+use persephone::{
+    Message, Persephone,
+    agents::{AgentsMessage, Selected},
+    backtest::{PanelMessage, TestKind},
+    keymap::Action,
+};
+use persephone_agents::{
+    check::Found,
+    plan::plan,
+    run::{RunEvent, Status, Summary},
+    stream::{Event, Finish, Who},
+    team::{LinkKind, Model, Starter},
+};
+use persephone_chart::ChartData;
+use persephone_core::{Candle, Timeframe};
+
+fn app() -> Persephone {
+    let candles = (0..500u64)
+        .map(|i| Candle {
+            ts: i * Timeframe::H1.nanos(),
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.0,
+            volume: 1.0,
+        })
+        .collect();
+    Persephone::preloaded(
+        ChartData::new("BTCUSDT", "BINANCE", Timeframe::H1, 2, candles),
+        Size::new(1600.0, 1000.0),
+    )
+}
+
+fn dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("persephone-agents-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn found() -> Found {
+    Found {
+        claude: Some("/usr/local/bin/claude".into()),
+        logged_in: Some(true),
+        lab: Some("/usr/local/bin/persephone-lab".into()),
+    }
+}
+
+fn say(app: &mut Persephone, message: AgentsMessage) {
+    let _ = app.update(Message::Agents(message));
+}
+
+fn shows(app: &Persephone, words: &str) -> bool {
+    let mut ui = iced_test::Simulator::with_size(
+        iced::Settings::default(),
+        Size::new(1600.0, 1000.0),
+        app.view(),
+    );
+    ui.find(words).is_ok()
+}
+
+#[test]
+fn ctrl_g_opens_it_over_the_charts_and_a_test_tab_closes_it() {
+    let mut app = app();
+    assert!(shows(&app, "Agents"), "its button in the top bar");
+    let _ = app.update(Message::Key(Action::Agents));
+    assert!(app.agents().saved.open);
+    assert!(shows(&app, "Teams"));
+    let _ = app.update(Message::Top(PanelMessage::Test(TestKind::Backtest)));
+    assert!(!app.agents().saved.open);
+}
+
+#[test]
+fn it_is_saved_with_the_layout() {
+    let dir = dir("layout");
+    let path = dir.join("layout.ron");
+    let (mut first, _) = Persephone::start(&[], Some(path.clone()));
+    first.use_agents_root(dir.join("teams"), found());
+    let _ = first.update(Message::Agents(AgentsMessage::Toggle));
+    let _ = first.update(Message::Agents(AgentsMessage::New(Starter::OneAnalyst)));
+    let (restored, _) = Persephone::start(&[], Some(path));
+    let saved = &restored.agents().saved;
+    assert!(saved.open);
+    assert_eq!(saved, &first.agents().saved, "the team and the folder too");
+    assert_eq!(restored.agents().teams.len(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_team_drawn_is_kept_in_its_folder() {
+    let dir = dir("drawn");
+    let mut app = app();
+    app.use_agents_root(dir.clone(), found());
+    say(&mut app, AgentsMessage::New(Starter::Blank));
+    say(&mut app, AgentsMessage::Add([0.0, 0.0]));
+    say(&mut app, AgentsMessage::Add([300.0, 0.0]));
+    let ids: Vec<String> = app
+        .agents()
+        .team()
+        .unwrap()
+        .agents
+        .iter()
+        .map(|a| a.id.clone())
+        .collect();
+    say(&mut app, AgentsMessage::LinkAs(LinkKind::HandsTo));
+    say(
+        &mut app,
+        AgentsMessage::Connect(ids[0].clone(), ids[1].clone()),
+    );
+    say(
+        &mut app,
+        AgentsMessage::Select(Selected::Agent(ids[1].clone())),
+    );
+    say(&mut app, AgentsMessage::Model(Model::Haiku));
+    say(&mut app, AgentsMessage::Name("Writer".into()));
+    say(
+        &mut app,
+        AgentsMessage::Moved {
+            id: ids[1].clone(),
+            at: [320.0, 40.0],
+            done: true,
+        },
+    );
+
+    let mut again = Persephone::preloaded(
+        ChartData::new("BTCUSDT", "BINANCE", Timeframe::H1, 2, Vec::new()),
+        Size::new(1600.0, 1000.0),
+    );
+    again.use_agents_root(dir.clone(), found());
+    let team = again.agents().team().unwrap();
+    let writer = team.agent(&ids[1]).unwrap();
+    assert_eq!(writer.name, "Writer");
+    assert_eq!(writer.model, Model::Haiku);
+    assert_eq!(writer.at, [320.0, 40.0]);
+    assert_eq!(team.links.len(), 1);
+    assert_eq!(team.links[0].kind, LinkKind::HandsTo);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_second_lead_replaces_the_first() {
+    let dir = dir("lead");
+    let mut app = app();
+    app.use_agents_root(dir.clone(), found());
+    say(&mut app, AgentsMessage::New(Starter::LeadAndAnalysts));
+    let team = app.agents().team().unwrap().clone();
+    let (lead, a, b) = (&team.agents[0].id, &team.agents[1].id, &team.agents[2].id);
+    say(&mut app, AgentsMessage::LinkAs(LinkKind::ReportsTo));
+    say(&mut app, AgentsMessage::Connect(a.clone(), b.clone()));
+    let team = app.agents().team().unwrap();
+    assert_eq!(team.lead_of(a), Some(b.as_str()));
+    assert_eq!(team.reports_of(lead).len(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn check_lists_what_to_fix_and_a_click_selects_its_card() {
+    let dir = dir("check");
+    let mut app = app();
+    app.use_agents_root(dir.clone(), found());
+    let _ = app.update(Message::Agents(AgentsMessage::Toggle));
+    say(&mut app, AgentsMessage::New(Starter::OneAnalyst));
+    say(&mut app, AgentsMessage::Add([300.0, 0.0]));
+    say(&mut app, AgentsMessage::Check);
+    let problems = &app.agents().problems;
+    assert!(
+        problems.iter().any(|p| p.what.contains("brief is empty")),
+        "{problems:?}"
+    );
+    let role = problems
+        .iter()
+        .find(|p| p.what.contains("describe its role"))
+        .unwrap();
+    let id = role.agents[0].clone();
+    assert!(shows(&app, &format!("• {}", role.what)));
+    say(&mut app, AgentsMessage::Select(Selected::Agent(id.clone())));
+    assert_eq!(app.agents().selected, Selected::Agent(id));
+    // Run won't start while there's something to fix.
+    say(&mut app, AgentsMessage::Run);
+    assert!(app.agents().live.is_none());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_runs_events_light_the_cards() {
+    let dir = dir("live");
+    let mut app = app();
+    app.use_agents_root(dir.clone(), found());
+    let _ = app.update(Message::Agents(AgentsMessage::Toggle));
+    say(&mut app, AgentsMessage::New(Starter::LeadAndAnalysts));
+    say(
+        &mut app,
+        AgentsMessage::Brief(iced::widget::text_editor::Action::Edit(
+            iced::widget::text_editor::Edit::Paste(Arc::new("Study BTC.".into())),
+        )),
+    );
+    assert_eq!(app.agents().team().unwrap().brief, "Study BTC.");
+    // The run itself isn't started here: the task it returns is never run.
+    say(&mut app, AgentsMessage::Run);
+    assert!(app.agents().running());
+
+    let team = app.agents().team().unwrap().clone();
+    let (lead, analyst) = (team.agents[0].id.clone(), team.agents[1].id.clone());
+    let plan = plan(&team).unwrap();
+    let mut send = |event| say(&mut app, AgentsMessage::Running(event));
+    send(RunEvent::Planned {
+        run: "r1".into(),
+        plan,
+    });
+    send(RunEvent::Status {
+        step: 0,
+        status: Status::Running,
+    });
+    send(RunEvent::Event {
+        step: 0,
+        event: Event::Delegated {
+            who: Who::Lead,
+            to: "analyst-a".into(),
+            task: "Test EMA".into(),
+        },
+    });
+    send(RunEvent::Event {
+        step: 0,
+        event: Event::Called {
+            who: Who::Member("analyst-a".into()),
+            tool: "run_backtest".into(),
+            about: "BTCUSDT 1h".into(),
+        },
+    });
+    let live = app.agents().live().unwrap();
+    assert_eq!(live.cards[&lead].status, Some(Status::Running));
+    assert_eq!(live.cards[&analyst].status, Some(Status::Running));
+    assert_eq!(live.cards[&analyst].calls, 1);
+    assert_eq!(live.cards[&analyst].doing, "run_backtest BTCUSDT 1h");
+    assert_eq!(live.lab_calls, 1);
+    assert!(shows(&app, "Analyst A → run_backtest BTCUSDT 1h"));
+
+    let mut send = |event| say(&mut app, AgentsMessage::Running(event));
+    send(RunEvent::Event {
+        step: 0,
+        event: Event::Returned {
+            who: Who::Lead,
+            from: "analyst-a".into(),
+            text: "It lost to holding.".into(),
+        },
+    });
+    send(RunEvent::Event {
+        step: 0,
+        event: Event::Finished(Finish {
+            ok: true,
+            turns: 9,
+            spend: 1.25,
+            ..Finish::default()
+        }),
+    });
+    send(RunEvent::Status {
+        step: 0,
+        status: Status::Done,
+    });
+    send(RunEvent::Ended(Summary {
+        run: "r1".into(),
+        team: team.name.clone(),
+        steps: Vec::new(),
+        spend: 1.25,
+    }));
+    let live = app.agents().live().unwrap();
+    assert_eq!(live.cards[&analyst].status, Some(Status::Done));
+    assert_eq!(live.cards[&lead].spend, 1.25);
+    assert!(!app.agents().running());
+    std::fs::remove_dir_all(dir).unwrap();
+}

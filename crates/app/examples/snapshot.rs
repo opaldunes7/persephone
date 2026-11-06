@@ -29,6 +29,9 @@
 //! `SNAPSHOT_HOVER=X,Y` moves the mouse there before the snapshot, to show a tooltip.
 //! `!` opens the news sidebar with headlines a day apart over the last week, and clicks the one
 //! from two days ago in it, as a person would.
+//! `=` opens the Agents view with two starter teams in a folder of its own, the lead and its
+//! analysts on the canvas; `*` selects the first analyst, `+` plays a made-up run onto it, and
+//! `,` shows the other team.
 //! AT_MS freezes the clock that many milliseconds after the last action (default: settled),
 //! to look at animation frames. iced appends the renderer name to the file name.
 
@@ -88,6 +91,28 @@ fn main() -> anyhow::Result<()> {
         match c {
             'D' => drop_file(&mut app)?,
             '!' => click_news(&mut app)?,
+            '=' => open_agents(&mut app),
+            '*' => {
+                let id = app
+                    .agents()
+                    .team()
+                    .and_then(|t| t.agents.get(1))
+                    .map(|a| a.id.clone());
+                if let Some(id) = id {
+                    let _ = app.update(Message::Agents(persephone::agents::AgentsMessage::Select(
+                        persephone::agents::Selected::Agent(id),
+                    )));
+                }
+            }
+            '+' => play_run(&mut app)?,
+            ',' => {
+                // The first team listed: the researcher and its reviewer.
+                let first = app.agents().teams.first().map(|t| t.id.clone());
+                if let Some(id) = first {
+                    let _ =
+                        app.update(Message::Agents(persephone::agents::AgentsMessage::Pick(id)));
+                }
+            }
             'G' => draw_examples(&mut app, focused),
             'R' => rehearse_live(&mut app, focused)?,
             'c' => {
@@ -603,6 +628,145 @@ fn made_up(symbol: &str, timeframe: Timeframe) -> std::sync::Arc<ChartData> {
         })
         .collect();
     ChartData::new(symbol, "BINANCE", timeframe, 2, candles)
+}
+
+/// The Agents view, with a researcher-and-reviewer pair and a lead with two analysts kept in a
+/// folder of the snapshot's own, the lead's team on the canvas.
+fn open_agents(app: &mut Persephone) {
+    use persephone::agents::AgentsMessage;
+    use persephone_agents::{check::Found, team::Starter};
+    let root =
+        std::env::temp_dir().join(format!("persephone-snapshot-agents-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let found = Found {
+        claude: Some("/usr/local/bin/claude".into()),
+        logged_in: Some(true),
+        lab: Some("/usr/local/bin/persephone-lab".into()),
+    };
+    app.use_agents_root(root, found.clone());
+    let say = |app: &mut Persephone, message| {
+        let _ = app.update(Message::Agents(message));
+    };
+    say(app, AgentsMessage::Toggle);
+    say(app, AgentsMessage::Found(found));
+    say(app, AgentsMessage::New(Starter::ResearcherAndReviewer));
+    say(app, AgentsMessage::New(Starter::LeadAndAnalysts));
+    say(
+        app,
+        AgentsMessage::Brief(iced::widget::text_editor::Action::Edit(
+            iced::widget::text_editor::Edit::Paste(std::sync::Arc::new(
+                "Is there anything worth trading in BTCUSDT and ETHUSDT on 1h bars, after realistic costs?"
+                    .into(),
+            )),
+        )),
+    );
+}
+
+/// A run of the team on the canvas, made up: the lead hands each analyst a market, they
+/// backtest, and the first brings its answer back.
+fn play_run(app: &mut Persephone) -> anyhow::Result<()> {
+    use persephone::agents::{AgentsMessage, Tab};
+    use persephone_agents::{
+        plan::plan,
+        run::{RunEvent, Status},
+        stream::{Event, Who},
+    };
+    let team = app
+        .agents()
+        .team()
+        .context("open the Agents view first, with =")?
+        .clone();
+    let plan = plan(&team).map_err(|_| anyhow::anyhow!("its steps wait on each other"))?;
+    let _ = app.update(Message::Agents(AgentsMessage::Run));
+    let member = |n: usize| Who::Member(persephone_agents::team::key(&team.agents[n].name));
+    let key = |n: usize| persephone_agents::team::key(&team.agents[n].name);
+    let events = [
+        RunEvent::Planned {
+            run: "2026-11-05-1432".into(),
+            plan,
+        },
+        RunEvent::Status {
+            step: 0,
+            status: Status::Running,
+        },
+        RunEvent::Event {
+            step: 0,
+            event: Event::Said {
+                who: Who::Lead,
+                text: "Two questions, one market each, with next-open fills, 2bp slippage and funding.".into(),
+            },
+        },
+        RunEvent::Event {
+            step: 0,
+            event: Event::Delegated {
+                who: Who::Lead,
+                to: key(1),
+                task: "BTCUSDT 1h, 2021-2024: does an EMA cross beat holding after costs?".into(),
+            },
+        },
+        RunEvent::Event {
+            step: 0,
+            event: Event::Delegated {
+                who: Who::Lead,
+                to: key(2),
+                task: "ETHUSDT 1h, 2021-2024: does a Donchian breakout beat holding after costs?".into(),
+            },
+        },
+        RunEvent::Event {
+            step: 0,
+            event: Event::Called {
+                who: member(1),
+                tool: "run_backtest".into(),
+                about: "BTCUSDT 1h 2021-01-01 2024-01-01 ema-cross".into(),
+            },
+        },
+        RunEvent::Event {
+            step: 0,
+            event: Event::Answered {
+                who: member(1),
+                tool: "run_backtest".into(),
+                ok: true,
+                text: "{\"run_id\": \"run-1793-1\", \"net_return\": 0.42, \"buy_and_hold_return\": 0.73}".into(),
+            },
+        },
+        RunEvent::Event {
+            step: 0,
+            event: Event::Called {
+                who: member(2),
+                tool: "run_backtest".into(),
+                about: "ETHUSDT 1h 2021-01-01 2024-01-01 donchian-breakout".into(),
+            },
+        },
+        RunEvent::Event {
+            step: 0,
+            event: Event::Called {
+                who: member(1),
+                tool: "run_walk_forward".into(),
+                about: "BTCUSDT 1h run-1793-1".into(),
+            },
+        },
+        RunEvent::Event {
+            step: 0,
+            event: Event::Returned {
+                who: Who::Lead,
+                from: key(1),
+                text: "The EMA cross made 42% to holding's 73% (run-1793-1), and lost out of sample in 5 of 6 windows. Nothing here beats holding.".into(),
+            },
+        },
+        RunEvent::Event {
+            step: 0,
+            event: Event::Called {
+                who: Who::Lead,
+                tool: "run_shifted".into(),
+                about: "run-1793-1".into(),
+            },
+        },
+    ];
+    for event in events {
+        let _ = app.update(Message::Agents(AgentsMessage::Running(event)));
+    }
+    let _ = app.update(Message::Agents(AgentsMessage::Tab(Tab::Activity)));
+    Ok(())
 }
 
 /// The news sidebar open with a headline a day for a week, and the one two days ago clicked.

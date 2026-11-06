@@ -4309,6 +4309,25 @@ fn an_answer_too_big_for_an_agent_goes_to_a_file() {
 }
 
 #[test]
+fn big_answers_can_be_saved_in_a_folder_of_their_own() {
+    let dir = std::env::temp_dir().join(format!("persephone-lab-answers-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let mut paths = Paths::under(dir.join("data"));
+    paths.answers = dir.join("agent").join("lab-answers");
+    let lab = Lab::new(paths).unwrap();
+
+    let big = json!({"rows": vec!["x".repeat(1_000); 200]});
+    let answer: Value = serde_json::from_str(&lab.fit_for_agent(&big)).unwrap();
+    let path = PathBuf::from(answer["path"].as_str().unwrap());
+    assert!(
+        path.starts_with(dir.join("agent").join("lab-answers")),
+        "{answer}"
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), big.to_string());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn the_written_reference_matches_the_tools() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/lab-tools.md");
     let written = fs::read_to_string(path).unwrap_or_default();

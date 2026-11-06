@@ -27,7 +27,11 @@ cargo build --release -p persephone-lab
 ```
 
 The program is `target/release/persephone-lab`. It uses the same folders as the app, so it sees the
-same markets, plugins and models.
+same markets, plugins and models. Two options go before the command:
+
+- `--data DIR` uses another folder instead.
+- `--answers DIR` saves answers too big to send an agent in that folder, instead of `lab/answers/`. It's
+  for an agent that may only read its own folder.
 
 ## Three ways in
 
@@ -42,6 +46,8 @@ claude mcp add persephone-lab -- /full/path/to/persephone-lab mcp
 ```
 
 Then tell it to use Lab. It's told to call `get_guide` first. Other MCP clients can run `persephone-lab mcp` the same way. It talks over standard input and output.
+
+To design teams of agents and run them from the app instead, see [Agents](agents.md).
 
 ### HTTP, for scripts and custom agents
 

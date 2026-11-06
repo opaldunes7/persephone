@@ -8,26 +8,36 @@
 //! persephone-lab prune --older-than 30d    Remove Lab's old saved runs and job files
 //! ```
 //!
-//! `--data DIR` before any of them uses another folder than the app's.
+//! `--data DIR` before any of them uses another folder than the app's, and `--answers DIR` saves
+//! answers too big to send an agent there rather than in Lab's own folder.
 
 use std::{process::ExitCode, time::Duration};
 
 use persephone_lab::{Lab, Paths, http, mcp, tools};
 use serde_json::{Value, json};
 
-const USAGE: &str = "usage: persephone-lab [--data DIR] tools [--markdown] | call NAME [ARGS-AS-JSON | @FILE] | mcp | serve [--port N] | prune --older-than 30d";
+const USAGE: &str = "usage: persephone-lab [--data DIR] [--answers DIR] tools [--markdown] | call NAME [ARGS-AS-JSON | @FILE] | mcp | serve [--port N] | prune --older-than 30d";
 /// The command line waits as long as a job takes.
 const WAIT_FOR_EVER: f64 = 86_400.0;
 
 fn run() -> Result<(), String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let mut data = None;
-    if args.first().is_some_and(|arg| arg == "--data") {
+    let (mut data, mut answers) = (None, None);
+    while let Some(option) = args
+        .first()
+        .filter(|arg| *arg == "--data" || *arg == "--answers")
+        .cloned()
+    {
         if args.len() < 2 {
             return Err(USAGE.into());
         }
-        data = Some(args.remove(1));
+        let dir = args.remove(1);
         args.remove(0);
+        if option == "--data" {
+            data = Some(dir);
+        } else {
+            answers = Some(dir);
+        }
     }
     let command = args.first().map(String::as_str);
     if command == Some("tools") {
@@ -40,10 +50,13 @@ fn run() -> Result<(), String> {
         }
         return Ok(());
     }
-    let paths = match data {
+    let mut paths = match data {
         Some(data) => Paths::under(data),
         None => Paths::default_paths()?,
     };
+    if let Some(answers) = answers {
+        paths.answers = answers.into();
+    }
     let lab = Lab::new(paths)?;
     match command {
         Some("call") => {

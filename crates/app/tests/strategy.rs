@@ -3146,6 +3146,7 @@ mod panel {
                 workspace: 1,
                 others: Vec::new(),
                 news: None,
+                agents: None,
                 layout: Layout::new(),
                 tiles: vec![SavedTile {
                     id: 0,

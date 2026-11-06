@@ -1,0 +1,13 @@
+[package]
+name = "persephone-agents"
+description = "Teams of Claude agents for Persephone: how a team is drawn, and running it as Claude Code sessions."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+dirs.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
