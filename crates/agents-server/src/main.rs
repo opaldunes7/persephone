@@ -9,6 +9,7 @@
 //! persephone-agents run TEAM [--run NAME]           Run a team here, saying what it does
 //! persephone-agents export TEAM [FILE]              A team's setup file, to keep or share
 //! persephone-agents import FILE [--name NAME]       A team from a setup file
+//! persephone-agents findings TEAM [--run NAME] [FILE]  What a run found, as Markdown
 //! ```
 //!
 //! `--root DIR` before any of them keeps teams somewhere other than `~/persephone-agents`, and
@@ -27,7 +28,7 @@ use persephone_agents::{
 };
 use serde_json::{Value, json};
 
-const USAGE: &str = "usage: persephone-agents [--root DIR] [--claude PATH] tools [--markdown] | call NAME [ARGS-AS-JSON | @FILE] | mcp | serve [--port N] | run TEAM [--run NAME] | export TEAM [FILE] | import FILE [--name NAME]";
+const USAGE: &str = "usage: persephone-agents [--root DIR] [--claude PATH] tools [--markdown] | call NAME [ARGS-AS-JSON | @FILE] | mcp | serve [--port N] | run TEAM [--run NAME] | export TEAM [FILE] | import FILE [--name NAME] | findings TEAM [--run NAME] [FILE]";
 
 fn run_cli() -> Result<(), String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -115,6 +116,27 @@ fn run_cli() -> Result<(), String> {
                     "{}",
                     serde_json::to_string_pretty(&answer["setup"]).unwrap_or_default()
                 ),
+            }
+            Ok(())
+        }
+        Some("findings") => {
+            let team = args.get(1).ok_or(USAGE)?;
+            let mut call = json!({"team": team});
+            let mut rest = args[2..].iter();
+            while let Some(arg) = rest.next() {
+                if arg == "--run" {
+                    call["run"] = json!(rest.next().ok_or("--run needs a run's name")?);
+                } else {
+                    call["path"] = json!(arg);
+                }
+            }
+            let answer = desk.dispatch("export_findings", &call)?;
+            match answer["written"].as_str() {
+                Some(path) => eprintln!(
+                    "Wrote what run {} found to {path}",
+                    answer["run"].as_str().unwrap_or_default()
+                ),
+                None => print!("{}", answer["findings"].as_str().unwrap_or_default()),
             }
             Ok(())
         }

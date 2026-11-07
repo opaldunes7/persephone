@@ -136,6 +136,17 @@ as "give B what A found" or "have C re-run B's results before you accept them".
   folder**. Its `vetoed.md` and `tasks.md` are yours to edit there.
 - **App feedback:** every agent's bugs and ideas for Persephone, in one place.
 - **Past runs:** pick one at the right of the run bar to read its activity again.
+- **Export findings…**, beside Past runs, saves what a run found as one Markdown file:
+  - its brief, and each step's status, calls and spend
+  - every step's report, in order
+  - what each agent believes and remembers now, with its journals from the run and its members'
+    notes
+  - the data the agents saved during the run
+  - their bugs and ideas for the app
+
+  It exports the past run you're reading, else the run on screen, else the latest. From another
+  AI it's the `export_findings` tool, and from the command line
+  `persephone-agents findings "My team" findings.md`.
 
 ## The folders
 
@@ -245,7 +256,8 @@ persephone-agents call create_team '{
 }'
 ```
 
-Then `check_team`, `run_team`, `get_run` while it goes, and `get_outputs` and `get_feedback` for
+Then `check_team`, `run_team`, `get_run` while it goes, `export_findings` for everything a run
+found in one document, and `get_outputs` and `get_feedback` for
 what the agents wrote. `get_guide` explains the rest, and [the tools' reference](tools.md)
 lists every tool and its arguments.
 

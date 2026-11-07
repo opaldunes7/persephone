@@ -194,6 +194,14 @@ Every agent's bugs and ideas for Persephone, in one place.
 
 - `team` (string, required): The team, by its id or name.
 
+## `export_findings`
+
+What a run found, as one Markdown document: the brief, each step's report in order, what each agent believes and remembers now, the data they saved during the run, and their bugs and ideas for the app.
+
+- `team` (string, required): The team, by its id or name.
+- `run` (string): The run; the latest if left out.
+- `path` (string): Write it to this file instead of answering with it.
+
 ## `export_team`
 
 A team's whole setup as a file: its brief, principles, every agent's settings, the links, Lab and the layout, by name. Import it with import_team to get the same setup again, here or on another computer. Agents' memory isn't in it.

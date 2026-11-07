@@ -464,3 +464,91 @@ fn a_setup_file_imports_as_a_team_and_exports_again() {
     assert!(app.agents().note.as_deref().unwrap().contains("`nmae`"));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn what_a_run_found_exports_as_one_file() {
+    use persephone_agents::{
+        folder,
+        run::{self, RunState, StepState, Summary},
+    };
+    let dir = dir("findings");
+    let mut app = app();
+    app.use_agents_root(dir.join("teams"), found());
+    let _ = app.update(Message::Agents(AgentsMessage::Toggle));
+    say(&mut app, AgentsMessage::New(Starter::OneAnalyst));
+    let team = app.agents().team().unwrap().clone();
+    assert_eq!(
+        app.agents().findings_run(),
+        None,
+        "nothing to export before a run"
+    );
+    // A run that's ended, as the runner leaves it.
+    let plan = plan(&team).unwrap();
+    let (name, run_dir) = run::reserve_run(&folder::team_dir(&dir.join("teams"), &team)).unwrap();
+    std::fs::write(
+        run_dir.join("plan.json"),
+        serde_json::to_string(&plan).unwrap(),
+    )
+    .unwrap();
+    let state = RunState {
+        run: name.clone(),
+        team: team.id.clone(),
+        pid: 0,
+        started: 0,
+        ended: Some(1),
+        steps: vec![StepState {
+            label: plan.label(&team, 0),
+            agent: team.agents[0].id.clone(),
+            status: Status::Done,
+            calls: 12,
+            spend: 0.5,
+            doing: String::new(),
+        }],
+        notes: Vec::new(),
+    };
+    std::fs::write(
+        run_dir.join("state.json"),
+        serde_json::to_string(&state).unwrap(),
+    )
+    .unwrap();
+    let report = run_dir.join("steps").join(run::step_name(&plan, 0));
+    std::fs::create_dir_all(&report).unwrap();
+    std::fs::write(
+        report.join("report.md"),
+        "# Report\n\nNothing worth trading.\n",
+    )
+    .unwrap();
+    let summary = Summary {
+        run: name.clone(),
+        team: team.name.clone(),
+        steps: Vec::new(),
+        spend: 0.5,
+    };
+    std::fs::write(
+        run_dir.join("summary.json"),
+        serde_json::to_string(&summary).unwrap(),
+    )
+    .unwrap();
+    say(
+        &mut app,
+        AgentsMessage::Changed {
+            teams: false,
+            runs: true,
+            files: false,
+        },
+    );
+    assert_eq!(app.agents().findings_run().as_deref(), Some(name.as_str()));
+    assert!(shows(&app, "Export findings…"));
+    let out = dir.join("found.md");
+    say(
+        &mut app,
+        AgentsMessage::FindingsSaveTo(name.clone(), Some(out.clone())),
+    );
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert!(written.contains("Nothing worth trading."), "{written}");
+    assert!(
+        written.contains("| Analyst: work | done | 12 | $0.50 |"),
+        "{written}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

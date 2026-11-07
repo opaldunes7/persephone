@@ -352,6 +352,19 @@ pub fn tools() -> Vec<Tool> {
             args: vec![TEAM],
         },
         Tool {
+            name: "export_findings",
+            what: "What a run found, as one Markdown document: the brief, each step's report in order, what each agent believes and remembers now, the data they saved during the run, and their bugs and ideas for the app.",
+            args: vec![
+                TEAM,
+                opt("run", "string", "The run; the latest if left out."),
+                opt(
+                    "path",
+                    "string",
+                    "Write it to this file instead of answering with it.",
+                ),
+            ],
+        },
+        Tool {
             name: "export_team",
             what: "A team's whole setup as a file: its brief, principles, every agent's settings, the links, Lab and the layout, by name. Import it with import_team to get the same setup again, here or on another computer. Agents' memory isn't in it.",
             args: vec![TEAM, opt("path", "string", "Also write it to this file.")],
@@ -496,6 +509,19 @@ impl Desk {
             "get_outputs" => self.get_outputs(args),
             "get_feedback" => self.get_feedback(args),
             "set_notes" => self.set_notes(args),
+            "export_findings" => {
+                let team = self.load(text(args, "team")?)?;
+                let (run, _) = self.find_run(&team, args)?;
+                let document = crate::findings::findings(&self.root, &team, &run)?;
+                match args.get("path").and_then(Value::as_str) {
+                    Some(path) => {
+                        let path = expand(path);
+                        folder::write_aside(&path, document.as_bytes())?;
+                        Ok(json!({"run": run, "written": path, "bytes": document.len()}))
+                    }
+                    None => Ok(json!({"run": run, "findings": document})),
+                }
+            }
             "export_team" => {
                 let team = self.load(text(args, "team")?)?;
                 let setup = export(&team);

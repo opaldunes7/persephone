@@ -336,3 +336,41 @@ fn a_design_with_problems_doesnt_start() {
     assert!(error.contains("brief"), "{error}");
     assert!(!Path::new(&rig.setup.root).join(&team.id).exists());
 }
+
+#[test]
+fn what_a_run_found_reads_as_one_document() {
+    let rig = Rig::new("findings");
+    let team = team(Starter::ResearcherAndReviewer);
+    let dir = rig.dir(&team, 0);
+    fs::create_dir_all(dir.join("memory")).unwrap();
+    let events = rig.run(&team);
+    let run = ended(&events).run.clone();
+    // What the researcher wrote while it ran, and a belief it holds.
+    fs::write(dir.join("runs/windows.json"), "{\"windows\": 7}").unwrap();
+    fs::write(
+        dir.join("memory/beliefs.md"),
+        "# Beliefs\n\nOne line each: claim.\nA claim without run ids stays open.\n\n- News adds nothing | supported | run-1\n",
+    )
+    .unwrap();
+    let document = persephone_agents::findings::findings(&rig.setup.root, &team, &run).unwrap();
+    for part in [
+        "# Desk: what run",
+        "## The brief\n\nStudy BTC.",
+        "| Researcher: work | done | 0 | $0.25 |",
+        "### Researcher: work\n\nreport from",
+        "### Reviewer: review of Researcher, round 1",
+        "### Researcher: answer, round 1",
+        "#### Beliefs\n\n- News adds nothing | supported | run-1",
+        "### Researcher: windows.json\n\n```json\n{\"windows\": 7}\n```",
+    ] {
+        assert!(document.contains(part), "missing {part:?} in:\n{document}");
+    }
+    assert!(
+        !document.contains("One line each"),
+        "the template's own lines are left out"
+    );
+    assert_eq!(
+        persephone_agents::findings::file_name(&team, &run),
+        format!("desk-{run}-findings.md")
+    );
+}

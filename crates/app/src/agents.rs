@@ -603,6 +603,17 @@ impl Agents {
         }
     }
 
+    /// The run Export findings saves: the past one being read, else the one on screen, else the
+    /// latest.
+    #[must_use]
+    pub fn findings_run(&self) -> Option<String> {
+        self.viewing
+            .as_ref()
+            .map(|(summary, _)| summary.run.clone())
+            .or_else(|| self.live().and_then(|live| live.run.clone()))
+            .or_else(|| self.past.first().map(|summary| summary.run.clone()))
+    }
+
     /// Makes a team from a setup file, under its own name or the next free one, and shows it.
     pub fn import_setup(&mut self, path: &Path) {
         use persephone_agents::control::{import, read_setup};
@@ -811,6 +822,9 @@ pub enum AgentsMessage {
     SetupPicked(Option<PathBuf>),
     /// Pick where to save the current team's setup file.
     ExportSetup,
+    /// Pick where to save what a run found.
+    ExportFindings,
+    FindingsSaveTo(String, Option<PathBuf>),
     SetupSaveTo(Option<PathBuf>),
     Archive,
     TeamName(String),
@@ -1035,7 +1049,34 @@ impl crate::Persephone {
                     });
                 }
             }
-            AgentsMessage::SetupPicked(None) | AgentsMessage::SetupSaveTo(None) => {}
+            AgentsMessage::ExportFindings => {
+                let (Some(team), Some(run)) = (agents.team(), agents.findings_run()) else {
+                    return Task::none();
+                };
+                let dialog = rfd::AsyncFileDialog::new()
+                    .set_title("Export what the run found")
+                    .set_file_name(persephone_agents::findings::file_name(team, &run))
+                    .add_filter("Markdown", &["md"]);
+                return Task::perform(dialog.save_file(), move |picked| {
+                    Message::Agents(AgentsMessage::FindingsSaveTo(
+                        run,
+                        picked.map(|file| file.path().to_owned()),
+                    ))
+                });
+            }
+            AgentsMessage::FindingsSaveTo(run, Some(path)) => {
+                if let Some(team) = agents.team() {
+                    let saved = persephone_agents::findings::findings(&agents.root(), team, &run)
+                        .and_then(|document| folder::write_aside(&path, document.as_bytes()));
+                    agents.note = Some(match saved {
+                        Ok(()) => format!("Saved what run {run} found to {}", path.display()),
+                        Err(why) => format!("Couldn't export it: {why}"),
+                    });
+                }
+            }
+            AgentsMessage::SetupPicked(None)
+            | AgentsMessage::SetupSaveTo(None)
+            | AgentsMessage::FindingsSaveTo(_, None) => {}
             AgentsMessage::Archive => {
                 if agents.running() {
                     agents.note = Some("Stop the run before archiving its team.".into());

@@ -4,6 +4,7 @@
 
 pub mod check;
 pub mod control;
+pub mod findings;
 pub mod folder;
 pub mod plan;
 pub mod prompts;

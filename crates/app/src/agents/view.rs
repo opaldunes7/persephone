@@ -314,6 +314,21 @@ fn run_bar<'a>(agents: &'a Agents, team: &'a Team) -> Element<'a, Message> {
                 .padding([3, 6]),
         );
     }
+    if let Some(run) = agents.findings_run() {
+        bar = bar.push(iced::widget::tooltip(
+            chip("Export findings…", false, Some(AgentsMessage::ExportFindings)),
+            container(
+                text(format!(
+                    "What run {run} found, as one Markdown file: its reports, what each agent believes now, the data they saved, and their notes on the app."
+                ))
+                .size(HINT),
+            )
+            .padding(6)
+            .max_width(360)
+            .style(container::rounded_box),
+            iced::widget::tooltip::Position::Bottom,
+        ));
+    }
     let mut top = column![bar].spacing(4);
     if !agents.problems.is_empty() {
         top = top.push(problems(&agents.problems));
