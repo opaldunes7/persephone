@@ -960,12 +960,26 @@ pub fn find_claude(configured: Option<&Path>) -> Option<PathBuf> {
 /// Lab's program: beside this one, as cargo builds them, or the workspace's release build.
 #[must_use]
 pub fn find_lab() -> Option<PathBuf> {
+    beside("persephone-lab")
+}
+
+/// `persephone-agents`, which runs a team in a process of its own: found as Lab is.
+#[must_use]
+pub fn find_runner() -> Option<PathBuf> {
+    beside("persephone-agents")
+}
+
+/// One of Persephone's programs: beside this one, as cargo builds them, or the workspace's
+/// release build.
+fn beside(name: &str) -> Option<PathBuf> {
     let here = std::env::current_exe().ok()?;
     let dir = here.parent()?;
     [
-        dir.join("persephone-lab"),
-        dir.join("../release/persephone-lab"),
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/release/persephone-lab"),
+        dir.join(name),
+        dir.join("../release").join(name),
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/release")
+            .join(name),
     ]
     .into_iter()
     .find(|path| path.is_file())

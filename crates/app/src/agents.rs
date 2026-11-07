@@ -353,6 +353,10 @@ pub struct Agents {
     pub typing: HashMap<&'static str, String>,
     /// The window to close once the run has stopped.
     pub closing: Option<window::Id>,
+    /// The program that runs a team in the background; none to look for `persephone-agents`.
+    pub runner: Option<PathBuf>,
+    /// Run teams inside the app even where `persephone-agents` is there, as tests do.
+    pub in_app: bool,
 }
 
 impl Default for Agents {
@@ -380,6 +384,8 @@ impl Default for Agents {
             note: None,
             typing: HashMap::new(),
             closing: None,
+            runner: None,
+            in_app: false,
         }
     }
 }
@@ -857,6 +863,8 @@ pub enum AgentsMessage {
     Vetoed(text_editor::Action),
     Tasks(text_editor::Action),
     SaveNotes,
+    /// A run asked of the background runner has started, by its name, or why it couldn't.
+    Started(Result<String, String>),
     /// Files under the teams' folder changed: teams' designs, runs, or agents' own files.
     Changed {
         teams: bool,
@@ -884,13 +892,21 @@ impl crate::Persephone {
         self.agents.load();
     }
 
+    /// Runs teams inside the app, as when `persephone-agents` isn't built. For tests.
+    #[doc(hidden)]
+    pub fn run_agents_in_app(&mut self) {
+        self.agents.in_app = true;
+    }
+
     pub(crate) fn agents_view(&self) -> iced::Element<'_, Message> {
         view::view(&self.agents)
     }
 
-    /// Asks every running session to stop, and closes `window` once they have.
+    /// Closes `window`. A run going in a process of its own carries on; one running inside the
+    /// app, as when `persephone-agents` isn't built, is stopped first, and the window closes once
+    /// it has.
     pub(crate) fn close_after_agents(&mut self, window: window::Id) -> Task<Message> {
-        if !self.agents.running() {
+        if !self.agents.live.as_ref().is_some_and(Live::going) {
             return window::close(window);
         }
         self.agents.closing = Some(window);
@@ -1336,6 +1352,13 @@ impl crate::Persephone {
                     None => {}
                 }
             }
+            AgentsMessage::Started(started) => match started {
+                Ok(_) => {
+                    agents.note = None;
+                    agents.watch_run();
+                }
+                Err(why) => agents.note = Some(format!("Couldn't start it: {why}")),
+            },
             AgentsMessage::Changed { teams, runs, files } => {
                 if teams {
                     agents.reload_teams();
@@ -1484,6 +1507,35 @@ impl crate::Persephone {
         let Some(claude) = found.claude else {
             return Task::none();
         };
+        agents.viewing = None;
+        agents.tab = Tab::Activity;
+        // In a process of its own, so it carries on when the window closes, and the app follows
+        // it from its folder as it would any other.
+        if let Some(runner) = agents
+            .runner
+            .clone()
+            .or_else(run::find_runner)
+            .filter(|_| !agents.in_app)
+        {
+            let desk = persephone_agents::control::Desk {
+                root: agents.root(),
+                claude: Some(claude),
+                runner: Some(runner),
+            };
+            let team = team.id.clone();
+            agents.note = Some("Starting the run…".into());
+            return Task::perform(
+                async move {
+                    std::thread::spawn(move || {
+                        desk.dispatch("run_team", &serde_json::json!({ "team": team }))
+                            .map(|answer| answer["run"].as_str().unwrap_or_default().to_owned())
+                    })
+                    .join()
+                    .unwrap_or_else(|_| Err("its starter stopped".into()))
+                },
+                |started| Message::Agents(AgentsMessage::Started(started)),
+            );
+        }
         let setup = Setup {
             root: agents.root(),
             claude,
@@ -1492,9 +1544,10 @@ impl crate::Persephone {
         };
         let control = Control::default();
         agents.live = Some(Live::new(&team.id, control.clone()));
-        agents.viewing = None;
-        agents.note = None;
-        agents.tab = Tab::Activity;
+        agents.note = Some(
+            "Running inside the app, as persephone-agents isn't built: closing the window stops it."
+                .into(),
+        );
         let stream = iced::stream::channel(64, async move |mut output: mpsc::Sender<Message>| {
             let (tx, mut rx) = mpsc::unbounded();
             std::thread::spawn(move || {

@@ -202,7 +202,8 @@ fn a_runs_events_light_the_cards() {
         )),
     );
     assert_eq!(app.agents().team().unwrap().brief, "Study BTC.");
-    // The run itself isn't started here: the task it returns is never run.
+    // Inside the app, where this test can feed it events; the task it returns is never run.
+    app.run_agents_in_app();
     say(&mut app, AgentsMessage::Run);
     assert!(app.agents().running());
 
@@ -407,6 +408,10 @@ fn a_run_started_elsewhere_lights_the_cards_and_can_be_stopped() {
     assert_eq!(live.cards[analyst].calls, 1);
     assert!(app.agents().running());
     assert!(shows(&app, "Stop"));
+    // Closing the window leaves a run in a process of its own going.
+    let _ = app.update(Message::CloseRequested(iced::window::Id::unique()));
+    assert!(app.agents().closing.is_none());
+    assert!(!run_dir.join("stop").exists());
     say(&mut app, AgentsMessage::Stop);
     assert!(
         run_dir.join("stop").exists(),

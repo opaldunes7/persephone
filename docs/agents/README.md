@@ -115,7 +115,11 @@ as "give B what A found" or "have C re-run B's results before you accept them".
   - each member's limit on turns
   - a session that keeps going well past its budget is stopped
 - **Stop** ends every session at once, with everything it started, Lab included.
-- Quitting the app stops the run the same way, and the window closes once it has.
+- **A run goes on when the window closes.** It runs in a process of its own (`persephone-agents`,
+  built with `cargo build --release -p persephone-agents-server`), so quitting the app, or a tool
+  that closes windows, doesn't end it. Open the Agents view again to see it live, and press Stop to
+  end it. Without `persephone-agents` built, a run goes on inside the app instead, and closing the
+  window stops it first.
 
 ## Watching a run
 
