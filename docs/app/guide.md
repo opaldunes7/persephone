@@ -679,7 +679,7 @@ same files.
 ## Persephone Lab
 
 Agents and scripts can read every data point and run every test through
-[Persephone Lab](lab.md), without the app open. Strategies they save appear in the backtest panel's
+[Persephone Lab](../lab/README.md), without the app open. Strategies they save appear in the backtest panel's
 strategy list, marked **Lab**, ready to backtest and replay. Everything the backtest panel shows,
 including the data behind its charts, is available to them as well.
 
@@ -690,8 +690,8 @@ role, model and effort, who reports to whom, who hands work to whom, and who rev
 starts them as Claude Code sessions that work through Lab, sandboxed so they can't touch Persephone's
 code, a shell or the web. Their cards light up as they work, and their reports, memory, and bugs and
 ideas for the app show beside them. Another AI can do all of it too, through `persephone-agents`, and a whole team can be saved and
-loaded as one JSON file ([setup files](agents-setup.md)). See
-[Agents](agents.md).
+loaded as one JSON file ([setup files](../agents/setup.md)). See
+[Agents](../agents/README.md).
 
 ## Where files live
 
@@ -714,4 +714,4 @@ Everything is in one folder:
 `persephone-cli data dir`, `plugin dir` and `models dir` print their folders. Delete
 `layout.ron` to start over with one chart.
 
-Agent teams are kept apart from all this, in `~/persephone-agents`; see [Agents](agents.md#the-folders).
+Agent teams are kept apart from all this, in `~/persephone-agents`; see [Agents](../agents/README.md#the-folders).

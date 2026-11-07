@@ -2,7 +2,7 @@
 
 An agent trial is an AI agent doing real research with Lab, with no sight of Persephone's code, then
 reporting what it found, what went wrong and what it missed. Seven trials so far have each found real
-bugs (see `docs/plan.md`). Run one on your own machine, where Binance is reachable, and paste its
+bugs (see `docs/project/plan.md`). Run one on your own machine, where Binance is reachable, and paste its
 report back to whoever is working on Persephone.
 
 ## Setup

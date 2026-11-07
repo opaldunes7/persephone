@@ -1639,8 +1639,8 @@ fn every_way_in_gives_the_same_answer() {
 /// Every call in the guide: each ```json block that names a tool.
 fn guide_calls() -> Vec<Value> {
     let docs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs");
-    let text = fs::read_to_string(docs.join("lab-agents.md")).unwrap()
-        + &fs::read_to_string(docs.join("lab-external-models.md")).unwrap();
+    let text = fs::read_to_string(docs.join("lab/agents-guide.md")).unwrap()
+        + &fs::read_to_string(docs.join("lab/external-models.md")).unwrap();
     text.split("```json")
         .skip(1)
         .map(|block| {
@@ -3719,16 +3719,16 @@ fn every_fan_and_heatmap_the_app_draws_an_agent_can_read() {
 #[test]
 fn the_docs_name_every_tool_and_what_each_screen_comes_from() {
     let docs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs");
-    let overview = fs::read_to_string(docs.join("lab.md")).unwrap();
+    let overview = fs::read_to_string(docs.join("lab/README.md")).unwrap();
     for tool in tools() {
         assert!(
             overview.contains(&format!("`{}`", tool.name)),
-            "`{}` isn't in docs/lab.md",
+            "`{}` isn't in docs/lab/README.md",
             tool.name
         );
     }
     // Every test the app's panel has is in the table of what's where, with every chart's field.
-    let guide = fs::read_to_string(docs.join("lab-agents.md")).unwrap();
+    let guide = fs::read_to_string(docs.join("lab/agents-guide.md")).unwrap();
     for named in [
         "Monte Carlo",
         "Random blocks",
@@ -4329,12 +4329,12 @@ fn big_answers_can_be_saved_in_a_folder_of_their_own() {
 
 #[test]
 fn the_written_reference_matches_the_tools() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/lab-tools.md");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/lab/tools.md");
     let written = fs::read_to_string(path).unwrap_or_default();
     assert_eq!(
         written,
         reference(),
-        "run: persephone-lab tools --markdown > docs/lab-tools.md"
+        "run: persephone-lab tools --markdown > docs/lab/tools.md"
     );
 }
 

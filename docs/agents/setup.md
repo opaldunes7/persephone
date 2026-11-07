@@ -8,7 +8,7 @@ team, ready to run.
 This page is written for you and for another AI. To have an AI write one, give it this page and
 say what you need, for example:
 
-> Read docs/agents-setup.md. Write me a Persephone agent setup file for a team that studies
+> Read docs/agents/setup.md. Write me a Persephone agent setup file for a team that studies
 > whether funding rates on BTC and ETH perpetuals predict returns. Use a Fable lead, three Haiku
 > analysts, and a Sonnet reviewer for the lead. Keep each session under $5.
 
@@ -33,7 +33,7 @@ persephone-agents import my-team.json --name "Another name"
 persephone-agents export "My team" my-team.json
 ```
 
-**From another AI**, through the `persephone-agents` tools (see [Agents](agents.md#from-another-ai)):
+**From another AI**, through the `persephone-agents` tools (see [Agents](README.md#from-another-ai)):
 `import_team` with `setup` (the JSON itself) or `path`, and `export_team` with `team` and an
 optional `path`.
 
@@ -134,7 +134,7 @@ what to fix. To be runnable at once:
 
 ## An example
 
-[examples/agents-setup.json](examples/agents-setup.json) is a crypto research desk:
+[examples/crypto-research-desk.json](examples/crypto-research-desk.json) is a crypto research desk:
 - Head, on Opus, leads two Sonnet analysts in one session.
 - Skeptic, in a session of its own, reviews the head's report for one round.
 

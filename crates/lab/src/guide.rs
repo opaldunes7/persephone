@@ -5,9 +5,9 @@ use persephone_research::settings::Settings;
 use serde_json::{Value, json};
 
 const GUIDE: &str = concat!(
-    include_str!("../../../docs/lab-agents.md"),
+    include_str!("../../../docs/lab/agents-guide.md"),
     "\n",
-    include_str!("../../../docs/lab-external-models.md"),
+    include_str!("../../../docs/lab/external-models.md"),
 );
 
 /// The guide's opening, before its first topic.

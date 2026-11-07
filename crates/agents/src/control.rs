@@ -358,7 +358,7 @@ pub fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "import_team",
-            what: "Makes a team from a setup file, as export_team writes it or as written by hand or by an AI (docs/agents-setup.md says how). Every key is checked, so a typo is caught rather than ignored. Its agents start with no memory.",
+            what: "Makes a team from a setup file, as export_team writes it or as written by hand or by an AI (docs/agents/setup.md says how). Every key is checked, so a typo is caught rather than ignored. Its agents start with no memory.",
             args: vec![
                 opt("setup", "object", "The setup itself."),
                 opt("path", "string", "Or a file holding it."),
@@ -2254,8 +2254,8 @@ mod tests {
 
     #[test]
     fn the_example_setup_imports_ready_to_run() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/agents-setup.json");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/agents/examples/crypto-research-desk.json");
         let team = import(&read_setup(&path).unwrap()).unwrap();
         assert_eq!(check(&team), vec![], "{}", team.name);
     }

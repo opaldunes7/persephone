@@ -47,7 +47,7 @@ claude mcp add persephone-lab -- /full/path/to/persephone-lab mcp
 
 Then tell it to use Lab. It's told to call `get_guide` first. Other MCP clients can run `persephone-lab mcp` the same way. It talks over standard input and output.
 
-To design teams of agents and run them from the app instead, see [Agents](agents.md).
+To design teams of agents and run them from the app instead, see [Agents](../agents/README.md).
 
 ### HTTP, for scripts and custom agents
 
@@ -78,7 +78,7 @@ persephone-lab call run_backtest '{"symbol": "BTCUSDT", "bars": "1h", "from": "2
 
 ## The tools
 
-[The full list](lab-tools.md) is generated from the tools themselves. In short:
+[The full list](tools.md) is generated from the tools themselves. In short:
 
 | For | Tools |
 |---|---|
@@ -96,7 +96,7 @@ persephone-lab call run_backtest '{"symbol": "BTCUSDT", "bars": "1h", "from": "2
 | What's happened | `get_call_log` |
 
 - **Everything the app's panel shows is here too.** Figures, tables and the data behind each chart come back as numbers.
-  [The agents' guide](lab-agents.md) has a table of every screen and where its data comes from, under `results`.
+  [The agents' guide](agents-guide.md) has a table of every screen and where its data comes from, under `results`.
 - **Big answers come in pages.** Pass a page's `next_cursor` as `cursor` to carry on. `export_data`
   writes any amount to a CSV or Parquet file, including for training models elsewhere.
 - **Slow work becomes a job.** A call waits `wait_seconds` (30 by default), then answers with a
@@ -116,7 +116,7 @@ persephone-lab prune --older-than 30d
 
 From the command line, `persephone-lab call NAME @file.json` reads a long call's arguments from a file.
 
-Agents read [their own guide](lab-agents.md), which Lab serves through `get_guide`.
+Agents read [their own guide](agents-guide.md), which Lab serves through `get_guide`.
 
 To see how much of this an agent can work out alone, give a fresh session only the MCP connection and a
 goal with a small budget, then watch what it gets stuck on. That spends your API credit.
@@ -153,7 +153,7 @@ arguments lists everything a tree can be made of, and with one says where it's w
 
 Backtests can send limit orders, keep real stops and targets, pay separate maker and taker fees and charge market impact, all as
 `settings`. A symbol like `BTCUSDT-PERP` is a perpetual, with its funding charged. Limits fill only when price trades through them.
-The `backtests` topic in [the agents' guide](lab-agents.md) has the details.
+The `backtests` topic in [the agents' guide](agents-guide.md) has the details.
 
 ## Moving your setup
 

@@ -186,12 +186,12 @@ fn a_run_is_stopped_from_outside() {
 
 #[test]
 fn the_written_reference_matches_the_tools() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/agents-tools.md");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/agents/tools.md");
     let written = fs::read_to_string(path).unwrap_or_default();
     assert_eq!(
         written,
         persephone_agents::control::reference(),
-        "run: persephone-agents tools --markdown > docs/agents-tools.md"
+        "run: persephone-agents tools --markdown > docs/agents/tools.md"
     );
 }
 
@@ -212,8 +212,8 @@ fn a_setup_file_goes_out_and_comes_back_in() {
         );
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
-    let example =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/agents-setup.json");
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/agents/examples/crypto-research-desk.json");
     let made = program(&["import", example.to_str().unwrap()]);
     assert!(
         made.starts_with("Made Crypto research desk (4 agents)"),

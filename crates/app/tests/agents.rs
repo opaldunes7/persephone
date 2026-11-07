@@ -423,8 +423,8 @@ fn a_setup_file_imports_as_a_team_and_exports_again() {
     let mut app = app();
     app.use_agents_root(dir.join("teams"), found());
     let _ = app.update(Message::Agents(AgentsMessage::Toggle));
-    let example =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/agents-setup.json");
+    let example = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/agents/examples/crypto-research-desk.json");
     say(&mut app, AgentsMessage::SetupPicked(Some(example.clone())));
     let team = app.agents().team().unwrap().clone();
     assert_eq!(team.name, "Crypto research desk");

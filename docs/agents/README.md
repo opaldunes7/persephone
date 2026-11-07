@@ -1,7 +1,7 @@
 # Agents
 
 Teams of Claude agents, drawn as cards on a canvas in the app, run as Claude Code sessions, and
-watched while they work. They research through [Persephone Lab](lab.md), and they write down what's
+watched while they work. They research through [Persephone Lab](../lab/README.md), and they write down what's
 broken in Persephone and what would make it better.
 
 - [Opening it](#opening-it)
@@ -40,7 +40,7 @@ Lab's on the Lab card.
 | Lead and analysts | An Opus lead with two Sonnet analysts, in one session |
 | Researcher and reviewer | Two sessions: a researcher, and a reviewer that re-runs its claims, for one round |
 
-**Setup files:** **Import…** makes a team from a JSON file, and **Export…** saves the team on the canvas as one, so a setup that works can be kept, shared, or written by another AI. See [Agent setup files](agents-setup.md).
+**Setup files:** **Import…** makes a team from a JSON file, and **Export…** saves the team on the canvas as one, so a setup that works can be kept, shared, or written by another AI. See [Agent setup files](setup.md).
 
 **Duplicate** copies a design with new agents, so the copy starts with no memory. **Archive** moves a
 team's folder out of the way. Nothing is ever deleted.
@@ -242,7 +242,7 @@ persephone-agents call create_team '{
 ```
 
 Then `check_team`, `run_team`, `get_run` while it goes, and `get_outputs` and `get_feedback` for
-what the agents wrote. `get_guide` explains the rest, and [the tools' reference](agents-tools.md)
+what the agents wrote. `get_guide` explains the rest, and [the tools' reference](tools.md)
 lists every tool and its arguments.
 
 **What it can and can't do:**

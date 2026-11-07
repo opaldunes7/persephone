@@ -1226,7 +1226,7 @@ pub fn tools() -> Vec<Tool> {
     ]
 }
 
-/// The tools' reference, as `docs/lab-tools.md` has it.
+/// The tools' reference, as `docs/lab/tools.md` has it.
 #[must_use]
 pub fn reference() -> String {
     let mut out = String::from(

@@ -304,9 +304,9 @@ program that hangs fails the backtest instead of freezing it.
 
 ### A Python example
 
-[`plugins/external/ema_cross.py`](../plugins/external/ema_cross.py) is a complete external
+[`plugins/external/ema_cross.py`](../../plugins/external/ema_cross.py) is a complete external
 strategy using only Python's standard library, with
-[`ema_cross.external`](../plugins/external/ema_cross.external) to go with it:
+[`ema_cross.external`](../../plugins/external/ema_cross.external) to go with it:
 
 ```bash
 python3 plugins/external/ema_cross.py          # listens on 127.0.0.1:7878

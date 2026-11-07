@@ -203,7 +203,7 @@ A team's whole setup as a file: its brief, principles, every agent's settings, t
 
 ## `import_team`
 
-Makes a team from a setup file, as export_team writes it or as written by hand or by an AI (docs/agents-setup.md says how). Every key is checked, so a typo is caught rather than ignored. Its agents start with no memory.
+Makes a team from a setup file, as export_team writes it or as written by hand or by an AI (docs/agents/setup.md says how). Every key is checked, so a typo is caught rather than ignored. Its agents start with no memory.
 
 - `setup` (object): The setup itself.
 - `path` (string): Or a file holding it.
