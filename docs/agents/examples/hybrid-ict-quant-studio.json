@@ -1,0 +1,55 @@
+{
+  "format": "persephone-agents/1",
+  "name": "Hybrid ICT Quant Studio",
+  "brief": "Question: do ICT/SMC entries (liquidity sweeps, fair value gaps, volume displacement) on BTCUSDT and ETHUSDT 1h bars do better in the 7 days after an important news catalyst than on ordinary days, after realistic costs?\n\nDesign, fixed before any backtest:\n1. Events: headlines from get_news with importance high (medium if fewer than 15 high ones), for each market, from collected_since onwards. Merge headlines within 24 hours of each other into one event. Its time is the first headline's published time.\n2. Direction, by rule and never by judgment: the market's return over the 4 hours after the event. Above +0.5% is bullish, below -0.5% bearish, otherwise neutral. Neutral events allow both directions.\n3. Window: the 7 days starting 4 hours after the event. Don't try other lengths.\n4. Control group: 7-day windows that start on days with no medium or high headline for that market, as many as there are events, spread over the same span.\n5. Costs on every run: fill_timing next_open, slippage_percent 0.02, the market's own fees, and the perpetual (BTCUSDT-PERP, ETHUSDT-PERP) for anything short, so funding counts. Stops are written into the logic tree with entry_price and high_since_entry or low_since_entry, because stop_loss_percent and trailing_stop_percent can't be used with next_open.\n6. Compare three things over the same windows: the ICT rules on event windows, the same rules on control windows, and holding the market.\n\nCount every variant tried (rules, parameters, markets, spans) and pass the total as variants_tried. The answer that matters is whether event windows beat control windows by more than chance, after costs. 'No edge' is a good answer if it's the true one.",
+  "at_once": 1,
+  "lab": {
+    "data": "app"
+  },
+  "agents": [
+    {
+      "name": "Lead_Architect",
+      "role": "Runs the study as the brief lays it out, and keeps to its design. Have News_Analyst list the events, their directions and the control windows. Have ICT_Quant write the rules. Then run the three-way comparison yourself, event windows against control windows against holding, on both markets, with the brief's costs, and re-run anything a member reports before relying on it. Write the report: the event and control counts, each result with its run ids, the variant count, and a plain verdict on whether the news adds an edge.",
+      "model": "opus",
+      "effort": "high",
+      "budget": 60,
+      "spend_cap": 12,
+      "memory": true,
+      "app_notes": true,
+      "uses_lab": true
+    },
+    {
+      "name": "News_Analyst",
+      "role": "Finds the events with get_news, following the brief's rules exactly: importance, merging within 24 hours, and the event time. Sets each event's direction from get_bars, from the 4-hour return after the event, never from reading the headline. You know how these markets moved, and a judgment would carry that in. Also picks the control windows: days with no medium or high headline, spread over the same span. Bring back a table of every event (market, time, headline, 4-hour return, direction) and every control window, and say how many headlines there were in all.",
+      "model": "haiku",
+      "effort": "medium",
+      "budget": 40,
+      "reports_to": "Lead_Architect"
+    },
+    {
+      "name": "ICT_Quant",
+      "role": "Writes ICT/SMC entries as Persephone logic trees, and checks each with validate_logic. A bullish fair value gap is low above the high two bars ago. A sell-side liquidity sweep is a low under the lowest low of the last 20 bars that closes back above it. Displacement is volume above twice its 20-bar average. Give a long and a short version, with the stop and the exit written in the tree using entry_price, high_since_entry or low_since_entry, as the brief requires. Use at most three named parameters, fixed before testing, and don't tune them on the event windows. Bring back each tree's JSON, what each part means, and its parameters.",
+      "model": "sonnet",
+      "effort": "medium",
+      "budget": 60,
+      "reports_to": "Lead_Architect"
+    },
+    {
+      "name": "Risk_Skeptic",
+      "role": "Tries to break the lead's findings. Re-run its main results with harsher costs: slippage_percent 0.05 and impact_percent 0.1, still with next_open. Check the event and control windows were set by the brief's rules, before results were seen. Run run_random_entries on the event-window trades, and check variants_tried counts everything tried. Reject a finding if its edge over the control windows goes when costs rise, if random entries match it, if its deflated Sharpe is under 0.95 with honest variants_tried, or if it rests on fewer than 30 trades. Say plainly what holds and what doesn't, with run ids.",
+      "model": "sonnet",
+      "effort": "high",
+      "budget": 60,
+      "spend_cap": 10,
+      "app_notes": false
+    }
+  ],
+  "links": [
+    {
+      "from": "Risk_Skeptic",
+      "to": "Lead_Architect",
+      "kind": "reviews",
+      "rounds": 1
+    }
+  ]
+}

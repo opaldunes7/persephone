@@ -2253,11 +2253,16 @@ mod tests {
     }
 
     #[test]
-    fn the_example_setup_imports_ready_to_run() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../docs/agents/examples/crypto-research-desk.json");
-        let team = import(&read_setup(&path).unwrap()).unwrap();
-        assert_eq!(check(&team), vec![], "{}", team.name);
+    fn every_example_setup_imports_ready_to_run() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/agents/examples");
+        let mut seen = 0;
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let team = import(&read_setup(&entry.path()).unwrap())
+                .unwrap_or_else(|e| panic!("{}: {e}", entry.path().display()));
+            assert_eq!(check(&team), vec![], "{}", team.name);
+            seen += 1;
+        }
+        assert!(seen >= 2);
     }
 
     #[test]
