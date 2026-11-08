@@ -67,6 +67,11 @@ pub fn test_tabs<'a>(
             "Places the backtest's trades at random times many times over, keeping how long each was held. If that does as well, the entries are worth nothing.",
         ),
         tab(
+            "News windows",
+            TestKind::NewsWindows,
+            "Backtests the strategy on the window after each important headline the news sidebar collected, and on as many windows with no such news, to see whether the news is what makes the difference.",
+        ),
+        tab(
             "Portfolio",
             TestKind::Portfolio,
             "Several markets on one account: they share cash and margin, and costs are the same as the backtest's. Hold them at weights, trade this chart's strategy on each, or follow a table of weights.",
@@ -717,6 +722,92 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                 .into(),
             )
         }
+        TestKind::NewsWindows => {
+            let run = match &panel.tests.news_windows {
+                TestRun::Running { .. } => action(
+                    "Cancel",
+                    false,
+                    Some(PanelMessage::StopNewsWindows),
+                    "Stop these runs; what they've found so far is dropped.".to_owned(),
+                ),
+                TestRun::Done(_) => action(
+                    "Run again",
+                    false,
+                    can_run.then_some(PanelMessage::RunAgain),
+                    run_or("Pick other quiet windows to compare with. Otherwise the same inputs give the same results."),
+                ),
+                _ => action(
+                    "Run",
+                    true,
+                    can_run.then_some(PanelMessage::RunNewsWindows),
+                    run_or("Backtest the window after each headline, and as many quiet windows, with this chart's strategy and settings. Orders fill on the chart's bars."),
+                ),
+            };
+            let news = &settings.news;
+            Some(
+                row![
+                    row![
+                        choice(
+                            "High",
+                            news.high,
+                            Edit::NewsHigh(true),
+                            "Only high headlines: rates, inflation, regulators, hacks and failures. They're market-wide, whatever the market.",
+                        ),
+                        choice(
+                            "Medium",
+                            !news.high,
+                            Edit::NewsHigh(false),
+                            "High headlines, and those naming this chart's market.",
+                        ),
+                    ]
+                    .spacing(2),
+                    boxed(
+                        "Days",
+                        Field::NewsLength,
+                        "",
+                        "How long each window lasts, from 1 to 30 days. Press Enter to apply.",
+                    ),
+                    boxed(
+                        "Hours after",
+                        Field::NewsAfter,
+                        "",
+                        "How long after the headline its window starts, so the first move isn't in it. Headlines within a day of each other are one event. Press Enter to apply.",
+                    ),
+                    boxed(
+                        "Controls",
+                        Field::NewsControls,
+                        "",
+                        "How many quiet windows to compare with: no such headline in them or just before, outside gaps in the news. Empty is as many as there are events. Press Enter to apply.",
+                    ),
+                ]
+                .push(news.high.then(|| {
+                    choice(
+                        "No medium",
+                        news.quiet_medium,
+                        Edit::NewsQuietMedium(!news.quiet_medium),
+                        "Quiet windows keep clear of medium headlines too, not only high ones. Stricter, so there are fewer of them.",
+                    )
+                }))
+                .push(choice(
+                    "Follow",
+                    news.follow,
+                    Edit::NewsFollow(!news.follow),
+                    "Each window trades only the way the market moved over the hours after the headline, or the same hours before a quiet window: long only after a rise, short only after a fall, either way after less. Turn Direction off to use it.",
+                ))
+                .push(news.follow.then(|| {
+                    boxed(
+                        "Move %",
+                        Field::NewsMove,
+                        "",
+                        "How far the market must move, in percent, before a window trades only that way. Press Enter to apply.",
+                    )
+                }))
+                .push(container(run).align_right(Fill))
+                .spacing(10)
+                .align_y(Alignment::Center)
+                .into(),
+            )
+        }
         TestKind::RandomEntries => {
             let run = match &panel.tests.random_entries {
                 TestRun::Running { .. } => action(
@@ -980,6 +1071,7 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
     const WARM_UP: &str = "How many bars before the span strategies warm up on. Raise it for look-backs longer than this. Press Enter to load them.";
     const CASH_INTEREST: &str = "What cash below zero costs in a portfolio, as a percentage a year. Without it, a book holding more than the account borrows free.";
     const TRAILING: &str = "A real stop this far from the best price since entry, moved at each close, so it only tightens. With Stop loss too, whichever is nearer goes first.";
+    const CLOSE_AT_END: &str = "Close whatever's still open on the last bar a fill can happen, paying fees and slippage. Off, an open trade is valued at the last close with no exit cost. Single markets only, for now.";
     const DECISIONS: &str = "Keep a row for each bar: what the strategy asked for, what was held, what went out, and why not. Shows as Decisions over the results.";
     const JITTER: &str = "How much longer than the latency orders take on average, drawn for each order. Most are quick and a few slow. Only fills on ticks can show it.";
     const SEED: &str = "Which draws of jitter a run uses, so it can be repeated.";
@@ -1163,6 +1255,14 @@ pub(super) fn settings_section<'a>(info: &PanelInfo<'a>) -> Element<'a, PanelMes
                     TARGET,
                     None,
                 ),
+            ),
+        ),
+        (
+            Chapter::Exits,
+            line(
+                switch(settings.close_at_end, Edit::CloseAtEnd, CLOSE_AT_END),
+                name("Close at the end", CLOSE_AT_END),
+                Space::new().into(),
             ),
         ),
         (

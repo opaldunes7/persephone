@@ -15,7 +15,7 @@ use std::{
 
 use persephone_core::{Candle, Side, UnixNanos, time::NANOS_PER_DAY};
 use persephone_data::binance::MAX_RANGE_BARS;
-use persephone_engine::{BacktestReport, BacktestRequest};
+use persephone_engine::{BacktestReport, BacktestRequest, Direction};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 use crate::{RunColumn, WARM_UP_BARS, settings::BlockLength};
@@ -951,6 +951,9 @@ pub struct BlockJob {
     pub request: BacktestRequest,
     pub candles: Vec<Candle>,
     pub blocks: Vec<Range<usize>>,
+    /// Which way each block may trade, in place of the request's: empty keeps the request's for
+    /// all.
+    pub directions: Vec<Direction>,
     pub warm_up: usize,
     /// How many blocks may run at once.
     pub workers: usize,
@@ -969,12 +972,13 @@ impl BlockJob {
         let stride = stride_for(longest.unwrap_or(0));
         let failure = Mutex::new(None);
         let done = AtomicUsize::new(0);
+        let indices: Vec<usize> = (0..self.blocks.len()).collect();
         let results = pool(
-            &self.blocks,
+            &indices,
             self.workers,
             &self.stop,
             &|| progress(done.fetch_add(1, Ordering::Relaxed) + 1),
-            &|block| match self.run_block(block, stride) {
+            &|&index| match self.run_block(index, stride) {
                 Ok(result) => Some(result),
                 Err(error) => {
                     if let Ok(mut failure) = failure.lock() {
@@ -997,15 +1001,19 @@ impl BlockJob {
         ))
     }
 
-    fn run_block(&self, block: &Range<usize>, stride: usize) -> Result<BlockResult, String> {
+    fn run_block(&self, index: usize, stride: usize) -> Result<BlockResult, String> {
+        let block = &self.blocks[index];
         let warm_from = block.start.saturating_sub(self.warm_up);
         let first = self.candles[block.start].ts;
         let to = self.candles[block.end - 1].ts;
-        let request = BacktestRequest {
+        let mut request = BacktestRequest {
             candles: self.candles[warm_from..block.end].to_vec(),
             trade_from: first,
             ..self.request.clone()
         };
+        if let Some(&way) = self.directions.get(index) {
+            request.rules.direction = way;
+        }
         let capital = request.starting_balance;
         let report = backtest(request)?;
         // Its bars count from where its warm-up began; the chart's from its first bar.

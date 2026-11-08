@@ -47,17 +47,18 @@ Returns: `columns`, `rows`, `next_cursor`
 
 ## `get_news`
 
-Headlines the app has collected from public feeds, newest first, in pages: when each was published, its source, title, how much it may matter, and its link. Only from when the app started collecting (`collected_since`); feeds keep their last few dozen items only, so older spans have none. Times are when each was published, not when the news broke.
+Headlines the app has collected from public feeds, newest first, in pages: when each was published, its source, title, how much it may matter, and its link. High means market-moving words (rates, inflation, regulators, hacks, failures), whatever the market: it doesn't depend on `symbol`. A regulator's own release is high only for what it's about, not for who issued it. `gaps` lists stretches of two days or more in the span with no headline from any feed: there, none means nothing was collected, not that nothing happened. Feeds keep their last few dozen items only, so `collected_since` is when collecting began, not proof of what's covered since. Times are when each was published, not when the news broke.
 
 - `from` (time): Start, in UTC.
 - `to` (time): End (not included), in UTC.
 - `query` (string): Only those whose title has these words.
-- `symbol` (string): The market they're judged against: one naming it is at least medium.
+- `symbol` (string): The market they're judged against: one naming it is at least medium, and `names_market` says which do.
 - `importance` (string): The least: low (all, the default), medium or high.
+- `market_only` (boolean): With `symbol`: only those naming the market, so high means high for it. Default false.
 - `cursor` (string): Where to carry on, from the last page's next_cursor.
 - `limit` (integer): The most to return in this page, up to 50,000. Default 100, to keep answers small.
 
-Returns: `columns`, `rows`, `next_cursor`, `total`, `collected_since`
+Returns: `columns`, `rows`, `next_cursor`, `total`, `collected_since`, `gaps`
 
 ## `get_history_range`
 
@@ -183,7 +184,7 @@ Returns: `strategies`, `plugin_errors`
 
 One strategy's parameters, with their defaults and limits. Works for a logic tree too.
 
-- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional "params": {"name": value}.
+- `strategy` (object_or_path, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]}, each with optional "params": {"name": value}. A JSON file's path works for the whole strategy, for a logic tree alone (as if under `logic`), or in place of the tree or the positions list.
 
 Returns: `name`, `description`, `params`, `values`
 
@@ -209,7 +210,7 @@ Returns: `id`, `kind`, `path`
 
 Backtests any strategy on any span with any settings. The run is saved, so its details can be read by run_id. Returns and falls are fractions, so 0.05 is 5%.
 
-- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional "params": {"name": value}.
+- `strategy` (object_or_path, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]}, each with optional "params": {"name": value}. A JSON file's path works for the whole strategy, for a logic tree alone (as if under `logic`), or in place of the tree or the positions list.
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
 - `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
@@ -288,12 +289,13 @@ Returns: `windows`, `unseen_return`, `buy_and_hold_return`, `profitable_windows`
 
 ## `run_backtests` *job*
 
-Many backtests in one call, in parallel: much quicker for an agent than one call each. Every run is saved, so all the tools that take a run_id work on them. One that fails doesn't stop the rest.
+Many backtests in one call, in parallel: much quicker for an agent than one call each. Every run is saved, so all the tools that take a run_id work on them. One that fails doesn't stop the rest. Each row says which run it is (`index` in `runs`, `symbol`, `bars`, `first_bar`, `last_bar`); run ids are given as runs finish, so they don't follow `index`. `open_at_end_return` is the part of a return from a trade still open at the end, valued at the last close. For windows after events against windows without, run_event_study counts them as one test, where this counts every run as a variant.
 
 - `runs` (list_or_path, required): A list of arguments as run_backtest takes, up to 5,000, or a JSON file holding one.
 - `defaults` (object): Arguments every run shares, such as bars, from, to and settings. A run's own win: `settings` merge key by key, and so do `strategy.params` for the same strategy; a different strategy keeps only the defaults' `Size %`.
 - `variants_tried` (integer): How many variants you've tried in all, counting every setting, rule, span and market before this call as well as the runs in it. The deflated Sharpe ratio counts the larger of this and the runs here, and `variants_tried` says which. Default: the runs here.
-- `limit` (integer): How many runs to list, best return first. Default 100.
+- `limit` (integer): How many runs to list. Default 100.
+- `order` (string): best (best return first, the default) or given (the order of `runs`).
 
 Returns: `columns`, `rows`, `total`, `succeeded`, `failed`, `not_run`, `first_error`, `deflated_sharpe`, `variants_tried`, `warnings`
 
@@ -315,7 +317,7 @@ Returns: `trades`, `runs`, `median`, `low`, `high`, `drawdown`, `ruin`, `actual`
 
 Backtests random stretches of a span, to see whether a strategy works throughout. Returns and falls are fractions.
 
-- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional "params": {"name": value}.
+- `strategy` (object_or_path, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]}, each with optional "params": {"name": value}. A JSON file's path works for the whole strategy, for a logic tree alone (as if under `logic`), or in place of the tree or the positions list.
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
 - `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
@@ -330,6 +332,32 @@ Backtests random stretches of a span, to see whether a strategy works throughout
 - `limit` (integer): How many blocks to list. Default 50.
 
 Returns: `profitable`, `median`, `best`, `worst`, `blocks`, `total`, `chart`, `median_buy_and_hold`, `warning`, `worst_dates`
+
+## `run_event_study` *job*
+
+Whether news makes a strategy do better: it's backtested on the window after each news event and on as many control windows with no such news, each warmed up on the bars before it, and the two groups' mean returns compared with a permutation p-value (10,000 shuffles of which windows are events). One study is one test: its windows are its sample, not variants tried. An event is a headline at `importance` or above, for `symbol`, with those within `merge_hours` of it; its window starts `after_hours` after it and lasts `length_hours`. A control window is as long, at a random bar from `seed`, with no such headline in it or in the `after_hours` before it, overlapping no other window and outside gaps in the news, where nothing's known. Or give the windows yourself as `windows` and `control_windows`. Returns are fractions of the capital; `holding_return` is the market's over the same bars, after funding on a perpetual. A row's `from` and `to` are what run_backtest takes for the same bars (`to` is the end of the last bar, exclusive); `last_bar` is that bar's open. With either group empty, `difference` and the group's means are null.
+
+- `strategy` (object_or_path, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]}, each with optional "params": {"name": value}. A JSON file's path works for the whole strategy, for a logic tree alone (as if under `logic`), or in place of the tree or the positions list.
+- `symbol` (string, required): The market's symbol, like BTCUSDT.
+- `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
+- `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
+- `from` (time): Start, in UTC: 2024-01-31 or 2024-01-31 09:30.
+- `to` (time): End (not included), in UTC.
+- `settings` (object): Costs and rules, as in run_backtest; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
+- `importance` (string): high (the default) or medium. High is market-wide: rates, regulators, hacks, whatever the market. Medium adds headlines naming the market.
+- `market_only` (boolean): Only headlines that name the market.
+- `merge_hours` (integer): Headlines this close to an event's first are part of it. Default 24.
+- `after_hours` (integer): Hours from the event to its window's start. Default 4.
+- `length_hours` (integer): How long each window is, in hours. Default 168, a week.
+- `controls` (integer): How many control windows. Default as many as there are events.
+- `control_importance` (string): medium or high: the least a headline must be to keep a control window out. Default `importance`; medium with high events makes quiet stricter.
+- `follow_move` (object): {"hours": 4, "threshold_percent": 0.5}: each window, event or control, trades only the way the market moved over the `hours` before it starts: long only above +threshold, short only below -threshold, either way between. With `after_hours` as `hours`, that's the move just after the event. Rows give `way` and `move`. Turn the direction setting off to use it.
+- `seed` (integer): The same seed gives the same control windows and p-values. Default 0.
+- `windows` (array): Event windows to use instead of news, as a list of {from, to} times.
+- `control_windows` (array): Control windows to use with `windows`, as a list of {from, to} times.
+- `limit` (integer): How many windows to list. Default 200.
+
+Returns: `events`, `controls`, `difference`, `p_value`, `excess_difference`, `excess_p_value`, `headlines`, `window_columns`, `window_rows`, `total`, `warnings`
 
 ## `run_random_entries` *job*
 
@@ -346,7 +374,7 @@ Returns: `runs`, `trades`, `actual_return`, `share_matching_return`, `share_matc
 
 Picks the best values on one stretch, tests them on the next, unseen, and slides along, giving what they did where they hadn't been picked. Returns and falls are fractions. `headline` is the fair comparison: the unseen windows compounded one after another against buy_and_hold_whole, the market held once over the same span. `unseen_return` and `buy_and_hold_return` add up windows each started from the same capital, so they aren't what an account would have made.
 
-- `strategy` (object): As run_backtest takes. Not needed with `candidates`, which give the strategies instead.
+- `strategy` (object_or_path): As run_backtest takes. Not needed with `candidates`, which give the strategies instead.
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
 - `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
@@ -370,7 +398,7 @@ Returns: `windows`, `unseen_return`, `profitable_windows`, `deepest_fall`, `trad
 
 Backtests a range of one or two parameters, scored by return, Monte Carlo or random blocks. Scores are fractions.
 
-- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional "params": {"name": value}.
+- `strategy` (object_or_path, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]}, each with optional "params": {"name": value}. A JSON file's path works for the whole strategy, for a logic tree alone (as if under `logic`), or in place of the tree or the positions list.
 - `symbol` (string, required): The market's symbol, like BTCUSDT.
 - `venue` (string): The venue of a market in the local store, from list_markets. Without one it's Binance spot.
 - `bars` (string): How bars are cut: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w or 1M; or 100t for every 100 ticks and 2.5v by volume, on local markets. Default 1h.
@@ -572,7 +600,7 @@ Returns: `drawings`
 Saves a strategy for the app, where it joins the backtest panel's strategy list.
 
 - `name` (string, required): What to call it.
-- `strategy` (object, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional "params": {"name": value}.
+- `strategy` (object_or_path, required): {"builtin": "ema-cross"}, {"plugin": "id"}, {"logic": {...tree...}} or {"positions": [[ts, 1], [ts, 0]]}, each with optional "params": {"name": value}. A JSON file's path works for the whole strategy, for a logic tree alone (as if under `logic`), or in place of the tree or the positions list.
 - `settings` (object): Costs and rules, as in run_backtest; only what differs from the defaults is needed. get_settings gives the defaults as exact JSON.
 - `run_id` (string): A run, whose summary to keep with it.
 - `note` (string): Anything worth saying about it.

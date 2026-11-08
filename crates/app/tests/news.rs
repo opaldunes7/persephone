@@ -532,3 +532,118 @@ fn a_headline_after_the_charts_last_bar_isnt_marked_on_it() {
     assert_eq!(app.news().note, None);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn the_sidebar_says_where_no_headlines_were_collected() {
+    let mut app = app();
+    with_headlines(&mut app, dir("gaps"));
+    let _ = app.update(Message::Chart(
+        0,
+        ChartMessage::RightClicked {
+            at: Point::new(200.0, 200.0),
+        },
+    ));
+    let _ = app.update(Message::Menu(MenuMessage::News));
+    settle(&mut app);
+    assert!(app.news().saved.open);
+    assert!(shows(&app, "Fed holds rates, part 13"));
+    // A headline every 100 hours leaves gaps of more than two days between them.
+    let date =
+        |hours: u64| persephone_core::time::DateTime::from_nanos(hours * HOUR + HOUR / 2).date();
+    assert!(shows(
+        &app,
+        &format!(
+            "No headlines were collected from {} to {}.",
+            date(1_200),
+            date(1_300)
+        )
+    ));
+}
+
+#[test]
+fn news_windows_tests_the_strategy_after_news_against_quiet_windows() {
+    use persephone::backtest::{Edit, Field, TestKind, TestRun, event_study::Kind};
+    let mut app = app();
+    app.use_news_root(dir("windows"));
+    // Something every 12 hours, so no gaps, and a rate decision now and then.
+    let mut found: Vec<Headline> = (0..125)
+        .map(|n| headline(n * 12, "NFT sales fall"))
+        .collect();
+    for hour in [205, 455, 705, 955, 1205] {
+        found.push(headline(hour, "Fed holds interest rates"));
+    }
+    news(&mut app, NewsMessage::Fetched(Arc::new(found), Vec::new()));
+    let _ = app.update(Message::Chart(
+        0,
+        ChartMessage::RightClicked {
+            at: Point::new(200.0, 200.0),
+        },
+    ));
+    let _ = app.update(Message::Menu(MenuMessage::Open(Page::Strategies)));
+    let _ = app.update(Message::Menu(MenuMessage::SetStrategy(
+        BuiltInStrategy::EmaCross,
+    )));
+    let (generation, request) = app.backtest_request(0).unwrap();
+    let report = persephone_engine::run_backtest(&request)
+        .map(Arc::new)
+        .map_err(|e| e.to_string());
+    let _ = app.update(Message::BacktestDone(0, generation, report));
+    let _ = app.update(Message::Key(Action::Backtest));
+    let panel = |app: &mut Persephone, message| {
+        let _ = app.update(Message::Backtest(message));
+    };
+    panel(&mut app, PanelMessage::Test(TestKind::NewsWindows));
+    assert!(shows(&app, "News windows"));
+    assert!(shows(&app, "Hours after"));
+    panel(&mut app, PanelMessage::Input(Field::NewsLength, "2".into()));
+    panel(&mut app, PanelMessage::Submit(Field::NewsLength));
+    assert_eq!(app.tile_backtest(0).unwrap().news.length_days, 2);
+
+    app.news_windows_now();
+    let TestRun::Done(study) = &app.panel().unwrap().tests.news_windows else {
+        panic!("{:?}", app.panel().unwrap().tests.news_windows);
+    };
+    let study = Arc::clone(study);
+    assert_eq!(study.events.windows, 5, "{:?}", study.warnings);
+    assert_eq!(study.controls.windows, 5, "{:?}", study.warnings);
+    let first = &study.windows[0];
+    assert_eq!(first.kind, Kind::Event);
+    assert_eq!(first.event.as_ref().unwrap().1, "Fed holds interest rates");
+    // Four hours on from the headline, which is half an hour past its bar.
+    assert_eq!(first.bars.start, 210);
+    assert_eq!(first.bars.len(), 48);
+    assert!(study.p_value.is_some());
+    assert!(shows(&app, "After news"));
+    assert!(shows(&app, "Quiet"));
+
+    // A window moves the chart to it.
+    panel(&mut app, PanelMessage::ShowWindow(0));
+
+    // Following the move gives each window a side, from the market before it.
+    assert!(shows(&app, "Follow"));
+    assert!(shows(&app, "No medium"));
+    panel(&mut app, PanelMessage::Edit(Edit::NewsFollow(true)));
+    assert!(shows(&app, "Move %"));
+    panel(&mut app, PanelMessage::Input(Field::NewsMove, "0".into()));
+    panel(&mut app, PanelMessage::Submit(Field::NewsMove));
+    app.news_windows_now();
+    let TestRun::Done(followed) = &app.panel().unwrap().tests.news_windows else {
+        panic!("{:?}", app.panel().unwrap().tests.news_windows);
+    };
+    assert!(followed.windows.iter().all(|w| w.moved.is_some()));
+    assert!(
+        followed
+            .windows
+            .iter()
+            .all(|w| w.way != persephone_engine::Direction::Both),
+        "with no threshold every move picks a side"
+    );
+    panel(&mut app, PanelMessage::Edit(Edit::NewsFollow(false)));
+
+    // Medium takes the market's own headlines too; a changed setting clears the result.
+    panel(&mut app, PanelMessage::Edit(Edit::NewsHigh(false)));
+    assert!(matches!(
+        app.panel().unwrap().tests.news_windows,
+        TestRun::Idle
+    ));
+}

@@ -85,14 +85,48 @@ const HIGH_WORDS: [&str; 24] = [
     "charges",
 ];
 
+/// Words naming who issued a release rather than what it's about, which every official title has.
+const ISSUERS: [&str; 3] = ["fed ", "federal reserve", "sec "];
+
+/// What makes a regulator's or central bank's own release one markets move on: policy, and
+/// crypto. A routine release, such as approving a bank's application, is none of these.
+const OFFICIAL_WORDS: [&str; 16] = [
+    "monetary policy",
+    "fomc",
+    "open market",
+    "statement",
+    "minutes",
+    " rate",
+    "inflation",
+    "projections",
+    "balance sheet",
+    "testimony",
+    "crypto",
+    "digital asset",
+    "stablecoin",
+    "bitcoin",
+    "ether",
+    "enforcement",
+];
+
 impl Headline {
     /// How much it may matter to a market named by `words` (its symbol's base asset and the
-    /// names it goes by): High for market-moving words or a regulator's own release, Medium if it
-    /// names the market, else Low.
+    /// names it goes by): High for market-moving words, whatever the market, Medium if it names
+    /// the market, else Low. A regulator's own release is High only for what it's about, as
+    /// every one names its issuer.
     #[must_use]
     pub fn importance(&self, words: &[&str]) -> Importance {
         let title = format!(" {} ", self.title.to_lowercase());
-        if self.official || HIGH_WORDS.iter().any(|word| title.contains(word)) {
+        let moving = if self.official {
+            OFFICIAL_WORDS.iter().any(|word| title.contains(word))
+                || HIGH_WORDS
+                    .iter()
+                    .filter(|word| !ISSUERS.contains(word))
+                    .any(|word| title.contains(word))
+        } else {
+            HIGH_WORDS.iter().any(|word| title.contains(word))
+        };
+        if moving {
             Importance::High
         } else if words.iter().any(|word| names(&title, word)) {
             Importance::Medium
@@ -673,7 +707,38 @@ impl NewsStore {
     pub fn since(&self) -> Option<UnixNanos> {
         self.headlines.first().map(|h| h.published)
     }
+
+    /// Stretches of `[from, to)` at least `least` long with no headline from any feed: nothing
+    /// collected then, or nothing published, which over days is unlikely. Oldest first; a
+    /// stretch running to `to` or from `from` counts too, but not before the first headline.
+    #[must_use]
+    pub fn gaps(
+        &self,
+        from: UnixNanos,
+        to: UnixNanos,
+        least: UnixNanos,
+    ) -> Vec<(UnixNanos, UnixNanos)> {
+        let Some(first) = self.since() else {
+            return Vec::new();
+        };
+        let from = from.max(first);
+        let mut gaps = Vec::new();
+        let mut last = from;
+        for headline in self.between(from, to) {
+            if headline.published.saturating_sub(last) >= least {
+                gaps.push((last, headline.published));
+            }
+            last = last.max(headline.published);
+        }
+        if to.saturating_sub(last) >= least && to > from {
+            gaps.push((last, to));
+        }
+        gaps
+    }
 }
+
+/// Two days, the shortest stretch without headlines that's said to be a gap.
+pub const GAP: UnixNanos = 2 * 86_400_000_000_000;
 
 #[cfg(test)]
 mod tests {
@@ -757,8 +822,53 @@ mod tests {
             "a word of its own"
         );
         assert_eq!(of("NFT sales fall"), Importance::Low);
+        // A regulator's release is high for what it's about, not for who issued it.
+        let official = |title: &str| {
+            let mut h = headline(0, title, "x");
+            h.official = true;
+            h.importance(&words)
+        };
+        assert_eq!(
+            official(
+                "Federal Reserve Board announces approval of application by Peoples Bancorp Inc."
+            ),
+            Importance::Low
+        );
+        assert_eq!(
+            official("Federal Reserve issues FOMC statement"),
+            Importance::High
+        );
+        assert_eq!(official("SEC charges crypto exchange"), Importance::High);
+        assert_eq!(
+            official("Fed approves Bitcoin custody bank"),
+            Importance::High
+        );
         assert_eq!(market_words("ETHUSDT-PERP"), ["ETH", "Ethereum", "Ether"]);
         assert_eq!(market_words("SOLBTC"), ["SOL", "Solana"]);
+    }
+
+    #[test]
+    fn stretches_with_nothing_collected_are_gaps() {
+        const DAY: UnixNanos = 86_400_000_000_000;
+        let dir = std::env::temp_dir().join(format!("persephone-news-gaps-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = NewsStore::open(&dir);
+        store
+            .add(
+                [1, 2, 10, 11]
+                    .iter()
+                    .map(|day| headline(day * DAY, &format!("day {day}"), &format!("d{day}")))
+                    .collect(),
+            )
+            .unwrap();
+        assert_eq!(store.gaps(0, 12 * DAY, GAP), [(2 * DAY, 10 * DAY)]);
+        assert_eq!(
+            store.gaps(0, 20 * DAY, GAP),
+            [(2 * DAY, 10 * DAY), (11 * DAY, 20 * DAY)],
+            "and up to the end"
+        );
+        assert!(store.gaps(DAY, 2 * DAY, GAP).is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -134,7 +134,35 @@ pub fn sidebar<'a>(
     .spacing(3);
     let mut list = column![].spacing(2);
     let headlines = shown(news, replay, words);
+    // Where nothing was collected, said between the headlines either side, newest first.
+    let gaps = match (headlines.last(), headlines.first()) {
+        (Some(oldest), Some(newest)) => news.store.gaps(
+            oldest.published,
+            newest.published.saturating_add(1),
+            persephone_data::news::GAP,
+        ),
+        _ => Vec::new(),
+    };
+    let mut gaps = gaps.into_iter().rev().peekable();
     for headline in &headlines {
+        while let Some(&(from, to)) = gaps.peek() {
+            if headline.published > from {
+                break;
+            }
+            list = list.push(
+                container(
+                    text(format!(
+                        "No headlines were collected from {} to {}.",
+                        DateTime::from_nanos(from).date(),
+                        DateTime::from_nanos(to).date()
+                    ))
+                    .size(HINT)
+                    .color(theme::TEXT_MUTED),
+                )
+                .padding([4, 6]),
+            );
+            gaps.next();
+        }
         let importance = headline.importance(words);
         let mark = match importance {
             Importance::High => theme::DOWN,

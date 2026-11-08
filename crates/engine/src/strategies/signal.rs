@@ -78,6 +78,10 @@ pub(crate) struct SignalStrategy {
     best_since_entry: f64,
     /// Keeping a row for each bar, and what's known of this one so far.
     log_decisions: bool,
+    /// Go flat on the last bar a fill can happen.
+    close_at_end: bool,
+    /// Orders fill at the next bar's open, so the last decision that can fill is a bar earlier.
+    next_open: bool,
     now: Decision,
     /// The limit order resting now, if any.
     resting: Option<Resting>,
@@ -154,6 +158,8 @@ impl SignalStrategy {
             trailing: None,
             best_since_entry: f64::NAN,
             log_decisions: false,
+            close_at_end: false,
+            next_open: false,
             now: Decision {
                 ts: 0,
                 wanted: None,
@@ -247,6 +253,13 @@ impl SignalStrategy {
     /// Keeps a row for each bar.
     pub(crate) fn logging_decisions(mut self, on: bool) -> Self {
         self.log_decisions = on;
+        self
+    }
+
+    /// Goes flat on the last bar a fill can happen, so nothing's left to value at the last close.
+    pub(crate) fn closing_at_end(mut self, on: bool, next_open: bool) -> Self {
+        self.close_at_end = on;
+        self.next_open = next_open;
         self
     }
 
@@ -632,6 +645,12 @@ impl DataActor for SignalStrategy {
             }
         };
         let next = self.bars_ahead.partition_point(|bar| bar.0 <= candle.ts);
+        // The last bar a fill can happen: this close, or the next open filling at the last bar's.
+        let bars_left = self.bars_ahead.len().saturating_sub(next);
+        let closing = self.close_at_end
+            && !self.bars_ahead.is_empty()
+            && bars_left == usize::from(self.next_open);
+        let wanted = if closing { Some(0) } else { wanted };
         if let Some(bar) = self.bars_ahead.get(next).filter(|_| !self.fills_finer) {
             self.bar_now.set_open(bar.1);
         }

@@ -3,6 +3,7 @@
 
 pub mod bundle;
 pub mod calendar;
+pub mod event_study;
 pub mod figures;
 pub mod logic;
 pub mod logic_draft;
@@ -99,6 +100,12 @@ pub enum Field {
     Windows,
     /// How many times Random entries places the trades.
     Entries,
+    /// News windows' length in days, hours from headline to window, and how many controls.
+    NewsLength,
+    NewsAfter,
+    NewsControls,
+    /// The move, in percent, that sets which way a News window trades.
+    NewsMove,
     /// An Optimize variable's range: the first variable or the second.
     Min(usize),
     Max(usize),
@@ -115,6 +122,12 @@ impl Field {
             TestKind::RandomBlocks => matches!(self, Self::Blocks),
             TestKind::Optimize | TestKind::WalkForward => self.belongs_to_tests(),
             TestKind::RandomEntries => matches!(self, Self::Entries),
+            TestKind::NewsWindows => {
+                matches!(
+                    self,
+                    Self::NewsLength | Self::NewsAfter | Self::NewsControls | Self::NewsMove
+                )
+            }
             TestKind::Portfolio => matches!(
                 self,
                 Self::SweepMin
@@ -142,6 +155,10 @@ impl Field {
                 | Self::Blocks
                 | Self::Windows
                 | Self::Entries
+                | Self::NewsLength
+                | Self::NewsAfter
+                | Self::NewsControls
+                | Self::NewsMove
                 | Self::SweepMin
                 | Self::SweepMax
                 | Self::SweepStep

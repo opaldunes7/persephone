@@ -885,3 +885,195 @@ pub(super) fn blocks_list<'a>(
     .spacing(2);
     fan_list(verdict.to_owned(), rows.into(), zoomed)
 }
+
+/// What News windows found: the two groups side by side, what to make of them, and every window,
+/// each a click from the chart.
+pub(super) fn news_windows_pane(study: &EventStudy) -> Element<'_, PanelMessage> {
+    let cell = |content: String, color: Color| {
+        text(content)
+            .size(HINT)
+            .font(iced::Font::MONOSPACE)
+            .color(color)
+            .width(RESULT_FIGURE)
+    };
+    let signed = |value: f64| {
+        let color = if value >= 0.0 { theme::UP } else { theme::DOWN };
+        cell(format!("{:+.2}%", value * 100.0), color)
+    };
+    let title = |content: &'static str, what: &'static str| {
+        tip(
+            text(content)
+                .size(HINT)
+                .color(theme::TEXT_MUTED)
+                .width(RESULT_FIGURE),
+            what,
+            None,
+        )
+    };
+    let group_row = |name: &'static str, group: &Group| {
+        let named = row![
+            text(name).size(HINT).color(theme::TEXT_BRIGHT).width(Fill),
+            cell(group.windows.to_string(), theme::TEXT),
+            cell(group.traded.to_string(), theme::TEXT),
+        ];
+        // An empty group has no means: a 0 would read as a flat result.
+        if group.windows == 0 {
+            return named
+                .extend((0..4).map(|_| cell("–".to_owned(), theme::TEXT_MUTED).into()))
+                .spacing(4);
+        }
+        named
+            .push(signed(group.mean_return))
+            .push(signed(group.mean_holding))
+            .push(signed(group.mean_excess))
+            .push(cell(
+                format!("{:.0}%", group.profitable * 100.0),
+                theme::TEXT,
+            ))
+            .spacing(4)
+    };
+    let percent = |value: Option<f64>| {
+        value.map_or_else(|| "–".to_owned(), |value| format!("{:+.2}%", value * 100.0))
+    };
+    let p_text = |p: Option<f64>| p.map_or_else(|| "–".to_owned(), |p| format!("{p:.3}"));
+    let verdict = match study.p_value {
+        Some(p) if p < 0.05 && study.difference.is_some_and(|d| d > 0.0) => {
+            "After news, the strategy did better than in quiet windows, by more than chance would often give."
+        }
+        Some(p) if p < 0.05 => {
+            "After news, the strategy did worse than in quiet windows, by more than chance would often give."
+        }
+        Some(_) => {
+            "The news windows and the quiet ones differ by no more than chance would often give."
+        }
+        None => "There's nothing to compare: one group has no windows.",
+    };
+    let mut left = column![
+        text(verdict).size(HINT).color(theme::TEXT_BRIGHT),
+        row![
+            text("").width(Fill),
+            title("Windows", "How many windows in the group."),
+            title("Traded", "How many of them made a trade."),
+            title("Return", "The strategy's mean return per window."),
+            title("Holding", "Holding the market over the same windows, after any funding."),
+            title("Over", "The strategy's return less holding's, on average."),
+            title("Made", "The share of windows the strategy made money in."),
+        ]
+        .spacing(4),
+        group_row("After news", &study.events),
+        group_row("Quiet", &study.controls),
+        text(format!(
+            "Return difference {}, p {} · over holding {}, p {}. The p-value is how often shuffling which windows are news gives as big a difference. One study is one test, not a variant per window.",
+            percent(study.difference),
+            p_text(study.p_value),
+            percent(study.excess_difference),
+            p_text(study.excess_p_value),
+        ))
+        .size(HINT)
+        .color(theme::TEXT_MUTED),
+    ]
+    .spacing(6);
+    if study.headlines > 0 {
+        left = left.push(
+            text(format!(
+                "{} headlines at that importance in the span.",
+                study.headlines
+            ))
+            .size(HINT)
+            .color(theme::TEXT_MUTED),
+        );
+    }
+    for warning in &study.warnings {
+        left = left.push(text(warning.as_str()).size(HINT).color(theme::DOWN));
+    }
+    let mut rows = column![].spacing(2);
+    for (at, window) in study.windows.iter().enumerate() {
+        let (label, color) = match window.kind {
+            Kind::Event => ("News", theme::TEXT_BRIGHT),
+            Kind::Control => ("Quiet", theme::TEXT_MUTED),
+        };
+        let way = window.moved.map_or_else(String::new, |moved| {
+            format!(
+                " Moved {:+.2}% before it, so it traded {}.",
+                moved * 100.0,
+                match window.way {
+                    persephone_engine::Direction::Both => "either way",
+                    persephone_engine::Direction::LongOnly => "long only",
+                    persephone_engine::Direction::ShortOnly => "short only",
+                }
+            )
+        });
+        let what = window.event.as_ref().map_or_else(
+            || {
+                format!(
+                    "No such headline in it or just before.{way} Click to move the chart to it."
+                )
+            },
+            |(when, headline)| {
+                format!(
+                    "{} {}: {headline}.{way} Click to move the chart to it.",
+                    DateTime::from_nanos(*when).date(),
+                    &DateTime::from_nanos(*when).time()[..5],
+                )
+            },
+        );
+        rows = rows.push(tip(
+            button(
+                row![
+                    text(label).size(HINT).color(color).width(44),
+                    text(format!(
+                        "{} – {}",
+                        DateTime::from_nanos(window.from).date(),
+                        DateTime::from_nanos(window.last_bar).date()
+                    ))
+                    .size(HINT)
+                    .color(theme::TEXT)
+                    .width(Fill),
+                    signed(window.return_),
+                    signed(window.holding),
+                    cell(window.trades.to_string(), theme::TEXT),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center),
+            )
+            .padding([2, 6])
+            .width(Fill)
+            .on_press(PanelMessage::ShowWindow(at))
+            .style(|_, status| result_style(false, status)),
+            what,
+            None,
+        ));
+    }
+    let list = column![
+        row![
+            text("Window")
+                .size(HINT)
+                .color(theme::TEXT_MUTED)
+                .width(Fill),
+            title("Return", "The strategy's return over the window."),
+            title("Holding", "Holding the market over it, after any funding."),
+            title("Trades", "Trades made in it."),
+        ]
+        .spacing(4)
+        .padding([0, 6]),
+        scrollable(rows)
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::hidden()
+            ))
+            .height(Fill),
+    ]
+    .spacing(2);
+    row![
+        container(scrollable(left).height(Fill))
+            .padding(Padding {
+                top: 8.0,
+                right: 8.0,
+                bottom: 6.0,
+                left: 12.0,
+            })
+            .width(FillPortion(1))
+            .height(Fill),
+        half(list.into()),
+    ]
+    .into()
+}

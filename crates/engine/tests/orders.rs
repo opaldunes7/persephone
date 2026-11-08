@@ -1292,3 +1292,39 @@ fn the_decision_log_says_when_a_trailing_stop_filled() {
         report.decisions
     );
 }
+
+#[test]
+fn closing_at_the_end_sells_what_is_open_on_the_last_bar_a_fill_can_happen() {
+    let bars = [FLAT, FLAT, FLAT, close_at(110.0)];
+    let fees = FeeRates {
+        maker: 0.001,
+        taker: 0.001,
+    };
+    let left = run(&bars, &[(1, 1)], SimSettings::default(), fees);
+    assert_eq!(
+        fills_of(&left).iter().map(|f| f.1).collect::<Vec<_>>(),
+        [Side::Buy]
+    );
+
+    let closing = SimSettings {
+        close_at_end: true,
+        ..SimSettings::default()
+    };
+    let closed = run(&bars, &[(1, 1)], closing, fees);
+    let fills = fills_of(&closed);
+    assert_eq!(fills.len(), 2, "{fills:?}");
+    assert_eq!((fills[1].0, fills[1].1, fills[1].2), (3, Side::Sell, 110.0));
+    assert!((fills[1].3 - fills[0].3).abs() < 1e-9);
+    // The exit's fee is paid, so it ends under the same trade left open.
+    assert!(closed.equity.last().unwrap() < left.equity.last().unwrap());
+
+    // With next-open fills it's decided a bar sooner and filled at the last bar's open.
+    let next_open = SimSettings {
+        next_open: true,
+        ..closing
+    };
+    let opened = run(&bars, &[(1, 1)], next_open, NO_FEES);
+    let fills = fills_of(&opened);
+    assert_eq!(fills.len(), 2, "{fills:?}");
+    assert_eq!((fills[1].0, fills[1].1, fills[1].2), (3, Side::Sell, 110.0));
+}

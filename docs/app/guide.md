@@ -358,6 +358,8 @@ bar has closed. **Start from…** begins again, or from one of the examples.
 
 **Random entries**, under **Test**, compares a backtest with chance. It places the same trades at random times, holding each as long, as many **Runs** as you set. **As good** is the share of placings that returned at least as much: near 50% means the entries add nothing. The charts show how the placings' returns and worst falls were spread, with the backtest's own marked in yellow, the median dashed and the middle 19 in 20 shaded.
 
+**News windows**, under **Test**, asks whether news makes the difference. It backtests the strategy on the window after each important headline the news sidebar has collected, and on as many quiet windows with no such headline in them or just before, then compares them. **High** takes only market-wide headlines (rates, inflation, regulators, hacks and failures); **Medium** adds those naming the chart's market. Headlines within a day of each other are one event. **Days** is each window's length, **Hours after** how long after the headline it starts, so the first jolt isn't in it, and **Controls** how many quiet windows (empty is as many as there are events). With High, **No medium** keeps the quiet windows clear of medium headlines too. **Follow** trades each window only the way the market moved over the hours after its headline (the same hours before a quiet window): long only after a rise of more than **Move %**, short only after such a fall, either way after less. Turn Direction off to use it. Quiet windows stay out of stretches where nothing was collected, as nothing's known there, and **Run again** picks others. The heading gives each group's mean return and the **p**-value: how often shuffling which windows are news gives as big a difference. Under 0.05, the news likely matters. The table beside it compares the strategy with holding the market in each group, and lists every window: click one to move the chart to it. The warnings say if a group has under 10 windows, if event windows overlap, or if fewer quiet windows could be found than asked. It's one test however many windows it has.
+
 **Optimize**, under **Test** in the backtest panel, tries a range of one of the strategy's variables
 or two together (including Size %). Pick each variable's **Min**, **Max** and **Step**, what to
 **Score by**, and press **Run**. **Cancel** stops it: backtests already under way finish and are
@@ -592,6 +594,7 @@ The panel's settings go beyond market orders:
 - **Impact** makes market orders fill worse the larger they are against their bar's volume. It's a rough assumption.
 - **Volume limit** stops an order taking more than that share of a bar's volume. What's left goes out at the next closes, at their prices, so big positions take time to build and to leave. A resting limit fills no more than that share of each bar, and a stop takes that share and leaves the rest to the closes after.
 - **Range slip** makes market orders and stops pay a share of a bar's high to low, times how many times wider it is than usual. A bar 10 times the usual width costs 100 times a usual one, so wild markets cost what they should. It's a rough assumption.
+- **Close at the end**, under Exits, sells or buys back whatever's still open on the last bar a fill can happen, paying fees and slippage: the last close, or the last bar's open with next-open fills. Off, an open trade is valued at the last close with no exit cost, and the report says when that trade is a third or more of the result. It's for single markets for now.
 - **Trailing stop** follows the best price since entry, moved at each close, so it only tightens. **Decision log**, when on, adds a **Decisions** table to the Backtest tab: for each bar, what the strategy asked for, what was held, what went out, and why not.
 - **No costs**, first under Costs, takes off everything there is to pay, including a market's own fees and funding.
 - **Warn at** says how large an order against its bar, and how few limits filling, gets a warning. **Warm-up** is how many bars before the span strategies warm up on: raise it for longer look-backs. **Cash interest** charges a portfolio for cash below zero, a year's rate. Optimize's **Pick on %** and Walk-forward's **Ratio** set how a span is split into what's picked on and what's unseen. Range slip's **over** and Impact's **power** set how far back a usual bar is judged from and how steeply impact grows.
@@ -641,7 +644,9 @@ it wider or narrower (220 to 520 pixels, always leaving the charts 400). It's sa
 - **Filters:** **All**, the focused chart's market (headlines naming it, as BTC or Bitcoin), and
   **Macro** (the Fed, the SEC, and rates, inflation, hacks, failures and the like). The bar beside
   each headline says how much it may matter: red for market-moving, amber for naming this market,
-  grey otherwise. It's a rough rule on the words, not a judgement.
+  grey otherwise. It's a rough rule on the words, not a judgement. Market-moving headlines are
+  market-wide, so a Fed decision is red on every chart. A regulator's or central bank's own release
+  is red only for what it's about (policy, rates, crypto, enforcement), not for being from the Fed.
 - **Clicking a headline** puts its bar in the middle of every chart on screen (in a replay the
   playhead goes there too), and lights its mark: a bigger diamond,
   ringed, with a line up through the bars and its title above. It's marked even if the filter
@@ -660,6 +665,8 @@ it wider or narrower (220 to 520 pixels, always leaving the charts 400). It's sa
   `news/searched.txt`. GDELT's time is when it first saw an article, never before it came out. **Keep collecting** reads the feeds while the
   sidebar's closed too, so there are no gaps. It turns on the first time you open the sidebar, and
   stays as you set it; nothing is fetched until then.
+- **Gaps:** where two days or more passed with no headline from any feed, a line between the
+  headlines either side says nothing was collected then, so a quiet stretch there isn't a quiet market.
 - **Times** are when each headline's publisher put it out, which can be after the news first broke.
   Good for seeing what was being said around a bar, not for trading on to the second.
 

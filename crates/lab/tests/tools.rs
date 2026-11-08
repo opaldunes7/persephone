@@ -127,6 +127,62 @@ fn backtest(lab: &Arc<Lab>, strategy: &Value) -> Value {
     .unwrap()
 }
 
+#[test]
+fn a_strategy_can_be_a_json_files_path_wherever_one_goes() {
+    let (lab, dir) = lab();
+    let whole = dir.join("strategy.json");
+    fs::write(&whole, tree().to_string()).unwrap();
+    let rules = dir.join("rules.json");
+    fs::write(&rules, tree()["logic"].to_string()).unwrap();
+    let given = backtest(&lab, &tree())["summary"]["net_return"].clone();
+    for strategy in [json!(whole), json!(rules), json!({"logic": rules})] {
+        assert_eq!(
+            backtest(&lab, &strategy)["summary"]["net_return"],
+            given,
+            "{strategy}"
+        );
+    }
+    // In a batch's defaults, and in a list of runs read from a file.
+    let batch = lab
+        .dispatch(
+            "run_backtests",
+            &json!({
+                "defaults": with(json!({"strategy": rules})),
+                "runs": [{"label": "a"}, {"label": "b", "strategy": whole}],
+                "wait_seconds": 120,
+            }),
+        )
+        .unwrap();
+    let columns = batch["columns"].as_array().unwrap();
+    let at = |name: &str| columns.iter().position(|c| c == name).unwrap();
+    let rows = batch["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{batch}");
+    assert!(
+        rows.iter().all(|row| row[at("net_return")] == given),
+        "{batch}"
+    );
+    let listed = dir.join("runs.json");
+    fs::write(
+        &listed,
+        json!([with(json!({"strategy": whole}))]).to_string(),
+    )
+    .unwrap();
+    let from_file = lab
+        .dispatch(
+            "run_backtests",
+            &json!({"runs": listed, "wait_seconds": 120}),
+        )
+        .unwrap();
+    assert_eq!(from_file["rows"][0][at("net_return")], given, "{from_file}");
+    let missing = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({"strategy": dir.join("none.json"), "wait_seconds": 120})),
+        )
+        .unwrap_err();
+    assert!(missing.contains("couldn't read"), "{missing}");
+}
+
 /// Every tool that works without the network, with arguments it should accept.
 fn calls(lab: &Arc<Lab>, dir: &std::path::Path) -> Vec<(&'static str, Value)> {
     let run = backtest(lab, &ema());
@@ -243,6 +299,15 @@ fn calls(lab: &Arc<Lab>, dir: &std::path::Path) -> Vec<(&'static str, Value)> {
                 "defaults": market(),
                 "wait_seconds": 120,
             }),
+        ),
+        (
+            "run_event_study",
+            with(json!({
+                "strategy": ema(),
+                "windows": [{"from": "2024-01-10", "to": "2024-01-14"}],
+                "control_windows": [{"from": "2024-01-20", "to": "2024-01-24"}],
+                "wait_seconds": 120,
+            })),
         ),
         (
             "run_random_entries",
@@ -3735,6 +3800,7 @@ fn the_docs_name_every_tool_and_what_each_screen_comes_from() {
         "Optimize",
         "Walk-forward",
         "Random entries",
+        "News windows",
         "Calendar",
         "`get_equity`'s `market`",
         "`return_chart`",
@@ -5261,5 +5327,278 @@ fn the_news_the_app_collected_reads_by_time_words_and_importance() {
     assert!(
         lab.dispatch("get_news", &json!({"importance": "huge"}))
             .is_err()
+    );
+}
+
+#[test]
+fn a_run_with_no_trades_blames_its_rules_unless_the_warm_up_is_short() {
+    let (lab, _dir) = lab();
+    let never = |long: Value| {
+        lab.dispatch(
+            "run_backtest",
+            &with(json!({"strategy": {"logic": {"long": long}}, "wait_seconds": 120})),
+        )
+        .unwrap()["summary"]["warnings"]
+            .to_string()
+    };
+    let rules = never(json!({"lt": ["close", 0]}));
+    assert!(rules.contains("its entry rules never came true"), "{rules}");
+    assert!(!rules.contains("warm"), "{rules}");
+}
+
+#[test]
+fn batch_rows_say_which_market_and_span_they_are_and_can_keep_their_order() {
+    let (lab, _dir) = lab();
+    let batch = |order: Option<&str>| {
+        let mut args = json!({
+            "defaults": market(),
+            "runs": [
+                {"strategy": {"builtin": "ema-cross", "params": {"Fast": 12, "Slow": 40}}},
+                {"strategy": ema()},
+                {"strategy": {"builtin": "ema-cross", "params": {"Fast": 8, "Slow": 30}}},
+            ],
+            "wait_seconds": 120,
+        });
+        if let Some(order) = order {
+            args["order"] = json!(order);
+        }
+        lab.dispatch("run_backtests", &args)
+    };
+    let given = batch(Some("given")).unwrap();
+    let columns = given["columns"].as_array().unwrap();
+    let at = |name: &str| {
+        columns
+            .iter()
+            .position(|c| c == name)
+            .unwrap_or_else(|| panic!("no {name} in {columns:?}"))
+    };
+    let rows = given["rows"].as_array().unwrap();
+    let indices: Vec<u64> = rows.iter().map(|row| row[0].as_u64().unwrap()).collect();
+    assert_eq!(indices, [0, 1, 2]);
+    for row in rows {
+        assert_eq!(row[at("symbol")], "BTCUSDT", "{row}");
+        assert_eq!(row[at("bars")], "1h", "{row}");
+        assert!(row[at("first_bar")].is_string(), "{row}");
+        assert!(row[at("last_bar")].is_string(), "{row}");
+        assert!(row[at("return_after_funding")].is_number(), "{row}");
+        assert_eq!(
+            row[at("return_after_funding")],
+            row[at("buy_and_hold_return")],
+            "no funding here"
+        );
+        assert_eq!(row.as_array().unwrap().len(), columns.len());
+    }
+    // Best first otherwise.
+    let best = batch(None).unwrap();
+    let net = at("net_return");
+    let nets: Vec<f64> = best["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row[net].as_f64().unwrap())
+        .collect();
+    assert!(nets.windows(2).all(|pair| pair[0] >= pair[1]), "{nets:?}");
+    assert!(batch(Some("random")).unwrap_err().contains("order"));
+}
+
+#[test]
+fn news_says_which_headlines_name_the_market_and_where_nothing_was_collected() {
+    use persephone_data::news::{Headline, NewsStore};
+    let (lab, dir) = lab();
+    let at = |day: u64| START + day * 24 * HOUR;
+    let headline = |day: u64, title: &str| Headline {
+        published: at(day),
+        seen: at(day),
+        source: "Wire".into(),
+        title: title.into(),
+        link: format!("https://example.com/{day}"),
+        id: format!("n{day}"),
+        official: false,
+    };
+    NewsStore::open(&dir)
+        .add(vec![
+            headline(1, "Fed holds rates"),
+            headline(2, "Bitcoin exchange hack"),
+            headline(10, "NFT sales fall"),
+        ])
+        .unwrap();
+    let get = |args: Value| lab.dispatch("get_news", &args);
+    let high = get(json!({"symbol": "BTCUSDT", "importance": "high"})).unwrap();
+    assert_eq!(high["total"], 2, "high is market-wide: {high}");
+    let names = high["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|c| c == "names_market")
+        .unwrap();
+    assert_eq!(high["rows"][0][names], true);
+    assert_eq!(high["rows"][1][names], false);
+    let only =
+        get(json!({"symbol": "BTCUSDT", "importance": "high", "market_only": true})).unwrap();
+    assert_eq!(only["total"], 1);
+    assert_eq!(only["rows"][0][3], "Bitcoin exchange hack");
+    assert!(
+        get(json!({"market_only": true}))
+            .unwrap_err()
+            .contains("symbol")
+    );
+    let gaps = get(json!({"from": "2024-01-01", "to": "2024-01-12"})).unwrap()["gaps"].clone();
+    assert_eq!(
+        gaps,
+        json!([{"from": "2024-01-03 00:00", "to": "2024-01-11 00:00"}]),
+        "and none before the first headline"
+    );
+}
+
+#[test]
+fn an_event_study_compares_the_windows_after_news_with_quiet_ones() {
+    use persephone_data::news::{Headline, NewsStore};
+    let (lab, dir) = lab();
+    let at = |hour: u64| START + hour * HOUR;
+    let headline = |hour: u64, title: &str| Headline {
+        published: at(hour),
+        seen: at(hour),
+        source: "Wire".into(),
+        title: title.into(),
+        link: format!("https://example.com/{hour}"),
+        id: format!("n{hour}"),
+        official: false,
+    };
+    // Something every 12 hours, so there are no gaps, and a rate decision every ten days or so.
+    let mut news: Vec<Headline> = (0..165)
+        .map(|i| headline(i * 12, "NFT sales fall"))
+        .collect();
+    for day in [8_u64, 18, 28, 38, 48, 58, 68] {
+        news.push(headline(day * 24 + 3, "Fed holds interest rates"));
+        news.push(headline(day * 24 + 9, "Inflation cools"));
+    }
+    NewsStore::open(&dir).add(news).unwrap();
+    let study = |more: Value| {
+        let mut args = with(json!({"strategy": ema(), "length_hours": 72, "wait_seconds": 120}));
+        for (key, value) in more.as_object().unwrap() {
+            args[key] = value.clone();
+        }
+        lab.dispatch("run_event_study", &args)
+    };
+    let found = study(json!({})).unwrap();
+    assert_eq!(
+        found["events"]["windows"], 7,
+        "a decision and its follow-up are one: {found}"
+    );
+    assert_eq!(found["controls"]["windows"], 7, "{found}");
+    assert_eq!(found["headlines"], 14);
+    assert_eq!(found["total"], 14);
+    let rows = found["window_rows"].as_array().unwrap();
+    assert_eq!(rows[0][0], "event");
+    assert_eq!(
+        rows[0][1], "2024-01-09 07:00",
+        "4 hours after the first headline"
+    );
+    assert_eq!(rows[0][2], "2024-01-12 07:00", "the end of its last bar");
+    assert_eq!(rows[0][3], "2024-01-12 06:00", "its last bar's open");
+    assert_eq!(rows[0][4], "2024-01-09 03:00");
+    assert_eq!(rows[0][5], "Fed holds interest rates");
+    assert_eq!(rows[0][6], "both");
+    assert_eq!(rows[0][7], Value::Null);
+    // A row's from and to are what run_backtest takes for the same bars.
+    let alone = lab
+        .dispatch(
+            "run_backtest",
+            &with(json!({"strategy": ema(), "from": rows[0][1], "to": rows[0][2], "wait_seconds": 120})),
+        )
+        .unwrap();
+    assert_eq!(alone["summary"]["last_bar"], rows[0][3], "{alone}");
+    assert!(
+        (alone["summary"]["net_return"].as_f64().unwrap() - rows[0][8].as_f64().unwrap()).abs()
+            < 1e-9,
+        "{alone} against {}",
+        rows[0]
+    );
+    let difference = found["events"]["mean_return"].as_f64().unwrap()
+        - found["controls"]["mean_return"].as_f64().unwrap();
+    assert!((found["difference"].as_f64().unwrap() - difference).abs() < 1e-12);
+    let p = found["p_value"].as_f64().unwrap();
+    assert!(p > 0.0 && p <= 1.0, "{p}");
+    assert!(
+        found["warnings"]
+            .to_string()
+            .contains("under 10 in a group"),
+        "{found}"
+    );
+    // The same seed, the same study; controls stay clear of the news.
+    assert_eq!(
+        study(json!({})).unwrap()["window_rows"],
+        found["window_rows"]
+    );
+    let span = |row: &Value| {
+        (
+            row[1].as_str().unwrap().to_owned(),
+            row[2].as_str().unwrap().to_owned(),
+        )
+    };
+    for control in rows.iter().filter(|row| row[0] == "control") {
+        let (from, to) = span(control);
+        for event in rows.iter().filter(|row| row[0] == "event") {
+            let (event_from, event_to) = span(event);
+            assert!(
+                to <= event_from || from >= event_to,
+                "{control} against {event}"
+            );
+        }
+    }
+
+    // Given windows instead, and what's wrong with them said.
+    let given = study(json!({
+        "windows": [{"from": "2024-01-10", "to": "2024-01-13"}],
+        "control_windows": [{"from": "2024-01-20", "to": "2024-01-23"}, {"from": "2024-02-01", "to": "2024-02-04"}],
+    }))
+    .unwrap();
+    assert_eq!(given["events"]["windows"], 1);
+    assert_eq!(given["controls"]["windows"], 2);
+    assert_eq!(given["headlines"], Value::Null);
+    // With no controls there's nothing to compare, and no number says otherwise.
+    let alone = study(json!({"windows": [{"from": "2024-01-10", "to": "2024-01-13"}]})).unwrap();
+    assert_eq!(alone["controls"]["windows"], 0);
+    assert_eq!(alone["controls"]["mean_return"], Value::Null);
+    assert_eq!(alone["difference"], Value::Null);
+    assert_eq!(alone["excess_difference"], Value::Null);
+    assert_eq!(alone["p_value"], Value::Null);
+    assert!(alone["events"]["mean_return"].is_number());
+    assert!(
+        alone["warnings"].to_string().contains("nothing to compare"),
+        "{alone}"
+    );
+
+    // Each window trades the way the market moved before it.
+    let followed = study(json!({"follow_move": {"hours": 4, "threshold_percent": 0.0}})).unwrap();
+    let rows = followed["window_rows"].as_array().unwrap();
+    assert!(
+        rows.iter().all(|row| row[6] == "long" || row[6] == "short"),
+        "with no threshold every move picks a side: {followed}"
+    );
+    for row in rows {
+        let moved = row[7].as_f64().unwrap();
+        assert_eq!(row[6], if moved > 0.0 { "long" } else { "short" }, "{row}");
+    }
+    let clash = study(json!({
+        "follow_move": {"hours": 4},
+        "settings": {"direction": {"on": true, "value": "long-only"}},
+    }))
+    .unwrap_err();
+    assert!(clash.contains("direction setting off"), "{clash}");
+    assert!(
+        study(json!({"follow_move": {"hours": 0}}))
+            .unwrap_err()
+            .contains("follow_move.hours")
+    );
+    let looser = study(json!({"importance": "medium", "control_importance": "high"})).unwrap_err();
+    assert!(looser.contains("stricter"), "{looser}");
+    let wrong =
+        study(json!({"windows": [{"from": "2030-01-01", "to": "2030-01-05"}]})).unwrap_err();
+    assert!(wrong.contains("fewer than two bars"), "{wrong}");
+    assert!(
+        study(json!({"importance": "low"}))
+            .unwrap_err()
+            .contains("importance")
     );
 }

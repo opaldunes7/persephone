@@ -568,6 +568,8 @@ pub enum Message {
     ),
     RandomEntriesProgress(u64, usize),
     RandomEntriesDone(u64, Result<Arc<backtest::positions::RandomEntries>, String>),
+    NewsWindowsProgress(u64, usize),
+    NewsWindowsDone(u64, Result<Arc<backtest::event_study::EventStudy>, String>),
     /// Where to export to, if anywhere was picked.
     ExportTo(Export, Option<PathBuf>),
     Exported(Result<String, String>),
@@ -1482,6 +1484,16 @@ impl Persephone {
             Message::RandomEntriesDone(run, result) => {
                 if let Some(panel) = self.panel.as_mut() {
                     panel.tests.random_entries.finish(run, result);
+                }
+            }
+            Message::NewsWindowsProgress(run, count) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.news_windows.progress(run, count);
+                }
+            }
+            Message::NewsWindowsDone(run, result) => {
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.tests.news_windows.finish(run, result);
                 }
             }
             Message::OptimizeProgress(run, count) => {
@@ -3409,6 +3421,7 @@ impl Persephone {
                 request,
                 candles,
                 blocks,
+                directions: Vec::new(),
                 warm_up: tile.backtest.warm_up_bars as usize,
                 workers,
                 stop,
@@ -4492,6 +4505,103 @@ impl Persephone {
         Some((run, job))
     }
 
+    /// Sets News windows going on the panel: the chart's strategy on the windows after the news
+    /// collected, and on as many with none, unless there's a reason not to.
+    fn start_news_windows(&mut self) -> Option<(u64, backtest::event_study::StudyJob)> {
+        use backtest::{
+            TestRun,
+            event_study::{FollowMove, NewsChoice, StudyJob, from_news},
+        };
+        use persephone_data::news::{GAP, market_words};
+        let id = self.panel.as_ref()?.tile;
+        if self.tiles.get(&id)?.backtest.test != backtest::TestKind::NewsWindows {
+            return None;
+        }
+        if let Some(problem) = self.test_problem(id) {
+            self.panel.as_mut()?.tests.news_windows = TestRun::Failed(problem.message);
+            return None;
+        }
+        let (_, mut request) = self.backtest_request(id)?;
+        let workers = self.test_workers(&request.strategy);
+        let tile = self.tiles.get(&id)?;
+        let candles = std::mem::take(&mut request.candles);
+        let from_index = span_start(&candles, tile.market.span);
+        let times: Vec<u64> = candles.iter().map(|c| c.ts).collect();
+        let words = market_words(&tile.market.symbol);
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+        let store = &self.news.store;
+        let (first, last) = (
+            times.get(from_index).copied().unwrap_or(0),
+            times.last().copied().unwrap_or(0),
+        );
+        let gaps = store.gaps(first.saturating_sub(GAP * 45), last.saturating_add(1), GAP);
+        let seed = self.panel.as_ref()?.tests.seed;
+        let found = from_news(
+            &times,
+            from_index,
+            store.all(),
+            &words,
+            &gaps,
+            store.since(),
+            &NewsChoice::of(&tile.backtest.news, seed),
+        );
+        let warm_up = tile.backtest.warm_up_bars as usize;
+        let panel = self.panel.as_mut()?;
+        if found.windows.is_empty() {
+            panel.tests.news_windows = TestRun::Failed(if store.since().is_none() {
+                "No news has been collected yet: open the news sidebar to collect it.".to_owned()
+            } else {
+                found.warnings.join(" ")
+            });
+            return None;
+        }
+        // On the chart's bars whatever the precision, to keep a batch quick.
+        request.ticks = None;
+        request.fill_bars = None;
+        let run = backtest::next_run();
+        let stop = Arc::new(AtomicBool::new(false));
+        panel.tests.news_windows = TestRun::Running {
+            run,
+            done: 0,
+            total: found.windows.len(),
+            stop: backtest::StopOnDrop(Arc::clone(&stop)),
+        };
+        Some((
+            run,
+            StudyJob {
+                request,
+                candles,
+                windows: found,
+                warm_up,
+                workers,
+                stop,
+                seed,
+                follow_move: FollowMove::chosen(&tile.backtest.news),
+            },
+        ))
+    }
+
+    fn run_news_windows(&mut self) -> Task<Message> {
+        let Some((run, job)) = self.start_news_windows() else {
+            return Task::none();
+        };
+        batch_task(
+            run,
+            move |progress| job.run(&|count| progress(count)),
+            Message::NewsWindowsProgress,
+            Message::NewsWindowsDone,
+        )
+    }
+
+    /// Runs News windows here and now, instead of handing back a task. For tests and snapshots.
+    #[doc(hidden)]
+    pub fn news_windows_now(&mut self) {
+        if let Some((run, job)) = self.start_news_windows() {
+            let result = job.run(&|_| {}).map(Arc::new);
+            let _ = self.update(Message::NewsWindowsDone(run, result));
+        }
+    }
+
     fn run_random_entries(&mut self) -> Task<Message> {
         let Some((run, job)) = self.start_random_entries() else {
             return Task::none();
@@ -4535,6 +4645,14 @@ impl Persephone {
         {
             report.notes.push(Note {
                 text: warning,
+                warning: true,
+            });
+        }
+        if let Some(warning) = figures::open_at_end(report).and_then(|open| open.warning())
+            && let Some(report) = Arc::get_mut(report)
+        {
+            report.notes.push(Note {
+                text: warning.replace("Set `close_at_end`", "Turn on Close at the end"),
                 warning: true,
             });
         }
@@ -5153,6 +5271,7 @@ impl Persephone {
                     Some(backtest::TestKind::Optimize) => self.run_optimize(),
                     Some(backtest::TestKind::WalkForward) => self.run_walk_forward(),
                     Some(backtest::TestKind::RandomEntries) => self.run_random_entries(),
+                    Some(backtest::TestKind::NewsWindows) => self.run_news_windows(),
                     Some(backtest::TestKind::Portfolio) => self.update_panel_portfolio_again(),
                     _ => self.draw_monte_carlo(),
                 };
@@ -5287,6 +5406,26 @@ impl Persephone {
             }
             P::StopRandomEntries => {
                 panel.tests.random_entries = backtest::TestRun::Idle;
+                return Task::none();
+            }
+            P::RunNewsWindows => {
+                if !self.apply_typed(id) {
+                    return Task::none();
+                }
+                return self.run_news_windows();
+            }
+            P::StopNewsWindows => {
+                panel.tests.news_windows = backtest::TestRun::Idle;
+                return Task::none();
+            }
+            P::ShowWindow(at) => {
+                // A window happened at a real time, so the chart can go there.
+                if let backtest::TestRun::Done(study) = &panel.tests.news_windows
+                    && let Some(window) = study.windows.get(at)
+                    && let Some(chart) = self.tiles.get_mut(&id).and_then(|t| t.chart.as_mut())
+                {
+                    chart.show_bar(window.bars.end.saturating_sub(1));
+                }
                 return Task::none();
             }
             P::WidenSpan => {

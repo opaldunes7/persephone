@@ -205,6 +205,11 @@ fn check(request: &PortfolioRequest) -> Result<(), EngineError> {
             "a portfolio goes at the market for now: limit orders, stops and targets are for single markets",
         ));
     }
+    if sim.close_at_end {
+        return Err(refuse(
+            "closing at the end is for single markets for now: a portfolio's holdings are valued at the last close",
+        ));
+    }
     if sim.next_open && (sim.latency_ms > 0 || sim.latency_jitter_ms > 0) {
         return Err(refuse(
             "filling at the next open can't go with latency; pick one",

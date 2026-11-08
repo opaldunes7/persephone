@@ -31,8 +31,8 @@ use persephone_engine::BacktestReport;
 use persephone_tiling::TileId;
 
 pub use persephone_research::{
-    Field, RunColumn, WARM_UP_BARS, calendar, figures, logic_draft, optimize, portfolio,
-    portfolio_tests, positions, robustness,
+    Field, RunColumn, WARM_UP_BARS, calendar, event_study, figures, logic_draft, optimize,
+    portfolio, portfolio_tests, positions, robustness,
     settings::{
         self, BlockLength, Commission, Edit, FillTiming, OneWay, OptimizeSettings, Precision,
         ScoreBy, Section, SessionRule, Settings, TestKind, Variable, parse_time, time_text,
@@ -124,6 +124,7 @@ impl Chapter {
                 settings.stop_loss_percent.on,
                 settings.trailing_stop_percent.on,
                 settings.take_profit_percent.on,
+                settings.close_at_end,
             ]),
             Self::Position => count(&[
                 settings.compound,
@@ -356,6 +357,7 @@ pub struct Tests {
     pub optimize: OptimizeRun,
     pub walk_forward: TestRun<walk_forward::WalkForward>,
     pub random_entries: TestRun<positions::RandomEntries>,
+    pub news_windows: TestRun<event_study::EventStudy>,
     pub portfolio: TestRun<portfolio::PortfolioRun>,
     /// The leg whose fills show, and the runs saved to go back to.
     pub portfolio_leg: usize,
@@ -399,6 +401,7 @@ impl Default for Tests {
             optimize: OptimizeRun::Idle,
             walk_forward: TestRun::Idle,
             random_entries: TestRun::Idle,
+            news_windows: TestRun::Idle,
             portfolio: TestRun::Idle,
             portfolio_leg: 0,
             saved_portfolios: Vec::new(),
@@ -502,6 +505,7 @@ impl Tests {
         self.optimize = OptimizeRun::Idle;
         self.walk_forward = TestRun::Idle;
         self.random_entries = TestRun::Idle;
+        self.news_windows = TestRun::Idle;
         self.portfolio = TestRun::Idle;
         self.portfolio_sweep = TestRun::Idle;
         self.portfolio_shifted = TestRun::Idle;
@@ -705,6 +709,10 @@ pub enum PanelMessage {
     OpenPortfolio(portfolio::SavedPortfolio),
     RunRandomEntries,
     StopRandomEntries,
+    RunNewsWindows,
+    StopNewsWindows,
+    /// Move the chart to this window of News windows, by its place in the results.
+    ShowWindow(usize),
     /// Write this chart's setup to a file.
     ExportChart,
     /// Write everything to a file.

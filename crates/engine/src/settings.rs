@@ -35,6 +35,9 @@ pub struct SimSettings {
     pub trailing_stop_percent: Option<f64>,
     /// Keep a row for each bar: what was asked, what was held, and why no order went out.
     pub decision_log: bool,
+    /// Close what's held on the last bar a fill can happen, paying fees and slippage, rather than
+    /// valuing it at the last close.
+    pub close_at_end: bool,
     /// A target this far from the entry, as a percentage, resting while a position's held.
     pub take_profit_percent: Option<f64>,
     /// What borrowing costs a short, as a percentage of its value a year.
@@ -96,6 +99,7 @@ impl Default for SimSettings {
             stop_loss_percent: None,
             trailing_stop_percent: None,
             decision_log: false,
+            close_at_end: false,
             take_profit_percent: None,
             borrow_percent_per_year: None,
             impact_percent: 0.0,

@@ -87,7 +87,7 @@ persephone-lab call run_backtest '{"symbol": "BTCUSDT", "bars": "1h", "from": "2
 | News the app collected | `get_news` |
 | Indicators and models | `list_indicators`, `compute_indicator`, `list_models`, `run_model` |
 | Strategies | `list_strategies`, `describe_strategy`, `validate_logic`, `install_plugin` (compiled, or a program over a socket) |
-| Running tests | `run_backtest`, `run_backtests`, `run_monte_carlo`, `run_random_blocks`, `run_optimize`, `run_walk_forward`, `run_random_entries` |
+| Running tests | `run_backtest`, `run_backtests`, `run_monte_carlo`, `run_random_blocks`, `run_optimize`, `run_walk_forward`, `run_random_entries`, `run_event_study` |
 | Several markets on one account | `run_portfolio`, `run_portfolios`, `get_decisions`, `run_shifted`, `run_portfolio_monte_carlo`, `run_portfolio_walk_forward`, `get_portfolio`, `get_portfolio_series`, `get_portfolio_fills`, `get_portfolio_trades` |
 | Reading a run | `get_report`, `get_trades`, `get_fills`, `get_limit_orders`, `get_equity`, `get_returns`, `get_calendar`, `list_runs`, `compare_runs` |
 | Long jobs | `get_job`, `cancel_job` |

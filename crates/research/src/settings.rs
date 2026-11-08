@@ -36,6 +36,10 @@ pub struct Settings {
     pub take_profit_percent: Section<f64>,
     /// A stop that follows the best price since entry, as a percentage.
     pub trailing_stop_percent: Section<f64>,
+    /// Close whatever's open on the last bar a fill can happen, paying its costs, rather than
+    /// valuing it at the last close.
+    #[serde(default)]
+    pub close_at_end: bool,
     /// Keep a row for each bar: what was asked, what was held, and why no order went out.
     pub decision_log: bool,
     /// What borrowing costs a short, as a percentage of its value a year.
@@ -95,6 +99,9 @@ pub struct Settings {
     pub windows: u32,
     /// How many times Random entries places the trades.
     pub entries: u32,
+    /// What News windows tests on.
+    #[serde(default)]
+    pub news: NewsWindows,
     /// Plugins added to the backtest, by name. They're only listed for now: no kind of
     /// backtest plugin exists yet.
     pub plugins: Vec<String>,
@@ -126,6 +133,7 @@ impl Default for Settings {
             }),
             stop_loss_percent: Section::off(2.0),
             trailing_stop_percent: Section::off(3.0),
+            close_at_end: false,
             decision_log: false,
             take_profit_percent: Section::off(4.0),
             borrow_percent_per_year: Section::off(10.0),
@@ -160,6 +168,7 @@ impl Default for Settings {
             fill_timing: FillTiming::Close,
             windows: 5,
             entries: 200,
+            news: NewsWindows::default(),
             plugins: Vec::new(),
             test: TestKind::Backtest,
             runs: 1_000,
@@ -188,10 +197,45 @@ pub enum TestKind {
     WalkForward,
     /// The backtest's holds placed at random times, to compare it with chance.
     RandomEntries,
+    /// The strategy on the windows after news, against windows with none.
+    NewsWindows,
     /// Several markets on one account.
     Portfolio,
     /// Building the chart's strategy as a logic tree, played back like the backtest.
     Build,
+}
+
+/// What News windows tests on: events from the news collected, and as many quiet windows.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NewsWindows {
+    /// Only high headlines, which are market-wide, or medium ones naming the market too.
+    pub high: bool,
+    pub length_days: u32,
+    /// From the headline to its window's start.
+    pub after_hours: u32,
+    /// How many control windows; 0 is as many as there are events.
+    pub controls: u32,
+    /// With high events, a control window must be clear of medium headlines too.
+    pub quiet_medium: bool,
+    /// Each window trades only the way the market moved over the hours after the headline (the
+    /// hours before a control window), by more than `follow_percent`.
+    pub follow: bool,
+    pub follow_percent: f64,
+}
+
+impl Default for NewsWindows {
+    fn default() -> Self {
+        Self {
+            high: true,
+            length_days: 7,
+            after_hours: 4,
+            controls: 0,
+            quiet_medium: false,
+            follow: false,
+            follow_percent: 0.5,
+        }
+    }
 }
 
 /// What the Optimize test varies and how it scores the results.
@@ -455,6 +499,13 @@ pub enum Edit {
     CashInterest(bool),
     NoCosts(bool),
     TrailingStop(bool),
+    CloseAtEnd(bool),
+    /// News windows takes only high headlines (true), or medium ones too.
+    NewsHigh(bool),
+    /// Its control windows keep clear of medium headlines too.
+    NewsQuietMedium(bool),
+    /// Its windows trade only the way the market moved before them.
+    NewsFollow(bool),
     DecisionLog(bool),
     ClearWeights,
     Spread(bool),
@@ -527,6 +578,10 @@ impl Settings {
             Edit::CashInterest(on) => self.cash_interest_percent_per_year.on = on,
             Edit::NoCosts(on) => self.no_costs = on,
             Edit::TrailingStop(on) => self.trailing_stop_percent.on = on,
+            Edit::CloseAtEnd(on) => self.close_at_end = on,
+            Edit::NewsHigh(high) => self.news.high = high,
+            Edit::NewsQuietMedium(on) => self.news.quiet_medium = on,
+            Edit::NewsFollow(on) => self.news.follow = on,
             Edit::DecisionLog(on) => self.decision_log = on,
             Edit::ClearWeights => self.portfolio.weights = None,
             Edit::Spread(on) => self.spread.on = on,
@@ -627,6 +682,16 @@ impl Settings {
             Field::Blocks => self.blocks.to_string(),
             Field::Windows => self.windows.to_string(),
             Field::Entries => self.entries.to_string(),
+            Field::NewsLength => self.news.length_days.to_string(),
+            Field::NewsAfter => self.news.after_hours.to_string(),
+            Field::NewsMove => trim(self.news.follow_percent),
+            Field::NewsControls => {
+                if self.news.controls == 0 {
+                    String::new()
+                } else {
+                    self.news.controls.to_string()
+                }
+            }
             Field::Min(slot) | Field::Max(slot) | Field::Step(slot) => {
                 let Some(variable) = &self.optimize.variables[slot] else {
                     return String::new();
@@ -794,6 +859,18 @@ impl Settings {
             Field::Blocks => self.blocks = number(2.0, 1_000.0, "Blocks")?.round() as u32,
             Field::Windows => self.windows = number(1.0, 100.0, "Windows")?.round() as u32,
             Field::Entries => self.entries = number(2.0, 5_000.0, "Runs")?.round() as u32,
+            Field::NewsLength => {
+                self.news.length_days = number(1.0, 30.0, "A window's length")?.round() as u32;
+            }
+            Field::NewsAfter => self.news.after_hours = whole(24 * 7, "Hours after")?,
+            Field::NewsMove => self.news.follow_percent = number(0.0, 50.0, "The move")?,
+            Field::NewsControls => {
+                self.news.controls = if text.is_empty() {
+                    0
+                } else {
+                    number(2.0, 1_000.0, "Controls")?.round() as u32
+                };
+            }
             Field::Min(slot) | Field::Max(slot) | Field::Step(slot) => {
                 let value = number(-1e12, 1e12, "Min, Max and Step each")?;
                 if let Some(variable) = &mut self.optimize.variables[slot] {
@@ -817,6 +894,7 @@ impl Settings {
             + self.limit.on as usize
             + self.stop_loss_percent.on as usize
             + self.trailing_stop_percent.on as usize
+            + self.close_at_end as usize
             + self.take_profit_percent.on as usize
             + self.borrow_percent_per_year.on as usize
             + self.impact_percent.on as usize
@@ -844,6 +922,7 @@ impl Settings {
             ("limit", self.limit.on),
             ("stop_loss_percent", self.stop_loss_percent.on),
             ("trailing_stop_percent", self.trailing_stop_percent.on),
+            ("close_at_end", self.close_at_end),
             ("take_profit_percent", self.take_profit_percent.on),
             ("borrow_percent_per_year", self.borrow_percent_per_year.on),
             ("impact_percent", self.impact_percent.on),
@@ -883,6 +962,7 @@ impl Settings {
         self.limit.on = false;
         self.stop_loss_percent.on = false;
         self.trailing_stop_percent.on = false;
+        self.close_at_end = false;
         self.take_profit_percent.on = false;
         self.borrow_percent_per_year.on = false;
         self.impact_percent.on = false;
@@ -967,6 +1047,7 @@ impl Settings {
             stop_loss_percent: self.on(&self.stop_loss_percent).copied(),
             trailing_stop_percent: self.on(&self.trailing_stop_percent).copied(),
             decision_log: self.decision_log,
+            close_at_end: self.stock && self.close_at_end,
             take_profit_percent: self.on(&self.take_profit_percent).copied(),
             borrow_percent_per_year: self.on(&self.borrow_percent_per_year).copied(),
             impact_percent: self.on(&self.impact_percent).copied().unwrap_or(0.0),

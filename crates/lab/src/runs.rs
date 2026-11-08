@@ -19,7 +19,6 @@ use persephone_core::{
 };
 use persephone_engine::{BacktestReport, BacktestRequest, Fill, LimitOutcome};
 use persephone_research::{
-    WARM_UP_BARS,
     calendar::{Calendar, days_in_month, weeks},
     figures,
     market::{MAX_FINE_BARS, MarketBars, fine_bars},
@@ -54,10 +53,14 @@ const LISTED_RUNS: usize = 20;
 const LISTED_VALUES: usize = 50;
 /// The most backtests `run_backtests` takes in one call.
 const MAX_BACKTESTS: usize = 5_000;
-const BATCH_COLUMNS: [&str; 35] = [
+const BATCH_COLUMNS: [&str; 41] = [
     "index",
     "run_id",
     "label",
+    "symbol",
+    "bars",
+    "first_bar",
+    "last_bar",
     "fills",
     "net_return",
     "max_drawdown",
@@ -66,7 +69,9 @@ const BATCH_COLUMNS: [&str; 35] = [
     "fees",
     "final_equity",
     "buy_and_hold_return",
+    "return_after_funding",
     "excess_return",
+    "open_at_end_return",
     "sharpe",
     "profit_factor",
     "exposure",
@@ -273,19 +278,15 @@ fn summary_of(
     })
 }
 
-/// What needs saying about a run: its own warnings, and if it made no trades, why that may be.
+/// What needs saying about a run: its own warnings. Why one made no trades is said later, where
+/// its look-back is known.
 fn warnings_of(report: &BacktestReport) -> Vec<String> {
-    let mut warnings: Vec<String> = report
+    let warnings: Vec<String> = report
         .notes
         .iter()
         .filter(|note| note.warning)
         .map(|note| note.text.clone())
         .collect();
-    if report.fills.is_empty() {
-        warnings.push(format!(
-            "It made no trades. A look-back longer than the `warm_up_bars` ({WARM_UP_BARS} unless set) warmed up on before the span isn't ready until that far in, and a rule on it is false until then."
-        ));
-    }
     warnings
 }
 
@@ -810,7 +811,12 @@ impl Lab {
         }
         let limits = figures::LimitSummary::of(&report);
         for warning in [
+            report
+                .fills
+                .is_empty()
+                .then(|| figures::no_trades_warning(look_back, from_index)),
             figures::look_back_warning(look_back, from_index, times.len()),
+            figures::open_at_end(&report).and_then(|open| open.warning()),
             limits.warning(),
             settings_of(args)?.ignored_warning(),
         ]
@@ -855,6 +861,13 @@ impl Lab {
         summary["bars_to_fill_average"] = json!(report.bars_to_fill_average);
         summary["bars_to_fill_longest"] = json!(report.bars_to_fill_longest);
         summary["unfilled_at_end"] = json!(report.unfilled_at_end);
+        summary["open_at_end"] = json!(figures::open_at_end(&report).map(|open| json!({
+            "side": if open.long { "long" } else { "short" },
+            "bars_held": open.bars_held,
+            "profit": open.profit,
+            "return": open.return_,
+            "share_of_result": open.share,
+        })));
         summary["first_bar"] = json!(times.get(from_index).copied().map(time_text));
         summary["last_bar"] = json!(times.last().copied().map(time_text));
         let run_id = new_id("run");
@@ -1001,7 +1014,12 @@ impl Lab {
                 let own = item
                     .as_object()
                     .ok_or_else(|| format!("`runs`: {item} isn't an object"))?;
-                Ok(crate::tools::merge_call(shared, own))
+                let mut call = crate::tools::merge_call(shared, own);
+                // A list read from a file can name its strategies by path too.
+                if let Some(strategy) = call.get_mut("strategy") {
+                    crate::tools::read_strategy(strategy, "runs: strategy")?;
+                }
+                Ok(call)
             })
             .collect::<Result<_, String>>()?;
         let specs: Vec<Option<StrategySpec>> = calls
@@ -1058,6 +1076,13 @@ impl Lab {
                     index,
                     run["run_id"],
                     summary["label"],
+                    calls[*index]["symbol"],
+                    calls[*index]
+                        .get("bars")
+                        .cloned()
+                        .unwrap_or_else(|| json!("1h")),
+                    summary["first_bar"],
+                    summary["last_bar"],
                     summary["fills"],
                     summary["net_return"],
                     summary["max_drawdown"],
@@ -1066,7 +1091,9 @@ impl Lab {
                     summary["fees"],
                     summary["final_equity"],
                     summary["buy_and_hold_return"],
+                    summary["benchmark"]["return_after_funding"],
                     summary["excess_return"],
+                    summary["open_at_end"]["return"],
                     summary["sharpe"],
                     summary["profit_factor"],
                     summary["exposure"],
@@ -1099,6 +1126,11 @@ impl Lab {
             row[BATCH_COLUMNS.len() - 1] = json!(error);
             Value::Array(row)
         }));
+        match args.get("order").and_then(Value::as_str) {
+            None | Some("best") => {}
+            Some("given") => rows.sort_by_key(|row| row[0].as_u64().unwrap_or(u64::MAX)),
+            Some(other) => return Err(format!("`order` is best or given, not `{other}`")),
+        }
         rows.truncate(limit_of(args, DEFAULT_ROWS));
         // The top row, made fair for being the best of all that ran, and of all tried before.
         let sharpes: Vec<f64> = succeeded
@@ -1596,6 +1628,7 @@ impl Lab {
             request,
             candles,
             blocks,
+            directions: Vec::new(),
             warm_up,
             workers,
             stop: Arc::clone(&job.stop),
@@ -1654,10 +1687,10 @@ impl Lab {
             .blocks
             .iter()
             .all(|block| block.fills == 0)
-            .then(|| {
-                format!(
-                    "No block made a trade. A look-back longer than the {warm_up} bars warmed up on before each block is never ready in time."
-                )
+            .then(|| match &look_back {
+                Some(look_back) => format!("No block made a trade. {look_back}"),
+                None => "No block made a trade: the entry rules never came true in any of them."
+                    .to_owned(),
             })
             .or(look_back);
         rows.truncate(limit_of(args, LISTED_VALUES));
@@ -1687,6 +1720,206 @@ impl Lab {
             "blocks": rows,
             "total": total,
             "warning": warning,
+        }))
+    }
+
+    /// The strategy on the windows after news, and on as many windows without it: whether the
+    /// news makes the difference. The windows come from the news collected, or are given.
+    pub(crate) fn run_event_study(&self, args: &Value, job: &Arc<Job>) -> Result<Value, String> {
+        use persephone_data::news::{GAP, Importance, NewsStore, market_words};
+        use persephone_research::event_study::{
+            FollowMove, Kind, NewsChoice, StudyJob, Window, Windows, bars_of, from_news, way_label,
+        };
+        let (mut request, _, _) = self.prepare(args)?;
+        let workers = self.workers_for(&request.strategy);
+        let candles = std::mem::take(&mut request.candles);
+        let times: Vec<u64> = candles.iter().map(|c| c.ts).collect();
+        let from_index = candles.partition_point(|c| c.ts < request.trade_from);
+        let seed = number(args, "seed", 0);
+        let given = |name: &str, kind: Kind| -> Result<Vec<Window>, String> {
+            let Some(list) = args.get(name) else {
+                return Ok(Vec::new());
+            };
+            let list = list
+                .as_array()
+                .ok_or_else(|| format!("`{name}` is a list of {{from, to}}"))?;
+            list.iter()
+                .enumerate()
+                .map(|(i, window)| {
+                    let at = |end: &str| {
+                        window
+                            .get(end)
+                            .ok_or_else(|| format!("`{name}` {}: no `{end}`", i + 1))
+                            .and_then(|value| {
+                                crate::parse_time(value)
+                                    .map_err(|e| format!("`{name}` {} `{end}`: {e}", i + 1))
+                            })
+                    };
+                    let (from, to) = (at("from")?, at("to")?);
+                    let bars = bars_of(&times, from, to)
+                        .filter(|bars| bars.start >= from_index)
+                        .ok_or_else(|| {
+                            format!(
+                                "`{name}` {}: fewer than two bars to trade from {} to {}",
+                                i + 1,
+                                time_text(from),
+                                time_text(to)
+                            )
+                        })?;
+                    Ok(Window::new(kind, bars))
+                })
+                .collect()
+        };
+        let found = if args.get("windows").is_some() || args.get("control_windows").is_some() {
+            let mut windows = given("windows", Kind::Event)?;
+            windows.extend(given("control_windows", Kind::Control)?);
+            Windows {
+                windows,
+                ..Windows::default()
+            }
+        } else {
+            let level = |name: &str| match args.get(name).and_then(Value::as_str) {
+                None => Ok(None),
+                Some("high") => Ok(Some(Importance::High)),
+                Some("medium") => Ok(Some(Importance::Medium)),
+                Some(other) => Err(format!("`{name}`: `{other}` isn't medium or high")),
+            };
+            let importance = level("importance")?.unwrap_or(Importance::High);
+            let control_importance = level("control_importance")?;
+            if control_importance.is_some_and(|least| least > importance) {
+                return Err(
+                    "`control_importance` may be stricter than `importance` (medium with high events), not looser".into(),
+                );
+            }
+            let hours = |name: &str, default: u64, most: u64| -> Result<u32, String> {
+                let value = number(args, name, default);
+                if value > most {
+                    return Err(format!("`{name}`: at most {most}"));
+                }
+                Ok(value as u32)
+            };
+            let choice = NewsChoice {
+                importance,
+                market_only: args
+                    .get("market_only")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                merge_hours: hours("merge_hours", 24, 24 * 90)?,
+                after_hours: hours("after_hours", 4, 24 * 90)?,
+                length_hours: hours("length_hours", 7 * 24, 24 * 366)?.max(1),
+                controls: args
+                    .get("controls")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize),
+                control_importance,
+                seed,
+            };
+            let symbol = args.get("symbol").and_then(Value::as_str).unwrap_or("");
+            let words = market_words(symbol);
+            let words: Vec<&str> = words.iter().map(String::as_str).collect();
+            let store = NewsStore::open(&self.paths.data);
+            let (first, last) = (
+                times.get(from_index).copied().unwrap_or(0),
+                times.last().copied().unwrap_or(0),
+            );
+            let gaps = store.gaps(first.saturating_sub(GAP * 45), last.saturating_add(1), GAP);
+            from_news(
+                &times,
+                from_index,
+                store.all(),
+                &words,
+                &gaps,
+                store.since(),
+                &choice,
+            )
+        };
+        if found.windows.is_empty() {
+            return Err(format!("No window to test. {}", found.warnings.join(" ")));
+        }
+        job.total.store(found.windows.len(), Ordering::Relaxed);
+        // On the bars whatever the precision, as the app does, to keep a batch quick.
+        request.ticks = None;
+        request.fill_bars = None;
+        let warm_up = settings_of(args)?.warm_up_bars as usize;
+        let look_back = stretch_look_back_warning(args, &request, warm_up);
+        let follow_move = match args.get("follow_move") {
+            None | Some(Value::Null) => None,
+            Some(follow) => {
+                let hours = follow
+                    .get("hours")
+                    .and_then(Value::as_u64)
+                    .filter(|hours| (1..=24 * 30).contains(hours))
+                    .ok_or("`follow_move.hours`: a whole number of hours, 1 to 720")?;
+                let threshold = follow
+                    .get("threshold_percent")
+                    .map_or(Some(0.0), Value::as_f64)
+                    .filter(|t| (0.0..=50.0).contains(t))
+                    .ok_or("`follow_move.threshold_percent`: a percentage, 0 to 50")?;
+                Some(FollowMove {
+                    hours: hours as u32,
+                    threshold: threshold / 100.0,
+                })
+            }
+        };
+        let study = StudyJob {
+            request,
+            candles,
+            windows: found,
+            warm_up,
+            workers,
+            stop: Arc::clone(&job.stop),
+            seed,
+            follow_move,
+        }
+        .run(&|done| job.done.store(done, Ordering::Relaxed))?;
+        // An empty group has no means: a 0 would read as a flat result.
+        let group = |group: &persephone_research::event_study::Group| {
+            let some = |value: f64| (group.windows > 0).then_some(value);
+            json!({
+                "windows": group.windows,
+                "traded": group.traded,
+                "mean_return": some(group.mean_return),
+                "mean_holding_return": some(group.mean_holding),
+                "mean_excess_return": some(group.mean_excess),
+                "profitable": some(group.profitable),
+            })
+        };
+        let total = study.windows.len();
+        let rows: Vec<Value> = study
+            .windows
+            .iter()
+            .take(limit_of(args, 200))
+            .map(|w| {
+                json!([
+                    w.kind.label(),
+                    time_text(w.from),
+                    time_text(w.to),
+                    time_text(w.last_bar),
+                    w.event.as_ref().map(|(at, _)| time_text(*at)),
+                    w.event.as_ref().map(|(_, title)| title),
+                    way_label(w.way),
+                    w.moved,
+                    w.return_,
+                    w.holding,
+                    w.trades,
+                    w.open_at_end,
+                ])
+            })
+            .collect();
+        let mut warnings = study.warnings;
+        warnings.extend(look_back);
+        Ok(json!({
+            "events": group(&study.events),
+            "controls": group(&study.controls),
+            "difference": study.difference,
+            "p_value": study.p_value,
+            "excess_difference": study.excess_difference,
+            "excess_p_value": study.excess_p_value,
+            "headlines": (study.headlines > 0).then_some(study.headlines),
+            "window_columns": ["kind", "from", "to", "last_bar", "event", "headline", "way", "move", "return", "holding_return", "trades", "open_at_end_return"],
+            "window_rows": rows,
+            "total": total,
+            "warnings": warnings,
         }))
     }
 

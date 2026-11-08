@@ -289,6 +289,13 @@ impl Lab {
                 return Err(format!("`importance`: `{other}` isn't low, medium or high"));
             }
         };
+        let market_only = args
+            .get("market_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if market_only && words.is_empty() {
+            return Err("`market_only` needs `symbol`, the market they should name".into());
+        }
         let store = NewsStore::open(&self.paths.data);
         let found: Vec<_> = store
             .between(from, to)
@@ -300,30 +307,55 @@ impl Lab {
                     .is_none_or(|q| h.title.to_lowercase().contains(q))
             })
             .filter(|h| h.importance(&words) >= least)
+            .filter(|h| !market_only || h.names_market(&words))
             .collect();
-        let mut page = crate::tools::page_of(
-            &["ts", "time", "source", "title", "importance", "link"],
-            found.len(),
-            args,
-            DEFAULT_ROWS,
-            |i| {
-                let h = found[i];
-                let importance = match h.importance(&words) {
-                    Importance::High => "high",
-                    Importance::Medium => "medium",
-                    Importance::Low => "low",
-                };
-                json!([
-                    h.published,
-                    crate::time_text(h.published),
-                    h.source,
-                    h.title,
-                    importance,
-                    h.link
-                ])
-            },
-        );
+        let named = !words.is_empty();
+        let columns: &[&str] = if named {
+            &[
+                "ts",
+                "time",
+                "source",
+                "title",
+                "importance",
+                "link",
+                "names_market",
+            ]
+        } else {
+            &["ts", "time", "source", "title", "importance", "link"]
+        };
+        let mut page = crate::tools::page_of(columns, found.len(), args, DEFAULT_ROWS, |i| {
+            let h = found[i];
+            let importance = match h.importance(&words) {
+                Importance::High => "high",
+                Importance::Medium => "medium",
+                Importance::Low => "low",
+            };
+            let mut row = json!([
+                h.published,
+                crate::time_text(h.published),
+                h.source,
+                h.title,
+                importance,
+                h.link
+            ]);
+            if named && let Some(row) = row.as_array_mut() {
+                row.push(json!(h.names_market(&words)));
+            }
+            row
+        });
         page["collected_since"] = json!(store.since().map(crate::time_text));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| {
+                UnixNanos::try_from(d.as_nanos()).unwrap_or(UnixNanos::MAX)
+            });
+        page["gaps"] = json!(
+            store
+                .gaps(from, to.min(now), persephone_data::news::GAP)
+                .iter()
+                .map(|&(from, to)| json!({"from": crate::time_text(from), "to": crate::time_text(to)}))
+                .collect::<Vec<_>>()
+        );
         Ok(page)
     }
 

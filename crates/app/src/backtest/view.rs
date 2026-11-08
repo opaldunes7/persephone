@@ -17,6 +17,7 @@ use super::{
     NO_VARIABLE, OneWay, OptimizeRun, Panel, PanelMessage, PortfolioView, Precision, RunColumn,
     ScoreBy, Settings, StrategyChoice, TestKind, TestRun, VaryChoice,
     calendar::{Calendar, Level, Total, days_in_month, weeks},
+    event_study::{EventStudy, Group, Kind},
     optimize::{OptimizeResult, Outcome},
     portfolio::{PortfolioRun, SavedPortfolio},
     portfolio_tests::{PortfolioMonteCarlo, SweepRow, Vary},
@@ -975,6 +976,50 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
                 note = Some(muted(
                     "Press Run to place this backtest's trades at random.".to_owned(),
                 ));
+                Space::new().width(Fill).height(Fill).into()
+            }
+        },
+        (Status::Done(_), TestKind::NewsWindows) => match &panel.tests.news_windows {
+            TestRun::Done(study) => {
+                heading = heading
+                    .push(figure(
+                        "After news",
+                        percent(study.events.mean_return),
+                        up_or_down(study.events.mean_return),
+                        "The strategy's mean return over the windows after news.",
+                    ))
+                    .push(figure(
+                        "Quiet",
+                        percent(study.controls.mean_return),
+                        up_or_down(study.controls.mean_return),
+                        "Its mean return over as long windows with no such news.",
+                    ))
+                    .push(figure(
+                        "p",
+                        study.p_value.map_or_else(|| "–".to_owned(), |p| format!("{p:.3}")),
+                        theme::TEXT,
+                        "How often shuffling which windows are news gives a difference at least as big. Under 0.05, the news likely matters.",
+                    ));
+                news_windows_pane(study)
+            }
+            TestRun::Running { done, total, .. } => {
+                note = Some(muted(format!("Backtesting window {done} of {total}…")));
+                Space::new().width(Fill).height(Fill).into()
+            }
+            TestRun::Failed(message) => {
+                note = Some(
+                    text(message.as_str())
+                        .size(theme::TEXT_SIZE)
+                        .color(theme::DOWN),
+                );
+                Space::new().width(Fill).height(Fill).into()
+            }
+            TestRun::Idle => {
+                if info.problem.is_none() {
+                    note = Some(muted(
+                        "Press Run to backtest the window after each headline the news sidebar collected, and as many quiet ones.".to_owned(),
+                    ));
+                }
                 Space::new().width(Fill).height(Fill).into()
             }
         },

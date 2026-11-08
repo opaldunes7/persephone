@@ -176,7 +176,7 @@ fn trades<'a>(
     }
     let total = ledger.rows.len();
     let said = if total == 0 {
-        "It made no trades.".to_owned()
+        persephone_research::figures::NO_TRADES.to_owned()
     } else if total > MOST_ROWS {
         format!(
             "The first {MOST_ROWS} of {total} trades, {:+.2} {quote} in all. Click one to follow it.",

@@ -463,6 +463,73 @@ pub fn profit_factor(report: &BacktestReport) -> Option<f64> {
     (losses > 0.0).then(|| gains / losses)
 }
 
+/// A trade still open when the run ended: valued at the last close, with no exit fee or
+/// slippage, so its profit isn't one the strategy took.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OpenAtEnd {
+    pub long: bool,
+    /// Bars from the close that opened it to the last.
+    pub bars_held: usize,
+    /// Its profit at the last close, in the quote currency.
+    pub profit: f64,
+    /// That profit over the starting capital: its part of the run's return.
+    pub return_: f64,
+    /// Its profit over the run's whole profit, by size: 1 when it's all of it.
+    pub share: f64,
+}
+
+/// The trade still open at the end of `report`, if there is one.
+#[must_use]
+pub fn open_at_end(report: &BacktestReport) -> Option<OpenAtEnd> {
+    let trades = round_trips(report);
+    let open = trades.last().filter(|t| t.open)?;
+    let whole: f64 = trades.iter().map(|t| t.profit).sum();
+    let share = if whole.abs() > f64::EPSILON {
+        (open.profit / whole).abs()
+    } else {
+        1.0
+    };
+    Some(OpenAtEnd {
+        long: open.long,
+        bars_held: open.exit_bar.saturating_sub(open.entry_bar),
+        profit: open.profit,
+        return_: open.profit / report.starting_balance,
+        share,
+    })
+}
+
+impl OpenAtEnd {
+    /// Said when the open trade is a third of the result or more, which is then partly a mark,
+    /// not a trade.
+    #[must_use]
+    pub fn warning(&self) -> Option<String> {
+        (self.share >= 1.0 / 3.0 && self.profit.abs() > f64::EPSILON).then(|| {
+            format!(
+                "A {} still open at the end, after {} bars, is {:.0}% of the result: it's valued at the last close with no exit fee or slippage. Set `close_at_end` to close it with costs.",
+                if self.long { "long" } else { "short" },
+                self.bars_held,
+                (self.share * 100.0).min(999.0)
+            )
+        })
+    }
+}
+
+/// Why a run made no trades, when its look-back can't explain it.
+pub const NO_TRADES: &str = "It made no trades: its entry rules never came true over the span.";
+
+/// Why a run made no trades: a look-back longer than the `before` bars warmed up on keeps rules
+/// on it false for a while, and otherwise the entry rules just never came true.
+#[must_use]
+pub fn no_trades_warning(look_back: usize, before: usize) -> String {
+    if look_back > before {
+        format!(
+            "It made no trades. A look-back here needs about {look_back} bars, with {before} warmed up on before the span, so rules on it are false until that far in; raise `warm_up_bars` if that's why."
+        )
+    } else {
+        NO_TRADES.to_owned()
+    }
+}
+
 /// Said when a logic tree's rules can't be true for at least 5% of the span, which trades or not is
 /// easy to miss, as a rule that isn't ready is just false. Less is usual and not worth saying.
 #[must_use]

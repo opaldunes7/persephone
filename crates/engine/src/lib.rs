@@ -320,6 +320,7 @@ pub fn run_backtest(request: &BacktestRequest) -> Result<BacktestReport, EngineE
         .participating(request.sim.max_participation_percent)
         .trailing(request.sim.trailing_stop_percent)
         .logging_decisions(request.sim.decision_log)
+        .closing_at_end(request.sim.close_at_end, request.sim.next_open)
         .slipping(Arc::new(range_costs))
         .compounding(request.sim.compound.then_some(request.starting_balance)),
     )?;

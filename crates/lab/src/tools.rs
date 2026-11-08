@@ -1,6 +1,10 @@
 //! The list of tools, and the one place every way into Lab calls them through.
 
-use std::{fs::OpenOptions, io::Write as _, sync::Arc};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write as _,
+    sync::Arc,
+};
 
 use serde_json::{Map, Value, json};
 
@@ -57,6 +61,8 @@ impl Tool {
                 json!(["string", "integer"])
             } else if arg.kind == "list_or_path" {
                 json!(["array", "string"])
+            } else if arg.kind == "object_or_path" {
+                json!(["object", "string"])
             } else if arg.kind == "list" {
                 json!("array")
             } else {
@@ -110,6 +116,7 @@ fn settings_schema() -> Value {
         ),
         "stop_loss_percent": section(number.clone(), "A stop this far from the entry, resting from the bar after it."),
         "trailing_stop_percent": section(number.clone(), "A real stop this far from the best price since entry, moved at each close, so it only tightens. With stop_loss_percent too, whichever is nearer goes first."),
+        "close_at_end": {"type": "boolean", "description": "Close whatever's still open on the last bar a fill can happen, paying fees and slippage: the last close, or with next_open the last bar's open. Off by default, when an open trade is valued at the last close with no exit cost; each run's summary says how much of its result that was, as open_at_end. Single markets only, for now."},
         "decision_log": {"type": "boolean", "description": "Keep a row for each bar, read with get_decisions: what was asked, what was held, what the rules made of it, and why no order went out. Off by default, as it's large."},
         "take_profit_percent": section(number.clone(), "A target this far from the entry, resting from the bar after it."),
         "borrow_percent_per_year": section(number.clone(), "What borrowing costs a short, as a percentage of its value a year."),
@@ -202,8 +209,8 @@ const LIMIT: Arg = opt(
 );
 const STRATEGY: Arg = arg(
     "strategy",
-    "object",
-    "{\"builtin\": \"ema-cross\"}, {\"plugin\": \"id\"}, {\"logic\": {...tree...}} or {\"positions\": [[ts, 1], [ts, 0]]} (or a JSON file's path), each with optional \"params\": {\"name\": value}.",
+    "object_or_path",
+    "{\"builtin\": \"ema-cross\"}, {\"plugin\": \"id\"}, {\"logic\": {...tree...}} or {\"positions\": [[ts, 1], [ts, 0]]}, each with optional \"params\": {\"name\": value}. A JSON file's path works for the whole strategy, for a logic tree alone (as if under `logic`), or in place of the tree or the positions list.",
 );
 const SETTINGS: Arg = opt(
     "settings",
@@ -228,7 +235,7 @@ fn walk_args() -> Vec<Arg> {
     let mut args = test_args();
     args[0] = opt(
         "strategy",
-        "object",
+        "object_or_path",
         "As run_backtest takes. Not needed with `candidates`, which give the strategies instead.",
     );
     args
@@ -307,7 +314,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         tool(
             "get_news",
-            "Headlines the app has collected from public feeds, newest first, in pages: when each was published, its source, title, how much it may matter, and its link. Only from when the app started collecting (`collected_since`); feeds keep their last few dozen items only, so older spans have none. Times are when each was published, not when the news broke.",
+            "Headlines the app has collected from public feeds, newest first, in pages: when each was published, its source, title, how much it may matter, and its link. High means market-moving words (rates, inflation, regulators, hacks, failures), whatever the market: it doesn't depend on `symbol`. A regulator's own release is high only for what it's about, not for who issued it. `gaps` lists stretches of two days or more in the span with no headline from any feed: there, none means nothing was collected, not that nothing happened. Feeds keep their last few dozen items only, so `collected_since` is when collecting began, not proof of what's covered since. Times are when each was published, not when the news broke.",
             vec![
                 opt("from", "time", "Start, in UTC."),
                 opt("to", "time", "End (not included), in UTC."),
@@ -315,17 +322,29 @@ pub fn tools() -> Vec<Tool> {
                 opt(
                     "symbol",
                     "string",
-                    "The market they're judged against: one naming it is at least medium.",
+                    "The market they're judged against: one naming it is at least medium, and `names_market` says which do.",
                 ),
                 opt(
                     "importance",
                     "string",
                     "The least: low (all, the default), medium or high.",
                 ),
+                opt(
+                    "market_only",
+                    "boolean",
+                    "With `symbol`: only those naming the market, so high means high for it. Default false.",
+                ),
                 CURSOR,
                 LIMIT,
             ],
-            &["columns", "rows", "next_cursor", "total", "collected_since"],
+            &[
+                "columns",
+                "rows",
+                "next_cursor",
+                "total",
+                "collected_since",
+                "gaps",
+            ],
         ),
         tool(
             "get_history_range",
@@ -701,7 +720,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         job(
             "run_backtests",
-            "Many backtests in one call, in parallel: much quicker for an agent than one call each. Every run is saved, so all the tools that take a run_id work on them. One that fails doesn't stop the rest.",
+            "Many backtests in one call, in parallel: much quicker for an agent than one call each. Every run is saved, so all the tools that take a run_id work on them. One that fails doesn't stop the rest. Each row says which run it is (`index` in `runs`, `symbol`, `bars`, `first_bar`, `last_bar`); run ids are given as runs finish, so they don't follow `index`. `open_at_end_return` is the part of a return from a trade still open at the end, valued at the last close. For windows after events against windows without, run_event_study counts them as one test, where this counts every run as a variant.",
             vec![
                 arg(
                     "runs",
@@ -718,10 +737,11 @@ pub fn tools() -> Vec<Tool> {
                     "integer",
                     "How many variants you've tried in all, counting every setting, rule, span and market before this call as well as the runs in it. The deflated Sharpe ratio counts the larger of this and the runs here, and `variants_tried` says which. Default: the runs here.",
                 ),
+                opt("limit", "integer", "How many runs to list. Default 100."),
                 opt(
-                    "limit",
-                    "integer",
-                    "How many runs to list, best return first. Default 100.",
+                    "order",
+                    "string",
+                    "best (best return first, the default) or given (the order of `runs`).",
                 ),
             ],
             &[
@@ -813,6 +833,84 @@ pub fn tools() -> Vec<Tool> {
                 "median_buy_and_hold",
                 "warning",
                 "worst_dates",
+            ],
+        ),
+        job(
+            "run_event_study",
+            "Whether news makes a strategy do better: it's backtested on the window after each news event and on as many control windows with no such news, each warmed up on the bars before it, and the two groups' mean returns compared with a permutation p-value (10,000 shuffles of which windows are events). One study is one test: its windows are its sample, not variants tried. An event is a headline at `importance` or above, for `symbol`, with those within `merge_hours` of it; its window starts `after_hours` after it and lasts `length_hours`. A control window is as long, at a random bar from `seed`, with no such headline in it or in the `after_hours` before it, overlapping no other window and outside gaps in the news, where nothing's known. Or give the windows yourself as `windows` and `control_windows`. Returns are fractions of the capital; `holding_return` is the market's over the same bars, after funding on a perpetual. A row's `from` and `to` are what run_backtest takes for the same bars (`to` is the end of the last bar, exclusive); `last_bar` is that bar's open. With either group empty, `difference` and the group's means are null.",
+            with(
+                test_args(),
+                &[
+                    opt(
+                        "importance",
+                        "string",
+                        "high (the default) or medium. High is market-wide: rates, regulators, hacks, whatever the market. Medium adds headlines naming the market.",
+                    ),
+                    opt(
+                        "market_only",
+                        "boolean",
+                        "Only headlines that name the market.",
+                    ),
+                    opt(
+                        "merge_hours",
+                        "integer",
+                        "Headlines this close to an event's first are part of it. Default 24.",
+                    ),
+                    opt(
+                        "after_hours",
+                        "integer",
+                        "Hours from the event to its window's start. Default 4.",
+                    ),
+                    opt(
+                        "length_hours",
+                        "integer",
+                        "How long each window is, in hours. Default 168, a week.",
+                    ),
+                    opt(
+                        "controls",
+                        "integer",
+                        "How many control windows. Default as many as there are events.",
+                    ),
+                    opt(
+                        "control_importance",
+                        "string",
+                        "medium or high: the least a headline must be to keep a control window out. Default `importance`; medium with high events makes quiet stricter.",
+                    ),
+                    opt(
+                        "follow_move",
+                        "object",
+                        "{\"hours\": 4, \"threshold_percent\": 0.5}: each window, event or control, trades only the way the market moved over the `hours` before it starts: long only above +threshold, short only below -threshold, either way between. With `after_hours` as `hours`, that's the move just after the event. Rows give `way` and `move`. Turn the direction setting off to use it.",
+                    ),
+                    opt(
+                        "seed",
+                        "integer",
+                        "The same seed gives the same control windows and p-values. Default 0.",
+                    ),
+                    opt(
+                        "windows",
+                        "array",
+                        "Event windows to use instead of news, as a list of {from, to} times.",
+                    ),
+                    opt(
+                        "control_windows",
+                        "array",
+                        "Control windows to use with `windows`, as a list of {from, to} times.",
+                    ),
+                    opt("limit", "integer", "How many windows to list. Default 200."),
+                ],
+            ),
+            &[
+                "events",
+                "controls",
+                "difference",
+                "p_value",
+                "excess_difference",
+                "excess_p_value",
+                "headlines",
+                "window_columns",
+                "window_rows",
+                "total",
+                "warnings",
             ],
         ),
         job(
@@ -1291,6 +1389,7 @@ pub(crate) fn check_args(tool: &Tool, args: &Value) -> Result<(), String> {
             "object" => value.is_object(),
             "array" => value.is_array(),
             "list_or_path" => value.is_array() || value.is_string(),
+            "object_or_path" => value.is_object() || value.is_string(),
             "list" => value.is_array(),
             _ => value.is_string() || value.is_u64(),
         };
@@ -1324,6 +1423,9 @@ impl Lab {
             )
         })?;
         check_args(tool, args)?;
+        let mut args = args.clone();
+        read_strategy_paths(&mut args)?;
+        let args = &args;
         // A portfolio's run has no one market's trades, and an empty answer would read as none made.
         if let Some(id) = args.get("run_id").and_then(Value::as_str)
             && !name.starts_with("get_portfolio")
@@ -1395,6 +1497,7 @@ impl Lab {
                     "run_portfolio_walk_forward" => lab.run_portfolio_walk_forward(&owned, job),
                     "run_monte_carlo" => lab.run_monte_carlo(&owned, job),
                     "run_random_blocks" => lab.run_random_blocks(&owned, job),
+                    "run_event_study" => lab.run_event_study(&owned, job),
                     "run_optimize" => lab.run_optimize(&owned, job),
                     "run_walk_forward" => lab.run_walk_forward(&owned, job),
                     "run_random_entries" => lab.run_random_entries(&owned, job),
@@ -1493,6 +1596,80 @@ fn merged(shared: &Value, own: &Value, depth: usize) -> Value {
 
 /// The keys that say which strategy it is.
 const STRATEGY_KINDS: [&str; 4] = ["builtin", "plugin", "logic", "positions"];
+
+/// Reads in every strategy a call gives as a JSON file's path, and every logic tree given as one,
+/// wherever a strategy goes: `strategy`, a batch's `defaults` and `runs`, `candidates` and a
+/// portfolio's `legs`. So every tool takes a path wherever it takes a strategy.
+///
+/// # Errors
+///
+/// Returns a message if a file can't be read or isn't JSON.
+pub(crate) fn read_strategy_paths(args: &mut Value) -> Result<(), String> {
+    if let Some(strategy) = args.get_mut("strategy") {
+        read_strategy(strategy, "strategy")?;
+    }
+    if let Some(strategy) = args
+        .get_mut("defaults")
+        .and_then(|defaults| defaults.get_mut("strategy"))
+    {
+        read_strategy(strategy, "defaults.strategy")?;
+    }
+    for list in ["runs", "legs"] {
+        if let Some(items) = args.get_mut(list).and_then(Value::as_array_mut) {
+            for (i, item) in items.iter_mut().enumerate() {
+                if let Some(strategy) = item.get_mut("strategy") {
+                    read_strategy(strategy, &format!("{list} {}: strategy", i + 1))?;
+                }
+            }
+        }
+    }
+    if let Some(items) = args.get_mut("candidates").and_then(Value::as_array_mut) {
+        for (i, item) in items.iter_mut().enumerate() {
+            let at = format!("candidates {}", i + 1);
+            if item.get("label").is_some()
+                && let Some(strategy) = item.get_mut("strategy")
+            {
+                read_strategy(strategy, &at)?;
+            } else {
+                read_strategy(item, &at)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One strategy, read from its file if it's a path, with a logic tree given as a path read too.
+/// A file holding a logic tree alone (`long`, `short`, `flat`) is taken as that strategy's tree.
+pub(crate) fn read_strategy(value: &mut Value, at: &str) -> Result<(), String> {
+    let read = |path: &str| -> Result<Value, String> {
+        let text =
+            fs::read_to_string(path).map_err(|e| format!("`{at}`: couldn't read {path}: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("`{at}`: {path} isn't JSON: {e}"))
+    };
+    if let Some(path) = value.as_str() {
+        let mut read_in = read(path)?;
+        let is_tree = read_in.as_object().is_some_and(|object| {
+            !object
+                .keys()
+                .any(|key| STRATEGY_KINDS.contains(&key.as_str()))
+                && ["long", "short", "flat"]
+                    .iter()
+                    .any(|key| object.contains_key(*key))
+        });
+        if is_tree {
+            read_in = json!({"logic": read_in});
+        }
+        *value = read_in;
+    }
+    if let Some(path) = value
+        .get("logic")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    {
+        value["logic"] = read(&path)?;
+    }
+    Ok(())
+}
 
 fn merged_strategy(shared: &Value, own: &Value) -> Value {
     let (Some(shared), Some(own_object)) = (shared.as_object(), own.as_object()) else {

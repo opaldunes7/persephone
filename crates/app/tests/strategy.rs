@@ -1428,6 +1428,36 @@ mod panel {
     }
 
     #[test]
+    fn close_at_the_end_is_an_exit_that_reaches_the_backtest() {
+        use persephone::backtest::Chapter;
+        let mut app = ready_panel(TestKind::Backtest);
+        assert!(!shows(&app, "Close at the end"));
+        panel(&mut app, PanelMessage::Chapter(Chapter::Exits, true));
+        assert!(shows(&app, "Close at the end"));
+        let (_, request) = app.backtest_request(0).unwrap();
+        assert!(!request.sim.close_at_end, "off by default");
+        panel(&mut app, PanelMessage::Edit(Edit::CloseAtEnd(true)));
+        assert!(app.tile_backtest(0).unwrap().close_at_end);
+        assert!(shows(&app, "1 on"), "the heading counts it");
+        let (_, request) = app.backtest_request(0).unwrap();
+        assert!(request.sim.close_at_end);
+        // Whatever was open at the end is sold, so the run ends flat.
+        finish_backtest(&mut app);
+        let Run::Done(report) = run_state(&app) else {
+            panic!("a finished backtest");
+        };
+        let held: f64 = report
+            .fills
+            .iter()
+            .map(|f| match f.side {
+                persephone_core::Side::Buy => f.qty,
+                persephone_core::Side::Sell => -f.qty,
+            })
+            .sum();
+        assert!(held.abs() < 1e-9, "{held}");
+    }
+
+    #[test]
     fn random_blocks_runs_by_itself_like_monte_carlo() {
         let mut app = app();
         set_strategy(&mut app, BuiltInStrategy::EmaCross);

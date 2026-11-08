@@ -112,7 +112,9 @@ How a backtest works, which decides what its numbers mean.
 
 
 A strategy is `{"builtin": id}`, `{"plugin": id}`, `{"logic": tree}` or `{"positions": list}`, each with optional
-`"params"`.
+`"params"`. Anywhere a strategy goes, including a batch's `defaults` and `runs`, `candidates` and a portfolio's `legs`,
+a JSON file's path works in its place: a file holding a whole strategy, or a logic tree alone, taken as `logic`. So does
+a path in place of the tree or the positions list, as `{"logic": "rules.json", "params": {"Size %": 100}}`.
 `list_strategies` lists them, and `describe_strategy` gives one's parameters and limits.
 
 ## portfolios
@@ -291,6 +293,7 @@ an error.
 | `limit` | `{"offset_percent": 0.05, "expires_bars": 3, "through_percent": 0.01}`: send orders as limits, `through_percent` being optional. See `backtests` |
 | `stop_loss_percent` | A real stop this far from the entry |
 | `trailing_stop_percent` | A real stop this far from the best price since entry, moved at each close. With `stop_loss_percent` too, whichever is nearer goes first. See `backtests` |
+| `close_at_end` | `true` closes whatever's still open on the last bar a fill can happen, paying fees and slippage: the last bar's close, or with `next_open` the last bar's open. Off, an open trade is valued at the last close with no exit cost, and `open_at_end` in the summary says how much of the result that is. Single markets only, for now |
 | `decision_log` | `true` keeps a row for each bar, read with `get_decisions`: what was asked, what was held, what the rules made of it, and why no order went out. A stop or target filling between closes gets a row of its own with the size it filled, saying whether the stop was the trailing one |
 | `take_profit_percent` | A real target this far from the entry |
 | `borrow_percent_per_year` | What borrowing costs a short |
@@ -324,7 +327,7 @@ an error.
 | `session` | When positions may open: `days` from Monday, `from` and `to` in minutes after midnight, `zone` as `UTC`, `-05:00` or `America/New_York`, and `close_after` to close when it ends. Outside it a signal can close a position, but not open or reverse one. An end before its start runs overnight, and equal times are all day |
 | `precision` | `"standard"`, or `"high"` to fill on ticks or 1-minute bars. Slower |
 
-The panel's own choices, `test`, `runs`, `ruin`, `blocks`, `block_length`, `windows`, `entries`, `optimize`,
+The panel's own choices, `test`, `runs`, `ruin`, `blocks`, `block_length`, `windows`, `entries`, `news`, `optimize`,
 `plugins` and `stock_open`, are accepted and ignored here. Tests take their own arguments instead.
 
 ## units
@@ -348,7 +351,13 @@ What every number means, the same everywhere.
   shrink later positions. A run with costs takes twice as long, so `friction: false` leaves these out for huge
   batches. A plugin that doesn't repeat itself may differ between the two runs.
 - **`benchmark`** has `return`, `sharpe` and `max_drawdown` for buying at the first close that could trade and holding to
-  the end, with no costs. `return` is the same as `buy_and_hold_return`.
+  the end, with no costs. `return` is the same as `buy_and_hold_return`, and `return_after_funding` takes off what a
+  perpetual's funding would have cost a long held that long.
+- **`open_at_end`** is the trade still open when a run ends, if one is: its `side`, `bars_held`, `profit`, `return` (that
+  profit as a fraction of the capital) and `share_of_result`. It's valued at the last close with no exit cost, and
+  `warnings` says when it's a third or more of the result. `close_at_end` closes it instead, paying its costs.
+- **"It made no trades"** in `warnings` says why: if a logic tree looks back further than the bars warmed up on, it
+  says so; otherwise its entry rules never came true over the span.
 - **`limit_orders`, `limits_filled` and `fill_rate`** say how limits went, and `maker` in `get_fills` which fills rested.
   **`limit_summary`** has how far the market then moved each order's way, on average, as percentages: `filled_move_1` and `missed_move_1`
   a bar on, the same with `_24` for 24 bars on, and `barely_filled`, how many fills went under a hundredth of a percent past their price.
@@ -367,6 +376,13 @@ What every number means, the same everywhere.
   none before `collected_since`, unless the app's **Older headlines** has fetched earlier ones from GDELT's
   archive for a chart's span (their `source` is the site's domain). A headline's time is when it was published, which can be after the news broke, so don't
   treat it as a signal to the second.
+  - **Importance:** `high` is market-wide: rates, inflation, regulators, hacks and failures, whatever the `symbol`.
+    `medium` names the market. A regulator's or central bank's own release is high only for what it's about (policy,
+    rates, statements, crypto, enforcement), so a routine one, such as approving a bank's application, is low.
+  - **With `symbol`,** each row has `names_market`, and `market_only: true` keeps only those that name it.
+  - **`gaps`** lists stretches of two days or more in the span with no headline from any feed: nothing was collected
+    then. `collected_since` is only the first headline, not a promise that everything after it is there, so a quiet
+    stretch in a gap isn't a quiet market.
 - **`fills_on`** in a summary says how orders filled: `bars`, `ticks`, `minute_bars` or `next_open`.
 - **`get_equity`'s `market`** is the app's market line: what holding the market with a position the run's size would be
   worth, from the first close that could trade. It's null on runs saved before it was added.
@@ -442,7 +458,11 @@ parallel and answers in one table, best return first, which saves a model turn f
 Each run's own arguments override `defaults`, key by key in `settings`: a run giving only `slippage_percent`
 keeps the defaults' `commission`. Its `strategy` merges its `params` with the defaults' when it's the same
 strategy or names none, and a different strategy keeps the defaults' `Size %`, so no run quietly falls to the
-10% default. If the runs still trade different `Size %`, `warnings` names which. `index` in a row is the run's place in your list. One that fails
+10% default. If the runs still trade different `Size %`, `warnings` names which. `index` in a row is the run's place in your list, and
+`symbol`, `bars`, `first_bar` and `last_bar` say which market and bars it ran on. `order: "given"` lists rows in your
+list's order instead of best first; run ids are handed out as runs finish, so don't read order from them. Each row also
+has `return_after_funding`, holding's return less a perpetual's funding, and `open_at_end_return`, what a trade still
+open at the end makes of its return. One that fails
 doesn't stop the others: `error` says why, and `failed` and `first_error` report it. It lists 100 unless
 `limit` says otherwise, and all are saved, so `get_report`, `get_trades` and the rest work on any `run_id`.
 
@@ -538,8 +558,54 @@ deepest fall. On its own it doesn't allow for how many strategies you tried befo
 `share_matching_adjusted` is the chance that at least one of that many worthless tries would have done as well: 3% after 11
 tries is 28%. `run_shifted` takes it too.
 
+Whether news matters is `run_event_study`'s question: see the `event-study` topic.
+
 Give any backtest a `label` to keep experiments apart. `list_runs` finds and sorts them, with
 `{"label": "my-idea", "sort": "sharpe"}`, by any summary figure.
+
+## event-study
+
+Whether a strategy does better after news than without it. `run_event_study` backtests it on the window after each
+news event and on as many control windows with no such news, and compares the two groups.
+
+```json
+{"tool": "run_event_study", "args": {
+  "symbol": "BTCUSDT", "bars": "1h", "from": "2024-01-01", "to": "2024-04-01",
+  "strategy": {"builtin": "ema-cross"}, "settings": {"fill_timing": "next_open"},
+  "windows": [{"from": "2024-01-10", "to": "2024-01-17"}, {"from": "2024-02-12", "to": "2024-02-19"}],
+  "control_windows": [{"from": "2024-01-22", "to": "2024-01-29"}, {"from": "2024-03-04", "to": "2024-03-11"}]
+}}
+```
+
+That call gives the windows itself. Leave `windows` out and they come from the news the app collected:
+`{"importance": "high", "merge_hours": 24, "after_hours": 4, "length_hours": 168, "seed": 1}` are the defaults.
+
+- **Events:** each headline at `importance` or above (`high`, or `medium` to add those naming the market), with
+  `market_only: true` for only those that name it. Headlines within `merge_hours` of an event's first are part of it.
+- **Windows:** each starts `after_hours` after its event's first headline and lasts `length_hours`. One that runs past
+  the last bar is left out, and `warnings` says how many.
+- **Controls:** `controls` of them, as many as there are events unless given, as long, at bars picked with `seed`. None
+  has such a headline in it or in the `after_hours` before it, overlaps another window, or touches a gap in the news, as
+  nothing's known there. `control_importance: "medium"` with high events keeps them clear of medium headlines too.
+  `warnings` says if fewer could be found, and for how many days of the span the news is known.
+- **Which way:** `follow_move: {"hours": 4, "threshold_percent": 0.5}` trades each window only the way the market moved
+  over the `hours` before it starts: long only after a rise above the threshold, short only after a fall below it, and
+  either way between. Control windows get theirs the same way, from the hours before them. With `hours` the same as
+  `after_hours`, an event's is the move just after it, known before its window trades. Turn the direction setting off
+  to use it. Rows give each window's `way` and `move`.
+- **Each window** is backtested alone, warmed up on the bars before it, with the call's settings and costs.
+  `window_rows` has each one's `kind`, `from` and `to`, `last_bar`, event, `way` and `move`, `return`,
+  `holding_return` (the market's, after a perpetual's funding), `trades` and `open_at_end_return`. A row's `from` and
+  `to` are what run_backtest takes for the same bars, so `to` is the end of the last bar; `last_bar` is that bar's
+  open.
+- **The answer:** `events` and `controls` each have their `windows`, how many `traded`, `mean_return`,
+  `mean_holding_return`, `mean_excess_return` (over holding) and the share `profitable`. `difference` is the events'
+  mean return less the controls', and `p_value` how often 10,000 shuffles of which windows are events give a
+  difference at least as big either way: under 0.05 is evidence the news matters. `excess_difference` and
+  `excess_p_value` are the same for returns over holding. With either group empty there's nothing to compare: the
+  differences, the p-values and that group's means are null.
+- **It's one test,** however many windows it has: they're its sample, not variants tried. Under 10 windows in a group,
+  `warnings` says the p-value means little. Event windows that overlap aren't independent, and `warnings` says so.
 
 ## jobs
 
@@ -637,6 +703,7 @@ imports. API keys, what AI models a plugin may use, plugins' code and market dat
 | Optimize: the best, and what they did unseen | `top`, `on_edge`, `held_out_buy_and_hold` |
 | Walk-forward: chart and table | `run_walk_forward`'s `chart` and `windows` |
 | Random entries: both charts | `run_random_entries`' `return_chart` and `fall_chart` |
+| News windows: both groups, the p-value and the windows | `run_event_study`'s `events`, `controls`, `p_value` and `window_rows` |
 | Portfolio: figures and the table by market | `get_portfolio` |
 | Portfolio: the account and exposure charts | `get_portfolio_series` |
 | Portfolio: Sweep | `run_portfolios` |
