@@ -135,8 +135,15 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
     let settings = settings_section(&info);
     let test = info.settings.test;
     // The backtest plays back, on its own tab or while its tree is built.
-    let ready = matches!(test, TestKind::Backtest | TestKind::Build)
-        && matches!(info.status, Status::Done(_));
+    // In any other test, a trade picked in its drawer plays its run instead.
+    let trade_picked = !matches!(test, TestKind::Backtest | TestKind::Build)
+        && panel
+            .inspect
+            .as_ref()
+            .is_some_and(|inspection| inspection.picked.is_some());
+    let ready = (matches!(test, TestKind::Backtest | TestKind::Build)
+        && matches!(info.status, Status::Done(_)))
+        || trade_picked;
     let started = panel.playback.at.is_some();
 
     let play = if panel.playback.playing {
@@ -148,7 +155,9 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
             true,
         )
     } else {
-        let what = if started {
+        let what = if trade_picked {
+            "Play this run from the trade picked, bar by bar, on its chart"
+        } else if started {
             "Carry on playing the backtest"
         } else {
             "Play the backtest back bar by bar, on the chart too"
@@ -1270,7 +1279,7 @@ pub fn panel(info: PanelInfo<'_>) -> Element<'_, PanelMessage> {
     let pane: Element<'_, PanelMessage> = match &panel.inspect {
         Some(inspection) => row![
             container(pane).width(FillPortion(3)).height(Fill),
-            inspect_drawer(inspection, info.quote),
+            inspect_drawer(inspection, info.quote, panel.playback.at),
         ]
         .height(Fill)
         .into(),

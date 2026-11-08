@@ -311,6 +311,7 @@ an error.
 | `warm_up_bars` | How many bars before `from` strategies warm up on. Default 500. Raise it for longer look-backs |
 | `hold_out_percent` | How much of the span an optimization with `hold_out` picks on. Default 70 |
 | `walk_ratio` | How many times longer than its unseen stretch a walk-forward window picks on. Default 3. `train_ratio` on the call wins |
+| `chapters_off` | Chapters switched off as a whole, as the app's chapter switches do: any of `costs`, `orders`, `exits`, `position`, `hours`, `records`, `plugins`. Nothing in one applies, though each setting in it keeps its own `on` for when it's back. Default `[]` |
 | `no_costs` | `true` means nothing to pay at all: no fees, funding, slippage, spread, impact, borrowing or interest, whatever else says. Unlike `stock: false`, it takes off a market's own fees and funding |
 | `sweep_min`, `sweep_max`, `sweep_step` | What the app's Portfolio Sweep and Walk-forward go through. Calls to `run_portfolios` and `run_portfolio_walk_forward` give their own setups |
 | `portfolio_block_bars` | How long a block is in the app's Portfolio Monte Carlo. `block_bars` on `run_portfolio_monte_carlo` is the same for calls |

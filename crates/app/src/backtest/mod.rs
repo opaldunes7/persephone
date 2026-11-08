@@ -34,8 +34,9 @@ pub use persephone_research::{
     Field, RunColumn, WARM_UP_BARS, calendar, event_study, figures, logic_draft, optimize,
     portfolio, portfolio_tests, positions, robustness,
     settings::{
-        self, BlockLength, Commission, Edit, FillTiming, OneWay, OptimizeSettings, Precision,
-        ScoreBy, Section, SessionRule, Settings, TestKind, Variable, parse_time, time_text,
+        self, BlockLength, Commission, Edit, FillTiming, Group, OneWay, OptimizeSettings,
+        Precision, ScoreBy, Section, SessionRule, Settings, TestKind, Variable, parse_time,
+        time_text,
     },
     thousands, trades, walk_forward,
 };
@@ -47,8 +48,8 @@ pub const DEFAULT_SHARE: f32 = 0.22;
 pub const MIN_HEIGHT: f32 = 190.0;
 /// The panel's draggable bottom edge.
 const EDGE_HEIGHT: f32 = 5.0;
-/// What the panel's pane takes around its content: the gap above it and its border.
-const PANE_FRAME: f32 = 10.0;
+/// What the panel's pane takes around its content: its border.
+const PANE_FRAME: f32 = 4.0;
 /// What the panel leaves the charts, however much it wants.
 const CHARTS_ROOM: f32 = 160.0;
 /// At Max speed, a whole span plays in this long.
@@ -93,6 +94,21 @@ impl Chapter {
             Self::Records => "Data & records",
             Self::Plugins => "Plugins",
         }
+    }
+
+    /// Its master switch's group, if it has one.
+    #[must_use]
+    pub fn group(self) -> Option<Group> {
+        Some(match self {
+            Self::TestOptions | Self::Markets | Self::Rebalancing => return None,
+            Self::Costs => Group::Costs,
+            Self::Orders => Group::Orders,
+            Self::Exits => Group::Exits,
+            Self::Position => Group::Position,
+            Self::Hours => Group::Hours,
+            Self::Records => Group::Records,
+            Self::Plugins => Group::Plugins,
+        })
     }
 
     /// How many of its switches are on, for its heading; `None` for one with none to count.
@@ -277,6 +293,70 @@ pub struct Inspection {
     pub picked: Option<usize>,
     /// Biggest profit first, rather than the order they opened.
     pub by_profit: bool,
+    /// The run itself, when it was found by running it again, to play back.
+    pub run: Option<Arc<InspectedRun>>,
+}
+
+/// A run's trades found again, and the run, to play back.
+pub type Found = (Arc<trades::Ledger>, Option<Arc<InspectedRun>>);
+
+/// What a run found again made along the way, to play it back: its account at each bar, and the
+/// span it traded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InspectedRun {
+    /// The account at each bar's close, by the bar's open.
+    pub equity: Vec<(UnixNanos, f64)>,
+    pub start: f64,
+    /// From its first traded bar's open to its last's.
+    pub span: (UnixNanos, UnixNanos),
+}
+
+impl InspectedRun {
+    /// A backtest's, over the bars it ran on, trading from `trade_from`.
+    #[must_use]
+    pub fn of_backtest(report: &BacktestReport, candles: &[Candle], trade_from: UnixNanos) -> Self {
+        let equity: Vec<(UnixNanos, f64)> = candles
+            .iter()
+            .zip(&report.equity)
+            .map(|(candle, &value)| (candle.ts, value))
+            .collect();
+        let first = equity
+            .iter()
+            .map(|(ts, _)| *ts)
+            .find(|ts| *ts >= trade_from)
+            .unwrap_or(trade_from);
+        let last = equity.last().map_or(first, |(ts, _)| *ts);
+        Self {
+            equity,
+            start: report.starting_balance,
+            span: (first, last),
+        }
+    }
+
+    /// A portfolio's account, on its shared timeline.
+    #[must_use]
+    pub fn of_portfolio(run: &portfolio::PortfolioRun) -> Self {
+        let equity: Vec<(UnixNanos, f64)> = run
+            .opens
+            .iter()
+            .copied()
+            .zip(run.report.equity.iter().copied())
+            .collect();
+        let first = run.opens.get(run.from_index).copied().unwrap_or(0);
+        let last = equity.last().map_or(first, |(ts, _)| *ts);
+        Self {
+            equity,
+            start: run.report.starting_balance,
+            span: (first, last),
+        }
+    }
+
+    /// The account as it was at the bar opening at `ts`, or the last before it.
+    #[must_use]
+    pub fn at(&self, ts: UnixNanos) -> Option<f64> {
+        let end = self.equity.partition_point(|(at, _)| *at <= ts);
+        end.checked_sub(1).map(|at| self.equity[at].1)
+    }
 }
 
 /// Where an inspection's trades have got to. Some are found by running that one run again.
@@ -297,6 +377,7 @@ impl Inspection {
             venues: Vec::new(),
             picked: None,
             by_profit: false,
+            run: None,
         }
     }
 

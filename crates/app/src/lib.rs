@@ -589,7 +589,7 @@ pub enum Message {
         Result<Arc<backtest::History>, String>,
     ),
     /// A run's trades, found again for the panel's inspection drawer.
-    Inspected(u64, Result<Arc<backtest::trades::Ledger>, String>),
+    Inspected(u64, Result<backtest::Found, String>),
     News(news::NewsMessage),
     Agents(agents::AgentsMessage),
     /// The window's close button: it closes once any agents' run has stopped.
@@ -4888,9 +4888,27 @@ impl Persephone {
             panel.timeline = Some(backtest::Timeline::new(data));
         }
         let timeline = panel.timeline.as_ref()?;
-        let from = timeline.first_from(tile.market.span.map_or(0, |(from, _)| from));
+        // A run found again in the drawer plays over the span it traded; the chart's own, its.
+        let run_span = panel
+            .inspect
+            .as_ref()
+            .filter(|inspection| inspection.picked.is_some())
+            .and_then(|inspection| inspection.run.as_ref())
+            .map(|run| run.span);
+        let from = timeline.first_from(
+            run_span.map_or_else(|| tile.market.span.map_or(0, |(from, _)| from), |s| s.0),
+        );
         let start = timeline.candles().get(from)?.ts;
-        Some((start, timeline.end()))
+        let end = run_span
+            .and_then(|(_, last)| {
+                let at = timeline
+                    .candles()
+                    .partition_point(|c| c.ts <= last)
+                    .checked_sub(1)?;
+                timeline.closes.get(at).copied()
+            })
+            .unwrap_or_else(|| timeline.end());
+        Some((start, end.max(start)))
     }
 
     fn advance_playback(&mut self, now: Instant) {
@@ -5744,6 +5762,12 @@ impl Persephone {
     }
 
     fn restudy_chart(&mut self, id: TileId) {
+        // A run found again in the drawer, while this chart follows one of its trades.
+        let inspected_run = self
+            .panel
+            .as_ref()
+            .filter(|panel| panel.replay_tile.unwrap_or(panel.tile) == id)
+            .and_then(|panel| panel.inspect.as_ref()?.run.clone());
         let Some(tile) = self.tiles.get_mut(&id) else {
             return;
         };
@@ -5789,8 +5813,27 @@ impl Persephone {
             }
             _ => None,
         };
-        if let Some(report) = report {
-            built.push(studies::equity(report, len));
+        match inspected_run.filter(|_| tile.inspected.is_some()) {
+            // That run's account, matched to these bars by time, over the span it traded.
+            Some(run) => {
+                let values = data
+                    .candles
+                    .iter()
+                    .map(|candle| {
+                        if candle.ts < run.span.0 || candle.ts > run.span.1 {
+                            f64::NAN
+                        } else {
+                            run.at(candle.ts).unwrap_or(f64::NAN)
+                        }
+                    })
+                    .collect();
+                built.push(studies::equity_line(values, run.start));
+            }
+            None => {
+                if let Some(report) = report {
+                    built.push(studies::equity(report, len));
+                }
+            }
         }
         chart.set_studies(built);
         let live = tile
@@ -5841,14 +5884,9 @@ impl Persephone {
         let gap = if gapped { GAP } else { 0.0 };
         let below = TOP_BAR + band;
         Panes {
-            panel: (band > 0.0).then(|| {
-                Rect::new(
-                    gap,
-                    TOP_BAR + gap,
-                    (width - 2.0 * gap).max(0.0),
-                    (band - gap).max(0.0),
-                )
-            }),
+            // Flush under the top bar; gaps at its sides and below.
+            panel: (band > 0.0)
+                .then(|| Rect::new(gap, TOP_BAR, (width - 2.0 * gap).max(0.0), band)),
             news: (news > 0.0).then(|| {
                 Rect::new(
                     width - news,
